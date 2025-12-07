@@ -2,6 +2,7 @@
 
 import { useMemo } from "react";
 import { useTrading } from "../tradingContext";
+import { BottomNav } from "@/components/BottomNav";
 
 function formatCurrency(value: number) {
   const sign = value < 0 ? "-" : "";
@@ -29,23 +30,7 @@ export default function PerformancePage() {
     [trades]
   );
 
-  if (closedTrades.length === 0) {
-    return (
-      <div className="screen-container">
-        <h2 className="section-title">Performance snapshot</h2>
-        <p
-          style={{
-            fontSize: "0.75rem",
-            color: "#9ca3af",
-            marginTop: "8px",
-          }}
-        >
-          No closed trades yet. Close trades on the Trades tab to see
-          performance here.
-        </p>
-      </div>
-    );
-  }
+  const hasClosed = closedTrades.length > 0;
 
   let totalPnL = 0;
   let wins = 0;
@@ -99,119 +84,160 @@ export default function PerformancePage() {
   const bestRDisplay = Number.isFinite(bestR) ? formatR(bestR) : "—";
   const worstRDisplay = Number.isFinite(worstR) ? formatR(worstR) : "—";
 
+  const netPnl = totalPnL;
+  const netR = totalR;
+
   return (
-    <div className="screen-container">
-      <h2 className="section-title">Performance snapshot</h2>
+    <>
+      <div className="app-page">
+        <header className="app-header">
+          <div className="app-header-title">Performance</div>
+          <div className="app-header-subtitle">Closed trade stats</div>
+        </header>
 
-      <div className="stat-box">
-        <div className="stat-header">
-          <span className="stat-title">All closed trades</span>
-          <span className="stat-chip">{tradeCount} trades</span>
+        <div className="mobile-card">
+          <div className="row-between">
+            <span className="text-sm">Net P&amp;L</span>
+            <span
+              className={`text-lg ${
+                netPnl > 0 ? "value-positive" : netPnl < 0 ? "value-negative" : ""
+              }`}
+            >
+              {netPnl.toFixed(2)}
+            </span>
+          </div>
+          <div className="row-between text-xs" style={{ marginTop: 6 }}>
+            <span>Net R</span>
+            <span>{netR.toFixed(2)}</span>
+          </div>
         </div>
 
-        <div className="grid">
-          <div>
-            <span className="grid-label">Net P&amp;L</span>
-            <span
-              className={`grid-value ${
-                totalPnL >= 0 ? "value-positive" : "value-negative"
-              }`}
-            >
-              {formatCurrency(totalPnL)}
-            </span>
+        {!hasClosed && (
+          <div className="mobile-card">
+            <div className="text-md" style={{ fontWeight: 600 }}>
+              Performance snapshot
+            </div>
+            <p className="text-sm" style={{ color: "#9ca3af", marginTop: 8 }}>
+              No closed trades yet. Close trades on the Trades tab to see performance here.
+            </p>
           </div>
-          <div>
-            <span className="grid-label">Net R</span>
-            <span
-              className={`grid-value ${
-                totalR >= 0 ? "value-positive" : "value-negative"
-              }`}
-            >
-              {formatR(totalR)}
-            </span>
-          </div>
-          <div>
-            <span className="grid-label">Win rate</span>
-            <span className="grid-value">
-              {winRate.toFixed(1)}%
-            </span>
-          </div>
-          <div>
-            <span className="grid-label">Avg R / trade</span>
-            <span
-              className={`grid-value ${
-                avgR >= 0 ? "value-positive" : "value-negative"
-              }`}
-            >
-              {formatR(avgR)}
-            </span>
-          </div>
-          <div>
-            <span className="grid-label">Avg win (R)</span>
-            <span
-              className={`grid-value ${
-                avgWinR >= 0 ? "value-positive" : "value-negative"
-              }`}
-            >
-              {winTrades.length === 0 ? "—" : formatR(avgWinR)}
-            </span>
-          </div>
-          <div>
-            <span className="grid-label">Avg loss (R)</span>
-            <span
-              className={`grid-value ${
-                avgLossR >= 0 ? "value-positive" : "value-negative"
-              }`}
-            >
-              {lossTrades.length === 0 ? "—" : formatR(avgLossR)}
-            </span>
-          </div>
-          <div>
-            <span className="grid-label">Profit factor</span>
-            <span
-              className={`grid-value ${
-                profitFactor >= 1 ? "value-positive" : "value-negative"
-              }`}
-            >
-              {profitFactor === 0 ? "—" : profitFactor.toFixed(2)}
-            </span>
-          </div>
-          <div>
-            <span className="grid-label">Expectancy / trade</span>
-            <span className="grid-value">
-              {formatR(expectancyR)}
-            </span>
-          </div>
-          <div>
-            <span className="grid-label">Best trade</span>
-            <span className={`grid-value ${bestR >= 0 ? "value-positive" : "value-negative"}`}>
-              {bestRDisplay}
-            </span>
-          </div>
-          <div>
-            <span className="grid-label">Toughest trade</span>
-            <span className={`grid-value ${worstR <= 0 ? "value-negative" : "value-positive"}`}>
-              {worstRDisplay}
-            </span>
-          </div>
-        </div>
-      </div>
+        )}
 
-      <div className="stat-notes">
-        <p>Notes</p>
-        <ul>
-          <li>
-            Wins: {wins} · Losses: {losses} · Total: {tradeCount}
-          </li>
-          <li>
-            R is based on your current $/R setting in Settings.
-          </li>
-          <li>
-            Close trades on the Trades tab with a realized P&amp;L to feed
-            this dashboard.
-          </li>
-        </ul>
+        {hasClosed && (
+          <div className="mobile-card">
+            <div className="text-md" style={{ fontWeight: 600, marginBottom: 6 }}>
+              Performance snapshot
+            </div>
+            <div
+              className="stat-header"
+              style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}
+            >
+              <span className="stat-title">All closed trades</span>
+              <span className="stat-chip">{tradeCount} trades</span>
+            </div>
+            <div className="grid">
+              <div>
+                <span className="grid-label">Net P&amp;L</span>
+                <span
+                  className={`grid-value ${
+                    totalPnL >= 0 ? "value-positive" : "value-negative"
+                  }`}
+                >
+                  {formatCurrency(totalPnL)}
+                </span>
+              </div>
+              <div>
+                <span className="grid-label">Net R</span>
+                <span
+                  className={`grid-value ${
+                    totalR >= 0 ? "value-positive" : "value-negative"
+                  }`}
+                >
+                  {formatR(totalR)}
+                </span>
+              </div>
+              <div>
+                <span className="grid-label">Win rate</span>
+                <span className="grid-value">{winRate.toFixed(1)}%</span>
+              </div>
+              <div>
+                <span className="grid-label">Avg R / trade</span>
+                <span
+                  className={`grid-value ${
+                    avgR >= 0 ? "value-positive" : "value-negative"
+                  }`}
+                >
+                  {formatR(avgR)}
+                </span>
+              </div>
+              <div>
+                <span className="grid-label">Avg win (R)</span>
+                <span
+                  className={`grid-value ${
+                    avgWinR >= 0 ? "value-positive" : "value-negative"
+                  }`}
+                >
+                  {winTrades.length === 0 ? "—" : formatR(avgWinR)}
+                </span>
+              </div>
+              <div>
+                <span className="grid-label">Avg loss (R)</span>
+                <span
+                  className={`grid-value ${
+                    avgLossR >= 0 ? "value-positive" : "value-negative"
+                  }`}
+                >
+                  {lossTrades.length === 0 ? "—" : formatR(avgLossR)}
+                </span>
+              </div>
+              <div>
+                <span className="grid-label">Profit factor</span>
+                <span
+                  className={`grid-value ${
+                    profitFactor >= 1 ? "value-positive" : "value-negative"
+                  }`}
+                >
+                  {profitFactor === 0 ? "—" : profitFactor.toFixed(2)}
+                </span>
+              </div>
+              <div>
+                <span className="grid-label">Expectancy / trade</span>
+                <span className={`grid-value ${expectancyR >= 0 ? "value-positive" : "value-negative"}`}>
+                  {formatR(expectancyR)}
+                </span>
+              </div>
+              <div>
+                <span className="grid-label">Best trade</span>
+                <span className={`grid-value ${bestR >= 0 ? "value-positive" : "value-negative"}`}>
+                  {bestRDisplay}
+                </span>
+              </div>
+              <div>
+                <span className="grid-label">Toughest trade</span>
+                <span className={`grid-value ${worstR <= 0 ? "value-negative" : "value-positive"}`}>
+                  {worstRDisplay}
+                </span>
+              </div>
+            </div>
+            <div className="stat-notes">
+              <p>Notes</p>
+              <ul>
+                <li>
+                  Wins: {wins} · Losses: {losses} · Total: {tradeCount}
+                </li>
+                <li>
+                  R is based on your current $/R setting in Settings.
+                </li>
+                <li>
+                  Close trades on the Trades tab with a realized P&amp;L to feed
+                  this dashboard.
+                </li>
+              </ul>
+            </div>
+          </div>
+        )}
       </div>
-    </div>
+      <BottomNav />
+    </>
   );
 }

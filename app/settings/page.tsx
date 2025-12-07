@@ -2,6 +2,7 @@
 
 import React, { useState } from "react";
 import { useTrading } from "../tradingContext";
+import { BottomNav } from "@/components/BottomNav";
 
 export default function SettingsPage() {
   const { settings, updateSettings } = useTrading();
@@ -62,122 +63,132 @@ export default function SettingsPage() {
   const dailyMaxLossDollar = settings.dailyMaxLossR * oneR;
 
   return (
-    <div className="screen-container">
-      <section className="card">
-        <h2 className="section-title">Account &amp; Risk Settings</h2>
-        <form onSubmit={handleSubmit} className="card-body form-grid">
-          <div className="form-group">
-            <label className="label">Account size ($)</label>
-            <input
-              type="number"
-              className="input"
-              value={accountSize}
-              onChange={(e) => setAccountSize(Number(e.target.value))}
-            />
-          </div>
+    <>
+      <div className="app-page">
+        <header className="app-header">
+          <div className="app-header-title">Settings</div>
+          <div className="app-header-subtitle">Account &amp; risk configuration</div>
+        </header>
 
-          <div className="form-group">
-            <label className="label">Risk per trade (% of account)</label>
-            <input
-              type="number"
-              className="input"
-              step="0.1"
-              value={riskPerTradePct}
-              onChange={(e) => setRiskPerTradePct(Number(e.target.value))}
-            />
+        <section className="mobile-card">
+          <div className="text-md" style={{ fontWeight: 600, marginBottom: 8 }}>
+            Account &amp; Risk Settings
           </div>
-
-          <div className="form-group">
-            <label className="label">Daily max loss (R)</label>
-            <input
-              type="number"
-              className="input"
-              step="0.5"
-              value={dailyMaxLossR}
-              onChange={(e) => setDailyMaxLossR(Number(e.target.value))}
-            />
-          </div>
-
-          <div className="form-group">
-            <label className="label">1R (derived)</label>
-            <div className="value read-only">
-              ${oneR.toFixed(0)} per 1R
+          <form onSubmit={handleSubmit} className="card-body form-grid">
+            <div className="form-group">
+              <label className="label">Account size ($)</label>
+              <input
+                type="number"
+                className="input"
+                value={accountSize}
+                onChange={(e) => setAccountSize(Number(e.target.value))}
+              />
             </div>
-          </div>
 
-          <div className="form-group">
-            <label className="label">Daily max loss (derived)</label>
-            <div className="value read-only">
-              {settings.dailyMaxLossR.toFixed(2)}R · $
-              {dailyMaxLossDollar.toFixed(0)}
+            <div className="form-group">
+              <label className="label">Risk per trade (% of account)</label>
+              <input
+                type="number"
+                className="input"
+                step="0.1"
+                value={riskPerTradePct}
+                onChange={(e) => setRiskPerTradePct(Number(e.target.value))}
+              />
             </div>
-          </div>
 
-          <hr className="divider" />
+            <div className="form-group">
+              <label className="label">Daily max loss (R)</label>
+              <input
+                type="number"
+                className="input"
+                step="0.5"
+                value={dailyMaxLossR}
+                onChange={(e) => setDailyMaxLossR(Number(e.target.value))}
+              />
+            </div>
 
-          <div className="form-group">
-            <label className="label">
-              Move stop to BE at (R)
-              <span className="label-sub">
-                Leave blank to disable. Example: 1 = move stop to breakeven
-                at +1R.
-              </span>
-            </label>
-            <input
-              type="number"
-              className="input"
-              step="0.1"
-              value={defaultMoveStopToBreakEvenAtR}
-              onChange={(e) =>
-                setDefaultMoveStopToBreakEvenAtR(e.target.value)
-              }
-              placeholder="e.g. 1"
-            />
-          </div>
+            <div className="form-group">
+              <label className="label">1R (derived)</label>
+              <div className="value read-only">
+                ${oneR.toFixed(0)} per 1R
+              </div>
+            </div>
 
-          <div className="form-group">
-            <label className="label">
-              First partial take-profit at (R)
-              <span className="label-sub">
-                Leave blank to disable. Example: 2 = consider partial at +2R.
-              </span>
-            </label>
-            <input
-              type="number"
-              className="input"
-              step="0.1"
-              value={defaultFirstPartialAtR}
-              onChange={(e) => setDefaultFirstPartialAtR(e.target.value)}
-              placeholder="e.g. 2"
-            />
-          </div>
+            <div className="form-group">
+              <label className="label">Daily max loss (derived)</label>
+              <div className="value read-only">
+                {settings.dailyMaxLossR.toFixed(2)}R · $
+                {dailyMaxLossDollar.toFixed(0)}
+              </div>
+            </div>
 
-          <div className="form-group">
-            <label className="label">
-              First partial take-profit size (% of position)
-              <span className="label-sub">
-                Leave blank to disable. Example: 50 = close half your size.
-              </span>
-            </label>
-            <input
-              type="number"
-              className="input"
-              step="1"
-              min="0"
-              max="100"
-              value={defaultFirstPartialPct}
-              onChange={(e) => setDefaultFirstPartialPct(e.target.value)}
-              placeholder="e.g. 50"
-            />
-          </div>
+            <hr className="divider" />
 
-          <div className="form-actions">
-            <button type="submit" className="btn btn-primary">
-              Save settings
-            </button>
-          </div>
-        </form>
-      </section>
-    </div>
+            <div className="form-group">
+              <label className="label">
+                Move stop to BE at (R)
+                <span className="label-sub">
+                  Leave blank to disable. Example: 1 = move stop to breakeven
+                  at +1R.
+                </span>
+              </label>
+              <input
+                type="number"
+                className="input"
+                step="0.1"
+                value={defaultMoveStopToBreakEvenAtR}
+                onChange={(e) =>
+                  setDefaultMoveStopToBreakEvenAtR(e.target.value)
+                }
+                placeholder="e.g. 1"
+              />
+            </div>
+
+            <div className="form-group">
+              <label className="label">
+                First partial take-profit at (R)
+                <span className="label-sub">
+                  Leave blank to disable. Example: 2 = consider partial at +2R.
+                </span>
+              </label>
+              <input
+                type="number"
+                className="input"
+                step="0.1"
+                value={defaultFirstPartialAtR}
+                onChange={(e) => setDefaultFirstPartialAtR(e.target.value)}
+                placeholder="e.g. 2"
+              />
+            </div>
+
+            <div className="form-group">
+              <label className="label">
+                First partial take-profit size (% of position)
+                <span className="label-sub">
+                  Leave blank to disable. Example: 50 = close half your size.
+                </span>
+              </label>
+              <input
+                type="number"
+                className="input"
+                step="1"
+                min="0"
+                max="100"
+                value={defaultFirstPartialPct}
+                onChange={(e) => setDefaultFirstPartialPct(e.target.value)}
+                placeholder="e.g. 50"
+              />
+            </div>
+
+            <div className="form-actions">
+              <button type="submit" className="btn btn-approve">
+                Save settings
+              </button>
+            </div>
+          </form>
+        </section>
+      </div>
+      <BottomNav />
+    </>
   );
 }

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { BottomNav } from "@/components/BottomNav";
 
 type TradeStatus = "OPEN" | "CLOSED" | "CANCELLED" | "PARTIAL";
 
@@ -261,22 +262,14 @@ export default function TradesPage() {
   const hasTrades = trades.length > 0;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 px-4 py-6">
-      <div className="mx-auto w-full max-w-6xl space-y-6">
-        {/* Header */}
-        <header className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">
-              Trades
-            </h1>
-            <p className="text-sm text-slate-400">
-              Live paper-trade log with risk summary.
-            </p>
-          </div>
+    <>
+      <div className="app-page">
+        <header className="app-header">
+          <div className="app-header-title">Trades</div>
+          <div className="app-header-subtitle">All executions &amp; orders</div>
         </header>
 
-        {/* Summary strip */}
-        <section className="grid gap-3 rounded-2xl bg-slate-900/70 p-4 shadow-lg shadow-black/40 sm:grid-cols-3 border border-slate-700/60">
+        <div className="grid gap-3 rounded-2xl bg-slate-900/70 p-4 shadow-lg shadow-black/40 sm:grid-cols-3 border border-slate-700/60">
           <div className="flex flex-col gap-1">
             <span className="text-xs uppercase tracking-wide text-slate-400">
               Open trades
@@ -324,9 +317,8 @@ export default function TradesPage() {
               Based on CLOSED trades with a realizedPnl field.
             </span>
           </div>
-        </section>
+        </div>
 
-        {/* Error / loading states */}
         {error && (
           <div className="rounded-xl border border-rose-700/70 bg-rose-950/40 px-4 py-3 text-sm text-rose-200">
             {error}
@@ -339,8 +331,7 @@ export default function TradesPage() {
           </div>
         )}
 
-        {/* Table */}
-        <section className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/80 shadow-lg shadow-black/50">
+        <section className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/80 shadow-lg shadow-black/50 table-wrapper">
           <div className="overflow-x-auto">
             <table className="min-w-full border-collapse text-sm">
               <thead className="bg-slate-900/80 border-b border-slate-800">
@@ -462,6 +453,7 @@ export default function TradesPage() {
           </div>
         </section>
       </div>
-    </div>
+      <BottomNav />
+    </>
   );
 }

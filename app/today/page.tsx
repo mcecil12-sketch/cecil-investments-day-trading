@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useState, useCallback } from "react";
+import { BottomNav } from "@/components/BottomNav";
 import { useTrading, TradeSide, Trade } from "../tradingContext";
 import { computeRiskPerShare } from "../../lib/risk";
 
@@ -20,6 +21,10 @@ type IncomingSignal = {
   playbookScore?: number;
   volumeScore?: number;
   catalystScore?: number;
+  rMultiple?: number;
+  positionSize?: number;
+  shares?: number;
+  score?: number;
 };
 
 type SignalsResponse = {
@@ -144,6 +149,9 @@ export default function TodayPage() {
   const [loadingAuto, setLoadingAuto] = useState(false);
   const [autoError, setAutoError] = useState<string | null>(null);
   const [spyStatusText, setSpyStatusText] = useState<string>("");
+  const [touchStartX, setTouchStartX] = useState<number | null>(null);
+  const [autoManageStatus, setAutoManageStatus] = useState<string | null>(null);
+  const [autoManageBusy, setAutoManageBusy] = useState(false);
 
   const oneR = settings.oneR;
   const dailyMaxLossR = settings.dailyMaxLossR;
@@ -322,9 +330,12 @@ export default function TodayPage() {
           signalId: signal.id,
           riskDollars: chosenRisk,
           submitToBroker: true,
-          quantity: size,
+          quantity: signal.positionSize ?? (signal as any).shares ?? size,
           orderType: "market",
           timeInForce: "day",
+          autoManage: true,
+          manageSizePct1: 0.5,
+          manageSizePct2: 1.0,
         }),
       });
 
@@ -396,6 +407,69 @@ export default function TodayPage() {
     });
   };
 
+  const handleSwipeStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    setTouchStartX(e.changedTouches[0].clientX);
+  };
+
+  const handleSwipeEnd = (
+    e: React.TouchEvent<HTMLDivElement>,
+    signal: IncomingSignal
+  ) => {
+    if (touchStartX == null) return;
+    const deltaX = e.changedTouches[0].clientX - touchStartX;
+    const threshold = 50;
+
+    if (Math.abs(deltaX) < threshold) {
+      setTouchStartX(null);
+      return;
+    }
+
+    if (deltaX > 0) {
+      handleApprove(signal);
+    } else {
+      handleDismiss(signal.id);
+    }
+
+    setTouchStartX(null);
+  };
+
+  async function runAutoManage() {
+    try {
+      setAutoManageBusy(true);
+      setAutoManageStatus("Running auto-management (dry run)...");
+
+      const res = await fetch("/api/auto-manage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dryRun: true }),
+      });
+
+      const json = await res.json();
+      if (!res.ok || !json.ok) {
+        throw new Error(json.error || "Failed to run auto-manage");
+      }
+
+      const count = json.evaluated ?? 0;
+      const interesting = (json.actions || []).filter(
+        (a: any) => a.suggestion !== "HOLD"
+      );
+
+      setAutoManageStatus(
+        `Checked ${count} trade(s). ${interesting.length} suggestion(s) (partials/stops).`
+      );
+
+      // eslint-disable-next-line no-console
+      console.log("[auto-manage] result", json);
+    } catch (err: any) {
+      console.error("runAutoManage error:", err);
+      setAutoManageStatus(
+        `Auto-manage error: ${err.message || "something went wrong"}`
+      );
+    } finally {
+      setAutoManageBusy(false);
+    }
+  }
+
   const sortedSignals = [...signals].sort((a, b) => {
     const pa = typeof a.priority === "number" ? a.priority : 0;
     const pb = typeof b.priority === "number" ? b.priority : 0;
@@ -409,6 +483,7 @@ export default function TodayPage() {
     (s) => (typeof s.priority === "number" ? s.priority : 0) >= 9
   );
 
+  const currentSignal = visibleSignals[0];
   const sandboxSignals: IncomingSignal[] = [
     {
       id: "SPY-demo-long",
@@ -435,8 +510,15 @@ export default function TodayPage() {
   const openAutoTrades = autoTrades.filter((t) => t.status === "open");
 
   return (
-    <div className="min-h-screen bg-[var(--ci-bg)] text-[var(--ci-text)]">
-      <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
+    <>
+      <div className="app-page">
+        <header className="app-header">
+          <div className="app-header-title">Cecil Trading</div>
+          <div className="app-header-subtitle">
+            Personal paper-trading assistant
+          </div>
+        </header>
+        <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
         {/* Stats tiles */}
         <section className="space-y-3">
           {manageSyncError && (
@@ -576,6 +658,79 @@ export default function TodayPage() {
               No A+ setups right now. Stay patient and protect capital.
             </p>
           )}
+          {currentSignal && (
+            <div
+              className="mobile-card"
+              onTouchStart={handleSwipeStart}
+              onTouchEnd={(e) => handleSwipeEnd(e, currentSignal)}
+            >
+              <div className="row-between" style={{ marginBottom: 4 }}>
+                <div>
+                  <div className="text-sm" style={{ opacity: 0.7 }}>
+                    Pending approval
+                  </div>
+                  <div className="text-lg" style={{ fontWeight: 600 }}>
+                    {currentSignal.ticker} · {currentSignal.side}
+                  </div>
+                </div>
+                <div className="column" style={{ textAlign: "right", fontSize: 11 }}>
+                  <span>Entry: {currentSignal.entryPrice?.toFixed(2)}</span>
+                  <span>Stop: {currentSignal.stopPrice?.toFixed(2)}</span>
+                  {currentSignal.targetPrice && (
+                    <span>Target: {currentSignal.targetPrice.toFixed(2)}</span>
+                  )}
+                </div>
+              </div>
+
+              <div
+                className="row-between"
+                style={{ marginTop: 8, marginBottom: 4, fontSize: 11 }}
+              >
+                <span>
+                  R: <strong>{currentSignal.rMultiple?.toFixed?.(2) ?? "–"}</strong>
+                </span>
+                <span>
+                  Size:{" "}
+                  <strong>
+                    {currentSignal.positionSize ?? currentSignal.shares ?? "–"}
+                  </strong>
+                </span>
+                <span>
+                  Score: <strong>{currentSignal.score ?? "–"}</strong>
+                </span>
+              </div>
+
+              {currentSignal.reasoning && (
+                <p className="text-xs" style={{ marginTop: 6, color: "#9ca3af" }}>
+                  {currentSignal.reasoning}
+                </p>
+              )}
+
+              <div
+                className="row"
+                style={{ marginTop: 10, justifyContent: "space-between" }}
+              >
+                <button
+                  className="btn btn-reject"
+                  style={{ flex: 1, marginRight: 6 }}
+                  onClick={() => handleDismiss(currentSignal.id)}
+                >
+                  Swipe ← or Tap · Reject
+                </button>
+                <button
+                  className="btn btn-approve"
+                  style={{ flex: 1, marginLeft: 6 }}
+                  onClick={() => handleApprove(currentSignal)}
+                >
+                  Swipe → or Tap · Approve
+                </button>
+              </div>
+
+              <div className="text-xs" style={{ marginTop: 6, color: "#6b7280" }}>
+                Tip: Swipe right to approve, left to reject while reviewing charts.
+              </div>
+            </div>
+          )}
           {visibleSignals.map((signal) => {
             const { size, dollarRisk, riskPerShare } = computeSizing(
               chosenRisk,
@@ -586,6 +741,8 @@ export default function TodayPage() {
               <div
                 key={signal.id}
                 className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 md:p-6 shadow-[0_0_12px_rgba(255,255,255,0.03)] space-y-3"
+                onTouchStart={handleSwipeStart}
+                onTouchEnd={(e) => handleSwipeEnd(e, signal)}
               >
                 <div className="flex items-center justify-between">
                   <div className="pill-row">
@@ -656,6 +813,32 @@ export default function TodayPage() {
               </div>
             );
           })}
+        </section>
+        <section className="mt-2 px-3">
+          <div className="rounded-2xl border border-neutral-700 bg-neutral-900/70 px-3 py-2 text-sm">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="font-medium text-neutral-100">
+                  Auto-management
+                </div>
+                <div className="text-xs text-neutral-400">
+                  Check open trades for 1R/2R partials and stops.
+                </div>
+              </div>
+              <button
+                className="rounded-full px-3 py-1 text-xs font-semibold bg-neutral-100 text-black disabled:opacity-50"
+                onClick={runAutoManage}
+                disabled={autoManageBusy}
+              >
+                {autoManageBusy ? "Running..." : "Run (dry run)"}
+              </button>
+            </div>
+            {autoManageStatus && (
+              <div className="mt-1 text-xs text-neutral-300">
+                {autoManageStatus}
+              </div>
+            )}
+          </div>
         </section>
 
         {/* Sandbox signals */}
@@ -783,7 +966,9 @@ export default function TodayPage() {
             </div>
           ))}
         </section>
-      </main>
-    </div>
+        </main>
+      </div>
+      <BottomNav />
+    </>
   );
 }

@@ -21,6 +21,9 @@ export interface IncomingTrade {
   submitToBroker?: boolean;
   orderType?: "market" | "limit";
   timeInForce?: "day" | "gtc";
+  autoManage?: boolean;
+  manageSizePct1?: number;
+  manageSizePct2?: number;
 }
 
 export interface TradeRecord extends IncomingTrade {
@@ -32,6 +35,18 @@ export interface TradeRecord extends IncomingTrade {
   brokerStatus?: string;
   brokerRaw?: any;
   error?: string;
+  management?: {
+    enabled: boolean;
+    tp1R: number;
+    tp2R: number;
+    tp1SizePct: number;
+    tp2SizePct: number;
+    tp1Done?: boolean;
+    tp2Done?: boolean;
+    movedToBE?: boolean;
+    lastPrice?: number;
+    lastUpdated?: string;
+  };
 }
 
 async function ensureFile() {
@@ -74,14 +89,14 @@ export async function POST(req: Request) {
 
     const now = new Date().toISOString();
     let status = "NEW";
-    let broker: any;
+    let brokerOrder: any;
     let error: string | undefined;
 
     if (body.submitToBroker) {
       try {
         status = "BROKER_PENDING";
 
-        broker = await submitOrder({
+        brokerOrder = await submitOrder({
           symbol: body.ticker,
           qty: body.quantity,
           side: mapDirection(body.side),
@@ -90,7 +105,7 @@ export async function POST(req: Request) {
         });
 
         status =
-          broker.status === "filled" || broker.status === "partially_filled"
+          brokerOrder.status === "filled" || brokerOrder.status === "partially_filled"
             ? "BROKER_FILLED"
             : "BROKER_PENDING";
       } catch (err: any) {
@@ -105,10 +120,23 @@ export async function POST(req: Request) {
       createdAt: now,
       updatedAt: now,
       status,
-      brokerOrderId: broker?.id,
-      brokerStatus: broker?.status,
-      brokerRaw: broker,
+      brokerOrderId: brokerOrder?.id,
+      brokerStatus: brokerOrder?.status,
+      brokerRaw: brokerOrder ? { id: brokerOrder.id, status: brokerOrder.status } : undefined,
       error,
+      management: body.autoManage
+        ? {
+            enabled: true,
+            tp1R: 1,
+            tp2R: 2,
+            tp1SizePct: body.manageSizePct1 ?? 0.5,
+            tp2SizePct: body.manageSizePct2 ?? 1.0,
+            tp1Done: false,
+            tp2Done: false,
+            movedToBE: false,
+            lastUpdated: now,
+          }
+        : undefined,
     };
 
     const trades = await readTrades();
