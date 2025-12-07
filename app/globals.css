@@ -1,0 +1,738 @@
+/* Global styles for Cecil Investments – no Tailwind required */
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100vh;
+  background-color: var(--ci-bg);
+  color: var(--ci-text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    sans-serif;
+}
+
+main {
+  min-height: 100vh;
+}
+
+/* Heading style */
+h1 {
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--ci-accent);
+}
+/* ─────────────── Layout Styles ─────────────── */
+
+.app-container {
+  max-width: 430px;
+  margin: 0 auto;
+  padding: 16px;
+  padding-bottom: 80px; /* room for bottom nav */
+  background: var(--ci-bg);
+  color: var(--ci-text);
+}
+
+/* Header */
+.app-header {
+  margin-bottom: 16px;
+}
+
+.app-title {
+  font-size: 1.4rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--ci-accent);
+}
+
+.app-subtitle {
+  color: var(--ci-text-muted);
+  font-size: 0.75rem;
+  margin-top: 2px;
+}
+
+/* KPI Pills */
+.pill-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background-color: var(--ci-card);
+  border: 1px solid var(--ci-border);
+  border-radius: 999px;
+}
+
+.pill-label {
+  color: var(--ci-text-muted);
+  font-size: 0.7rem;
+}
+
+.pill-value {
+  color: var(--ci-text);
+  font-weight: 600;
+  font-size: 0.75rem;
+}
+
+/* Bottom Navigation */
+.bottom-nav {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background-color: var(--ci-card);
+  padding: 10px 0;
+  display: flex;
+  justify-content: space-evenly;
+  border-top: 1px solid var(--ci-border);
+  backdrop-filter: blur(6px);
+}
+
+.nav-item {
+  color: var(--ci-text-muted);
+  text-decoration: none;
+  font-size: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.nav-item svg {
+  color: var(--ci-text-muted);
+  opacity: 0.8;
+}
+
+.nav-item.active {
+  color: var(--ci-accent);
+  font-weight: 600;
+}
+
+.nav-item.active svg {
+  color: var(--ci-accent);
+  opacity: 1;
+}
+
+/* ─────────────── Today screen & cards ─────────────── */
+
+.today-container {
+  margin-top: 16px;
+}
+
+.section-title {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--ci-text-muted);
+  margin-bottom: 8px;
+}
+
+.cards {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Card styling */
+.card {
+  background: var(--ci-card);
+  border-radius: 14px;
+  padding: 10px;
+  border: 1px solid var(--ci-border);
+  box-shadow: 0 0 12px rgba(255, 255, 255, 0.03);
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+
+.symbol {
+  font-weight: 650;
+  font-size: 0.9rem;
+}
+
+.timeframe {
+  font-size: 0.7rem;
+  color: var(--ci-text-muted);
+  margin-left: 4px;
+}
+
+.side {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.side-long {
+  color: var(--ci-positive);
+}
+
+.side-short {
+  color: var(--ci-negative);
+}
+/* ─────────────── Trades filters ─────────────── */
+
+.filters-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.filter-group {
+  flex: 1;
+  min-width: 90px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.filter-label {
+  font-size: 0.7rem;
+  color: var(--ci-text-muted);
+}
+
+.filter-select {
+  font-size: 0.75rem;
+  padding: 4px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--ci-border);
+  background-color: var(--ci-card);
+  color: var(--ci-text);
+}
+
+/* Grid of values */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px 8px;
+  font-size: 0.7rem;
+  margin-bottom: 6px;
+}
+
+.grid-label {
+  color: var(--ci-text-muted);
+}
+
+.grid-value {
+  color: var(--ci-text);
+  font-weight: 500;
+  margin-left: 4px;
+}
+
+/* Notes & tags */
+.notes {
+  font-size: 0.7rem;
+  color: var(--ci-text-muted);
+  margin-bottom: 6px;
+  line-height: 1.35;
+}
+
+.tag-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: var(--ci-text-muted);
+}
+
+.tag-source {
+  color: var(--ci-text-muted);
+}
+
+.tag-status {
+  font-weight: 500;
+}
+
+.tag-status.positive {
+  color: var(--ci-positive);
+}
+
+.tag-status.negative {
+  color: var(--ci-negative);
+}
+/* Approve / Reject buttons */
+.btn-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.btn {
+  flex: 1;
+  padding: 6px 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: 999px;
+  border: 1px solid var(--ci-border);
+  cursor: pointer;
+  transition: transform 0.08s ease, box-shadow 0.08s ease, background 0.08s ease;
+}
+
+.btn-approve {
+  background: var(--ci-accent);
+  color: #000;
+  box-shadow: 0 8px 20px rgba(255, 255, 255, 0.1);
+}
+
+.btn-approve:hover {
+  filter: brightness(0.98);
+}
+
+.btn-reject {
+  background-color: var(--ci-card);
+  color: var(--ci-text);
+  border: 1px solid var(--ci-border);
+}
+
+.btn-reject:hover {
+  background-color: #111;
+}
+
+.btn:active {
+  transform: translateY(1px) scale(0.98);
+  box-shadow: none;
+}
+/* Generic screen container */
+.screen-container {
+  margin-top: 16px;
+  background: var(--ci-bg);
+  color: var(--ci-text);
+}
+
+/* Slight tweaks for trade / settings cards */
+.trade-card {
+  background: var(--ci-card);
+}
+
+.settings-card {
+  background: var(--ci-card);
+}
+
+/* Performance box */
+.stat-box {
+  background: var(--ci-card);
+  border-radius: 12px;
+  padding: 10px;
+  border: 1px solid var(--ci-border);
+  margin-bottom: 10px;
+}
+
+.stat-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.stat-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ci-text);
+}
+
+.stat-chip {
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--ci-border);
+  color: var(--ci-text);
+}
+
+.stat-notes {
+  font-size: 0.75rem;
+  color: var(--ci-text-muted);
+}
+
+.stat-notes p {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.stat-notes ul {
+  padding-left: 14px;
+}
+
+.stat-notes li {
+  margin-bottom: 2px;
+}
+/* ─────────────── Page transition animation ─────────────── */
+
+@keyframes slide-up-fade {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Apply to main screen containers */
+.today-container,
+.screen-container {
+  animation: slide-up-fade 0.18s ease-out;
+}
+/* ─────────────── New signal form ─────────────── */
+
+.new-signal-card {
+  background: var(--ci-card);
+  border-radius: 14px;
+  padding: 10px;
+  border: 1px solid var(--ci-border);
+  margin-bottom: 10px;
+}
+
+.new-signal-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--ci-text);
+}
+
+.new-signal-subtitle {
+  font-size: 0.7rem;
+  color: var(--ci-text-muted);
+  margin-top: 2px;
+  margin-bottom: 8px;
+}
+
+.new-signal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.form-row {
+  display: flex;
+  gap: 8px;
+}
+
+.form-group {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.form-label {
+  font-size: 0.7rem;
+  color: var(--ci-text-muted);
+}
+
+.form-input {
+  font-size: 0.75rem;
+  padding: 5px 7px;
+  border-radius: 8px;
+  border: 1px solid var(--ci-border);
+  background-color: var(--ci-card);
+  color: var(--ci-text);
+}
+
+.form-input::placeholder {
+  color: var(--ci-text-muted);
+}
+
+.form-input:focus {
+  outline: 1px solid var(--ci-accent);
+}
+
+/* Submit button for the form */
+.btn-submit {
+  width: 100%;
+  margin-top: 2px;
+  background: var(--ci-accent);
+  color: #000;
+  font-size: 0.8rem;
+  font-weight: 600;
+  border-radius: 999px;
+  border: 1px solid var(--ci-border);
+  padding: 7px 0;
+  cursor: pointer;
+  box-shadow: 0 8px 20px rgba(255, 255, 255, 0.1);
+  transition: transform 0.08s ease, box-shadow 0.08s ease, filter 0.08s ease;
+}
+
+.btn-submit:hover:not(:disabled) {
+  filter: brightness(0.98);
+}
+
+.btn-submit:active:not(:disabled) {
+  transform: translateY(1px) scale(0.98);
+  box-shadow: none;
+}
+
+.btn-submit:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Section subtitle for manual signals */
+.section-subtitle {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: #94a3b8;
+  margin-bottom: 8px;
+}
+/* ─────────────── Toast popup ─────────────── */
+
+@keyframes toast-pop {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, 12px);
+  }
+  15% {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+  85% {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, 12px);
+  }
+}
+
+.toast {
+  position: fixed;
+  bottom: 72px; /* just above bottom nav */
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 90%;
+  background: rgba(6, 24, 17, 0.98);
+  border-radius: 999px;
+  padding: 8px 14px;
+  border: 1px solid #22c55e;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.7);
+  animation: toast-pop 2s ease-in-out forwards;
+  z-index: 50;
+}
+
+.toast-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background-color: #22c55e;
+  box-shadow: 0 0 8px rgba(34, 197, 94, 0.9);
+}
+
+.toast-text {
+  font-size: 0.75rem;
+  color: #e5f9ed;
+}
+/* ------- Cecil Investments app shell ------- */
+
+.app-container {
+  background: #000000;
+  color: #f9fafb;
+  min-height: 100vh;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "Segoe UI", sans-serif;
+}
+
+/* Main content area under the green header */
+.app-container main {
+  padding: 16px;
+  max-width: 1100px;
+  margin: 0 auto 80px; /* leave room for bottom nav */
+}
+
+/* Generic “card” look for sections on Today / Trades / Stats */
+.app-container main section {
+  background: #020617; /* very dark navy */
+  border-radius: 12px;
+  border: 1px solid #1f2937;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+/* Section titles */
+.app-container main h2 {
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  margin-bottom: 0.25rem;
+}
+
+/* Helper text */
+.app-container main p,
+.app-container main label {
+  font-size: 0.75rem;
+}
+
+/* Inputs / selects / textareas */
+.app-container main input,
+.app-container main select,
+.app-container main textarea {
+  background: #020617;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  color: #e5e7eb;
+  padding: 4px 8px;
+  font-size: 0.8rem;
+}
+
+.app-container main input:focus,
+.app-container main select:focus,
+.app-container main textarea:focus {
+  outline: 1px solid #22c55e;
+  border-color: #22c55e;
+}
+
+/* Buttons that look like the green pills */
+.app-container main button {
+  border-radius: 999px;
+  border: 1px solid #16a34a;
+  background: #22c55e;
+  color: #022c22;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.app-container main button:hover {
+  background: #4ade80;
+}
+
+/* More neutral/secondary buttons (like Dismiss, Refresh) */
+.app-container main button[disabled],
+.app-container main button.secondary {
+  background: #020617;
+  color: #e5e7eb;
+  border-color: #4b5563;
+}
+
+.app-container main button.secondary:hover {
+  background: #111827;
+}
+
+/* Code pills (for /api/signals, etc.) */
+.app-container main code {
+  background: #111827;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.7rem;
+}
+
+/* List items / rows inside cards */
+.app-container main .trade-row,
+.app-container main .signal-row {
+  border-radius: 8px;
+  border: 1px solid #1f2937;
+  background: #020617;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+}
+
+/* --- CTA buttons --------------------------------------------------- */
+.btn-approve {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.4rem 0.9rem;
+  border-radius: 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  background: var(--ci-positive);
+  color: #000;
+  border: 1px solid var(--ci-positive);
+  transition: background 120ms ease, transform 80ms ease, box-shadow 120ms ease;
+}
+
+.btn-approve:hover {
+  background: #4ef58a;
+  box-shadow: 0 0 12px rgba(74, 222, 128, 0.4);
+}
+
+.btn-approve:active {
+  transform: translateY(1px);
+}
+
+/* “No thanks / reject / dismiss” */
+.btn-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.35rem 0.85rem;
+  border-radius: 0.5rem;
+  font-size: 0.7rem;
+  font-weight: 500;
+  border: 1px solid var(--ci-negative);
+  color: var(--ci-negative);
+  background: transparent;
+  transition: background 120ms ease, color 120ms ease, transform 80ms ease;
+}
+
+.btn-dismiss:hover {
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.btn-dismiss:active {
+  transform: translateY(1px);
+}
+
+/* --- Positive / negative values ------------------------------------ */
+.value-positive {
+  color: var(--ci-positive);
+}
+
+.value-negative {
+  color: var(--ci-negative);
+}
+
+/* Subtle pill background for good/bad outcomes (e.g. tags or chips) */
+.pill-result {
+  border-radius: 9999px;
+  padding: 2px 8px;
+  font-size: 0.7rem;
+}
+
+.pill-result.positive {
+  background: rgba(74, 222, 128, 0.14);
+  color: var(--ci-positive);
+}
+
+.pill-result.negative {
+  background: rgba(239, 68, 68, 0.14);
+  color: var(--ci-negative);
+}
+:root {
+  --ci-bg: #0a0a0a;          /* App background: deep black */
+  --ci-card: #141414;        /* Card backgrounds */
+  --ci-border: #262626;      /* Subtle borders */
+  --ci-text: #fafafa;        /* Main text */
+  --ci-text-muted: #9ca3af;  /* Muted text */
+
+  --ci-accent: #bfbfbf;      /* Silver accent */
+  --ci-accent-soft: #a6a6a6; /* Hover / soft silver */
+
+  --ci-positive: #4ade80;    /* Green */
+  --ci-negative: #ef4444;    /* Red */
+}
+
+body {
+  background-color: var(--ci-bg);
+  color: var(--ci-text);
+}

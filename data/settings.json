@@ -1,0 +1,8 @@
+{
+  "autoManagementEnabled": false,
+  "maxRiskPerTrade": 150,
+  "maxRiskPerDay": 600,
+  "maxTradesPerDay": 10,
+  "autoEntryReady": false,
+  "autoEntryNotes": ""
+}

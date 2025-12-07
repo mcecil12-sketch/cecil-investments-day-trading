@@ -1,0 +1,38 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Trade {
+  id                  String   @id
+  ticker              String
+  side                String
+  size                Int
+  entryPrice          Float
+  stopPrice           Float?
+  targetPrice         Float?
+  openedAt            DateTime
+  closedAt            DateTime?
+  status              String
+  notes               String?
+  realizedPnL         Float?
+  initialRiskPerShare Float?
+  initialDollarRisk   Float?
+  maxRReached         Float?
+  management          Json?
+}
+
+model Signal {
+  id         String   @id
+  ticker     String
+  side       String
+  entryPrice Float
+  stopPrice  Float?
+  targetPrice Float?
+  reasoning  String?
+  source     String?
+  createdAt  DateTime
+}
