@@ -1,7 +1,9 @@
 "use client";
 
 import React, { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import { BottomNav } from "@/components/BottomNav";
+import { AutoManagePoller } from "@/components/AutoManagePoller";
 import { useTrading, TradeSide, Trade } from "../tradingContext";
 import { computeRiskPerShare } from "../../lib/risk";
 
@@ -134,6 +136,33 @@ function StatTile({
   );
 }
 
+// --- Compact header stat pill ----------------------------------------------
+function StatPill(props: {
+  label: string;
+  value: React.ReactNode;
+  tone?: "neutral" | "positive" | "negative";
+}) {
+  const { label, value, tone = "neutral" } = props;
+
+  const toneClass =
+    tone === "positive"
+      ? "value-positive"
+      : tone === "negative"
+      ? "value-negative"
+      : "text-slate-100";
+
+  return (
+    <div className="flex flex-col rounded-2xl border border-slate-800/80 bg-slate-900/70 px-3 py-2 min-w-[110px]">
+      <span className="text-[10px] uppercase tracking-wide text-slate-400">
+        {label}
+      </span>
+      <span className={`mt-0.5 text-sm font-semibold ${toneClass}`}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
 export default function TodayPage() {
   const { settings, dailyPnL, addTrade } = useTrading();
   const [signals, setSignals] = useState<IncomingSignal[]>([]);
@@ -168,6 +197,38 @@ export default function TodayPage() {
   else if (dailyPnL > 0) statusText = "Green day so far";
   else if (dailyPnL < 0 && lossUsedR < dailyMaxLossR * 0.5) statusText = "Drawdown · stay selective";
   else if (dailyPnL < 0 && lossUsedR >= dailyMaxLossR * 0.5) statusText = "Near daily loss limit";
+
+  const statusLabel = blockedForDay
+    ? "Locked out"
+    : dailyPnL !== 0
+    ? "In trades"
+    : "Flat";
+  const todayPnlRaw = dailyPnL;
+  const netRRaw = oneR > 0 ? todayPnlRaw / oneR : 0;
+  const tradesToday = dailyStats?.totalTrades ?? 0;
+  const dailyTradeLimit = settingsData?.maxTradesPerDay ?? "—";
+  const remainingRiskRaw = remainingR;
+  const remainingRiskDollarFormatted = `$${Math.max(
+    dailyMaxLossDollar - lossUsedDollar,
+    0
+  ).toFixed(0)}`;
+
+  const summary = {
+    todayPnlFormatted: `$${todayPnlRaw.toFixed(2)}`,
+    todayPnl: todayPnlRaw,
+    netRFormatted: oneR > 0 ? `${netRRaw.toFixed(2)}R` : "—",
+    netR: netRRaw,
+    tradesToday,
+    remainingR: remainingRiskRaw,
+    remainingUsdFormatted: remainingRiskDollarFormatted,
+    sessionStatusText: blockedForDay ? "Daily limit hit" : statusLabel,
+  };
+
+  const todayPnlDisplay = summary.todayPnlFormatted; // example
+  const netRDisplay = summary.netRFormatted;
+  const tradesTodayDisplay = `${summary.tradesToday} / ${dailyTradeLimit}`;
+  const remainingRiskDisplay = `${summary.remainingR.toFixed(1)}R · ${summary.remainingUsdFormatted}`;
+  const statusDisplay = summary.sessionStatusText;
 
   useEffect(() => {
     async function fetchSignals() {
@@ -470,7 +531,13 @@ export default function TodayPage() {
     }
   }
 
-  const sortedSignals = [...signals].sort((a, b) => {
+  const pendingSignals = signals.filter(
+    (s: any) =>
+      s?.status === "PENDING" &&
+      (s?.grade === "A" || (typeof s?.score === "number" && s.score >= 9))
+  );
+
+  const sortedSignals = [...pendingSignals].sort((a, b) => {
     const pa = typeof a.priority === "number" ? a.priority : 0;
     const pb = typeof b.priority === "number" ? b.priority : 0;
     if (pb !== pa) return pb - pa;
@@ -484,171 +551,80 @@ export default function TodayPage() {
   );
 
   const currentSignal = visibleSignals[0];
-  const sandboxSignals: IncomingSignal[] = [
-    {
-      id: "SPY-demo-long",
-      ticker: "SPY",
-      side: "LONG",
-      entryPrice: 500,
-      stopPrice: 495,
-      targetPrice: 510,
-      reasoning: "Demo: SPY pullback to support with clear risk.",
-      source: "Sandbox",
-    },
-    {
-      id: "QQQ-demo-short",
-      ticker: "QQQ",
-      side: "SHORT",
-      entryPrice: 430,
-      stopPrice: 435,
-      targetPrice: 420,
-      reasoning: "Demo: QQQ reversal from resistance.",
-      source: "Sandbox",
-    },
-  ];
-
   const openAutoTrades = autoTrades.filter((t) => t.status === "open");
 
   return (
     <>
+      <AutoManagePoller />
       <div className="app-page">
-        <header className="app-header">
-          <div className="app-header-title">Cecil Trading</div>
-          <div className="app-header-subtitle">
-            Personal paper-trading assistant
+        {/* --- Slim header bar --------------------------------------------------- */}
+        <header className="mb-3">
+          <div className="flex items-center justify-between mb-2">
+            <div>
+              <h1 className="text-sm font-semibold text-slate-50">
+                Cecil Trading
+              </h1>
+              <p className="text-[11px] text-slate-400">
+                Today overview
+              </p>
+            </div>
+            <span className="text-[11px] text-slate-500 uppercase tracking-wide">
+              Paper account
+            </span>
+          </div>
+          <div className="text-[11px] text-neutral-500">
+            <Link
+              href="/settings"
+              className="underline-offset-2 hover:text-neutral-300"
+            >
+              Edit risk &amp; guardrails
+            </Link>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <StatPill
+              label="Today P&L"
+              value={todayPnlDisplay}
+              tone={todayPnlRaw > 0 ? "positive" : todayPnlRaw < 0 ? "negative" : "neutral"}
+            />
+            <StatPill
+              label="Net R"
+              value={netRDisplay}
+              tone={netRRaw > 0 ? "positive" : netRRaw < 0 ? "negative" : "neutral"}
+            />
+            <StatPill
+              label="Trades"
+              value={tradesTodayDisplay}
+            />
+            <StatPill
+              label="Risk left"
+              value={remainingRiskDisplay}
+              tone={remainingRiskRaw <= 0 ? "negative" : "neutral"}
+            />
+            <StatPill
+              label="Status"
+              value={statusDisplay}
+              tone={
+                statusDisplay === "Daily limit hit"
+                  ? "negative"
+                  : statusDisplay === "Ready"
+                  ? "positive"
+                  : "neutral"
+              }
+            />
           </div>
         </header>
-        <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
-        {/* Stats tiles */}
-        <section className="space-y-3">
-          {manageSyncError && (
-            <p className="text-[var(--ci-negative)] text-sm">{manageSyncError}</p>
-          )}
-          {statsError ? (
-            <div className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 shadow-[0_0_12px_rgba(255,255,255,0.03)] text-[var(--ci-negative)] text-sm">
-              Stats unavailable: {statsError}
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-              <div className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 shadow-[0_0_12px_rgba(255,255,255,0.03)] space-y-1">
-                <div className="text-[var(--ci-text-muted)] text-xs uppercase tracking-wide">
-                  Today P&amp;L
-                </div>
-                <div
-                  className={`text-[var(--ci-accent)] text-2xl md:text-3xl font-light ${
-                    dailyPnL > 0
-                      ? "text-[var(--ci-positive)]"
-                      : dailyPnL < 0
-                      ? "text-[var(--ci-negative)]"
-                      : ""
-                  }`}
-                >
-                  ${dailyPnL.toFixed(2)}
-                </div>
-              </div>
-              <StatTile
-                label="Net R"
-                value={
-                  oneR > 0 ? (dailyPnL / oneR).toFixed(2) + "R" : "—"
-                }
-              />
-              <StatTile label="Trades" value={dailyStats?.totalTrades ?? "—"} />
-              <StatTile
-                label="Avg / Best / Worst R"
-                value={
-                  dailyStats
-                    ? `${dailyStats.avgRealizedR != null ? dailyStats.avgRealizedR.toFixed(2) : "—"} / ${
-                        dailyStats.bestR != null ? dailyStats.bestR.toFixed(2) : "—"
-                      } / ${
-                        dailyStats.worstR != null ? dailyStats.worstR.toFixed(2) : "—"
-                      }`
-                    : "—"
-                }
-              />
-            </div>
-          )}
-        </section>
 
-        {/* Risk dashboard */}
-        <section className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 md:p-6 shadow-[0_0_12px_rgba(255,255,255,0.03)] space-y-3">
-          <div className="text-[var(--ci-text-muted)] text-xs uppercase tracking-wide">
-            Risk &amp; Guardrails
-          </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-            <StatTile label="Account size" value={`$${settings.accountSize.toLocaleString()}`} />
-            <StatTile
-              label="Risk per trade"
-              value={`${settings.riskPerTradePct.toFixed(2)}% · $${oneR.toFixed(0)}`}
-            />
-            <StatTile label="1R" value={`$${oneR.toFixed(0)}`} />
-            <StatTile
-              label="Daily max loss"
-              value={`${dailyMaxLossR.toFixed(1)}R · $${dailyMaxLossDollar.toFixed(0)}`}
-            />
-            <StatTile
-              label="Today P&L"
-              value={`$${dailyPnL.toFixed(2)}`}
-              tone={dailyPnL > 0 ? "positive" : dailyPnL < 0 ? "negative" : undefined}
-            />
-            <StatTile label="Loss used (R)" value={`${lossUsedR.toFixed(2)}R`} />
-            <StatTile
-              label="Remaining to limit"
-              value={`${remainingR.toFixed(2)}R · $${Math.max(
-                dailyMaxLossDollar - lossUsedDollar,
-                0
-              ).toFixed(0)}`}
-            />
-            <StatTile label="Status" value={statusText} />
-            <StatTile
-              label="Guardrails"
-              value={
-                settingsData
-                  ? `Max/trade $${settingsData.maxRiskPerTrade ?? "—"} · Daily $${settingsData.maxRiskPerDay ?? "—"} · Trades/day ${settingsData.maxTradesPerDay ?? "—"}`
-                  : "—"
-              }
-            />
-            <StatTile
-              label="Auto-management"
-              value={settingsData?.autoManagementEnabled ? "ON" : "OFF"}
-            />
-            <StatTile
-              label="Auto-entry"
-              value={
-                settingsData?.autoEntryReady
-                  ? "READY (manual entries only)"
-                  : "NOT READY"
-              }
-              detail={settingsData?.autoEntryNotes}
-            />
-            <div className="flex flex-col">
-              <span className="text-[var(--ci-text-muted)] text-xs uppercase tracking-wide">
-                Manual risk ($ per trade)
-              </span>
-              <input
-                type="number"
-                className="input"
-                value={riskDollars}
-                onChange={(e) => setRiskDollars(Number(e.target.value) || 0)}
-                min={0}
-                step={25}
-                style={{
-                  background: "var(--ci-card)",
-                  border: "1px solid var(--ci-border)",
-                  color: "var(--ci-text)",
-                  padding: "8px",
-                  borderRadius: "8px",
-                  marginTop: "6px",
-                }}
-              />
-            </div>
-          </div>
-        </section>
+        <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
 
         {/* Pending approvals */}
         <section className="space-y-3">
-          <h2 className="text-sm uppercase tracking-wide text-[var(--ci-text-muted)]">
-            Pending approvals (A+ only ≥ 9)
+          <h2 className="text-sm font-semibold text-neutral-100">
+            Pending approvals
           </h2>
+          <p className="text-[11px] text-neutral-500">
+            A-grade pullbacks only (score ≥ 9)
+          </p>
           {spyStatusText && (
             <p className="text-xs text-[var(--ci-text-muted)]">{spyStatusText}</p>
           )}
@@ -839,68 +815,6 @@ export default function TodayPage() {
               </div>
             )}
           </div>
-        </section>
-
-        {/* Sandbox signals */}
-        <section className="space-y-3">
-          <h2 className="text-sm uppercase tracking-wide text-[var(--ci-text-muted)]">
-            Sandbox · SPY / QQQ
-          </h2>
-          {sandboxSignals.map((signal) => {
-            const { size, dollarRisk } = computeSizing(
-              chosenRisk,
-              signal.entryPrice,
-              signal.stopPrice ?? undefined
-            );
-            return (
-              <div
-                key={signal.id}
-                className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 md:p-6 shadow-[0_0_12px_rgba(255,255,255,0.03)] space-y-3"
-              >
-                <div className="flex items-center justify-between">
-                  <div className="pill-row">
-                    <span className="pill ticker-pill">{signal.ticker}</span>
-                    <span className={`pill side-pill ${signal.side.toLowerCase()}`}>
-                      {signal.side}
-                    </span>
-                    <span className="pill source-pill">Demo</span>
-                  </div>
-                  <div className="muted-text small">{signal.reasoning ?? "Practice setup"}</div>
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
-                  <div>
-                    <div className="label">Entry</div>
-                    <div className="value">{signal.entryPrice.toFixed(2)}</div>
-                  </div>
-                  <div>
-                    <div className="label">Stop</div>
-                    <div className="value">
-                      {signal.stopPrice != null ? signal.stopPrice.toFixed(2) : "—"}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="label">Target</div>
-                    <div className="value">
-                      {signal.targetPrice != null ? signal.targetPrice.toFixed(2) : "—"}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="label">Size (≈)</div>
-                    <div className="value">
-                      {size ? `${size.toLocaleString()} sh · ~$${dollarRisk.toFixed(0)}` : "—"}
-                    </div>
-                  </div>
-                </div>
-                <button
-                  className="btn-approve"
-                  disabled={blockedForDay}
-                  onClick={() => handleApprove(signal)}
-                >
-                  Approve demo trade
-                </button>
-              </div>
-            );
-          })}
         </section>
 
         {/* Auto-managed open trades view */}

@@ -7,6 +7,14 @@ type TradeStatus = "OPEN" | "CLOSED" | "CANCELLED" | "PARTIAL";
 
 type Side = "LONG" | "SHORT";
 
+type ManagementStatus =
+  | "UNMANAGED"
+  | "STOP_MOVED_TO_BREAKEVEN"
+  | "PARTIAL_TAKEN_1R"
+  | "PARTIAL_TAKEN_2R"
+  | "TRAILING"
+  | "CLOSED";
+
 type ManagementRule = {
   rMultiple: number;
   percentToClose: number;
@@ -37,6 +45,7 @@ export type TradeRow = {
   source?: string | null;
   notes?: string | null;
   management?: ManagementConfig | null;
+  managementStatus?: ManagementStatus;
 
   openedAt?: string | null;
   closedAt?: string | null;
@@ -101,6 +110,7 @@ function normalizeTrades(data: TradesResponse): TradeRow[] {
       source: t.source ?? null,
       notes: t.notes ?? null,
       management: t.management ?? null,
+      managementStatus: t.managementStatus ?? undefined,
       openedAt: t.openedAt ?? null,
       closedAt: t.closedAt ?? null,
       ...t,
@@ -196,6 +206,48 @@ function sidePillClasses(side: Side): string {
   return side === "LONG"
     ? "bg-emerald-950 text-emerald-300 border border-emerald-600/60"
     : "bg-rose-950 text-rose-300 border border-rose-600/60";
+}
+
+function renderManagementPill(status?: ManagementStatus) {
+  if (!status) {
+    return (
+      <span className="inline-flex items-center rounded-full border border-neutral-700 px-2 py-0.5 text-[10px] uppercase tracking-wide text-neutral-400">
+        N/A
+      </span>
+    );
+  }
+
+  const label = status.replace(/_/g, " ");
+  let extraClass = "";
+
+  switch (status) {
+    case "UNMANAGED":
+      extraClass = "border-neutral-600 text-neutral-300";
+      break;
+    case "STOP_MOVED_TO_BREAKEVEN":
+      extraClass = "border-emerald-500 text-emerald-300";
+      break;
+    case "PARTIAL_TAKEN_1R":
+    case "PARTIAL_TAKEN_2R":
+      extraClass = "border-sky-500 text-sky-300";
+      break;
+    case "TRAILING":
+      extraClass = "border-amber-500 text-amber-300";
+      break;
+    case "CLOSED":
+      extraClass = "border-neutral-500 text-neutral-300 line-through";
+      break;
+    default:
+      extraClass = "border-neutral-600 text-neutral-300";
+  }
+
+  return (
+    <span
+      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-wide ${extraClass}`}
+    >
+      {label}
+    </span>
+  );
 }
 
 export default function TradesPage() {
@@ -360,6 +412,9 @@ export default function TradesPage() {
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-400">
                     Status
                   </th>
+                  <th className="px-3 py-2 text-left text-xs font-medium text-neutral-400">
+                    Mgmt
+                  </th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-400">
                     Opened
                   </th>
@@ -437,6 +492,10 @@ export default function TradesPage() {
                       >
                         {t.status}
                       </span>
+                    </td>
+
+                    <td className="px-3 py-2 align-middle">
+                      {renderManagementPill(t.managementStatus as ManagementStatus)}
                     </td>
 
                     <td className="px-4 py-3 align-middle text-xs text-slate-300">

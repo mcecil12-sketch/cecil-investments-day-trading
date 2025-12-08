@@ -2,6 +2,7 @@ import "./globals.css";
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { TradingProvider } from "./tradingContext";
+import { AutoManagePoller } from "@/components/AutoManagePoller";
 
 export const metadata: Metadata = {
   title: "Cecil Investments · Trading Desk",
@@ -17,6 +18,7 @@ export default function RootLayout({
     <html lang="en">
       <body className="app-root">
         <TradingProvider>
+          <AutoManagePoller />
           <div className="app-shell">
             <main className="app-main">{children}</main>
           </div>

@@ -9,18 +9,38 @@ const TRADES_PATH = path.join(process.cwd(), "data", "trades.json");
 
 type Direction = "LONG" | "SHORT";
 
+export type TradeStatus =
+  | "NEW"
+  | "BROKER_PENDING"
+  | "BROKER_FILLED"
+  | "BROKER_REJECTED"
+  | "BROKER_ERROR";
+
+export type ManagementStatus =
+  | "UNMANAGED"
+  | "STOP_MOVED_TO_BREAKEVEN"
+  | "PARTIAL_TAKEN_1R"
+  | "PARTIAL_TAKEN_2R"
+  | "TRAILING"
+  | "CLOSED";
+
 export interface IncomingTrade {
   ticker: string;
-  side: Direction;
+  side: Direction; // LONG / SHORT
   quantity: number;
+
   entryPrice: number;
   stopPrice: number;
   targetPrice?: number;
+
   reasoning?: string;
   source?: string;
+
   submitToBroker?: boolean;
   orderType?: "market" | "limit";
   timeInForce?: "day" | "gtc";
+
+  // optional automation flags
   autoManage?: boolean;
   manageSizePct1?: number;
   manageSizePct2?: number;
@@ -30,11 +50,20 @@ export interface TradeRecord extends IncomingTrade {
   id: string;
   createdAt: string;
   updatedAt: string;
-  status: string;
+  status: TradeStatus;
+
+  // Broker info
   brokerOrderId?: string;
   brokerStatus?: string;
   brokerRaw?: any;
   error?: string;
+
+  // Auto-management info
+  managementStatus?: ManagementStatus;
+  lastAutoPrice?: number;
+  lastAutoCheckAt?: string;
+
+  // legacy/extended management config (kept for compatibility)
   management?: {
     enabled: boolean;
     tp1R: number;
@@ -88,7 +117,7 @@ export async function POST(req: Request) {
     const body = (await req.json()) as IncomingTrade;
 
     const now = new Date().toISOString();
-    let status = "NEW";
+    let status: TradeStatus = "NEW";
     let brokerOrder: any;
     let error: string | undefined;
 
@@ -124,6 +153,10 @@ export async function POST(req: Request) {
       brokerStatus: brokerOrder?.status,
       brokerRaw: brokerOrder ? { id: brokerOrder.id, status: brokerOrder.status } : undefined,
       error,
+      // Seed management fields for the auto-management engine
+      managementStatus: "UNMANAGED",
+      lastAutoPrice: body.entryPrice,
+      lastAutoCheckAt: now,
       management: body.autoManage
         ? {
             enabled: true,
