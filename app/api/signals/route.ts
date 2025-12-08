@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { promises as fs } from "fs";
 import path from "path";
+import { sendPullbackAlert } from "@/lib/notify";
 
 type TradeSide = "LONG" | "SHORT";
 
@@ -155,6 +156,22 @@ export async function POST(req: Request) {
 
       signal.priority = computePriority(signal);
       next.push(signal);
+
+      // Alert hook: only for A-grade or score >= 9
+      const isAGrade =
+        raw.grade === "A" ||
+        (typeof raw.score === "number" && raw.score >= 9);
+
+      if (isAGrade) {
+        await sendPullbackAlert({
+          ticker: signal.ticker,
+          side: signal.side,
+          entryPrice: signal.entryPrice,
+          stopPrice: signal.stopPrice,
+          score: raw.score,
+          reason: signal.reasoning,
+        });
+      }
     }
 
     await writeSignalsFile(next);
