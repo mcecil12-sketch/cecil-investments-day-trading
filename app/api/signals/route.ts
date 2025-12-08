@@ -1,220 +1,134 @@
 import { NextResponse } from "next/server";
 import { promises as fs } from "fs";
 import path from "path";
+import { scoreSignalWithAI, RawSignal, ScoredSignal } from "@/lib/aiScoring";
 import { sendPullbackAlert } from "@/lib/notify";
 
-type TradeSide = "LONG" | "SHORT";
+const DATA_FILE = path.join(process.cwd(), "data", "signals.json");
 
-export interface Signal {
-  id: string;
-  ticker: string;
-  side: TradeSide;
-  entryPrice: number;
-  stopPrice?: number;
-  targetPrice?: number;
-  reasoning?: string;
-  source?: string;
-  createdAt: string;
-  priority?: number; // 0–10 A+ score
-
-  // Optional advanced scoring
-  trendScore?: number;
-  liquidityScore?: number;
-  playbookScore?: number;
-  volumeScore?: number;
-  catalystScore?: number;
-}
-
-interface SignalsFileShape {
-  signals: Signal[];
-}
-
-const SIGNALS_FILE = path.join(process.cwd(), "data", "signals.json");
-
-async function readSignalsFile(): Promise<Signal[]> {
+async function readSignals(): Promise<ScoredSignal[]> {
   try {
-    const raw = await fs.readFile(SIGNALS_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-
-    if (Array.isArray(parsed)) return parsed as Signal[];
-    if (parsed && Array.isArray(parsed.signals)) return parsed.signals as Signal[];
-    return [];
+    const raw = await fs.readFile(DATA_FILE, "utf8");
+    return JSON.parse(raw);
   } catch (err: any) {
-    if (err.code === "ENOENT") return [];
-    console.error("[signals] Error reading signals file:", err);
+    if (err.code === "ENOENT") {
+      return [];
+    }
+    console.error("[signals] readSignals error", err);
     throw err;
   }
 }
 
-async function writeSignalsFile(signals: Signal[]): Promise<void> {
-  const wrapper: SignalsFileShape = { signals };
-  const data = JSON.stringify(wrapper, null, 2);
-  await fs.mkdir(path.dirname(SIGNALS_FILE), { recursive: true });
-  await fs.writeFile(SIGNALS_FILE, data, "utf8");
+async function writeSignals(signals: ScoredSignal[]): Promise<void> {
+  await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
+  await fs.writeFile(DATA_FILE, JSON.stringify(signals, null, 2), "utf8");
 }
 
-// Compute priority (A+ score) from component scores if not provided
-function computePriority(sig: Signal): number | undefined {
-  const parts = [
-    sig.trendScore,
-    sig.liquidityScore,
-    sig.playbookScore,
-    sig.volumeScore,
-    sig.catalystScore,
-  ].filter((v) => typeof v === "number") as number[];
+export async function GET(req: Request) {
+  const url = new URL(req.url);
+  const minScoreParam = url.searchParams.get("minScore");
+  const gradeParam = url.searchParams.get("grade");
+  const statusParam = url.searchParams.get("status"); // e.g. PENDING, APPROVED, REJECTED
+  const limitParam = url.searchParams.get("limit");
 
-  if (!parts.length) return sig.priority;
+  const minScore = minScoreParam ? Number(minScoreParam) : undefined;
+  const limit = limitParam ? Number(limitParam) : undefined;
 
-  // Average 0–1 → scale to 0–10
-  const avg = parts.reduce((a, b) => a + b, 0) / parts.length;
-  return Math.round(avg * 10 * 10) / 10; // one decimal place
-}
+  let signals = await readSignals();
 
-// GET /api/signals -> { signals }
-export async function GET() {
-  try {
-    const signals = await readSignalsFile();
-    return NextResponse.json(
-      { signals },
-      { status: 200 }
-    );
-  } catch (err) {
-    console.error("[signals] GET error:", err);
-    return NextResponse.json(
-      { error: "Failed to load signals" },
-      { status: 500 }
+  if (typeof minScore === "number" && !Number.isNaN(minScore)) {
+    signals = signals.filter((s) => s.aiScore >= minScore);
+  }
+
+  if (gradeParam) {
+    signals = signals.filter((s) => s.aiGrade === gradeParam);
+  }
+
+  if (statusParam) {
+    signals = signals.filter(
+      (s: any) =>
+        !s.status || // default to PENDING if missing
+        (statusParam === "PENDING" && (s.status === "PENDING" || !s.status)) ||
+        s.status === statusParam
     );
   }
+
+  // Most recent first
+  signals.sort(
+    (a, b) =>
+      new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
+
+  if (limit && limit > 0) {
+    signals = signals.slice(0, limit);
+  }
+
+  return NextResponse.json({ signals });
 }
 
-// POST /api/signals
-//
-// Supports either:
-//  - single object: { ticker, side, entryPrice, ... }
-//  - array: [ { ... }, { ... } ]  (used by /api/scan)
 export async function POST(req: Request) {
-  try {
-    const body = await req.json();
-    const incoming = Array.isArray(body) ? body : [body];
+  const body = await req.json();
 
-    const now = new Date().toISOString();
-    const existing = await readSignalsFile();
-    const next: Signal[] = [...existing];
+  const {
+    ticker,
+    side,
+    entryPrice,
+    stopPrice,
+    targetPrice,
+    timeframe = "1Min",
+    source = "VWAP_PULLBACK",
+    rawMeta = {},
+  } = body;
 
-    for (const raw of incoming) {
-      const ticker: string = raw.ticker;
-      const sideRaw: string = raw.side;
-      const entryPrice: number = Number(raw.entryPrice);
-      const stopPrice: number | undefined =
-        raw.stopPrice !== undefined ? Number(raw.stopPrice) : undefined;
-      const targetPrice: number | undefined =
-        raw.targetPrice !== undefined ? Number(raw.targetPrice) : undefined;
-
-      if (!ticker || !sideRaw || !entryPrice) {
-        console.warn("[signals] Skipping invalid signal payload:", raw);
-        continue;
-      }
-
-      const side: TradeSide =
-        sideRaw.toUpperCase() === "SHORT" ? "SHORT" : "LONG";
-
-      const reasoning: string | undefined =
-        typeof raw.reasoning === "string" ? raw.reasoning : undefined;
-
-      const source: string | undefined =
-        typeof raw.source === "string" ? raw.source : "VWAP Scanner";
-
-      const trendScore =
-        raw.trendScore !== undefined ? Number(raw.trendScore) : undefined;
-      const liquidityScore =
-        raw.liquidityScore !== undefined ? Number(raw.liquidityScore) : undefined;
-      const playbookScore =
-        raw.playbookScore !== undefined ? Number(raw.playbookScore) : undefined;
-      const volumeScore =
-        raw.volumeScore !== undefined ? Number(raw.volumeScore) : undefined;
-      const catalystScore =
-        raw.catalystScore !== undefined ? Number(raw.catalystScore) : undefined;
-
-      const signal: Signal = {
-        id: raw.id || `sig-${ticker}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        ticker: ticker.toUpperCase(),
-        side,
-        entryPrice,
-        stopPrice,
-        targetPrice,
-        reasoning,
-        source,
-        createdAt: raw.createdAt || now,
-        // temp priority before compute
-        priority: raw.priority !== undefined ? Number(raw.priority) : undefined,
-        trendScore,
-        liquidityScore,
-        playbookScore,
-        volumeScore,
-        catalystScore,
-      };
-
-      signal.priority = computePriority(signal);
-      next.push(signal);
-
-      // Alert hook: only for A-grade or score >= 9
-      const isAGrade =
-        raw.grade === "A" ||
-        (typeof raw.score === "number" && raw.score >= 9);
-
-      if (isAGrade) {
-        await sendPullbackAlert({
-          ticker: signal.ticker,
-          side: signal.side,
-          entryPrice: signal.entryPrice,
-          stopPrice: signal.stopPrice,
-          score: raw.score,
-          reason: signal.reasoning,
-        });
-      }
-    }
-
-    await writeSignalsFile(next);
-
+  if (!ticker || !side || !entryPrice || !stopPrice || !targetPrice) {
     return NextResponse.json(
-      { ok: true, count: incoming.length },
-      { status: 201 }
-    );
-  } catch (err) {
-    console.error("[signals] POST error:", err);
-    return NextResponse.json(
-      { ok: false, error: "Failed to save signal(s)" },
-      { status: 500 }
+      { error: "Missing required fields for signal." },
+      { status: 400 }
     );
   }
-}
 
-// DELETE /api/signals?id=...  -> remove one signal
-export async function DELETE(req: Request) {
-  try {
-    const { searchParams } = new URL(req.url);
-    const id = searchParams.get("id");
+  const now = new Date().toISOString();
 
-    if (!id) {
-      return NextResponse.json(
-        { ok: false, error: "id query parameter is required" },
-        { status: 400 }
-      );
+  const rawSignal: RawSignal = {
+    id: rawMeta.id ?? `${ticker}-${now}`,
+    ticker,
+    side,
+    entryPrice: Number(entryPrice),
+    stopPrice: Number(stopPrice),
+    targetPrice: Number(targetPrice),
+    timeframe,
+    source,
+    createdAt: now,
+    vwap: rawMeta.vwap,
+    pullbackPct: rawMeta.pullbackPct,
+    trendScore: rawMeta.trendScore,
+    liquidityScore: rawMeta.liquidityScore,
+    playbookScore: rawMeta.playbookScore,
+    volumeScore: rawMeta.volumeScore,
+    catalystScore: rawMeta.catalystScore,
+  };
+
+  // AI agent scoring step
+  const scored = await scoreSignalWithAI(rawSignal);
+
+  const signals = await readSignals();
+  signals.push(scored);
+  await writeSignals(signals);
+
+  console.log("[signals] New signal scored", {
+    ticker: scored.ticker,
+    score: scored.aiScore,
+    grade: scored.aiGrade,
+  });
+
+  // Only alert on A / 9+ scores
+  if (scored.aiGrade === "A" || scored.aiScore >= 9) {
+    try {
+      await sendPullbackAlert(scored);
+    } catch (err) {
+      console.error("[signals] sendPullbackAlert failed", err);
     }
-
-    const signals = await readSignalsFile();
-    const next = signals.filter((s) => s.id !== id);
-    await writeSignalsFile(next);
-
-    return NextResponse.json(
-      { ok: true, removedId: id },
-      { status: 200 }
-    );
-  } catch (err) {
-    console.error("[signals] DELETE error:", err);
-    return NextResponse.json(
-      { ok: false, error: "Failed to delete signal" },
-      { status: 500 }
-    );
   }
+
+  return NextResponse.json({ signal: scored });
 }
