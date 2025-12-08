@@ -1,9 +1,5 @@
 import OpenAI from "openai";
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
 export type Side = "LONG" | "SHORT";
 
 export type RawSignal = {
@@ -47,7 +43,8 @@ function gradeFromScore(score: number): "A" | "B" | "C" | "D" | "F" {
 }
 
 export async function scoreSignalWithAI(signal: RawSignal): Promise<ScoredSignal> {
-  if (!process.env.OPENAI_API_KEY) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
     // Fail-safe: if key missing, treat as low-quality
     console.warn("[aiScoring] OPENAI_API_KEY not set; returning default low score.");
     return {
@@ -102,6 +99,7 @@ Catalyst score: ${signal.catalystScore ?? "n/a"}
 Return ONLY JSON.
 `.trim();
 
+  const openai = new OpenAI({ apiKey });
   const completion = await openai.chat.completions.create({
     model: "gpt-4.1",
     temperature: 0.3,
