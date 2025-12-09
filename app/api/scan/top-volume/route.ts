@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { fetchRecentBars } from "@/lib/alpaca";
 import { getAlpacaClient } from "@/lib/alpacaClient";
-import { v4 as uuidv4 } from "uuid";
+import { randomUUID } from "crypto";
 
 export const runtime = "nodejs";
 
@@ -63,7 +63,7 @@ function buildSignal(symbol: string, bars: any[]) {
   const target = side === "LONG" ? entry * 1.02 : entry * 0.98;
 
   return {
-    id: uuidv4(),
+    id: randomUUID(),
     ticker: symbol,
     side,
     entryPrice: entry,

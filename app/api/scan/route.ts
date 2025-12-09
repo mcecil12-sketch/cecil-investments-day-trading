@@ -4,7 +4,7 @@ import { AlpacaBar, fetchRecentBars } from "@/lib/alpaca";
 
 const DEFAULT_WATCHLIST = ["SPY", "QQQ", "TSLA", "NVDA", "META", "AMD"];
 
-type ScanMode = "pullback" | "breakout" | "compression" | "premarket";
+type ScanMode = "pullback" | "breakout" | "compression" | "premarket-vwap";
 
 const DEFAULT_MIN_PRICE = 5;
 const DEFAULT_MIN_AVG_VOLUME = 1_000_000;
@@ -259,7 +259,7 @@ export async function GET(req: Request) {
       : rawMode === "compression" || rawMode === "nr7"
       ? "compression"
       : rawMode === "premarket" || rawMode === "premarket-vwap"
-      ? "premarket"
+      ? "premarket-vwap"
       : "pullback"; // default/alias for vwap
 
   const limit =

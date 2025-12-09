@@ -9,10 +9,10 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@alpacahq/alpaca-trade-api": "^3.1.0",
+    "@alpacahq/alpaca-trade-api": "^3.1.3",
     "dotenv": "^16.4.5",
-    "openai": "^4.68.1",
     "next": "14.2.3",
+    "openai": "^4.104.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "recharts": "^3.5.1"

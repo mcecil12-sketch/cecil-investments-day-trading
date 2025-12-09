@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { v4 as uuidv4 } from "uuid";
+import { randomUUID } from "crypto";
 import { getAlpacaClient } from "@/lib/alpacaClient";
 import type { AlpacaBar } from "@/lib/alpaca";
 
@@ -169,7 +169,7 @@ export async function GET(req: Request) {
         const target = side === "LONG" ? entry * 1.01 : entry * 0.99;
 
         const signal = {
-          id: uuidv4(),
+          id: randomUUID(),
           ticker: symbol,
           side,
           entryPrice: entry,
