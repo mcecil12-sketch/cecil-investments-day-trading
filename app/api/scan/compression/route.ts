@@ -5,6 +5,8 @@ import { isCompression } from "@/lib/scannerUtils";
 import { randomUUID } from "crypto";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 const DEFAULT_LIMIT = 150;
 const DEFAULT_MIN_PRICE = 10;

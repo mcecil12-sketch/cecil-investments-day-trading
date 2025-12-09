@@ -4,6 +4,8 @@ import { getAlpacaClient } from "@/lib/alpacaClient";
 import type { AlpacaBar } from "@/lib/alpaca";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 const DEFAULT_LIMIT = 150;
 const DEFAULT_MIN_PRICE = 10;

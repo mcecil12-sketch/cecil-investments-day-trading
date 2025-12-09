@@ -4,6 +4,8 @@ import { getAlpacaClient } from "@/lib/alpacaClient";
 import { randomUUID } from "crypto";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 const DEFAULT_MIN_PRICE = 10;
 const DEFAULT_MIN_AVG_VOL = 2_000_000;
