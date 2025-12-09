@@ -6,9 +6,10 @@ const DEFAULT_WATCHLIST = ["SPY", "QQQ", "TSLA", "NVDA", "META", "AMD"];
 
 type ScanMode = "pullback" | "breakout" | "compression" | "premarket-vwap";
 
-const DEFAULT_MIN_PRICE = 5;
-const DEFAULT_MIN_AVG_VOLUME = 1_000_000;
-const DEFAULT_LIMIT = 400;
+// Default filters tuned to surface more candidates by easing price/volume gates.
+const DEFAULT_MIN_PRICE = 3;
+const DEFAULT_MIN_AVG_VOLUME = 300_000;
+const DEFAULT_LIMIT = 600;
 
 // Prefer both ID/SECRET envs; fall back to generic keys
 const ALPACA_API_KEY =
@@ -126,9 +127,9 @@ function detectPullback(symbol: string, bars: AlpacaBar[]): OutgoingSignal | nul
   const distancePct = ((last.c - vwap) / vwap) * 100;
 
   const first = bars[0];
-  const trendUp = last.c > first.c * 1.01; // >1% up over window
+  const trendUp = last.c > first.c * 1.005; // >0.5% up over window
 
-  const nearVwap = distancePct > -0.5 && distancePct < 0.5;
+  const nearVwap = distancePct > -1 && distancePct < 1;
 
   if (!(trendUp && nearVwap)) return null;
 
@@ -158,15 +159,15 @@ function detectBreakout(symbol: string, bars: AlpacaBar[]): OutgoingSignal | nul
   const closes = bars.map((b) => b.c);
   const vols = bars.map((b) => b.v);
 
-  const lookback = 20;
+  const lookback = 15;
   const recentCloses = closes.slice(-lookback);
   const recentVols = vols.slice(-lookback);
 
   const maxClose = Math.max(...recentCloses);
   const avgVol = recentVols.reduce((sum, v) => sum + v, 0) / recentVols.length || 0;
 
-  const isBreakout = last.c >= maxClose * 0.999; // basically at new high
-  const isHighVolume = last.v >= avgVol * 1.5;
+  const isBreakout = last.c >= maxClose * 0.995; // near new high
+  const isHighVolume = last.v >= avgVol * 1.3;
 
   if (!(isBreakout && isHighVolume)) return null;
 
@@ -194,7 +195,7 @@ function detectCompression(symbol: string, bars: AlpacaBar[]): OutgoingSignal | 
   const ranges = last7.map((b) => b.h - b.l);
   const lastRange = ranges[ranges.length - 1];
 
-  const smallest = ranges.every((r) => lastRange <= r);
+  const smallest = ranges.every((r) => lastRange <= r * 1.05); // allow slightly larger
 
   if (!smallest) return null;
 
@@ -224,7 +225,7 @@ function detectPremarketVWAP(symbol: string, bars: AlpacaBar[]): OutgoingSignal 
   const vwap = computeVWAP(bars);
   const distancePct = ((last.c - vwap) / vwap) * 100;
 
-  const nearVwap = distancePct > -0.5 && distancePct < 0.5;
+  const nearVwap = distancePct > -1 && distancePct < 1;
 
   if (!nearVwap) return null;
 
