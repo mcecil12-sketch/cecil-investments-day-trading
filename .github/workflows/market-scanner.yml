@@ -1,0 +1,27 @@
+name: Market Scanner
+
+on:
+  schedule:
+    - cron: "*/5 13-20 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  run-scanners:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit VWAP pullback scanner
+        run: |
+          curl -sS "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=vwap" || true
+
+      - name: Hit breakout scanner
+        run: |
+          curl -sS "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=breakout" || true
+
+      - name: Hit compression/NR7 scanner
+        run: |
+          curl -sS "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=compression" || true
+
+      # Uncomment to backstop premarket via Actions as well
+      # - name: Hit premarket VWAP scanner
+      #   run: |
+      #     curl -sS "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=premarket" || true
