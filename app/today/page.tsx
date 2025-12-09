@@ -27,10 +27,15 @@ type IncomingSignal = {
   positionSize?: number;
   shares?: number;
   score?: number;
+  aiScore?: number | null;
+  aiGrade?: "A" | "B" | "C" | "D" | "F" | null;
+  patternType?: string;
 };
 
-type SignalsResponse = {
-  signals: IncomingSignal[];
+type AiTopResponse = {
+  status: "ok" | "error";
+  signals?: IncomingSignal[];
+  message?: string;
 };
 
 type AutoSide = "long" | "short";
@@ -181,6 +186,7 @@ export default function TodayPage() {
   const [touchStartX, setTouchStartX] = useState<number | null>(null);
   const [autoManageStatus, setAutoManageStatus] = useState<string | null>(null);
   const [autoManageBusy, setAutoManageBusy] = useState(false);
+  const [errorSignals, setErrorSignals] = useState<string | null>(null);
 
   const oneR = settings.oneR;
   const dailyMaxLossR = settings.dailyMaxLossR;
@@ -230,22 +236,33 @@ export default function TodayPage() {
   const remainingRiskDisplay = `${summary.remainingR.toFixed(1)}R · ${summary.remainingUsdFormatted}`;
   const statusDisplay = summary.sessionStatusText;
 
-  useEffect(() => {
-    async function fetchSignals() {
-      setLoadingSignals(true);
-      try {
-        const res = await fetch("/api/signals");
-        if (!res.ok) throw new Error("Failed to fetch signals");
-        const data = (await res.json()) as SignalsResponse;
-        setSignals(data.signals || []);
-      } catch (err) {
-        console.error(err);
-      } finally {
-        setLoadingSignals(false);
+  const loadSignals = useCallback(async () => {
+    setLoadingSignals(true);
+    setErrorSignals(null);
+    try {
+      const res = await fetch("/api/ai-top?limit=50", { cache: "no-store" });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Failed to load signals (${res.status}): ${text}`);
       }
+      const data = (await res.json()) as AiTopResponse;
+      setSignals(data.signals || []);
+    } catch (err: any) {
+      console.error("[today] loadSignals error", err);
+      setErrorSignals(err?.message || "Failed to load signals");
+      setSignals([]);
+    } finally {
+      setLoadingSignals(false);
     }
-    fetchSignals();
   }, []);
+
+  useEffect(() => {
+    loadSignals();
+  }, [loadSignals]);
+
+  const refreshSignals = () => {
+    loadSignals();
+  };
 
   const loadStats = useCallback(async () => {
     try {
@@ -533,8 +550,11 @@ export default function TodayPage() {
 
   const pendingSignals = signals.filter(
     (s: any) =>
-      s?.status === "PENDING" &&
-      (s?.grade === "A" || (typeof s?.score === "number" && s.score >= 9))
+      (s?.status ?? "PENDING") === "PENDING" &&
+      (s?.aiGrade === "A" ||
+        s?.grade === "A" ||
+        (typeof s?.aiScore === "number" && s.aiScore >= 9) ||
+        (typeof s?.score === "number" && s.score >= 9))
   );
 
   const sortedSignals = [...pendingSignals].sort((a, b) => {
@@ -572,13 +592,20 @@ export default function TodayPage() {
               Paper account
             </span>
           </div>
-          <div className="text-[11px] text-neutral-500">
+          <div className="flex items-center justify-between text-[11px] text-neutral-500 mb-2">
             <Link
               href="/settings"
               className="underline-offset-2 hover:text-neutral-300"
             >
               Edit risk &amp; guardrails
             </Link>
+            <button
+              onClick={refreshSignals}
+              className="ml-3 rounded-full border border-slate-700 px-3 py-1 text-[11px] text-slate-200 hover:bg-slate-800 active:bg-slate-900 disabled:opacity-50"
+              disabled={loadingSignals}
+            >
+              {loadingSignals ? "Refreshing…" : "Refresh signals"}
+            </button>
           </div>
 
           <div className="flex flex-wrap gap-2">
@@ -625,6 +652,9 @@ export default function TodayPage() {
           <p className="text-[11px] text-neutral-500">
             A-grade pullbacks only (score ≥ 9)
           </p>
+          {errorSignals && (
+            <p className="text-xs text-[var(--ci-negative)]">{errorSignals}</p>
+          )}
           {spyStatusText && (
             <p className="text-xs text-[var(--ci-text-muted)]">{spyStatusText}</p>
           )}

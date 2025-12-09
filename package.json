@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@alpacahq/alpaca-trade-api": "^3.1.0",
     "dotenv": "^16.4.5",
     "openai": "^4.68.1",
     "next": "14.2.3",
