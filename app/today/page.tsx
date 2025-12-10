@@ -702,7 +702,11 @@ export default function TodayPage() {
                   </strong>
                 </span>
                 <span>
-                  Score: <strong>{currentSignal.score ?? "–"}</strong>
+                  Score:{" "}
+                  <strong>
+                    {currentSignal.aiScore ?? currentSignal.score ?? "–"}
+                    {currentSignal.aiGrade ? ` (${currentSignal.aiGrade})` : ""}
+                  </strong>
                 </span>
               </div>
 
