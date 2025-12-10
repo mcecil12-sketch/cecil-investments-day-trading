@@ -101,7 +101,7 @@ Return ONLY JSON.
 
   const openai = new OpenAI({ apiKey });
   const completion = await openai.chat.completions.create({
-    model: "gpt-4.1",
+    model: "gpt-5.1-mini",
     temperature: 0.3,
     response_format: { type: "json_object" },
     messages: [
