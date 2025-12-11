@@ -160,7 +160,7 @@ export default function PerformancePage() {
 
   return (
     <>
-      <div className="app-page">
+      <div className="app-page pb-20">
         <header className="mb-4">
           <div className="flex items-center justify-between mb-2">
             <div>

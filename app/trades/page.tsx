@@ -315,7 +315,7 @@ export default function TradesPage() {
 
   return (
     <>
-      <div className="app-page">
+      <div className="app-page pb-20">
         <header className="app-header">
           <div className="app-header-title">Trades</div>
           <div className="app-header-subtitle">All executions &amp; orders</div>

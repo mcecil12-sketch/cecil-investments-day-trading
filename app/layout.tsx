@@ -5,8 +5,8 @@ import { TradingProvider } from "./tradingContext";
 import { AutoManagePoller } from "@/components/AutoManagePoller";
 
 export const metadata: Metadata = {
-  title: "Cecil Investments · Trading Desk",
-  description: "Intraday trading · R-based risk · Alpaca paper",
+  title: "Cecil Trading",
+  description: "Cecil Investments – Day Trading Assistant",
 };
 
 export default function RootLayout({
@@ -19,8 +19,8 @@ export default function RootLayout({
       <body className="app-root">
         <TradingProvider>
           <AutoManagePoller />
-          <div className="app-shell">
-            <main className="app-main">{children}</main>
+          <div className="min-h-screen pb-16">
+            {children}
           </div>
         </TradingProvider>
       </body>

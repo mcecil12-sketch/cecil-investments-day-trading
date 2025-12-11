@@ -2,18 +2,18 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import type { LucideIcon } from "lucide-react";
 import {
   HomeIcon,
   LineChartIcon,
   BarChart3Icon,
   SettingsIcon,
 } from "lucide-react";
-import React from "react";
 
 type TabConfig = {
   href: string;
   label: string;
-  icon: React.ComponentType<{ size?: number; strokeWidth?: number }>;
+  icon: LucideIcon;
 };
 
 const TABS: TabConfig[] = [

@@ -64,7 +64,7 @@ export default function SettingsPage() {
 
   return (
     <>
-      <div className="app-page">
+      <div className="app-page pb-20">
         <header className="app-header">
           <div className="app-header-title">Settings</div>
           <div className="app-header-subtitle">Account &amp; risk configuration</div>
