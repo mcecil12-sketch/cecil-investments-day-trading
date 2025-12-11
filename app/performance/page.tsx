@@ -1,241 +1,324 @@
 "use client";
 
-import { useMemo } from "react";
+import React, { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import { useTrading } from "../tradingContext";
 import { BottomNav } from "@/components/BottomNav";
 
-function formatCurrency(value: number) {
-  const sign = value < 0 ? "-" : "";
-  const abs = Math.abs(value);
-  return `${sign}$${abs.toFixed(2)}`;
+type Stats = {
+  totalTrades?: number;
+  wins?: number;
+  losses?: number;
+  breakeven?: number;
+  totalRealizedPnL?: number;
+  maxDrawdown?: number;
+  avgRealizedR?: number | null;
+  bestR?: number | null;
+  worstR?: number | null;
+  autoStopsAppliedToday?: number;
+};
+
+type SettingsData = {
+  maxTradesPerDay?: number;
+};
+
+function StatPill(props: {
+  label: string;
+  value: React.ReactNode;
+  tone?: "neutral" | "positive" | "negative";
+}) {
+  const { label, value, tone = "neutral" } = props;
+
+  const toneClass =
+    tone === "positive"
+      ? "value-positive"
+      : tone === "negative"
+      ? "value-negative"
+      : "text-slate-100";
+
+  return (
+    <div className="flex flex-col rounded-2xl border border-slate-800/80 bg-slate-900/70 px-3 py-2 min-w-[110px]">
+      <span className="text-[10px] uppercase tracking-wide text-slate-400">
+        {label}
+      </span>
+      <span className={`mt-0.5 text-sm font-semibold ${toneClass}`}>
+        {value}
+      </span>
+    </div>
+  );
 }
 
-function formatR(value: number) {
-  if (!Number.isFinite(value)) return "—";
-  const sign = value < 0 ? "-" : "";
-  const abs = Math.abs(value).toFixed(2);
-  return `${sign}${abs}R`;
-}
-
-function safeRealizedPnL(trade: any): number {
-  return typeof trade.realizedPnL === "number" ? trade.realizedPnL : 0;
+function StatTile({
+  label,
+  value,
+  detail,
+}: {
+  label: string;
+  value: React.ReactNode;
+  detail?: React.ReactNode;
+}) {
+  return (
+    <div className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 md:p-6 shadow-[0_0_12px_rgba(255,255,255,0.03)] space-y-1">
+      <div className="text-[var(--ci-text-muted)] text-xs uppercase tracking-wide">
+        {label}
+      </div>
+      <div className="text-xl md:text-2xl font-semibold text-slate-50">
+        {value}
+      </div>
+      {detail && (
+        <div className="text-[var(--ci-text-muted)] text-xs">{detail}</div>
+      )}
+    </div>
+  );
 }
 
 export default function PerformancePage() {
-  const { trades, settings } = useTrading();
-  const ONE_R_DOLLARS = settings.oneR || 100;
+  const { settings, dailyPnL } = useTrading();
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [statsError, setStatsError] = useState<string | null>(null);
+  const [settingsData, setSettingsData] = useState<SettingsData | null>(null);
 
-  const closedTrades = useMemo(
-    () => trades.filter((t) => t.status === "CLOSED"),
-    [trades]
-  );
+  const oneR = settings.oneR;
+  const dailyMaxLossR = settings.dailyMaxLossR;
+  const dailyMaxLossDollar = dailyMaxLossR * oneR;
 
-  const hasClosed = closedTrades.length > 0;
+  const loadStats = useCallback(async () => {
+    try {
+      const res = await fetch("/api/trades/summary");
+      if (!res.ok) throw new Error(`Stats failed (${res.status})`);
+      const data = await res.json();
+      setStats(data?.stats ?? null);
+      setStatsError(null);
+    } catch (err: any) {
+      console.error("[performance] stats load failed", err);
+      setStatsError(err?.message || "Stats unavailable");
+    }
+  }, []);
 
-  let totalPnL = 0;
-  let wins = 0;
-  let losses = 0;
-  let bestR = -Infinity;
-  let worstR = Infinity;
+  useEffect(() => {
+    loadStats();
+  }, [loadStats]);
 
-  closedTrades.forEach((trade) => {
-    const pnl = safeRealizedPnL(trade);
-    totalPnL += pnl;
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await fetch("/api/settings");
+        if (!res.ok) throw new Error("Failed to load settings");
+        const data = await res.json();
+        if (!cancelled) setSettingsData(data?.settings ?? null);
+      } catch (err) {
+        console.error("[performance] load settings failed", err);
+      }
+    };
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-    const r = pnl / ONE_R_DOLLARS;
+  const lossUsedDollar = dailyPnL < 0 ? Math.abs(dailyPnL) : 0;
+  const lossUsedR = oneR > 0 && lossUsedDollar > 0 ? lossUsedDollar / oneR : 0;
+  const remainingR = Math.max(dailyMaxLossR - lossUsedR, 0);
+  const blockedForDay = lossUsedR >= dailyMaxLossR;
 
-    if (r > 0) wins += 1;
-    if (r < 0) losses += 1;
+  const todayPnlRaw = dailyPnL;
+  const netRRaw = oneR > 0 ? todayPnlRaw / oneR : 0;
+  const tradesToday = stats?.totalTrades ?? 0;
+  const dailyTradeLimit = settingsData?.maxTradesPerDay ?? "—";
+  const remainingRiskDollarFormatted = `$${Math.max(
+    dailyMaxLossDollar - lossUsedDollar,
+    0
+  ).toFixed(0)}`;
 
-    if (r > bestR) bestR = r;
-    if (r < worstR) worstR = r;
-  });
+  const netPnl = stats?.totalRealizedPnL ?? 0;
+  const netR = stats?.avgRealizedR ?? 0;
 
-  const tradeCount = closedTrades.length;
-  const winRate = tradeCount > 0 ? (wins / tradeCount) * 100 : 0;
-  const totalR = totalPnL / ONE_R_DOLLARS;
-  const avgR = tradeCount > 0 ? totalR / tradeCount : 0;
+  const netSentiment =
+    netPnl > 0.01 ? "Net winner" : netPnl < -0.01 ? "Net loser" : "Flat";
 
-  const winTrades = closedTrades.filter((t) => safeRealizedPnL(t) > 0);
-  const lossTrades = closedTrades.filter((t) => safeRealizedPnL(t) < 0);
+  const netSentimentClass =
+    netPnl > 0.01
+      ? "value-positive"
+      : netPnl < -0.01
+      ? "value-negative"
+      : "text-slate-200";
 
-  const sumPnL = (arr: typeof closedTrades) =>
-    arr.reduce((acc, t) => acc + safeRealizedPnL(t), 0);
-
-  const avgWinDollar =
-    winTrades.length > 0 ? sumPnL(winTrades) / winTrades.length : 0;
-  const avgLossDollar =
-    lossTrades.length > 0 ? sumPnL(lossTrades) / lossTrades.length : 0;
-
-  const avgWinR = avgWinDollar / ONE_R_DOLLARS;
-  const avgLossR = avgLossDollar / ONE_R_DOLLARS;
-
-  const grossWin = sumPnL(winTrades);
-  const grossLoss = Math.abs(sumPnL(lossTrades));
-  const profitFactor =
-    grossLoss === 0 ? 0 : grossWin / grossLoss;
-
-  const lossRate =
-    tradeCount > 0 ? lossTrades.length / tradeCount : 0;
-  const expectancyDollar =
-    (winRate / 100) * avgWinDollar - lossRate * Math.abs(avgLossDollar);
-  const expectancyR = expectancyDollar / ONE_R_DOLLARS;
-
-  const bestRDisplay = Number.isFinite(bestR) ? formatR(bestR) : "—";
-  const worstRDisplay = Number.isFinite(worstR) ? formatR(worstR) : "—";
-
-  const netPnl = totalPnL;
-  const netR = totalR;
+  const todayPnlDisplay = `$${todayPnlRaw.toFixed(2)}`;
+  const netRDisplay = oneR > 0 ? `${netRRaw.toFixed(2)}R` : "—";
+  const tradesTodayDisplay = `${tradesToday} / ${dailyTradeLimit}`;
+  const remainingRiskDisplay = `${remainingR.toFixed(
+    1
+  )}R · ${remainingRiskDollarFormatted}`;
+  const statusDisplay = blockedForDay
+    ? "Daily limit hit"
+    : dailyPnL > 0
+    ? "Green day so far"
+    : dailyPnL < 0
+    ? "Drawdown · stay selective"
+    : "Flat";
 
   return (
     <>
       <div className="app-page">
-        <header className="app-header">
-          <div className="app-header-title">Performance</div>
-          <div className="app-header-subtitle">Closed trade stats</div>
+        <header className="mb-4">
+          <div className="flex items-center justify-between mb-2">
+            <div>
+              <h1 className="text-sm font-semibold text-slate-50">
+                Performance
+              </h1>
+              <p className="text-[11px] text-slate-400">
+                Paper account session summary
+              </p>
+            </div>
+            <Link
+              href="/today"
+              className="text-[11px] text-slate-400 underline-offset-2 hover:text-slate-200"
+            >
+              Back to Today
+            </Link>
+          </div>
+
+          {/* Session summary pills (mirrors Today header) */}
+          <div className="flex flex-wrap gap-2">
+            <StatPill
+              label="Today P&L"
+              value={todayPnlDisplay}
+              tone={
+                todayPnlRaw > 0
+                  ? "positive"
+                  : todayPnlRaw < 0
+                  ? "negative"
+                  : "neutral"
+              }
+            />
+            <StatPill
+              label="Net R"
+              value={netRDisplay}
+              tone={
+                netRRaw > 0
+                  ? "positive"
+                  : netRRaw < 0
+                  ? "negative"
+                  : "neutral"
+              }
+            />
+            <StatPill label="Trades" value={tradesTodayDisplay} />
+            <StatPill
+              label="Risk left"
+              value={remainingRiskDisplay}
+              tone={remainingR <= 0 ? "negative" : "neutral"}
+            />
+            <StatPill
+              label="Status"
+              value={statusDisplay}
+              tone={
+                statusDisplay === "Daily limit hit"
+                  ? "negative"
+                  : statusDisplay === "Green day so far"
+                  ? "positive"
+                  : "neutral"
+              }
+            />
+            <StatPill
+              label="Sentiment"
+              value={<span className={netSentimentClass}>{netSentiment}</span>}
+              tone={
+                netPnl > 0.01
+                  ? "positive"
+                  : netPnl < -0.01
+                  ? "negative"
+                  : "neutral"
+              }
+            />
+          </div>
         </header>
 
-        <div className="mobile-card">
-          <div className="row-between">
-            <span className="text-sm">Net P&amp;L</span>
-            <span
-              className={`text-lg ${
-                netPnl > 0 ? "value-positive" : netPnl < 0 ? "value-negative" : ""
-              }`}
-            >
-              {netPnl.toFixed(2)}
-            </span>
-          </div>
-          <div className="row-between text-xs" style={{ marginTop: 6 }}>
-            <span>Net R</span>
-            <span>{netR.toFixed(2)}</span>
-          </div>
-        </div>
+        <main className="max-w-6xl mx-auto px-4 py-4 space-y-6">
+          {statsError && (
+            <p className="text-xs text-[var(--ci-negative)]">{statsError}</p>
+          )}
 
-        {!hasClosed && (
-          <div className="mobile-card">
-            <div className="text-md" style={{ fontWeight: 600 }}>
-              Performance snapshot
-            </div>
-            <p className="text-sm" style={{ color: "#9ca3af", marginTop: 8 }}>
-              No closed trades yet. Close trades on the Trades tab to see performance here.
+          {/* High-level performance tiles */}
+          <section className="space-y-3">
+            <h2 className="text-sm font-semibold text-neutral-100">
+              Session performance
+            </h2>
+            <p className="text-[11px] text-neutral-500">
+              Quick view of your paper trading stats for this session.
             </p>
-          </div>
-        )}
 
-        {hasClosed && (
-          <div className="mobile-card">
-            <div className="text-md" style={{ fontWeight: 600, marginBottom: 6 }}>
-              Performance snapshot
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+              <StatTile
+                label="Total trades"
+                value={stats?.totalTrades ?? "—"}
+              />
+              <StatTile
+                label="Win rate"
+                value={
+                  stats && stats.totalTrades
+                    ? `${(
+                        ((stats.wins ?? 0) / stats.totalTrades) *
+                        100
+                      ).toFixed(1)}%`
+                    : "—"
+                }
+                detail={
+                  stats
+                    ? `${stats.wins ?? 0}W / ${
+                        stats.losses ?? 0
+                      }L / ${stats.breakeven ?? 0}BE`
+                    : undefined
+                }
+              />
+              <StatTile
+                label="Realized P&L"
+                value={
+                  stats?.totalRealizedPnL != null
+                    ? `$${stats.totalRealizedPnL.toFixed(2)}`
+                    : "—"
+                }
+                detail={
+                  stats?.avgRealizedR != null
+                    ? `≈ ${netR.toFixed(2)}R`
+                    : undefined
+                }
+              />
+              <StatTile
+                label="Avg R / trade"
+                value={
+                  stats?.avgRealizedR != null
+                    ? `${stats.avgRealizedR.toFixed(2)}R`
+                    : "—"
+                }
+              />
+              <StatTile
+                label="Best trade (R)"
+                value={
+                  stats?.bestR != null ? `${stats.bestR.toFixed(2)}R` : "—"
+                }
+              />
+              <StatTile
+                label="Worst trade (R)"
+                value={
+                  stats?.worstR != null ? `${stats.worstR.toFixed(2)}R` : "—"
+                }
+              />
+              <StatTile
+                label="Max drawdown"
+                value={
+                  stats?.maxDrawdown != null
+                    ? `$${stats.maxDrawdown.toFixed(2)}`
+                    : "—"
+                }
+              />
+              <StatTile
+                label="Auto-stops today"
+                value={stats?.autoStopsAppliedToday ?? "—"}
+              />
             </div>
-            <div
-              className="stat-header"
-              style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}
-            >
-              <span className="stat-title">All closed trades</span>
-              <span className="stat-chip">{tradeCount} trades</span>
-            </div>
-            <div className="grid">
-              <div>
-                <span className="grid-label">Net P&amp;L</span>
-                <span
-                  className={`grid-value ${
-                    totalPnL >= 0 ? "value-positive" : "value-negative"
-                  }`}
-                >
-                  {formatCurrency(totalPnL)}
-                </span>
-              </div>
-              <div>
-                <span className="grid-label">Net R</span>
-                <span
-                  className={`grid-value ${
-                    totalR >= 0 ? "value-positive" : "value-negative"
-                  }`}
-                >
-                  {formatR(totalR)}
-                </span>
-              </div>
-              <div>
-                <span className="grid-label">Win rate</span>
-                <span className="grid-value">{winRate.toFixed(1)}%</span>
-              </div>
-              <div>
-                <span className="grid-label">Avg R / trade</span>
-                <span
-                  className={`grid-value ${
-                    avgR >= 0 ? "value-positive" : "value-negative"
-                  }`}
-                >
-                  {formatR(avgR)}
-                </span>
-              </div>
-              <div>
-                <span className="grid-label">Avg win (R)</span>
-                <span
-                  className={`grid-value ${
-                    avgWinR >= 0 ? "value-positive" : "value-negative"
-                  }`}
-                >
-                  {winTrades.length === 0 ? "—" : formatR(avgWinR)}
-                </span>
-              </div>
-              <div>
-                <span className="grid-label">Avg loss (R)</span>
-                <span
-                  className={`grid-value ${
-                    avgLossR >= 0 ? "value-positive" : "value-negative"
-                  }`}
-                >
-                  {lossTrades.length === 0 ? "—" : formatR(avgLossR)}
-                </span>
-              </div>
-              <div>
-                <span className="grid-label">Profit factor</span>
-                <span
-                  className={`grid-value ${
-                    profitFactor >= 1 ? "value-positive" : "value-negative"
-                  }`}
-                >
-                  {profitFactor === 0 ? "—" : profitFactor.toFixed(2)}
-                </span>
-              </div>
-              <div>
-                <span className="grid-label">Expectancy / trade</span>
-                <span className={`grid-value ${expectancyR >= 0 ? "value-positive" : "value-negative"}`}>
-                  {formatR(expectancyR)}
-                </span>
-              </div>
-              <div>
-                <span className="grid-label">Best trade</span>
-                <span className={`grid-value ${bestR >= 0 ? "value-positive" : "value-negative"}`}>
-                  {bestRDisplay}
-                </span>
-              </div>
-              <div>
-                <span className="grid-label">Toughest trade</span>
-                <span className={`grid-value ${worstR <= 0 ? "value-negative" : "value-positive"}`}>
-                  {worstRDisplay}
-                </span>
-              </div>
-            </div>
-            <div className="stat-notes">
-              <p>Notes</p>
-              <ul>
-                <li>
-                  Wins: {wins} · Losses: {losses} · Total: {tradeCount}
-                </li>
-                <li>
-                  R is based on your current $/R setting in Settings.
-                </li>
-                <li>
-                  Close trades on the Trades tab with a realized P&amp;L to feed
-                  this dashboard.
-                </li>
-              </ul>
-            </div>
-          </div>
-        )}
+          </section>
+        </main>
       </div>
       <BottomNav />
     </>

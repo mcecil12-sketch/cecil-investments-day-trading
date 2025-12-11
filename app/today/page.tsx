@@ -53,7 +53,12 @@ type AutoTrade = {
   riskPerShare: number;
   riskAmount: number;
   breakEvenMoved?: boolean;
-  partialPlan?: { rMultiple: number; percent: number; label?: string; filled?: boolean }[];
+  partialPlan?: {
+    rMultiple: number;
+    percent: number;
+    label?: string;
+    filled?: boolean;
+  }[];
   hitTargets?: number[];
   currentR?: number;
   lastPrice?: number;
@@ -101,7 +106,11 @@ type SettingsData = {
   autoEntryNotes?: string;
 };
 
-function computeSizing(oneR: number, entryPrice: number, stopPrice?: number | null) {
+function computeSizing(
+  oneR: number,
+  entryPrice: number,
+  stopPrice?: number | null
+) {
   const riskPerShare = computeRiskPerShare(entryPrice, stopPrice);
   if (!oneR || !riskPerShare) return { size: 0, dollarRisk: 0, riskPerShare };
   const size = Math.floor(oneR / riskPerShare);
@@ -136,7 +145,9 @@ function StatTile({
       >
         {value}
       </div>
-      {detail && <div className="text-[var(--ci-text-muted)] text-xs">{detail}</div>}
+      {detail && (
+        <div className="text-[var(--ci-text-muted)] text-xs">{detail}</div>
+      )}
     </div>
   );
 }
@@ -172,8 +183,13 @@ export default function TodayPage() {
   const { settings, dailyPnL, addTrade } = useTrading();
   const [signals, setSignals] = useState<IncomingSignal[]>([]);
   const [loadingSignals, setLoadingSignals] = useState(false);
-  const [riskDollars, setRiskDollars] = useState(150);
-  const [statusBySignal, setStatusBySignal] = useState<Record<string, string>>({});
+
+  // Session-level risk override (drives chosenRisk used for sizing)
+  const [riskDollars, setRiskDollars] = useState<number>(() => settings.oneR || 150);
+
+  const [statusBySignal, setStatusBySignal] = useState<Record<string, string>>(
+    {}
+  );
   const [manageSyncError, setManageSyncError] = useState<string | null>(null);
   const [dailyStats, setDailyStats] = useState<Stats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
@@ -191,6 +207,8 @@ export default function TodayPage() {
   const oneR = settings.oneR;
   const dailyMaxLossR = settings.dailyMaxLossR;
   const dailyMaxLossDollar = dailyMaxLossR * oneR;
+
+  // If the slider hasn't been touched, this will effectively be your default 1R.
   const chosenRisk = riskDollars || oneR;
 
   const lossUsedDollar = dailyPnL < 0 ? Math.abs(dailyPnL) : 0;
@@ -199,16 +217,16 @@ export default function TodayPage() {
   const blockedForDay = lossUsedR >= dailyMaxLossR;
 
   let statusText = "Flat";
-  if (blockedForDay) statusText = "Max loss reached · new approvals blocked";
+  if (blockedForDay)
+    statusText = "Max loss reached · new approvals blocked";
   else if (dailyPnL > 0) statusText = "Green day so far";
-  else if (dailyPnL < 0 && lossUsedR < dailyMaxLossR * 0.5) statusText = "Drawdown · stay selective";
-  else if (dailyPnL < 0 && lossUsedR >= dailyMaxLossR * 0.5) statusText = "Near daily loss limit";
+  else if (dailyPnL < 0 && lossUsedR < dailyMaxLossR * 0.5)
+    statusText = "Drawdown · stay selective";
+  else if (dailyPnL < 0 && lossUsedR >= dailyMaxLossR * 0.5)
+    statusText = "Near daily loss limit";
 
-  const statusLabel = blockedForDay
-    ? "Locked out"
-    : dailyPnL !== 0
-    ? "In trades"
-    : "Flat";
+  const statusLabel =
+    blockedForDay ? "Locked out" : dailyPnL !== 0 ? "In trades" : "Flat";
   const todayPnlRaw = dailyPnL;
   const netRRaw = oneR > 0 ? todayPnlRaw / oneR : 0;
   const tradesToday = dailyStats?.totalTrades ?? 0;
@@ -230,11 +248,32 @@ export default function TodayPage() {
     sessionStatusText: blockedForDay ? "Daily limit hit" : statusLabel,
   };
 
-  const todayPnlDisplay = summary.todayPnlFormatted; // example
+  const todayPnlDisplay = summary.todayPnlFormatted;
   const netRDisplay = summary.netRFormatted;
   const tradesTodayDisplay = `${summary.tradesToday} / ${dailyTradeLimit}`;
-  const remainingRiskDisplay = `${summary.remainingR.toFixed(1)}R · ${summary.remainingUsdFormatted}`;
+  const remainingRiskDisplay = `${summary.remainingR.toFixed(
+    1
+  )}R · ${summary.remainingUsdFormatted}`;
   const statusDisplay = summary.sessionStatusText;
+
+  const riskRatio = oneR > 0 ? chosenRisk / oneR : 1;
+  let riskBadgeLabel = "Using default 1R";
+  let riskBadgeTone: "neutral" | "positive" | "negative" = "neutral";
+
+  if (oneR > 0) {
+    if (riskRatio > 1.25) {
+      riskBadgeLabel = `${riskRatio.toFixed(1)}× your 1R (aggressive)`;
+      riskBadgeTone = "negative";
+    } else if (riskRatio < 0.75) {
+      riskBadgeLabel = `${riskRatio.toFixed(1)}× your 1R (conservative)`;
+      riskBadgeTone = "positive";
+    } else {
+      riskBadgeLabel = `${riskRatio.toFixed(1)}× your 1R`;
+      riskBadgeTone = "neutral";
+    }
+  } else {
+    riskBadgeLabel = "Set a 1R value in Settings";
+  }
 
   const loadSignals = useCallback(async () => {
     setLoadingSignals(true);
@@ -338,9 +377,13 @@ export default function TodayPage() {
       setLoadingAuto(true);
       setAutoError(null);
       const res = await fetch("/api/auto-manage");
-      if (!res.ok) throw new Error(`Failed to fetch auto-managed trades: ${res.statusText}`);
+      if (!res.ok)
+        throw new Error(
+          `Failed to fetch auto-managed trades: ${res.statusText}`
+        );
       const data: AutoManageResponse = await res.json();
-      if (!data.ok) throw new Error(data.error || "Auto-manage API returned not ok");
+      if (!data.ok)
+        throw new Error(data.error || "Auto-manage API returned not ok");
       setAutoTrades(data.trades || []);
       setAutoSummary(data.summary || null);
     } catch (err: any) {
@@ -358,7 +401,9 @@ export default function TodayPage() {
   const handleApprove = async (signal: IncomingSignal) => {
     if (blockedForDay) {
       if (typeof window !== "undefined") {
-        window.alert("Daily loss limit reached · approvals are blocked for the rest of the day.");
+        window.alert(
+          "Daily loss limit reached · approvals are blocked for the rest of the day."
+        );
       }
       return;
     }
@@ -376,7 +421,10 @@ export default function TodayPage() {
       return;
     }
 
-    setStatusBySignal((prev) => ({ ...prev, [signal.id]: "Submitting order…" }));
+    setStatusBySignal((prev) => ({
+      ...prev,
+      [signal.id]: "Submitting order…",
+    }));
 
     const nowIso = new Date().toISOString();
     const tradeId = `signal-${signal.id}-${Date.now()}`;
@@ -419,7 +467,10 @@ export default function TodayPage() {
 
       if (!res.ok) {
         const text = await res.text();
-        setStatusBySignal((prev) => ({ ...prev, [signal.id]: `Error: ${res.status} ${text}` }));
+        setStatusBySignal((prev) => ({
+          ...prev,
+          [signal.id]: `Error: ${res.status} ${text}`,
+        }));
         return;
       }
 
@@ -428,7 +479,9 @@ export default function TodayPage() {
 
       setStatusBySignal((prev) => ({
         ...prev,
-        [signal.id]: `Order sent · tradeId ${tradeId}${alpacaOrderId ? ` · alpaca ${alpacaOrderId}` : ""}`,
+        [signal.id]: `Order sent · tradeId ${tradeId}${
+          alpacaOrderId ? ` · alpaca ${alpacaOrderId}` : ""
+        }`,
       }));
     } catch (err: any) {
       setStatusBySignal((prev) => ({
@@ -440,7 +493,9 @@ export default function TodayPage() {
 
     if (typeof window !== "undefined") {
       window.alert(
-        `Approved ${signal.ticker} · size ${size} · ~$${dollarRisk.toFixed(0)} risk (≈ 1R).`
+        `Approved ${signal.ticker} · size ${size} · ~$${dollarRisk.toFixed(
+          0
+        )} risk (≈ 1R).`
       );
     }
   };
@@ -454,7 +509,8 @@ export default function TodayPage() {
         body: JSON.stringify({
           ticker: signal.ticker,
           side: (signal.side as any) ?? "LONG",
-          quantity: (signal as any).positionSize ?? (signal as any).qty ?? 100,
+          quantity:
+            (signal as any).positionSize ?? (signal as any).qty ?? 100,
           entryPrice: signal.entryPrice,
           stopPrice: signal.stopPrice,
           targetPrice: signal.targetPrice,
@@ -552,7 +608,7 @@ export default function TodayPage() {
     (s: any) =>
       (s?.status ?? "PENDING") === "PENDING" &&
       (s?.aiGrade === "A" ||
-        s?.grade === "A" ||
+        (s as any)?.grade === "A" ||
         (typeof s?.aiScore === "number" && s.aiScore >= 9) ||
         (typeof s?.score === "number" && s.score >= 9))
   );
@@ -573,6 +629,9 @@ export default function TodayPage() {
   const currentSignal = visibleSignals[0];
   const openAutoTrades = autoTrades.filter((t) => t.status === "open");
 
+  const minRisk = 25;
+  const maxRisk = 1000;
+
   return (
     <>
       <AutoManagePoller />
@@ -584,9 +643,7 @@ export default function TodayPage() {
               <h1 className="text-sm font-semibold text-slate-50">
                 Cecil Trading
               </h1>
-              <p className="text-[11px] text-slate-400">
-                Today overview
-              </p>
+              <p className="text-[11px] text-slate-400">Today overview</p>
             </div>
             <span className="text-[11px] text-slate-500 uppercase tracking-wide">
               Paper account
@@ -612,17 +669,26 @@ export default function TodayPage() {
             <StatPill
               label="Today P&L"
               value={todayPnlDisplay}
-              tone={todayPnlRaw > 0 ? "positive" : todayPnlRaw < 0 ? "negative" : "neutral"}
+              tone={
+                todayPnlRaw > 0
+                  ? "positive"
+                  : todayPnlRaw < 0
+                  ? "negative"
+                  : "neutral"
+              }
             />
             <StatPill
               label="Net R"
               value={netRDisplay}
-              tone={netRRaw > 0 ? "positive" : netRRaw < 0 ? "negative" : "neutral"}
+              tone={
+                netRRaw > 0
+                  ? "positive"
+                  : netRRaw < 0
+                  ? "negative"
+                  : "neutral"
+              }
             />
-            <StatPill
-              label="Trades"
-              value={tradesTodayDisplay}
-            />
+            <StatPill label="Trades" value={tradesTodayDisplay} />
             <StatPill
               label="Risk left"
               value={remainingRiskDisplay}
@@ -640,280 +706,414 @@ export default function TodayPage() {
               }
             />
           </div>
+
+          {/* Session risk override control */}
+          <div className="mt-3 rounded-2xl border border-slate-800/80 bg-slate-900/70 px-3 py-3 space-y-2">
+            <div className="flex items-center justify-between text-[11px] text-slate-300">
+              <span className="font-medium">Session risk per trade</span>
+              <span className="font-semibold">
+                ~${chosenRisk.toFixed(0)}
+                {oneR > 0 && (
+                  <span className="ml-1 text-slate-400">
+                    ({(riskRatio || 1).toFixed(1)}× 1R)
+                  </span>
+                )}
+              </span>
+            </div>
+
+            <input
+              type="range"
+              min={Math.max(Math.floor((oneR || 50) * 0.25), 25)}
+              max={Math.max(Math.floor((oneR || 150) * 2.5), 250)}
+              step={10}
+              value={riskDollars}
+              onChange={(e) => setRiskDollars(Number(e.target.value))}
+              className="w-full"
+            />
+
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  className="w-20 rounded-md bg-slate-950/80 border border-slate-700 px-2 py-1 text-[11px] text-slate-100"
+                  value={riskDollars}
+                  onChange={(e) => {
+                    const next = Number(e.target.value);
+                    if (Number.isNaN(next)) return;
+                    setRiskDollars(Math.max(0, next));
+                  }}
+                />
+                <span className="text-[11px] text-slate-400">
+                  USD risk per trade
+                </span>
+              </div>
+
+              <span
+                className={`inline-flex items-center rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-wide border ${
+                  riskBadgeTone === "positive"
+                    ? "border-[var(--ci-positive)] text-[var(--ci-positive)]"
+                    : riskBadgeTone === "negative"
+                    ? "border-[var(--ci-negative)] text-[var(--ci-negative)]"
+                    : "border-slate-700 text-slate-200"
+                }`}
+              >
+                {riskBadgeLabel}
+              </span>
+            </div>
+          </div>
         </header>
 
         <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
-
-        {/* Pending approvals */}
-        <section className="space-y-3">
-          <h2 className="text-sm font-semibold text-neutral-100">
-            Pending approvals
-          </h2>
-          <p className="text-[11px] text-neutral-500">
-            A-grade pullbacks only (score ≥ 9)
-          </p>
-          {errorSignals && (
-            <p className="text-xs text-[var(--ci-negative)]">{errorSignals}</p>
-          )}
-          {spyStatusText && (
-            <p className="text-xs text-[var(--ci-text-muted)]">{spyStatusText}</p>
-          )}
-          {loadingSignals && <p className="muted-text">Loading signals…</p>}
-          {!loadingSignals && visibleSignals.length === 0 && (
-            <p className="empty-text">
-              No A+ setups right now. Stay patient and protect capital.
+          {/* Pending approvals */}
+          <section className="space-y-3">
+            <h2 className="text-sm font-semibold text-neutral-100">
+              Pending approvals
+            </h2>
+            <p className="text-[11px] text-neutral-500">
+              A-grade pullbacks only (score ≥ 9)
             </p>
-          )}
-          {currentSignal && (
-            <div
-              className="mobile-card"
-              onTouchStart={handleSwipeStart}
-              onTouchEnd={(e) => handleSwipeEnd(e, currentSignal)}
-            >
-              <div className="row-between" style={{ marginBottom: 4 }}>
-                <div>
-                  <div className="text-sm" style={{ opacity: 0.7 }}>
-                    Pending approval
-                  </div>
-                  <div className="text-lg" style={{ fontWeight: 600 }}>
-                    {currentSignal.ticker} · {currentSignal.side}
-                  </div>
-                </div>
-                <div className="column" style={{ textAlign: "right", fontSize: 11 }}>
-                  <span>Entry: {currentSignal.entryPrice?.toFixed(2)}</span>
-                  <span>Stop: {currentSignal.stopPrice?.toFixed(2)}</span>
-                  {currentSignal.targetPrice && (
-                    <span>Target: {currentSignal.targetPrice.toFixed(2)}</span>
-                  )}
-                </div>
-              </div>
-
+            {errorSignals && (
+              <p className="text-xs text-[var(--ci-negative)]">
+                {errorSignals}
+              </p>
+            )}
+            {spyStatusText && (
+              <p className="text-xs text-[var(--ci-text-muted)]">
+                {spyStatusText}
+              </p>
+            )}
+            {loadingSignals && <p className="muted-text">Loading signals…</p>}
+            {!loadingSignals && visibleSignals.length === 0 && (
+              <p className="empty-text">
+                No A+ setups right now. Stay patient and protect capital.
+              </p>
+            )}
+            {currentSignal && (
               <div
-                className="row-between"
-                style={{ marginTop: 8, marginBottom: 4, fontSize: 11 }}
-              >
-                <span>
-                  R: <strong>{currentSignal.rMultiple?.toFixed?.(2) ?? "–"}</strong>
-                </span>
-                <span>
-                  Size:{" "}
-                  <strong>
-                    {currentSignal.positionSize ?? currentSignal.shares ?? "–"}
-                  </strong>
-                </span>
-                <span>
-                  Score:{" "}
-                  <strong>
-                    {currentSignal.aiScore ?? currentSignal.score ?? "–"}
-                    {currentSignal.aiGrade ? ` (${currentSignal.aiGrade})` : ""}
-                  </strong>
-                </span>
-              </div>
-
-              {currentSignal.reasoning && (
-                <p className="text-xs" style={{ marginTop: 6, color: "#9ca3af" }}>
-                  {currentSignal.reasoning}
-                </p>
-              )}
-
-              <div
-                className="row"
-                style={{ marginTop: 10, justifyContent: "space-between" }}
-              >
-                <button
-                  className="btn btn-reject"
-                  style={{ flex: 1, marginRight: 6 }}
-                  onClick={() => handleDismiss(currentSignal.id)}
-                >
-                  Swipe ← or Tap · Reject
-                </button>
-                <button
-                  className="btn btn-approve"
-                  style={{ flex: 1, marginLeft: 6 }}
-                  onClick={() => handleApprove(currentSignal)}
-                >
-                  Swipe → or Tap · Approve
-                </button>
-              </div>
-
-              <div className="text-xs" style={{ marginTop: 6, color: "#6b7280" }}>
-                Tip: Swipe right to approve, left to reject while reviewing charts.
-              </div>
-            </div>
-          )}
-          {visibleSignals.map((signal) => {
-            const { size, dollarRisk, riskPerShare } = computeSizing(
-              chosenRisk,
-              signal.entryPrice,
-              signal.stopPrice ?? undefined
-            );
-            return (
-              <div
-                key={signal.id}
-                className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 md:p-6 shadow-[0_0_12px_rgba(255,255,255,0.03)] space-y-3"
+                className="mobile-card"
                 onTouchStart={handleSwipeStart}
-                onTouchEnd={(e) => handleSwipeEnd(e, signal)}
+                onTouchEnd={(e) => handleSwipeEnd(e, currentSignal)}
               >
-                <div className="flex items-center justify-between">
-                  <div className="pill-row">
-                    <span className="pill ticker-pill">{signal.ticker}</span>
-                    <span className={`pill side-pill ${signal.side.toLowerCase()}`}>
-                      {signal.side}
+                <div className="row-between" style={{ marginBottom: 4 }}>
+                  <div>
+                    <div className="text-sm" style={{ opacity: 0.7 }}>
+                      Pending approval
+                    </div>
+                    <div className="text-lg" style={{ fontWeight: 600 }}>
+                      {currentSignal.ticker} · {currentSignal.side}
+                    </div>
+                  </div>
+                  <div
+                    className="column"
+                    style={{ textAlign: "right", fontSize: 11 }}
+                  >
+                    <span>
+                      Entry: {currentSignal.entryPrice?.toFixed(2)}
                     </span>
-                    {signal.source && <span className="pill source-pill">{signal.source}</span>}
-                    {typeof signal.priority === "number" && (
-                      <span className="pill priority-pill">P{signal.priority.toFixed(1)}</span>
+                    <span>
+                      Stop: {currentSignal.stopPrice?.toFixed(2)}
+                    </span>
+                    {currentSignal.targetPrice && (
+                      <span>
+                        Target: {currentSignal.targetPrice.toFixed(2)}
+                      </span>
                     )}
                   </div>
-                  {signal.createdAt && (
+                </div>
+
+                <div
+                  className="row-between"
+                  style={{
+                    marginTop: 8,
+                    marginBottom: 4,
+                    fontSize: 11,
+                  }}
+                >
+                  <span>
+                    R:{" "}
+                    <strong>
+                      {currentSignal.rMultiple?.toFixed?.(2) ?? "–"}
+                    </strong>
+                  </span>
+                  <span>
+                    Size:{" "}
+                    <strong>
+                      {currentSignal.positionSize ??
+                        currentSignal.shares ??
+                        "–"}
+                    </strong>
+                  </span>
+                  <span>
+                    Score: <strong>{currentSignal.score ?? "–"}</strong>
+                  </span>
+                </div>
+
+                {currentSignal.reasoning && (
+                  <p
+                    className="text-xs"
+                    style={{ marginTop: 6, color: "#9ca3af" }}
+                  >
+                    {currentSignal.reasoning}
+                  </p>
+                )}
+
+                <div
+                  className="row"
+                  style={{ marginTop: 10, justifyContent: "space-between" }}
+                >
+                  <button
+                    className="btn btn-reject"
+                    style={{ flex: 1, marginRight: 6 }}
+                    onClick={() => handleDismiss(currentSignal.id)}
+                  >
+                    Swipe ← or Tap · Reject
+                  </button>
+                  <button
+                    className="btn btn-approve"
+                    style={{ flex: 1, marginLeft: 6 }}
+                    onClick={() => handleApprove(currentSignal)}
+                  >
+                    Swipe → or Tap · Approve
+                  </button>
+                </div>
+
+                <div
+                  className="text-xs"
+                  style={{ marginTop: 6, color: "#6b7280" }}
+                >
+                  Tip: Swipe right to approve, left to reject while reviewing
+                  charts.
+                </div>
+              </div>
+            )}
+            {visibleSignals.map((signal) => {
+              const { size, dollarRisk, riskPerShare } = computeSizing(
+                chosenRisk,
+                signal.entryPrice,
+                signal.stopPrice ?? undefined
+              );
+              return (
+                <div
+                  key={signal.id}
+                  className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 md:p-6 shadow-[0_0_12px_rgba(255,255,255,0.03)] space-y-3"
+                  onTouchStart={handleSwipeStart}
+                  onTouchEnd={(e) => handleSwipeEnd(e, signal)}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="pill-row">
+                      <span className="pill ticker-pill">
+                        {signal.ticker}
+                      </span>
+                      <span
+                        className={`pill side-pill ${signal.side.toLowerCase()}`}
+                      >
+                        {signal.side}
+                      </span>
+                      {signal.source && (
+                        <span className="pill source-pill">
+                          {signal.source}
+                        </span>
+                      )}
+                      {typeof signal.priority === "number" && (
+                        <span className="pill priority-pill">
+                          P{signal.priority.toFixed(1)}
+                        </span>
+                      )}
+                    </div>
+                    {signal.createdAt && (
+                      <div className="muted-text small">
+                        {new Date(
+                          signal.createdAt
+                        ).toLocaleTimeString()}
+                      </div>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+                    <div>
+                      <div className="label">Entry</div>
+                      <div className="value">
+                        {signal.entryPrice.toFixed(2)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="label">Stop</div>
+                      <div className="value">
+                        {signal.stopPrice != null
+                          ? signal.stopPrice.toFixed(2)
+                          : "—"}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="label">Target</div>
+                      <div className="value">
+                        {signal.targetPrice != null
+                          ? signal.targetPrice.toFixed(2)
+                          : "—"}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="label">Sizing (≈)</div>
+                      <div className="value">
+                        {size
+                          ? `${size.toLocaleString()} sh · ~$${dollarRisk.toFixed(
+                              0
+                            )}`
+                          : "—"}
+                        {riskPerShare
+                          ? ` · ${riskPerShare.toFixed(2)} /sh`
+                          : ""}
+                      </div>
+                    </div>
+                  </div>
+                  {signal.reasoning && (
+                    <div>
+                      <div className="label">Reasoning</div>
+                      <div className="muted-text">{signal.reasoning}</div>
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2 mt-2">
+                    <button
+                      className="btn-approve"
+                      disabled={blockedForDay}
+                      onClick={() => handleApprove(signal)}
+                    >
+                      Approve
+                    </button>
+                    <button
+                      className="btn-dismiss"
+                      onClick={() => handleDismiss(signal.id)}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                  {statusBySignal[signal.id] && (
                     <div className="muted-text small">
-                      {new Date(signal.createdAt).toLocaleTimeString()}
+                      {statusBySignal[signal.id]}
                     </div>
                   )}
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+              );
+            })}
+          </section>
+          <section className="mt-2 px-3">
+            <div className="rounded-2xl border border-neutral-700 bg-neutral-900/70 px-3 py-2 text-sm">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="font-medium text-neutral-100">
+                    Auto-management
+                  </div>
+                  <div className="text-xs text-neutral-400">
+                    Check open trades for 1R/2R partials and stops.
+                  </div>
+                </div>
+                <button
+                  className="rounded-full px-3 py-1 text-xs font-semibold bg-neutral-100 text-black disabled:opacity-50"
+                  onClick={runAutoManage}
+                  disabled={autoManageBusy}
+                >
+                  {autoManageBusy ? "Running..." : "Run (dry run)"}
+                </button>
+              </div>
+              {autoManageStatus && (
+                <div className="mt-1 text-xs text-neutral-300">
+                  {autoManageStatus}
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* Auto-managed open trades view */}
+          <section className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 md:p-6 shadow-[0_0_12px_rgba(255,255,255,0.03)] space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm uppercase tracking-wide text-[var(--ci-text-muted)]">
+                Auto-managed open trades (engine view)
+              </h2>
+              <button
+                className="inline-flex items-center justify-center px-3 py-1 rounded-lg text-xs font-medium border border-[var(--ci-accent)] text-[var(--ci-accent)] bg-transparent hover:bg-[var(--ci-card)] transition-colors"
+                onClick={loadAutoTrades}
+                disabled={loadingAuto}
+              >
+                {loadingAuto ? "Running engine…" : "Refresh engine"}
+              </button>
+            </div>
+            {autoError && (
+              <p className="text-[var(--ci-negative)] text-sm">{autoError}</p>
+            )}
+            {!loadingAuto && openAutoTrades.length === 0 && (
+              <p className="muted-text">
+                No open trades in the backend book right now.
+              </p>
+            )}
+            {autoSummary && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+                <StatTile label="Open trades" value={autoSummary.openTrades} />
+                <StatTile
+                  label="Symbols tracked"
+                  value={autoSummary.symbolCount}
+                />
+                <StatTile
+                  label="Max R (book)"
+                  value={
+                    autoSummary.maxR != null
+                      ? autoSummary.maxR.toFixed(2)
+                      : "—"
+                  }
+                />
+                <StatTile
+                  label="Min R (book)"
+                  value={
+                    autoSummary.minR != null
+                      ? autoSummary.minR.toFixed(2)
+                      : "—"
+                  }
+                />
+              </div>
+            )}
+            {openAutoTrades.map((t) => (
+              <div key={t.id} className="border-t border-[var(--ci-border)] pt-3">
+                <div className="flex items-center justify-between">
+                  <div className="pill-row">
+                    <span className="pill ticker-pill">{t.symbol}</span>
+                    <span
+                      className={`pill side-pill ${
+                        t.side === "long" ? "long" : "short"
+                      }`}
+                    >
+                      {t.side.toUpperCase()}
+                    </span>
+                    <span className="pill source-pill">
+                      {t.currentSize}/{t.size} sh
+                    </span>
+                  </div>
+                  <div className="muted-text small">
+                    Opened: {new Date(t.createdAt).toLocaleString()}
+                  </div>
+                </div>
+                <div className="grid grid-2 md:grid-cols-4 gap-3 mt-2">
                   <div>
                     <div className="label">Entry</div>
-                    <div className="value">{signal.entryPrice.toFixed(2)}</div>
+                    <div className="value">{t.entryPrice.toFixed(2)}</div>
                   </div>
                   <div>
                     <div className="label">Stop</div>
+                    <div className="value">{t.stopPrice.toFixed(2)}</div>
+                  </div>
+                  <div>
+                    <div className="label">Last</div>
                     <div className="value">
-                      {signal.stopPrice != null ? signal.stopPrice.toFixed(2) : "—"}
+                      {t.lastPrice != null ? t.lastPrice.toFixed(2) : "—"}
                     </div>
                   </div>
                   <div>
-                    <div className="label">Target</div>
+                    <div className="label">Current R</div>
                     <div className="value">
-                      {signal.targetPrice != null ? signal.targetPrice.toFixed(2) : "—"}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="label">Sizing (≈)</div>
-                    <div className="value">
-                      {size ? `${size.toLocaleString()} sh · ~$${dollarRisk.toFixed(0)}` : "—"}
-                      {riskPerShare ? ` · ${riskPerShare.toFixed(2)} /sh` : ""}
+                      {t.currentR != null ? t.currentR.toFixed(2) : "—"}
                     </div>
                   </div>
                 </div>
-                {signal.reasoning && (
-                  <div>
-                    <div className="label">Reasoning</div>
-                    <div className="muted-text">{signal.reasoning}</div>
-                  </div>
-                )}
-                <div className="flex items-center gap-2 mt-2">
-                  <button
-                    className="btn-approve"
-                    disabled={blockedForDay}
-                    onClick={() => handleApprove(signal)}
-                  >
-                    Approve
-                  </button>
-                  <button
-                    className="btn-dismiss"
-                    onClick={() => handleDismiss(signal.id)}
-                  >
-                    Dismiss
-                  </button>
-                </div>
-                {statusBySignal[signal.id] && (
-                  <div className="muted-text small">{statusBySignal[signal.id]}</div>
-                )}
               </div>
-            );
-          })}
-        </section>
-        <section className="mt-2 px-3">
-          <div className="rounded-2xl border border-neutral-700 bg-neutral-900/70 px-3 py-2 text-sm">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <div className="font-medium text-neutral-100">
-                  Auto-management
-                </div>
-                <div className="text-xs text-neutral-400">
-                  Check open trades for 1R/2R partials and stops.
-                </div>
-              </div>
-              <button
-                className="rounded-full px-3 py-1 text-xs font-semibold bg-neutral-100 text-black disabled:opacity-50"
-                onClick={runAutoManage}
-                disabled={autoManageBusy}
-              >
-                {autoManageBusy ? "Running..." : "Run (dry run)"}
-              </button>
-            </div>
-            {autoManageStatus && (
-              <div className="mt-1 text-xs text-neutral-300">
-                {autoManageStatus}
-              </div>
-            )}
-          </div>
-        </section>
-
-        {/* Auto-managed open trades view */}
-        <section className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 md:p-6 shadow-[0_0_12px_rgba(255,255,255,0.03)] space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm uppercase tracking-wide text-[var(--ci-text-muted)]">
-              Auto-managed open trades (engine view)
-            </h2>
-            <button
-              className="inline-flex items-center justify-center px-3 py-1 rounded-lg text-xs font-medium border border-[var(--ci-accent)] text-[var(--ci-accent)] bg-transparent hover:bg-[var(--ci-card)] transition-colors"
-              onClick={loadAutoTrades}
-              disabled={loadingAuto}
-            >
-              {loadingAuto ? "Running engine…" : "Refresh engine"}
-            </button>
-          </div>
-          {autoError && (
-            <p className="text-[var(--ci-negative)] text-sm">{autoError}</p>
-          )}
-          {!loadingAuto && openAutoTrades.length === 0 && (
-            <p className="muted-text">No open trades in the backend book right now.</p>
-          )}
-          {autoSummary && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-              <StatTile label="Open trades" value={autoSummary.openTrades} />
-              <StatTile label="Symbols tracked" value={autoSummary.symbolCount} />
-              <StatTile label="Max R (book)" value={autoSummary.maxR != null ? autoSummary.maxR.toFixed(2) : "—"} />
-              <StatTile label="Min R (book)" value={autoSummary.minR != null ? autoSummary.minR.toFixed(2) : "—"} />
-            </div>
-          )}
-          {openAutoTrades.map((t) => (
-            <div key={t.id} className="border-t border-[var(--ci-border)] pt-3">
-              <div className="flex items-center justify-between">
-                <div className="pill-row">
-                  <span className="pill ticker-pill">{t.symbol}</span>
-                  <span className={`pill side-pill ${t.side === "long" ? "long" : "short"}`}>
-                    {t.side.toUpperCase()}
-                  </span>
-                  <span className="pill source-pill">
-                    {t.currentSize}/{t.size} sh
-                  </span>
-                </div>
-                <div className="muted-text small">Opened: {new Date(t.createdAt).toLocaleString()}</div>
-              </div>
-              <div className="grid grid-2 md:grid-cols-4 gap-3 mt-2">
-                <div>
-                  <div className="label">Entry</div>
-                  <div className="value">{t.entryPrice.toFixed(2)}</div>
-                </div>
-                <div>
-                  <div className="label">Stop</div>
-                  <div className="value">{t.stopPrice.toFixed(2)}</div>
-                </div>
-                <div>
-                  <div className="label">Last</div>
-                  <div className="value">{t.lastPrice != null ? t.lastPrice.toFixed(2) : "—"}</div>
-                </div>
-                <div>
-                  <div className="label">Current R</div>
-                  <div className="value">{t.currentR != null ? t.currentR.toFixed(2) : "—"}</div>
-                </div>
-              </div>
-            </div>
-          ))}
-        </section>
+            ))}
+          </section>
         </main>
       </div>
       <BottomNav />

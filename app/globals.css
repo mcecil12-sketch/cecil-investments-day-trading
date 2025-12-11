@@ -1,185 +1,386 @@
-/* Mobile-first app shell */
-.app-root {
-  margin: 0;
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Core theme */
+  --ci-bg: #000000;
+  --ci-bg-alt: #0a0c0d;
+  --ci-bg-elevated: var(--ci-bg-alt);
+  --ci-card: var(--ci-bg-alt);
+  --ci-border: rgba(255, 255, 255, 0.08);
+
+  /* Typography */
+  --ci-text: #ffffff;
+  --ci-text-muted: #9aa0a6;
+  --ci-text-soft: #9aa0a6;
+  --ci-accent: #c0c0c0;
+  --ci-accent-soft: #c0c0c0;
+
+  /* Trading colors */
+  --ci-positive: #00c15a;
+  --ci-negative: #ff4e4e;
+
+  /* Shadows / radius */
+  --ci-shadow-soft: 0 18px 40px rgba(0, 0, 0, 0.55);
+  --ci-radius-lg: 1rem;
+  --ci-radius-pill: 999px;
+
+  /* Fonts */
+  --ci-font-primary: "Inter Tight", sans-serif;
+  --ci-font-numeric: "JetBrains Mono", monospace;
+  --ci-font-sans: var(--ci-font-primary);
+
+  /* Pills */
+  --ci-pill-bg: rgba(255, 255, 255, 0.04);
+  --ci-pill-border: rgba(255, 255, 255, 0.12);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
   padding: 0;
-  min-height: 100vh;
-  background: #000;
-  color: #f3f4f6;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
-    "Segoe UI", sans-serif;
+  margin: 0;
+  min-height: 100%;
 }
 
-.app-shell {
-  min-height: 100vh;
-  display: flex;
-  justify-content: center;
-  background: radial-gradient(circle at top, #111827 0, #000 55%, #000 100%);
+body {
+  font-family: var(--ci-font-sans);
+  background: var(--ci-bg);
+  color: var(--ci-text);
+  -webkit-font-smoothing: antialiased;
 }
 
-.app-main {
-  /* Phone-first width, but still nice on desktop */
-  width: 100%;
-  max-width: 480px;
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  background: #020617;
-}
+/* App shell ----------------------------------------------------- */
 
-/* Ensure content doesn't sit under bottom nav */
 .app-page {
-  flex: 1 1 auto;
-  overflow-y: auto;
-  padding: 12px 10px 72px; /* 72px bottom room for nav */
+  min-height: 100vh;
+  padding-bottom: 4.5rem; /* room for bottom nav */
+  background: var(--ci-bg);
+  color: var(--ci-text);
 }
 
-/* Headline + strap on small devices */
-.app-header {
-  padding: 12px 12px 6px;
-}
+/* Common layout helpers ----------------------------------------- */
 
-.app-header-title {
-  font-size: 1.2rem;
-  font-weight: 600;
-}
-
-.app-header-subtitle {
-  font-size: 0.75rem;
-  color: #9ca3af;
-}
-
-/* Generic mobile card */
-.mobile-card {
-  background: #020617;
-  border-radius: 18px;
-  border: 1px solid #111827;
-  padding: 12px 14px;
-  margin-bottom: 10px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
-}
-
-/* Touch-friendly buttons */
-.btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 44px;
-  padding: 10px 16px;
-  border-radius: 999px;
-  font-size: 0.9rem;
-  font-weight: 500;
-  border: 1px solid transparent;
-  cursor: pointer;
-}
-
-.btn-approve {
-  background: #16a34a;
-  color: #ecfdf5;
-}
-
-.btn-reject {
-  background: #b91c1c;
-  color: #fee2e2;
-}
-
-.btn-outline {
-  background: transparent;
-  border-color: #4b5563;
-  color: #e5e7eb;
-}
-
-.btn + .btn {
-  margin-left: 8px;
-}
-
-/* Utility text sizes for mobile */
-.text-xs {
-  font-size: 0.75rem;
-}
-.text-sm {
-  font-size: 0.8rem;
-}
-.text-md {
-  font-size: 0.9rem;
-}
-.text-lg {
-  font-size: 1.05rem;
-}
-
-/* Simple row/column helpers */
-.row {
-  display: flex;
-  align-items: center;
-}
 .row-between {
   display: flex;
   align-items: center;
   justify-content: space-between;
 }
+
+.row {
+  display: flex;
+  align-items: center;
+}
+
 .column {
   display: flex;
   flex-direction: column;
 }
 
-/* Stats strip at the top */
-.stats-strip {
-  display: flex;
-  flex-direction: column;
-  padding: 8px 10px 4px;
-  border-bottom: 1px solid #111827;
+.muted-text {
+  font-size: 0.75rem;
+  color: var(--ci-text-muted);
 }
-.stats-strip-row {
-  display: flex;
-  justify-content: space-between;
+
+.muted-text.small {
   font-size: 0.7rem;
-  color: #9ca3af;
-}
-.stats-strip-row strong {
-  color: #e5e7eb;
 }
 
-/* Value coloring already wired in other pages */
+.empty-text {
+  font-size: 0.8rem;
+  color: var(--ci-text-subtle);
+  padding: 0.5rem 0;
+}
+
+/* Cards & surfaces ---------------------------------------------- */
+
+.mobile-card,
+.card {
+  border-radius: var(--ci-radius-lg);
+  background: var(--ci-card);
+  border: 1px solid var(--ci-border);
+  padding: 0.9rem 1rem;
+  box-shadow: var(--ci-shadow-soft);
+}
+
+.mobile-card {
+  margin-bottom: 0.75rem;
+}
+
+/* Labels + values on Today / Performance ------------------------ */
+
+.label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ci-text-subtle);
+  margin-bottom: 0.1rem;
+}
+
+.value {
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--ci-text);
+}
+
+/* Positive / negative helpers ----------------------------------- */
+
 .value-positive {
-  color: #22c55e;
+  color: var(--ci-positive);
 }
+
 .value-negative {
-  color: #f97316;
+  color: var(--ci-negative);
 }
 
-/* Make tables horizontally scrollable on phones */
-.table-wrapper {
-  width: 100%;
-  overflow-x: auto;
+.pill-result {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  border-radius: var(--ci-radius-pill);
+  padding: 0.2rem 0.65rem;
+  border: 1px solid rgba(148, 163, 184, 0.5);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 
-/* Touch-friendly nav bar */
+.pill-result.positive {
+  border-color: rgba(34, 197, 94, 0.7);
+  color: var(--ci-positive);
+}
+
+.pill-result.negative {
+  border-color: rgba(248, 113, 113, 0.7);
+  color: var(--ci-negative);
+}
+
+/* Pills for tickers, sides, sources ----------------------------- */
+
+.pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--ci-radius-pill);
+  padding: 0.1rem 0.6rem;
+  font-size: 0.7rem;
+  border: 1px solid var(--ci-pill-border);
+  background-color: var(--ci-pill-bg);
+  color: var(--ci-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.ticker-pill {
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  color: var(--ci-text);
+}
+
+.side-pill.long {
+  border-color: rgba(34, 197, 94, 0.9);
+  color: var(--ci-positive);
+}
+
+.side-pill.short {
+  border-color: rgba(248, 113, 113, 0.9);
+  color: var(--ci-negative);
+}
+
+.source-pill {
+  opacity: 0.85;
+}
+
+.priority-pill {
+  border-style: dashed;
+}
+
+/* Buttons -------------------------------------------------------- */
+
+button {
+  font-family: inherit;
+}
+
+.btn,
+.btn-approve,
+.btn-reject,
+.btn-dismiss {
+  border-radius: 999px;
+  font-size: 0.8rem;
+  padding: 0.45rem 0.9rem;
+  font-weight: 500;
+  border-width: 1px;
+  border-style: solid;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.06s ease;
+}
+
+.btn-approve {
+  background: linear-gradient(to right, #22c55e, #16a34a);
+  border-color: #22c55e;
+  color: #000000;
+}
+
+.btn-approve:hover {
+  filter: brightness(1.05);
+  transform: translateY(-0.5px);
+}
+
+.btn-reject,
+.btn-dismiss {
+  background: transparent;
+  border-color: var(--ci-border);
+  color: var(--ci-text-muted);
+}
+
+.btn-reject:hover,
+.btn-dismiss:hover {
+  border-color: rgba(255, 255, 255, 0.2);
+  background-color: var(--ci-bg-alt);
+}
+
+/* Links ---------------------------------------------------------- */
+
+a {
+  color: var(--ci-accent);
+}
+
+a:hover {
+  color: #f9fafb;
+}
+
+/* Bottom nav base tweaks (works with your TSX) ------------------- */
+
 .bottom-nav {
-  position: sticky;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  height: 60px;
-  border-top: 1px solid #111827;
-  background: #020617;
   display: flex;
   align-items: center;
-  justify-content: space-around;
-  padding-bottom: env(safe-area-inset-bottom, 0);
+  justify-content: center;
+  background: var(--ci-bg);
+  backdrop-filter: blur(16px);
+  border-top: 1px solid var(--ci-border);
+  box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.8);
 }
 
-.bottom-nav-item {
-  flex: 1;
+.bottom-nav .bottom-nav-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-evenly;
+  width: 100%;
+  gap: 0.75rem;
+}
+
+.bottom-nav a {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
   text-align: center;
+}
+
+.bottom-nav-link {
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
   font-size: 0.7rem;
-  color: #9ca3af;
 }
 
-.bottom-nav-item span {
-  display: block;
-  margin-top: 2px;
+/* Utility for tiny pill-like headers (Today header, etc.) -------- */
+
+.badge-soft {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--ci-border);
+  background: var(--ci-bg-alt);
+  font-size: 0.7rem;
+  color: var(--ci-text-muted);
 }
 
-.bottom-nav-item.active {
-  color: #e5e7eb;
-  font-weight: 600;
+/* Tables on Trades / Performance -------------------------------- */
+
+.table-shell {
+  border-radius: var(--ci-radius-lg);
+  border: 1px solid var(--ci-border);
+  background: var(--ci-bg-alt);
+  box-shadow: var(--ci-shadow-soft);
+  overflow: hidden;
+}
+
+.table-shell table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.table-shell th,
+.table-shell td {
+  padding: 0.55rem 0.75rem;
+  font-size: 0.8rem;
+}
+
+.table-shell th {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+  color: var(--ci-text-subtle);
+  border-bottom: 1px solid var(--ci-border);
+}
+
+.table-shell tr:nth-child(even) td {
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+/* Forms / inputs ------------------------------------------------- */
+
+input,
+select {
+  background-color: var(--ci-bg-alt);
+  border-radius: 0.6rem;
+  border: 1px solid var(--ci-border);
+  color: var(--ci-text);
+  padding: 0.4rem 0.6rem;
+  font-size: 0.8rem;
+}
+
+input::placeholder {
+  color: var(--ci-text-muted);
+}
+
+/* Small risk slider label feel (used when you add slider later) -- */
+
+.risk-label {
+  font-size: 0.75rem;
+  color: var(--ci-text-muted);
+}
+
+.risk-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.6);
+  font-size: 0.75rem;
+  color: var(--ci-text);
+}
+
+/* Responsive fine-tuning ----------------------------------------- */
+
+@media (min-width: 768px) {
+  .mobile-card {
+    padding: 1rem 1.25rem;
+  }
 }
