@@ -234,7 +234,7 @@ export default function PerformancePage() {
           </div>
         </header>
 
-        <main className="max-w-6xl mx-auto px-4 py-4 space-y-6">
+        <main className="max-w-6xl mx-auto px-4 pt-6 pb-24 space-y-6">
           {statsError && (
             <p className="text-xs text-[var(--ci-negative)]">{statsError}</p>
           )}

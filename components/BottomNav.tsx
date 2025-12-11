@@ -1,5 +1,3 @@
-"use client";
-
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
@@ -15,9 +13,9 @@ export function BottomNav() {
 
   const tab = (href: string, label: string, icon: React.ReactNode) => {
     const active = pathname === href;
+
     return (
       <Link
-        key={href}
         href={href}
         className={`flex flex-col items-center justify-center flex-1 py-1 ${
           active ? "text-[var(--ci-accent)]" : "text-[var(--ci-text-muted)]"

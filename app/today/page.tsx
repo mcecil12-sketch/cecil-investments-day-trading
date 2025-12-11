@@ -763,7 +763,7 @@ export default function TodayPage() {
           </div>
         </header>
 
-        <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
+        <main className="max-w-6xl mx-auto px-4 pt-6 pb-24 space-y-6">
           {/* Pending approvals */}
           <section className="space-y-3">
             <h2 className="text-sm font-semibold text-neutral-100">
