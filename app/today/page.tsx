@@ -2,8 +2,8 @@
 
 import React, { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { BottomNav } from "@/components/BottomNav";
 import { AutoManagePoller } from "@/components/AutoManagePoller";
+import { BottomNav } from "@/components/BottomNav";
 import { useTrading, TradeSide, Trade } from "../tradingContext";
 import { computeRiskPerShare } from "../../lib/risk";
 
@@ -635,8 +635,9 @@ export default function TodayPage() {
   return (
     <>
       <AutoManagePoller />
-      <div className="app-page">
-        {/* --- Slim header bar --------------------------------------------------- */}
+      <div className="app-page pb-20">
+        <div className="max-w-6xl mx-auto px-4 pb-6">
+          {/* --- Slim header bar --------------------------------------------------- */}
         <header className="mb-3">
           <div className="flex items-center justify-between mb-2">
             <div>
@@ -1115,6 +1116,7 @@ export default function TodayPage() {
             ))}
           </section>
         </main>
+        </div>
       </div>
       <BottomNav />
     </>

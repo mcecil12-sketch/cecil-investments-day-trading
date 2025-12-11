@@ -1,39 +1,71 @@
+"use client";
+
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   HomeIcon,
-  BarChart3Icon,
   LineChartIcon,
+  BarChart3Icon,
   SettingsIcon,
 } from "lucide-react";
 import React from "react";
 
+type TabConfig = {
+  href: string;
+  label: string;
+  icon: React.ComponentType<{ size?: number; strokeWidth?: number }>;
+};
+
+const TABS: TabConfig[] = [
+  { href: "/today", label: "Today", icon: HomeIcon },
+  { href: "/trades", label: "Trades", icon: LineChartIcon },
+  { href: "/performance", label: "Performance", icon: BarChart3Icon },
+  { href: "/settings", label: "Settings", icon: SettingsIcon },
+];
+
 export function BottomNav() {
   const pathname = usePathname();
 
-  const tab = (href: string, label: string, icon: React.ReactNode) => {
-    const active = pathname === href;
-
-    return (
-      <Link
-        href={href}
-        className={`flex flex-col items-center justify-center flex-1 py-1 ${
-          active ? "text-[var(--ci-accent)]" : "text-[var(--ci-text-muted)]"
-        }`}
-      >
-        <div className="mb-1 flex items-center justify-center">{icon}</div>
-        <span className="text-[10px] font-medium tracking-wide">{label}</span>
-      </Link>
-    );
-  };
-
   return (
-    <nav className="bottom-nav fixed bottom-0 left-0 right-0 h-14 bg-[var(--ci-bg-elevated)] border-t border-[var(--ci-border)] shadow-[0_-4px_12px_rgba(0,0,0,0.6)] backdrop-blur-md z-50">
-      <div className="bottom-nav-inner mx-auto flex w-full max-w-5xl items-center justify-evenly gap-2 px-4">
-        {tab("/today", "Today", <HomeIcon size={18} />)}
-        {tab("/trades", "Trades", <LineChartIcon size={18} />)}
-        {tab("/performance", "Performance", <BarChart3Icon size={18} />)}
-        {tab("/settings", "Settings", <SettingsIcon size={18} />)}
+    <nav
+      className="
+        fixed inset-x-0 bottom-0 z-50
+        border-t border-[var(--ci-border)]
+        bg-[var(--ci-card)]/96
+        backdrop-blur-lg
+        shadow-[0_-12px_20px_rgba(2,6,23,0.55)]
+      "
+    >
+      <div
+        className="
+          mx-auto max-w-4xl
+          flex items-center justify-around
+          px-4 py-3
+        "
+        style={{ paddingBottom: "calc(env(safe-area-inset-bottom) + 6px)" }}
+      >
+        {TABS.map(({ href, label, icon: Icon }) => {
+          const active = pathname === href;
+
+          return (
+            <Link
+              key={href}
+              href={href}
+              className={`
+                flex flex-col items-center justify-center
+                gap-1
+                text-[12px] font-semibold tracking-wide
+                transition-colors
+                ${active
+                  ? "text-[var(--ci-accent)]"
+                  : "text-[var(--ci-text-muted)]"}
+              `}
+            >
+              <Icon size={20} strokeWidth={1.6} />
+              <span>{label}</span>
+            </Link>
+          );
+        })}
       </div>
     </nav>
   );
