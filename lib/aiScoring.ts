@@ -1,4 +1,6 @@
 import OpenAI from "openai";
+import { recordSpend } from "./aiBudget";
+import { recordAICall } from "./aiMetrics";
 
 export type Side = "LONG" | "SHORT";
 
@@ -99,16 +101,20 @@ Catalyst score: ${signal.catalystScore ?? "n/a"}
 Return ONLY JSON.
 `.trim();
 
+  const model = "gpt-5.1-mini";
   const openai = new OpenAI({ apiKey });
   const completion = await openai.chat.completions.create({
-    model: "gpt-5.1-mini",
+    model,
     temperature: 0.3,
     response_format: { type: "json_object" },
     messages: [
       { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
+    { role: "user", content: userPrompt },
     ],
   });
+
+  recordSpend(model);
+  recordAICall(model);
 
   const content = completion.choices[0]?.message?.content ?? "{}";
 
