@@ -2,13 +2,13 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { HomeIcon, LineChartIcon, BarChart3Icon, SettingsIcon } from "lucide-react";
+import { HomeIcon, LineChartIcon, BarChart3Icon, SettingsIcon, type LucideProps } from "lucide-react";
 import React from "react";
 
 type TabDef = {
   href: string;
   label: string;
-  Icon: React.ComponentType<{ size?: number; className?: string }>;
+  Icon: React.ComponentType<LucideProps>;
 };
 
 const TABS: TabDef[] = [
