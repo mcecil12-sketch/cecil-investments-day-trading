@@ -1,8 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
-import { useTrading } from "../tradingContext";
-import { BottomNav } from "@/components/BottomNav";
+import { useTrading } from "@/tradingContext";
 
 export default function SettingsPage() {
   const { settings, updateSettings } = useTrading();
@@ -188,7 +187,6 @@ export default function SettingsPage() {
           </form>
         </section>
       </div>
-      <BottomNav />
     </>
   );
 }

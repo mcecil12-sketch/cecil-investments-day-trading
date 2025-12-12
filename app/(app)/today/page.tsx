@@ -3,9 +3,8 @@
 import React, { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { AutoManagePoller } from "@/components/AutoManagePoller";
-import { BottomNav } from "@/components/BottomNav";
-import { useTrading, TradeSide, Trade } from "../tradingContext";
-import { computeRiskPerShare } from "../../lib/risk";
+import { useTrading, TradeSide, Trade } from "@/tradingContext";
+import { computeRiskPerShare } from "@/lib/risk";
 
 type IncomingSignal = {
   id: string;
@@ -1118,7 +1117,6 @@ export default function TodayPage() {
         </main>
         </div>
       </div>
-      <BottomNav />
     </>
   );
 }

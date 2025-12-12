@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { BottomNav } from "@/components/BottomNav";
 
 type TradeStatus = "OPEN" | "CLOSED" | "CANCELLED" | "PARTIAL";
 
@@ -512,7 +511,6 @@ export default function TradesPage() {
           </div>
         </section>
       </div>
-      <BottomNav />
     </>
   );
 }

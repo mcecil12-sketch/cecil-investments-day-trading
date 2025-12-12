@@ -22,7 +22,9 @@
         "name": "next"
       }
     ],
+    "baseUrl": ".",
     "paths": {
+      "@/tradingContext": ["./app/tradingContext.tsx"],
       "@/*": [
         "./*"
       ]

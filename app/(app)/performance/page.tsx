@@ -2,8 +2,7 @@
 
 import React, { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { useTrading } from "../tradingContext";
-import { BottomNav } from "@/components/BottomNav";
+import { useTrading } from "@/tradingContext";
 
 type Stats = {
   totalTrades?: number;
@@ -320,7 +319,6 @@ export default function PerformancePage() {
           </section>
         </main>
       </div>
-      <BottomNav />
     </>
   );
 }
