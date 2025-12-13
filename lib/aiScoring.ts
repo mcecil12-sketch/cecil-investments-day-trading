@@ -56,6 +56,7 @@ export async function scoreSignalWithAI(signal: RawSignal): Promise<ScoredSignal
       aiScore: 0,
       aiGrade: "F",
       aiSummary: "AI scoring disabled (no API key).",
+      totalScore: 0,
     };
   }
 
