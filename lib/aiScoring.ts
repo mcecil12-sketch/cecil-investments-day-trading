@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { recordSpend } from "./aiBudget";
 import { recordAICall } from "./aiMetrics";
+import { bumpFunnel } from "./funnelMetrics";
 
 export type Side = "LONG" | "SHORT";
 
@@ -28,6 +29,7 @@ export type ScoredSignal = RawSignal & {
   aiScore: number; // 0–10, numeric
   aiGrade: "A" | "B" | "C" | "D" | "F";
   aiSummary: string; // short explanation
+  totalScore: number;
 };
 
 type ModelResponse = {
@@ -115,6 +117,7 @@ Return ONLY JSON.
 
   recordSpend(model);
   recordAICall(model);
+  bumpFunnel({ gptScored: 1, gptScoredByModel: { [model]: 1 } });
 
   const content = completion.choices[0]?.message?.content ?? "{}";
 
@@ -139,6 +142,7 @@ Return ONLY JSON.
     aiScore: normalizedScore,
     aiGrade: grade,
     aiSummary: summary,
+    totalScore: normalizedScore,
   };
 
   console.log("[aiScoring] Result:", {

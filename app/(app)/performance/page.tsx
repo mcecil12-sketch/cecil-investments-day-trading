@@ -3,6 +3,8 @@
 import React, { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { useTrading } from "@/tradingContext";
+import { AiHealthPill } from "@/components/performance/AiHealthPill";
+import { IntradayFunnel } from "@/components/performance/IntradayFunnel";
 
 type Stats = {
   totalTrades?: number;
@@ -237,6 +239,11 @@ export default function PerformancePage() {
           {statsError && (
             <p className="text-xs text-[var(--ci-negative)]">{statsError}</p>
           )}
+
+          <div className="space-y-6">
+            <AiHealthPill />
+            <IntradayFunnel />
+          </div>
 
           {/* High-level performance tiles */}
           <section className="space-y-3">

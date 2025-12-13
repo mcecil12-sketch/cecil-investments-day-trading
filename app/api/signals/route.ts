@@ -3,6 +3,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import { scoreSignalWithAI, RawSignal, ScoredSignal } from "@/lib/aiScoring";
 import { sendPullbackAlert } from "@/lib/notify";
+import { bumpFunnel } from "@/lib/funnelMetrics";
 
 const DATA_FILE = path.join(process.cwd(), "data", "signals.json");
 
@@ -87,6 +88,8 @@ export async function POST(req: Request) {
     );
   }
 
+  bumpFunnel({ signalsReceived: 1 });
+
   const now = new Date().toISOString();
 
   const rawSignal: RawSignal = {
@@ -120,6 +123,10 @@ export async function POST(req: Request) {
     score: scored.aiScore,
     grade: scored.aiGrade,
   });
+
+  if (typeof scored.totalScore === "number" && scored.totalScore >= 8) {
+    bumpFunnel({ qualified: 1 });
+  }
 
   // Only alert on A / 9+ scores
   if (scored.aiGrade === "A" || scored.aiScore >= 9) {

@@ -5,6 +5,8 @@ const PUBLIC_PATHS = [
   "/login",
   "/api/login",
   "/api/ai-stats",
+  "/api/ai-health",
+  "/api/funnel-stats",
 ];
 
 export function middleware(req: NextRequest) {
