@@ -1,31 +1,31 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
-
-function resolveLoginRedirect(searchParams: ReadonlyURLSearchParams | null) {
-  const maybeFrom = searchParams?.get("from");
-  if (!maybeFrom) return "/today";
-
-  try {
-    const url = new URL(maybeFrom, "http://example.com");
-    return `${url.pathname}${url.search}`;
-  } catch {
-    return "/today";
-  }
-}
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 
 export default function LoginPage() {
   const router = useRouter();
-  const searchParams = useSearchParams();
-  const redirectTarget = useMemo(
-    () => resolveLoginRedirect(searchParams),
-    [searchParams]
-  );
   const [pin, setPin] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [redirectTarget, setRedirectTarget] = useState("/today");
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const maybeFrom = params.get("from");
+    if (!maybeFrom) {
+      setRedirectTarget("/today");
+      return;
+    }
+
+    try {
+      const url = new URL(maybeFrom, window.location.origin);
+      setRedirectTarget(`${url.pathname}${url.search}`);
+    } catch {
+      setRedirectTarget("/today");
+    }
+  }, []);
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
@@ -43,7 +43,7 @@ export default function LoginPage() {
         throw new Error(json.error || "Login failed.");
       }
 
-      // On success, go to Today page (or home if you prefer)
+      // On success, go to resolved target
       router.replace(redirectTarget);
     } catch (err: any) {
       console.error("Login error:", err);
