@@ -557,3 +557,17 @@ main, section {
   -webkit-overflow-scrolling: touch;
   padding-bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom, 0px));
 }
+
+/* Today: compact AI health placement */
+.today-ai-health {
+  margin: 6px 0 14px 0;
+}
+
+.today-ai-health .ai-health-row {
+  margin: 0;
+}
+
+.today-ai-health .ai-health-subtle {
+  display: none; /* hide the long "reason" line on Today; keep it on Performance */
+}
+

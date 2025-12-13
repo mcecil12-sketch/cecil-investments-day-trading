@@ -3,6 +3,7 @@
 import React, { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { AutoManagePoller } from "@/components/AutoManagePoller";
+import { TodayAiHealth } from "@/components/today/TodayAiHealth";
 import { useTrading, TradeSide, Trade } from "@/tradingContext";
 import { computeRiskPerShare } from "@/lib/risk";
 
@@ -645,6 +646,9 @@ export default function TodayPage() {
               </h1>
               <p className="text-[11px] text-slate-400">Today overview</p>
             </div>
+          </div>
+          <TodayAiHealth />
+          <div className="flex items-center justify-between text-[11px] text-neutral-500 mb-2">
             <span className="text-[11px] text-slate-500 uppercase tracking-wide">
               Paper account
             </span>
