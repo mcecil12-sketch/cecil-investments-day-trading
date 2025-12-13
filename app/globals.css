@@ -482,3 +482,43 @@ body {
 .bottom-nav-tab.is-active .bottom-nav-label {
   color: var(--nav-accent);
 }
+
+/* --- iOS Safari bottom-toolbar / safe-area fixes --- */
+:root{
+  --bottom-nav-h: 64px;
+}
+
+/* Use dynamic viewport height on mobile so layout doesn't jump when Safari UI expands/collapses */
+html, body {
+  height: 100%;
+}
+
+.app-shell {
+  min-height: 100dvh;
+  /* Reserve space for fixed bottom nav + iOS safe area */
+  padding-bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom, 0px));
+}
+
+/* Content area should not hide behind fixed bottom nav */
+.app-shell-content {
+  padding-bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom, 0px));
+}
+
+/* Fixed bottom nav that respects iOS safe area */
+.bottom-nav {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+
+  height: var(--bottom-nav-h);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+
+  /* Ensure it stays above browser UI and page content */
+  z-index: 1000;
+
+  /* Prevent accidental overlay jitter */
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+}
+
