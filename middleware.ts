@@ -10,13 +10,19 @@ const PUBLIC_PATHS = [
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
-  if (PUBLIC_PATHS.some((p) => pathname.startsWith(p))) {
+  if (
+    pathname.startsWith("/_next") ||
+    pathname.startsWith("/api/health") ||
+    PUBLIC_PATHS.some((p) => pathname.startsWith(p))
+  ) {
     return NextResponse.next();
   }
 
   const authPin = req.cookies.get("auth_pin")?.value;
   if (!authPin) {
-    return NextResponse.redirect(new URL("/login", req.url));
+    const loginUrl = new URL("/login", req.url);
+    loginUrl.searchParams.set("from", pathname);
+    return NextResponse.redirect(loginUrl);
   }
 
   return NextResponse.next();
