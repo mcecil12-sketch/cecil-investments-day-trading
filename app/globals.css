@@ -522,3 +522,38 @@ html, body {
   -webkit-transform: translateZ(0);
 }
 
+
+/* ===== HARD STOP: page-level scrolling ===== */
+body > * {
+  overflow: hidden !important;
+}
+
+main, section {
+  overflow: visible;
+  height: auto;
+}
+
+/* ===== Bottom nav comfort fix ===== */
+:root {
+  --bottom-nav-h: 80px;       /* was too tight */
+  --bottom-nav-pad: 16px;
+}
+
+.bottom-nav {
+  height: var(--bottom-nav-h);
+  padding-top: var(--bottom-nav-pad);
+  padding-bottom: calc(var(--bottom-nav-pad) + env(safe-area-inset-bottom, 0px));
+}
+
+.app-shell {
+  height: 100dvh;
+  height: -webkit-fill-available;
+  overflow: hidden;
+}
+
+.app-shell-content {
+  flex: 1;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom, 0px));
+}

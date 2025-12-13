@@ -91,7 +91,7 @@ export default function ScanConsolePage() {
   }
 
   return (
-    <main className="min-h-screen bg-slate-950 text-slate-50 px-4 py-6">
+    <main className="auto bg-slate-950 text-slate-50 px-4 py-6">
       <div className="max-w-2xl mx-auto space-y-6">
         <header className="space-y-2">
           <h1 className="text-2xl font-semibold">Scan Console</h1>

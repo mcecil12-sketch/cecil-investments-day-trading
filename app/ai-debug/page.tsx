@@ -54,7 +54,7 @@ export default function AIDebugPage() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-100 px-4 py-6">
+    <div className="auto bg-neutral-950 text-neutral-100 px-4 py-6">
       <div className="max-w-6xl mx-auto space-y-4">
         <header>
           <h1 className="text-lg font-semibold tracking-tight">

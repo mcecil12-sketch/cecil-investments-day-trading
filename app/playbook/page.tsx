@@ -106,7 +106,7 @@ export default function PlaybookPage() {
   }, [trades]);
 
   return (
-    <div className="min-h-screen bg-[var(--ci-bg)] text-[var(--ci-text)]">
+    <div className="auto bg-[var(--ci-bg)] text-[var(--ci-text)]">
       <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
         <h1 className="text-lg md:text-xl font-semibold tracking-tight">Playbook performance</h1>
         {loading && <p className="muted-text">Loading trades…</p>}
