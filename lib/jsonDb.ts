@@ -21,7 +21,7 @@ export function readJsonFile<T>(filename: string, fallback: T): T {
   }
 }
 
-export function writeJsonFile(filename: string, value: any) {
+export function writeJsonFile<T>(filename: string, value: T) {
   ensureDataDir();
   const p = path.join(DATA_DIR, filename);
   fs.writeFileSync(p, JSON.stringify(value, null, 2), "utf8");
