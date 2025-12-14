@@ -25,6 +25,23 @@ async function writeSignals(signals: ScoredSignal[]): Promise<void> {
   await fs.writeFile(DATA_FILE, JSON.stringify(signals, null, 2), "utf8");
 }
 
+async function appendSignal(signal: ScoredSignal) {
+  const signals = await readSignals();
+  signals.push(signal);
+  await writeSignals(signals);
+}
+
+async function replaceSignal(scored: ScoredSignal) {
+  const signals = await readSignals();
+  const idx = signals.findIndex((s) => s.id === scored.id);
+  if (idx >= 0) {
+    signals[idx] = scored;
+  } else {
+    signals.push(scored);
+  }
+  await writeSignals(signals);
+}
+
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const minScoreParam = url.searchParams.get("minScore");
@@ -111,12 +128,24 @@ export async function POST(req: Request) {
     catalystScore: rawMeta.catalystScore,
   };
 
-  // AI agent scoring step
-  const scored = await scoreSignalWithAI(rawSignal);
+  const placeholder: ScoredSignal = {
+    ...rawSignal,
+    aiScore: 0,
+    aiGrade: "F",
+    aiSummary: "AI scoring pending",
+    totalScore: 0,
+  };
 
-  const signals = await readSignals();
-  signals.push(scored);
-  await writeSignals(signals);
+  await appendSignal(placeholder);
+
+  let scored: ScoredSignal = placeholder;
+
+  try {
+    scored = await scoreSignalWithAI(rawSignal);
+    await replaceSignal(scored);
+  } catch (err: any) {
+    console.error("AI scoring failed:", err);
+  }
 
   console.log("[signals] New signal scored", {
     ticker: scored.ticker,
@@ -128,7 +157,6 @@ export async function POST(req: Request) {
     bumpFunnel({ qualified: 1 });
   }
 
-  // Only alert on A / 9+ scores
   if (scored.aiGrade === "A" || scored.aiScore >= 9) {
     try {
       await sendPullbackAlert(scored);
