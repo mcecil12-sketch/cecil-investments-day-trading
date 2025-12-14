@@ -31,6 +31,6 @@ export async function readSignals<T = unknown[]>(filename = "signals.json"): Pro
   return readJsonFile<T>(filename, [] as unknown as T);
 }
 
-export function writeSignals<T = unknown[]>(filename = "signals.json", value: T) {
+export function writeSignals<T = unknown[]>(value: T, filename = "signals.json") {
   writeJsonFile<T>(filename, value);
 }

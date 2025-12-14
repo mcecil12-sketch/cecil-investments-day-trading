@@ -5,13 +5,13 @@ import { bumpFunnel } from "@/lib/funnelMetrics";
 import { readSignals, writeSignals } from "@/lib/jsonDb";
 
 async function appendSignal(signal: ScoredSignal) {
-  const signals = await readSignals();
+  const signals = await readSignals<ScoredSignal[]>();
   signals.push(signal);
   await writeSignals(signals);
 }
 
 async function replaceSignal(scored: ScoredSignal) {
-  const signals = await readSignals();
+  const signals = await readSignals<ScoredSignal[]>();
   const idx = signals.findIndex((s) => s.id === scored.id);
   if (idx >= 0) {
     signals[idx] = scored;
@@ -31,7 +31,7 @@ export async function GET(req: Request) {
   const minScore = minScoreParam ? Number(minScoreParam) : undefined;
   const limit = limitParam ? Number(limitParam) : undefined;
 
-  let signals = await readSignals();
+  let signals = await readSignals<ScoredSignal[]>();
 
   if (typeof minScore === "number" && !Number.isNaN(minScore)) {
     signals = signals.filter((s) => s.aiScore >= minScore);
