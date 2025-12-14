@@ -38,6 +38,8 @@ export function AiHealthPill() {
   }, []);
 
   const status = h?.status ?? "ERROR";
+  const normalized = status.toLowerCase();
+
   const label =
     status === "HEALTHY"
       ? "AI Healthy"
@@ -45,21 +47,32 @@ export function AiHealthPill() {
       ? "AI Idle"
       : status === "CAPPED"
       ? "AI Capped"
-      : "AI Error";
+      : status === "ERROR"
+      ? "AI Error"
+      : "AI Status";
 
-  const cls =
-    status === "HEALTHY"
-      ? "pill pill-ok"
-      : status === "IDLE"
-      ? "pill pill-warn"
-      : status === "CAPPED"
-      ? "pill pill-warn"
-      : "pill pill-bad";
+  const statusClass = (() => {
+    switch (normalized) {
+      case "healthy":
+        return "ai-pill ai-pill-green";
+      case "idle":
+        return "ai-pill ai-pill-blue";
+      case "throttled":
+        return "ai-pill ai-pill-yellow";
+      case "capped":
+        return "ai-pill ai-pill-red";
+      case "error":
+        return "ai-pill ai-pill-red ai-pill-error";
+      case "offline":
+      default:
+        return "ai-pill ai-pill-offline";
+    }
+  })();
 
   return (
     <div className="ai-health-row">
-      <span className={cls} title={h?.reason ?? ""}>
-        {label}
+      <span className={statusClass} title={h?.reason ?? ""}>
+        {status === "ERROR" ? "❌ AI Error" : label}
       </span>
       <span className="ai-health-subtle">{h?.reason ?? ""}</span>
     </div>
