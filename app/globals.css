@@ -658,8 +658,13 @@ main, section {
   border-color: rgba(155, 155, 155, 0.3);
 }
 
+.ai-pill-closed {
+  color: #8ac3ff;
+  background: rgba(138, 195, 255, 0.12);
+  border-color: rgba(138, 195, 255, 0.35);
+}
+
 /* Error emphasis */
 .ai-pill-error {
   font-weight: 700;
 }
-

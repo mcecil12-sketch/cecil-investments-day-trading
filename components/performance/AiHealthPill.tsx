@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 
 type Health = {
-  status: "HEALTHY" | "IDLE" | "CAPPED" | "ERROR";
+  status: "HEALTHY" | "DEGRADED" | "MARKET_CLOSED" | "CAPPED" | "ERROR" | "OFFLINE";
   reason: string;
   timestamp: string;
 };
@@ -14,7 +14,7 @@ export function AiHealthPill() {
   useEffect(() => {
     let active = true;
 
-    async function load() {
+    const loadHealth = async () => {
       try {
         const r = await fetch("/api/ai-health", { cache: "no-store" });
         const j = await r.json();
@@ -27,10 +27,23 @@ export function AiHealthPill() {
             timestamp: new Date().toISOString(),
           });
       }
-    }
+    };
 
-    load();
-    const id = setInterval(load, 30000);
+    const sendHeartbeat = async () => {
+      try {
+        await fetch("/api/ai-heartbeat", { method: "POST", cache: "no-store" });
+      } catch {
+        // ignore
+      }
+    };
+
+    const tick = async () => {
+      await sendHeartbeat();
+      await loadHealth();
+    };
+
+    tick();
+    const id = setInterval(tick, 30000);
     return () => {
       active = false;
       clearInterval(id);
@@ -40,30 +53,39 @@ export function AiHealthPill() {
   const status = h?.status ?? "ERROR";
   const normalized = status.toLowerCase();
 
-  const label =
-    status === "HEALTHY"
-      ? "AI Healthy"
-      : status === "IDLE"
-      ? "AI Idle"
-      : status === "CAPPED"
-      ? "AI Capped"
-      : status === "ERROR"
-      ? "AI Error"
-      : "AI Status";
+  const label = (() => {
+    switch (status) {
+      case "HEALTHY":
+        return "AI Healthy";
+      case "DEGRADED":
+        return "AI Degraded";
+      case "MARKET_CLOSED":
+        return "Market Closed";
+      case "CAPPED":
+        return "AI Capped";
+      case "ERROR":
+        return "AI Error";
+      case "OFFLINE":
+        return "AI Offline";
+      default:
+        return "AI Status";
+    }
+  })();
 
   const statusClass = (() => {
-    switch (normalized) {
-      case "healthy":
+    switch (status) {
+      case "HEALTHY":
         return "ai-pill ai-pill-green";
-      case "idle":
-        return "ai-pill ai-pill-blue";
-      case "throttled":
+      case "DEGRADED":
         return "ai-pill ai-pill-yellow";
-      case "capped":
+      case "MARKET_CLOSED":
+        return "ai-pill ai-pill-closed";
+      case "CAPPED":
         return "ai-pill ai-pill-red";
-      case "error":
+      case "ERROR":
         return "ai-pill ai-pill-red ai-pill-error";
-      case "offline":
+      case "OFFLINE":
+        return "ai-pill ai-pill-offline";
       default:
         return "ai-pill ai-pill-offline";
     }

@@ -7,6 +7,7 @@ type Metrics = {
   date: string;
   calls: number;
   byModel: Record<string, number>;
+  lastHeartbeat?: string;
 };
 
 function todayKey() {
@@ -39,6 +40,13 @@ export function recordAICall(model: string) {
 
   data.calls += 1;
   data.byModel[model] = (data.byModel[model] ?? 0) + 1;
+  data.lastHeartbeat = new Date().toISOString();
 
+  save(data);
+}
+
+export function heartbeatMetrics() {
+  const data = load();
+  data.lastHeartbeat = new Date().toISOString();
   save(data);
 }

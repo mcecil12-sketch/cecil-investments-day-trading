@@ -7,6 +7,7 @@ const PUBLIC_PATHS = [
   "/api/ai-stats",
   "/api/ai-health",
   "/api/funnel-stats",
+  "/api/ai-heartbeat",
 ];
 
 export function middleware(req: NextRequest) {
