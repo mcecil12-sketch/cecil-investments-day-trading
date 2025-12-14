@@ -1,32 +1,12 @@
 // lib/signals.ts
-import { readJsonFile, writeJsonFile } from "./jsonDb";
-
-const SIGNALS_FILE = "signals.json";
-
-export type StoredSignalSide = "LONG" | "SHORT";
-
-export type StoredSignalStatus = "PENDING" | "APPROVED" | "DISMISSED";
-
-export interface StoredSignal {
-  id: string;
-  ticker: string;
-  side: StoredSignalSide;
-  entryPrice: number;
-  stopPrice?: number | null;
-  targetPrice?: number | null;
-  reasoning?: string;
-  source: string;      // e.g. "Scanner", "Manual", "Sandbox"
-  createdAt: string;   // ISO string
-  priority: number;    // higher = more important
-  status: StoredSignalStatus;
-}
+import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
 
 export async function getAllSignals(): Promise<StoredSignal[]> {
-  return readJsonFile<StoredSignal[]>(SIGNALS_FILE, []);
+  return readSignals();
 }
 
 export async function saveAllSignals(signals: StoredSignal[]): Promise<void> {
-  await writeJsonFile<StoredSignal[]>(SIGNALS_FILE, signals);
+  await writeSignals(signals);
 }
 
 export function createSignalId(): string {

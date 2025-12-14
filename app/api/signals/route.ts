@@ -2,16 +2,16 @@ import { NextResponse } from "next/server";
 import { scoreSignalWithAI, RawSignal, ScoredSignal } from "@/lib/aiScoring";
 import { sendPullbackAlert } from "@/lib/notify";
 import { bumpFunnel } from "@/lib/funnelMetrics";
-import { readSignals, writeSignals } from "@/lib/jsonDb";
+import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
 
-async function appendSignal(signal: ScoredSignal) {
-  const signals = await readSignals<ScoredSignal[]>();
+async function appendSignal(signal: StoredSignal) {
+  const signals = await readSignals();
   signals.push(signal);
   await writeSignals(signals);
 }
 
-async function replaceSignal(scored: ScoredSignal) {
-  const signals = await readSignals<ScoredSignal[]>();
+async function replaceSignal(scored: StoredSignal) {
+  const signals = await readSignals();
   const idx = signals.findIndex((s) => s.id === scored.id);
   if (idx >= 0) {
     signals[idx] = scored;
@@ -31,10 +31,10 @@ export async function GET(req: Request) {
   const minScore = minScoreParam ? Number(minScoreParam) : undefined;
   const limit = limitParam ? Number(limitParam) : undefined;
 
-  let signals = await readSignals<ScoredSignal[]>();
+  let signals = await readSignals();
 
   if (typeof minScore === "number" && !Number.isNaN(minScore)) {
-    signals = signals.filter((s) => s.aiScore >= minScore);
+    signals = signals.filter((s) => (s.aiScore ?? 0) >= minScore);
   }
 
   if (gradeParam) {
@@ -107,21 +107,38 @@ export async function POST(req: Request) {
     catalystScore: rawMeta.catalystScore,
   };
 
-  const placeholder: ScoredSignal = {
+  const placeholder: StoredSignal = {
     ...rawSignal,
     aiScore: 0,
     aiGrade: "F",
     aiSummary: "AI scoring pending",
     totalScore: 0,
+    status: "PENDING",
   };
 
   await appendSignal(placeholder);
 
-  let scored: ScoredSignal = placeholder;
+  const placeholderScored: ScoredSignal = {
+    ...placeholder,
+    timeframe: placeholder.timeframe ?? "1Min",
+    source: placeholder.source ?? "unknown",
+    aiScore: placeholder.aiScore ?? 0,
+    aiGrade: (placeholder.aiGrade ?? "F") as ScoredSignal["aiGrade"],
+    aiSummary: placeholder.aiSummary ?? "AI scoring pending",
+    totalScore: placeholder.totalScore ?? 0,
+    stopPrice: rawSignal.stopPrice,
+    targetPrice: rawSignal.targetPrice,
+  };
+
+  let scored: ScoredSignal = placeholderScored;
 
   try {
     scored = await scoreSignalWithAI(rawSignal);
-    await replaceSignal(scored);
+      const updated: StoredSignal = {
+        ...scored,
+        status: "PENDING",
+      };
+      await replaceSignal(updated);
   } catch (err: any) {
     console.error("AI scoring failed:", err);
   }

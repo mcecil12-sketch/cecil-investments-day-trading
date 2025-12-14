@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import { recordSpend } from "./aiBudget";
-import { recordAICall } from "./aiMetrics";
+import { recordAiCall } from "./aiMetrics";
 import { bumpFunnel } from "./funnelMetrics";
 
 export type Side = "LONG" | "SHORT";
@@ -117,7 +117,7 @@ Return ONLY JSON.
   });
 
   recordSpend(model);
-  recordAICall(model);
+  recordAiCall(model);
   bumpFunnel({ gptScored: 1, gptScoredByModel: { [model]: 1 } });
 
   const content = completion.choices[0]?.message?.content ?? "{}";
