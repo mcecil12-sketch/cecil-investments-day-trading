@@ -1,7 +1,7 @@
 // app/api/signals/all/route.ts
 
 import { NextResponse } from "next/server";
-import { readJsonFile } from "@/lib/jsonDb";
+import { readSignals } from "@/lib/jsonDb";
 
 export type IncomingSignal = {
   id?: string;
@@ -24,7 +24,7 @@ export type IncomingSignal = {
 };
 
 async function readSignalsFile(): Promise<IncomingSignal[]> {
-  return readJsonFile<IncomingSignal[]>("signals.json", []);
+  return readSignals<IncomingSignal[]>();
 }
 
 function clamp01(value: unknown, fallback: number): number {

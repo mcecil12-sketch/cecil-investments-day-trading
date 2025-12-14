@@ -2,15 +2,7 @@ import { NextResponse } from "next/server";
 import { scoreSignalWithAI, RawSignal, ScoredSignal } from "@/lib/aiScoring";
 import { sendPullbackAlert } from "@/lib/notify";
 import { bumpFunnel } from "@/lib/funnelMetrics";
-import { readJsonFile, writeJsonFile } from "@/lib/jsonDb";
-
-async function readSignals(): Promise<ScoredSignal[]> {
-  return readJsonFile<ScoredSignal[]>("signals.json", []);
-}
-
-async function writeSignals(signals: ScoredSignal[]): Promise<void> {
-  writeJsonFile("signals.json", signals);
-}
+import { readSignals, writeSignals } from "@/lib/jsonDb";
 
 async function appendSignal(signal: ScoredSignal) {
   const signals = await readSignals();

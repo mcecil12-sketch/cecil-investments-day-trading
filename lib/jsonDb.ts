@@ -26,3 +26,11 @@ export function writeJsonFile<T>(filename: string, value: T) {
   const p = path.join(DATA_DIR, filename);
   fs.writeFileSync(p, JSON.stringify(value, null, 2), "utf8");
 }
+
+export async function readSignals<T = unknown[]>(filename = "signals.json"): Promise<T> {
+  return readJsonFile<T>(filename, [] as unknown as T);
+}
+
+export function writeSignals<T = unknown[]>(filename = "signals.json", value: T) {
+  writeJsonFile<T>(filename, value);
+}
