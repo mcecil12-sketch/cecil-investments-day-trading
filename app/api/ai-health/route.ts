@@ -65,7 +65,16 @@ export async function GET() {
   const budget = safeRead(BUDGET_PATH);
   const metrics = safeRead(METRICS_PATH);
 
-  const mins = minutesSinceFileWrite(METRICS_PATH);
+  const minsByFile = minutesSinceFileWrite(METRICS_PATH);
+
+  let minsByHeartbeat: number | null = null;
+  const hb = (metrics as any)?.lastHeartbeat;
+  if (hb) {
+    const t = Date.parse(hb);
+    if (!Number.isNaN(t)) minsByHeartbeat = (Date.now() - t) / 1000 / 60;
+  }
+
+  const mins = minsByHeartbeat ?? minsByFile;
   const alive = mins !== null && mins <= 3;
 
   if (!alive) {

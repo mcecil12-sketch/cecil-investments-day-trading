@@ -49,4 +49,5 @@ export function heartbeatMetrics() {
   const data = load();
   data.lastHeartbeat = new Date().toISOString();
   save(data);
+  return data;
 }
