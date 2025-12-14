@@ -1,8 +1,7 @@
 // app/api/signals/all/route.ts
 
 import { NextResponse } from "next/server";
-import { promises as fs } from "fs";
-import path from "path";
+import { readJsonFile } from "@/lib/jsonDb";
 
 export type IncomingSignal = {
   id?: string;
@@ -24,23 +23,8 @@ export type IncomingSignal = {
   catalystScore?: number;
 };
 
-const SIGNALS_FILE = path.join(process.cwd(), "data", "signals.json");
-
 async function readSignalsFile(): Promise<IncomingSignal[]> {
-  try {
-    const raw = await fs.readFile(SIGNALS_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) {
-      return parsed as IncomingSignal[];
-    }
-    return [];
-  } catch (err: any) {
-    if (err.code === "ENOENT") {
-      return [];
-    }
-    console.error("Error reading signals file:", err);
-    throw err;
-  }
+  return readJsonFile<IncomingSignal[]>("signals.json", []);
 }
 
 function clamp01(value: unknown, fallback: number): number {

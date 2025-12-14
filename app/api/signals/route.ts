@@ -1,28 +1,15 @@
 import { NextResponse } from "next/server";
-import { promises as fs } from "fs";
-import path from "path";
 import { scoreSignalWithAI, RawSignal, ScoredSignal } from "@/lib/aiScoring";
 import { sendPullbackAlert } from "@/lib/notify";
 import { bumpFunnel } from "@/lib/funnelMetrics";
-
-const DATA_FILE = path.join(process.cwd(), "data", "signals.json");
+import { readJsonFile, writeJsonFile } from "@/lib/jsonDb";
 
 async function readSignals(): Promise<ScoredSignal[]> {
-  try {
-    const raw = await fs.readFile(DATA_FILE, "utf8");
-    return JSON.parse(raw);
-  } catch (err: any) {
-    if (err.code === "ENOENT") {
-      return [];
-    }
-    console.error("[signals] readSignals error", err);
-    throw err;
-  }
+  return readJsonFile<ScoredSignal[]>("signals.json", []);
 }
 
 async function writeSignals(signals: ScoredSignal[]): Promise<void> {
-  await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
-  await fs.writeFile(DATA_FILE, JSON.stringify(signals, null, 2), "utf8");
+  writeJsonFile("signals.json", signals);
 }
 
 async function appendSignal(signal: ScoredSignal) {

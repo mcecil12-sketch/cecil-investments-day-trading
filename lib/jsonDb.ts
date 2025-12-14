@@ -1,31 +1,28 @@
-// lib/jsonDb.ts
-import { promises as fs } from "fs";
+import fs from "fs";
 import path from "path";
 
-function resolveDataPath(fileName: string) {
-  return path.join(process.cwd(), "data", fileName);
-}
+const IS_VERCEL = process.env.VERCEL === "1";
+const DATA_DIR = IS_VERCEL ? "/tmp" : path.join(process.cwd(), "data");
 
-export async function readJsonFile<T>(fileName: string, fallback: T): Promise<T> {
-  const filePath = resolveDataPath(fileName);
-
-  try {
-    const raw = await fs.readFile(filePath, "utf8");
-    return JSON.parse(raw) as T;
-  } catch (err: any) {
-    // If file doesn't exist yet, initialize it with fallback
-    if (err?.code === "ENOENT") {
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.writeFile(filePath, JSON.stringify(fallback, null, 2), "utf8");
-      return fallback;
-    }
-    console.error(`Error reading ${fileName}`, err);
-    throw err;
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
   }
 }
 
-export async function writeJsonFile<T>(fileName: string, data: T): Promise<void> {
-  const filePath = resolveDataPath(fileName);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf8");
+export function readJsonFile<T>(filename: string, fallback: T): T {
+  ensureDataDir();
+  const p = path.join(DATA_DIR, filename);
+  try {
+    if (!fs.existsSync(p)) return fallback;
+    return JSON.parse(fs.readFileSync(p, "utf8")) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+export function writeJsonFile(filename: string, value: any) {
+  ensureDataDir();
+  const p = path.join(DATA_DIR, filename);
+  fs.writeFileSync(p, JSON.stringify(value, null, 2), "utf8");
 }
