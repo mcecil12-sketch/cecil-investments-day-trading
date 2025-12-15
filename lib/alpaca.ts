@@ -1,17 +1,56 @@
-const ALPACA_KEY_ID =
-  process.env.ALPACA_API_KEY_ID || process.env.ALPACA_KEY_ID;
-const ALPACA_SECRET_KEY =
-  process.env.ALPACA_API_SECRET_KEY || process.env.ALPACA_SECRET_KEY;
+function stripV2(base: string) {
+  return base.replace(/\/+$/, "").replace(/\/v2$/, "");
+}
 
-// Trading base URL: prefer explicit paper/live vars, fall back to generic/base
-const ALPACA_BASE_URL =
+export const TRADING_BASE = stripV2(
   process.env.ALPACA_BASE_URL ||
-  process.env.ALPACA_PAPER_BASE_URL ||
-  "https://paper-api.alpaca.markets/v2";
+    process.env.ALPACA_PAPER_BASE_URL ||
+    "https://paper-api.alpaca.markets"
+);
 
-// Market data base URL (v2)
-const ALPACA_DATA_BASE_URL =
-  process.env.ALPACA_DATA_BASE_URL || "https://data.alpaca.markets/v2";
+export const DATA_BASE = stripV2(
+  process.env.ALPACA_DATA_BASE_URL || "https://data.alpaca.markets"
+);
+
+export const ALPACA_FEED = process.env.ALPACA_DATA_FEED || "iex";
+
+const KEY_ID =
+  process.env.ALPACA_API_KEY_ID ||
+  process.env.ALPACA_API_KEY ||
+  process.env.ALPACA_KEY_ID ||
+  "";
+
+const SECRET =
+  process.env.ALPACA_API_SECRET_KEY ||
+  process.env.ALPACA_API_SECRET ||
+  process.env.ALPACA_SECRET_KEY ||
+  "";
+
+export function hasAlpacaCreds() {
+  return Boolean(KEY_ID && SECRET);
+}
+
+export function alpacaHeaders() {
+  if (!KEY_ID || !SECRET) {
+    throw new Error("Missing Alpaca credentials (key/secret).");
+  }
+  return {
+    "APCA-API-KEY-ID": KEY_ID,
+    "APCA-API-SECRET-KEY": SECRET,
+    "Cache-Control": "no-store",
+    Pragma: "no-cache",
+  };
+}
+
+export function tradingUrl(path: string) {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return `${TRADING_BASE}/v2${p}`;
+}
+
+export function dataUrl(path: string) {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return `${DATA_BASE}/v2${p}`;
+}
 
 export type AlpacaBar = {
   t: string;
@@ -24,16 +63,9 @@ export type AlpacaBar = {
 };
 
 async function alpacaFetch(url: string, init: RequestInit = {}) {
-  if (!ALPACA_KEY_ID || !ALPACA_SECRET_KEY) {
-    throw new Error("Missing Alpaca API keys.");
-  }
-
   const headers = {
-    "APCA-API-KEY-ID": ALPACA_KEY_ID,
-    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+    ...alpacaHeaders(),
     ...(init.headers || {}),
-    "Cache-Control": "no-store",
-    Pragma: "no-cache",
   };
 
   return fetch(url, {
@@ -44,52 +76,87 @@ async function alpacaFetch(url: string, init: RequestInit = {}) {
   });
 }
 
+const WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
+
+export function computeBarsWindow(endTimeIso?: string) {
+  const end = endTimeIso ? new Date(endTimeIso) : new Date();
+  const start = new Date(end.getTime() - WINDOW_MS);
+  return { startIso: start.toISOString(), endIso: end.toISOString() };
+}
+
+export function buildBarsQuery(params: {
+  timeframe: string;
+  limit?: number;
+  start?: string;
+  end?: string;
+  feed?: string;
+  adjustment?: string;
+}) {
+  const q = new URLSearchParams();
+  q.set("timeframe", params.timeframe);
+  q.set("feed", params.feed || ALPACA_FEED);
+  if (params.limit != null) q.set("limit", String(params.limit));
+  if (params.start) q.set("start", params.start);
+  if (params.end) q.set("end", params.end);
+  if (params.adjustment) q.set("adjustment", params.adjustment);
+  return q.toString();
+}
+
+export async function fetchRecentBarsWithUrl(args: {
+  ticker: string;
+  timeframe: string;
+  limit?: number;
+  start?: string;
+  end?: string;
+}) {
+  const ticker = args.ticker.toUpperCase();
+  const qs = buildBarsQuery({
+    timeframe: args.timeframe,
+    limit: args.limit,
+    start: args.start,
+    end: args.end,
+    feed: ALPACA_FEED,
+    adjustment: "raw",
+  });
+  const url = dataUrl(`/stocks/${ticker}/bars?${qs}`);
+  const res = await fetch(url, {
+    headers: alpacaHeaders(),
+    cache: "no-store",
+    next: { revalidate: 0 },
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Alpaca bars failed ${res.status}: ${text}`);
+  }
+
+  const json = await res.json();
+  const bars: AlpacaBar[] =
+    json?.bars?.[ticker] ||
+    json?.bars ||
+    json?.[ticker] ||
+    [];
+  const out = Array.isArray(bars) ? bars.slice() : [];
+  out.sort((a, b) => new Date(a.t).getTime() - new Date(b.t).getTime());
+
+  return { url, bars: out, json };
+}
+
 export async function fetchRecentBars(
   symbol: string,
   timeframe: string,
   limit = 100,
   endTimeIso?: string
 ): Promise<AlpacaBar[]> {
-  const tf = timeframe || "1Min";
-
-  const end = endTimeIso ? new Date(endTimeIso) : new Date();
-  const start = new Date(end.getTime() - 2 * 24 * 60 * 60 * 1000);
-
-  const startIso = start.toISOString();
-  const endIso = end.toISOString();
-
-  const feed = process.env.ALPACA_DATA_FEED || "iex";
-
-  const url =
-    `${ALPACA_DATA_BASE_URL}/stocks/bars` +
-    `?symbols=${encodeURIComponent(symbol)}` +
-    `&timeframe=${encodeURIComponent(tf)}` +
-    `&start=${encodeURIComponent(startIso)}` +
-    `&end=${encodeURIComponent(endIso)}` +
-    `&limit=${encodeURIComponent(String(limit))}` +
-    `&feed=${encodeURIComponent(feed)}` +
-    `&_ts=${Date.now()}` +
-    `&adjustment=raw`;
-
-  const res = await alpacaFetch(url);
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Alpaca bars failed ${res.status}: ${txt.slice(0, 300)}`);
-  }
-
-  const json = await res.json();
-
-  const bars: AlpacaBar[] =
-    json?.bars?.[symbol] ||
-    json?.bars ||
-    json?.[symbol] ||
-    [];
-
-  const out = Array.isArray(bars) ? bars.slice() : [];
-  out.sort((a, b) => new Date(a.t).getTime() - new Date(b.t).getTime());
-
-  return out;
+  const { startIso, endIso } = computeBarsWindow(endTimeIso);
+  const { bars } = await fetchRecentBarsWithUrl({
+    ticker: symbol,
+    timeframe,
+    limit,
+    start: startIso,
+    end: endIso,
+  });
+  return bars;
 }
 
 export interface SubmitOrderParams {
@@ -131,7 +198,7 @@ export async function submitOrder(
     body.limit_price = params.limitPrice;
   }
 
-  const res = await alpacaFetch(`${ALPACA_BASE_URL}/orders`, {
+  const res = await alpacaFetch(tradingUrl("/orders"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -153,10 +220,13 @@ export type AlpacaOrder = {
 };
 
 export async function getOrder(orderId: string): Promise<AlpacaOrder> {
-  const res = await alpacaFetch(`${ALPACA_BASE_URL}/orders/${encodeURIComponent(orderId)}?nested=true`, {
-    method: "GET",
-    headers: { "Content-Type": "application/json" },
-  });
+  const res = await alpacaFetch(
+    tradingUrl(`/orders/${encodeURIComponent(orderId)}?nested=true`),
+    {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    }
+  );
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `Failed to fetch order ${orderId}`);
@@ -168,11 +238,14 @@ export async function replaceOrder(
   orderId: string,
   body: Record<string, any>
 ): Promise<AlpacaOrder> {
-  const res = await alpacaFetch(`${ALPACA_BASE_URL}/orders/${encodeURIComponent(orderId)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const res = await alpacaFetch(
+    tradingUrl(`/orders/${encodeURIComponent(orderId)}`),
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }
+  );
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `Failed to replace order ${orderId}`);
@@ -190,7 +263,7 @@ export async function getPositions(
   symbol?: string
 ): Promise<AlpacaPosition[] | AlpacaPosition> {
   const path = symbol ? `/positions/${encodeURIComponent(symbol)}` : "/positions";
-  const res = await alpacaFetch(`${ALPACA_BASE_URL}${path}`, {
+  const res = await alpacaFetch(tradingUrl(path), {
     method: "GET",
     headers: { "Content-Type": "application/json" },
   });
@@ -214,7 +287,7 @@ export type LatestQuote = {
 
 export async function getLatestQuote(symbol: string): Promise<LatestQuote> {
   const res = await alpacaFetch(
-    `${ALPACA_DATA_BASE_URL}/stocks/${encodeURIComponent(symbol)}/quotes/latest`,
+    dataUrl(`/stocks/${encodeURIComponent(symbol)}/quotes/latest`),
     { method: "GET" }
   );
   if (!res.ok) {

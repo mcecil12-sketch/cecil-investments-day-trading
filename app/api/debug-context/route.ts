@@ -3,50 +3,47 @@ export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 import { NextResponse } from "next/server";
-import { fetchRecentBars } from "@/lib/alpaca";
-import { buildSignalContext } from "@/lib/signalContext";
+import { fetchRecentBarsWithUrl, hasAlpacaCreds, ALPACA_FEED } from "@/lib/alpaca";
 
 export async function GET(req: Request) {
   try {
-    const url = new URL(req.url);
-    const ticker = (url.searchParams.get("ticker") || "SPY").toUpperCase();
-    const timeframe = url.searchParams.get("timeframe") || "1Min";
+    const u = new URL(req.url);
 
-    const bars = await fetchRecentBars(ticker, timeframe, 30);
-    const ctx = await buildSignalContext({ ticker, timeframe, limit: 90 });
+    const ticker = (u.searchParams.get("ticker") || "SPY").toUpperCase();
+    const timeframe = u.searchParams.get("timeframe") || "1Min";
+
+    const { url, json } = await fetchRecentBarsWithUrl({
+      ticker,
+      timeframe,
+      limit: 90,
+    });
+
+    const bars = json?.bars || json?.[ticker] || [];
 
     return NextResponse.json({
       ok: true,
       ticker,
       timeframe,
-      barsUsed: bars.length,
-      firstBar: bars[0] || null,
-      lastBar: bars.length ? bars[bars.length - 1] : null,
-      barKeys: bars.length ? Object.keys(bars[bars.length - 1] as any) : [],
-      computedContext: ctx,
+      barsUrlAttempted: url,
+      barsUsed: Array.isArray(bars) ? bars.length : 0,
+      firstBar: Array.isArray(bars) ? bars[0] : null,
+      lastBar: Array.isArray(bars) ? bars[bars.length - 1] : null,
       env: {
-        hasAlpacaKey: !!process.env.ALPACA_API_KEY,
-        hasAlpacaSecret: !!process.env.ALPACA_API_SECRET,
-        alpacaDataFeed: process.env.ALPACA_DATA_FEED || null,
+        hasAlpacaKey: hasAlpacaCreds(),
+        hasAlpacaSecret: hasAlpacaCreds(),
+        alpacaDataFeed: ALPACA_FEED,
       },
     });
   } catch (err: any) {
-    const msg = err?.message || String(err);
-    console.log("[debug-context] error:", msg);
     return NextResponse.json(
       {
         ok: false,
-        error: msg,
-        name: err?.name || null,
-        code: err?.code || null,
-        stack: (err?.stack || "").split("\n").slice(0, 8),
-        env: {
-          hasAlpacaKey: !!process.env.ALPACA_API_KEY,
-          hasAlpacaSecret: !!process.env.ALPACA_API_SECRET,
-          alpacaDataFeed: process.env.ALPACA_DATA_FEED || null,
-        },
+        error: String(err?.message || err),
+        name: err?.name || "Error",
+        code: err?.code ?? null,
+        stack: err?.stack ? String(err.stack).split("\n") : undefined,
       },
-      { status: 200 }
+      { status: 500 }
     );
   }
 }
