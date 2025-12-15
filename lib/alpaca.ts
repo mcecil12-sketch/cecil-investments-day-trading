@@ -39,14 +39,54 @@ async function alpacaFetch(url: string, init: RequestInit = {}) {
 
 export async function fetchRecentBars(
   symbol: string,
-  timeframe = "1Min",
-  limit = 50
+  timeframe: string,
+  limit = 100
 ): Promise<AlpacaBar[]> {
-  const url = `${ALPACA_DATA_BASE_URL}/stocks/${symbol}/bars?timeframe=${timeframe}&limit=${limit}&adjustment=all`;
+  const tf = timeframe || "1Min";
 
-  const res = await alpacaFetch(url);
+  const end = new Date();
+  const start = new Date(end.getTime() - 5 * 24 * 60 * 60 * 1000);
+
+  const startIso = start.toISOString();
+  const endIso = end.toISOString();
+
+  const feed = process.env.ALPACA_DATA_FEED || "iex";
+
+  const url =
+    `https://data.alpaca.markets/v2/stocks/bars` +
+    `?symbols=${encodeURIComponent(symbol)}` +
+    `&timeframe=${encodeURIComponent(tf)}` +
+    `&start=${encodeURIComponent(startIso)}` +
+    `&end=${encodeURIComponent(endIso)}` +
+    `&limit=${encodeURIComponent(String(limit))}` +
+    `&feed=${encodeURIComponent(feed)}` +
+    `&adjustment=raw`;
+
+  const res = await fetch(url, {
+    headers: {
+      "APCA-API-KEY-ID": process.env.ALPACA_API_KEY || "",
+      "APCA-API-SECRET-KEY": process.env.ALPACA_API_SECRET || "",
+    },
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Alpaca bars failed ${res.status}: ${txt.slice(0, 300)}`);
+  }
+
   const json = await res.json();
-  return json.bars ?? [];
+
+  const bars: AlpacaBar[] =
+    json?.bars?.[symbol] ||
+    json?.bars ||
+    json?.[symbol] ||
+    [];
+
+  const out = Array.isArray(bars) ? bars.slice() : [];
+  out.sort((a, b) => new Date(a.t).getTime() - new Date(b.t).getTime());
+
+  return out;
 }
 
 export interface SubmitOrderParams {
