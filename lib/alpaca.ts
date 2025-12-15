@@ -46,7 +46,7 @@ export async function fetchRecentBars(
   const tf = timeframe || "1Min";
 
   const end = endTimeIso ? new Date(endTimeIso) : new Date();
-  const start = new Date(end.getTime() - 5 * 24 * 60 * 60 * 1000);
+  const start = new Date(end.getTime() - 2 * 24 * 60 * 60 * 1000);
 
   const startIso = start.toISOString();
   const endIso = end.toISOString();

@@ -109,7 +109,7 @@ Rules:
         ticker: rawSignal.ticker,
         timeframe,
         limit: 90,
-        endTimeIso: rawSignal.createdAt || (rawSignal as any).timestamp || undefined,
+        endTimeIso: rawSignal.createdAt,
       });
     } catch (e: any) {
       console.log("[aiScoring] context build failed (non-fatal):", e?.message ?? String(e));
