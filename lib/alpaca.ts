@@ -32,9 +32,16 @@ async function alpacaFetch(url: string, init: RequestInit = {}) {
     "APCA-API-KEY-ID": ALPACA_KEY_ID,
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
     ...(init.headers || {}),
+    "Cache-Control": "no-store",
+    Pragma: "no-cache",
   };
 
-  return fetch(url, { ...init, headers });
+  return fetch(url, {
+    ...init,
+    headers,
+    cache: "no-store",
+    next: { revalidate: 0 },
+  });
 }
 
 export async function fetchRecentBars(
@@ -54,22 +61,17 @@ export async function fetchRecentBars(
   const feed = process.env.ALPACA_DATA_FEED || "iex";
 
   const url =
-    `https://data.alpaca.markets/v2/stocks/bars` +
+    `${ALPACA_DATA_BASE_URL}/stocks/bars` +
     `?symbols=${encodeURIComponent(symbol)}` +
     `&timeframe=${encodeURIComponent(tf)}` +
     `&start=${encodeURIComponent(startIso)}` +
     `&end=${encodeURIComponent(endIso)}` +
     `&limit=${encodeURIComponent(String(limit))}` +
     `&feed=${encodeURIComponent(feed)}` +
+    `&_ts=${Date.now()}` +
     `&adjustment=raw`;
 
-  const res = await fetch(url, {
-    headers: {
-      "APCA-API-KEY-ID": process.env.ALPACA_API_KEY || "",
-      "APCA-API-SECRET-KEY": process.env.ALPACA_API_SECRET || "",
-    },
-    cache: "no-store",
-  });
+  const res = await alpacaFetch(url);
 
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
