@@ -4,6 +4,7 @@ export const revalidate = 0;
 
 import { NextResponse } from "next/server";
 import { fetchRecentBarsWithUrl, hasAlpacaCreds, ALPACA_FEED } from "@/lib/alpaca";
+import { fetchAlpacaClock } from "@/lib/alpacaClock";
 
 export async function GET(req: Request) {
   try {
@@ -20,10 +21,14 @@ export async function GET(req: Request) {
 
     const bars = json?.bars || json?.[ticker] || [];
 
+    const clock = await fetchAlpacaClock().catch(() => null);
+
     return NextResponse.json({
       ok: true,
       ticker,
       timeframe,
+      serverNow: new Date().toISOString(),
+      alpacaClock: clock,
       barsUrlAttempted: url,
       barsUsed: Array.isArray(bars) ? bars.length : 0,
       firstBar: Array.isArray(bars) ? bars[0] : null,
