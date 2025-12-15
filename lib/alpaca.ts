@@ -108,17 +108,27 @@ export async function fetchRecentBarsWithUrl(args: {
   limit?: number;
   start?: string;
   end?: string;
+  adjustment?: "raw" | "split" | "dividend" | "all";
+  windowMinutes?: number;
 }) {
   const ticker = args.ticker.toUpperCase();
-  const qs = buildBarsQuery({
+  const endIso = args.end || new Date().toISOString();
+  const windowMinutes = args.windowMinutes ?? 180;
+  const startIso =
+    args.start ||
+    new Date(Date.parse(endIso) - windowMinutes * 60 * 1000).toISOString();
+
+  const params = buildBarsQuery({
     timeframe: args.timeframe,
     limit: args.limit,
-    start: args.start,
-    end: args.end,
+    start: startIso,
+    end: endIso,
     feed: ALPACA_FEED,
-    adjustment: "raw",
+    adjustment: args.adjustment,
   });
-  const url = dataUrl(`/stocks/${ticker}/bars?${qs}`);
+
+  const url = dataUrl(`/stocks/${ticker}/bars?${params}`);
+
   const res = await fetch(url, {
     headers: alpacaHeaders(),
     cache: "no-store",

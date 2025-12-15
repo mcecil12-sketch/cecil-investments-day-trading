@@ -13,13 +13,15 @@ export async function GET(req: Request) {
     const ticker = (u.searchParams.get("ticker") || "SPY").toUpperCase();
     const timeframe = u.searchParams.get("timeframe") || "1Min";
 
-    const { url, json } = await fetchRecentBarsWithUrl({
+    const result = await fetchRecentBarsWithUrl({
       ticker,
       timeframe,
       limit: 90,
+      adjustment: "raw",
+      windowMinutes: 30,
     });
 
-    const bars = json?.bars || json?.[ticker] || [];
+    const { bars, json, url } = result;
 
     const clock = await fetchAlpacaClock().catch(() => null);
 
