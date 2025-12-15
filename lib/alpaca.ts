@@ -40,11 +40,12 @@ async function alpacaFetch(url: string, init: RequestInit = {}) {
 export async function fetchRecentBars(
   symbol: string,
   timeframe: string,
-  limit = 100
+  limit = 100,
+  endTimeIso?: string
 ): Promise<AlpacaBar[]> {
   const tf = timeframe || "1Min";
 
-  const end = new Date();
+  const end = endTimeIso ? new Date(endTimeIso) : new Date();
   const start = new Date(end.getTime() - 5 * 24 * 60 * 60 * 1000);
 
   const startIso = start.toISOString();

@@ -85,9 +85,15 @@ export async function buildSignalContext(params: {
   ticker: string;
   timeframe: string;
   limit?: number;
+  endTimeIso?: string;
 }): Promise<SignalContext> {
   const limit = params.limit ?? 90;
-  const bars = await fetchRecentBars(params.ticker, params.timeframe, limit);
+  const bars = await fetchRecentBars(
+    params.ticker,
+    params.timeframe,
+    limit,
+    params.endTimeIso
+  );
   const vwap = computeVWAP(bars);
   const { trend, slopePct } = computeTrend(bars);
   const { avg, last, rel } = computeVolumes(bars);
