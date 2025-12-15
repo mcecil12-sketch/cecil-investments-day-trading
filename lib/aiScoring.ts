@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { recordSpend, recordAiCall, recordAiError } from "./aiMetrics";
 import { bumpFunnel } from "./funnelMetrics";
-import { buildSignalContext } from "@/lib/signalContext";
+import { buildSignalContext, SignalContext } from "@/lib/signalContext";
 
 export type Side = "LONG" | "SHORT";
 
@@ -23,6 +23,7 @@ export type RawSignal = {
   playbookScore?: number;
   volumeScore?: number;
   catalystScore?: number;
+  signalContext?: SignalContext;
 };
 
 export type ScoredSignal = RawSignal & {
@@ -59,13 +60,13 @@ function gradeFromScore(score: number): "A" | "B" | "C" | "D" | "F" {
   return "F";
 }
 
-export async function scoreSignalWithAI(signal: RawSignal): Promise<ScoredSignal> {
+export async function scoreSignalWithAI(rawSignal: RawSignal): Promise<ScoredSignal> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     // Fail-safe: if key missing, treat as low-quality
     console.warn("[aiScoring] OPENAI_API_KEY not set; returning default low score.");
     return {
-      ...signal,
+      ...rawSignal,
       aiScore: 0,
       aiGrade: "F",
       aiSummary: "AI scoring disabled (no API key).",
@@ -94,18 +95,18 @@ Rules:
 `.trim();
 
   // --- Context enrichment (A1) --------------------------------------------
-  const timeframe = signal.timeframe || "1Min";
+  const timeframe = rawSignal.timeframe || "1Min";
   const needsContext =
-    signal.vwap == null ||
-    signal.trendScore == null ||
-    signal.volumeScore == null ||
-    signal.liquidityScore == null;
+    rawSignal.vwap == null ||
+    rawSignal.trendScore == null ||
+    rawSignal.volumeScore == null ||
+    rawSignal.liquidityScore == null;
 
   let ctx: any = null;
   if (needsContext) {
     try {
       ctx = await buildSignalContext({
-        ticker: signal.ticker,
+        ticker: rawSignal.ticker,
         timeframe,
         limit: 90,
       });
@@ -115,44 +116,29 @@ Rules:
     }
   }
 
-  const contextBlock = ctx
-    ? `Context (computed from Alpaca bars):
-- barsUsed: ${ctx.barsUsed}
-- vwap: ${ctx.vwap ?? "null"}
-- trend: ${ctx.trend} (slopePctPerBar: ${ctx.trendSlopePct?.toFixed?.(4) ?? ctx.trendSlopePct})
-- avgVolume: ${ctx.avgVolume ?? "null"}
-- lastVolume: ${ctx.lastVolume ?? "null"}
-- relVolume: ${ctx.relVolume ?? "null"}
-- avgRangePct: ${ctx.rangePctAvg ?? "null"}
-- liquidityNote: ${ctx.liquidityNote}
-`
-    : `Context: unavailable (bar fetch or computation failed).`;
-  // ------------------------------------------------------------------------
+  const signal = ctx
+    ? {
+        ...rawSignal,
+        signalContext: ctx,
+      }
+    : rawSignal;
 
-  const userPrompt = `
-Evaluate this VWAP pullback setup:
+  const contextBlock =
+    signal.signalContext
+      ? JSON.stringify(signal.signalContext, null, 2)
+      : "null";
 
-Ticker: ${signal.ticker}
-Side: ${signal.side}
-Entry: ${signal.entryPrice}
-Stop: ${signal.stopPrice}
-Target: ${signal.targetPrice}
-Timeframe: ${signal.timeframe}
-Source: ${signal.source}
-Created at: ${signal.createdAt}
+  const prompt = `
+You are scoring an intraday trading signal.
 
-Optional metrics:
-VWAP: ${signal.vwap ?? "n/a"}
-Pullback %: ${signal.pullbackPct ?? "n/a"}
-Trend score: ${signal.trendScore ?? "n/a"}
-Liquidity score: ${signal.liquidityScore ?? "n/a"}
-Playbook score: ${signal.playbookScore ?? "n/a"}
-Volume score: ${signal.volumeScore ?? "n/a"}
-Catalyst score: ${signal.catalystScore ?? "n/a"}
+Signal JSON:
+${JSON.stringify(signal, null, 2)}
 
+ComputedContext JSON (from Alpaca bars):
 ${contextBlock}
 
-  Return ONLY JSON.
+Return ONLY valid JSON with:
+{ "aiScore": number, "aiSummary": string, "aiGrade": string, "totalScore": number }
 `.trim();
 
   const BULK_MODEL = process.env.OPENAI_MODEL_BULK || "gpt-5-mini";
@@ -171,7 +157,7 @@ ${contextBlock}
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
+        { role: "user", content: prompt },
       ],
     });
   } catch (err: any) {
