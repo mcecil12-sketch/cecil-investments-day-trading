@@ -5,6 +5,7 @@ export type AiMetrics = {
   calls: number;
   byModel: Record<string, number>;
   lastHeartbeat: string | null;
+  errors: Record<string, number>;
 };
 
 function isoNow() {
@@ -32,7 +33,13 @@ function metricsKey(date: string) {
 const HEARTBEAT_KEY = "ai:heartbeat:v1";
 
 export async function getAiMetrics(date = etDateKey()): Promise<AiMetrics> {
-  const base: AiMetrics = { date, calls: 0, byModel: {}, lastHeartbeat: null };
+  const base: AiMetrics = {
+    date,
+    calls: 0,
+    byModel: {},
+    lastHeartbeat: null,
+    errors: {},
+  };
 
   if (!redis) return base;
 
@@ -66,8 +73,31 @@ export async function recordAiCall(model: string): Promise<void> {
     };
 
   current.calls = (current.calls ?? 0) + 1;
-  current.byModel = current.byModel ?? {};
-  current.byModel[model] = (current.byModel[model] ?? 0) + 1;
+  const counts = (current.byModel ?? {}) as Record<string, number>;
+  counts[model] = (counts[model] ?? 0) + 1;
+  current.byModel = counts;
+
+  await redis.set(key, current);
+}
+
+export async function recordAiError(model: string, message: string): Promise<void> {
+  if (!redis) return;
+
+  const date = etDateKey();
+  const key = metricsKey(date);
+
+  const current =
+    (await redis.get<AiMetrics>(key)) ?? {
+      date,
+      calls: 0,
+      byModel: {},
+      lastHeartbeat: null,
+      errors: {},
+    };
+
+  const errCounts = (current.errors ?? {}) as Record<string, number>;
+  errCounts[model] = (errCounts[model] ?? 0) + 1;
+  current.errors = errCounts;
 
   await redis.set(key, current);
 }

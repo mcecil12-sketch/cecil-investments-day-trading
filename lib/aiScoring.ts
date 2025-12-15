@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import { recordSpend } from "./aiBudget";
-import { recordAiCall } from "./aiMetrics";
+import { recordAiCall, recordAiError } from "./aiMetrics";
 import { bumpFunnel } from "./funnelMetrics";
 
 export type Side = "LONG" | "SHORT";
@@ -101,23 +101,34 @@ Playbook score: ${signal.playbookScore ?? "n/a"}
 Volume score: ${signal.volumeScore ?? "n/a"}
 Catalyst score: ${signal.catalystScore ?? "n/a"}
 
-Return ONLY JSON.
+  Return ONLY JSON.
 `.trim();
 
-  const model = "gpt-5.1-mini";
+  const BULK_MODEL = process.env.OPENAI_MODEL_BULK || "gpt-5-mini";
+  const HEAVY_MODEL = process.env.OPENAI_MODEL_HEAVY || "gpt-5.1";
+  const useHeavyModel = (signal.playbookScore ?? 0) >= 8;
+  const model = useHeavyModel ? HEAVY_MODEL : BULK_MODEL;
+
   const openai = new OpenAI({ apiKey });
-  const completion = await openai.chat.completions.create({
-    model,
-    temperature: 0.3,
-    response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: systemPrompt },
-    { role: "user", content: userPrompt },
-    ],
-  });
+  await recordAiCall(model);
+
+  let completion;
+  try {
+    completion = await openai.chat.completions.create({
+      model,
+      temperature: 0.3,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    });
+  } catch (err: any) {
+    await recordAiError(model, err?.message ?? String(err));
+    throw err;
+  }
 
   recordSpend(model);
-  recordAiCall(model);
   bumpFunnel({ gptScored: 1, gptScoredByModel: { [model]: 1 } });
 
   const content = completion.choices[0]?.message?.content ?? "{}";
