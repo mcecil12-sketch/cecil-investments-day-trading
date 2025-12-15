@@ -113,7 +113,13 @@ export async function fetchRecentBarsWithUrl(args: {
 }) {
   const ticker = args.ticker.toUpperCase();
   const endIso = args.end || new Date().toISOString();
-  const windowMinutes = args.windowMinutes ?? 180;
+  const defaultWindow =
+    args.timeframe === "1Min"
+      ? 90
+      : args.timeframe === "5Min"
+      ? 6 * 60
+      : 24 * 60;
+  const windowMinutes = args.windowMinutes ?? defaultWindow;
   const startIso =
     args.start ||
     new Date(Date.parse(endIso) - windowMinutes * 60 * 1000).toISOString();

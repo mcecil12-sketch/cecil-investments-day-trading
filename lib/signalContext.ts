@@ -1,4 +1,5 @@
-import { fetchRecentBars, AlpacaBar } from "@/lib/alpaca";
+import { fetchRecentBarsWithUrl, AlpacaBar } from "@/lib/alpaca";
+import { getRollingWindowMinutes, resolveEndIso } from "@/lib/barWindow";
 
 export type SignalContext = {
   timeframe: string;
@@ -81,28 +82,52 @@ function liquidityNoteFromContext(avgVolume: number | null, price: number | null
   return "Low liquidity risk (est. <$2M avg bar dollar-volume).";
 }
 
+const DEBUG_SIGNAL_CONTEXT = process.env.DEBUG_SIGNAL_CONTEXT === "1";
+
 export async function buildSignalContext(params: {
   ticker: string;
   timeframe: string;
   limit?: number;
   endTimeIso?: string;
 }): Promise<SignalContext> {
-  const limit = params.limit ?? 90;
-  const bars = await fetchRecentBars(
-    params.ticker,
-    params.timeframe,
+  const limit = params.limit ?? 120;
+  const endIso = resolveEndIso(params.endTimeIso);
+  const windowMinutes = getRollingWindowMinutes(params.timeframe);
+
+  const { json, url, bars } = await fetchRecentBarsWithUrl({
+    ticker: params.ticker,
+    timeframe: params.timeframe,
+    adjustment: "raw",
+    end: endIso,
     limit,
-    params.endTimeIso
-  );
-  const vwap = computeVWAP(bars);
-  const { trend, slopePct } = computeTrend(bars);
-  const { avg, last, rel } = computeVolumes(bars);
-  const rangePctAvg = computeAvgRangePct(bars);
-  const lastClose = bars.length ? bars[bars.length - 1].c : null;
+    windowMinutes,
+  });
+
+  const sampledBars = bars ?? json?.bars ?? [];
+
+  if (DEBUG_SIGNAL_CONTEXT) {
+    const lastBarTime = sampledBars.length ? sampledBars[sampledBars.length - 1].t : null;
+    console.log("[signalContext]", {
+      ticker: params.ticker,
+      timeframe: params.timeframe,
+      barsUsed: sampledBars.length,
+      endIso,
+      windowMinutes,
+      lastBarTime,
+      url,
+    });
+  }
+
+  const vwap = computeVWAP(sampledBars);
+  const { trend, slopePct } = computeTrend(sampledBars);
+  const { avg, last, rel } = computeVolumes(sampledBars);
+  const rangePctAvg = computeAvgRangePct(sampledBars);
+  const lastClose = sampledBars.length ? sampledBars[sampledBars.length - 1].c : null;
   const liquidityNote = liquidityNoteFromContext(avg, lastClose ?? null);
+
   return {
     timeframe: params.timeframe,
-    barsUsed: bars.length,
+    barsUsed: sampledBars.length,
     vwap: vwap ?? null,
     trend,
     trendSlopePct: slopePct,

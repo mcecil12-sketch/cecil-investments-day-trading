@@ -31,6 +31,8 @@ export type ScoredSignal = RawSignal & {
   aiGrade: "A" | "B" | "C" | "D" | "F";
   aiSummary: string; // short explanation
   totalScore: number;
+  status?: string;
+  skipReason?: string;
 };
 
 type ModelResponse = {
@@ -59,6 +61,8 @@ function gradeFromScore(score: number): "A" | "B" | "C" | "D" | "F" {
   if (score >= 4) return "D";
   return "F";
 }
+
+const MIN_BARS_FOR_AI = Number(process.env.MIN_BARS_FOR_AI ?? 20);
 
 export async function scoreSignalWithAI(rawSignal: RawSignal): Promise<ScoredSignal> {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -96,33 +100,38 @@ Rules:
 
   // --- Context enrichment (A1) --------------------------------------------
   const timeframe = rawSignal.timeframe || "1Min";
-  const needsContext =
-    rawSignal.vwap == null ||
-    rawSignal.trendScore == null ||
-    rawSignal.volumeScore == null ||
-    rawSignal.liquidityScore == null;
 
-  let ctx: any = null;
-  if (needsContext) {
-    try {
-      ctx = await buildSignalContext({
-        ticker: rawSignal.ticker,
-        timeframe,
-        limit: 90,
-        endTimeIso: rawSignal.createdAt,
-      });
-    } catch (e: any) {
-      console.log("[aiScoring] context build failed (non-fatal):", e?.message ?? String(e));
-      ctx = null;
-    }
+  let context: SignalContext | null = null;
+  try {
+    context = await buildSignalContext({
+      ticker: rawSignal.ticker,
+      timeframe,
+      limit: 90,
+      endTimeIso: rawSignal.createdAt,
+    });
+  } catch (e: any) {
+    console.log("[aiScoring] context build failed (non-fatal):", e?.message ?? String(e));
   }
 
-  const signal = ctx
+  const signal = context
     ? {
         ...rawSignal,
-        signalContext: ctx,
+        signalContext: context,
       }
     : rawSignal;
+
+  if (context && context.barsUsed < MIN_BARS_FOR_AI) {
+    const reason = `Insufficient recent bars (${context.barsUsed} < ${MIN_BARS_FOR_AI})`;
+    return {
+      ...signal,
+      aiScore: 0,
+      aiGrade: "F",
+      aiSummary: reason,
+      totalScore: 0,
+      status: "SKIPPED",
+      skipReason: reason,
+    };
+  }
 
   const contextBlock =
     signal.signalContext
