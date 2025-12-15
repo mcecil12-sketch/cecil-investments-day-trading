@@ -38,6 +38,10 @@ type ModelResponse = {
   summary: string;
 };
 
+function supportsCustomTemperature(model: string) {
+  return !model.startsWith("gpt-5");
+}
+
 function gradeFromScore(score: number): "A" | "B" | "C" | "D" | "F" {
   if (score >= 9) return "A";
   if (score >= 7.5) return "B";
@@ -116,7 +120,7 @@ Catalyst score: ${signal.catalystScore ?? "n/a"}
   try {
     completion = await openai.chat.completions.create({
       model,
-      temperature: 0.3,
+      ...(supportsCustomTemperature(model) ? { temperature: 0.3 } : {}),
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: systemPrompt },
