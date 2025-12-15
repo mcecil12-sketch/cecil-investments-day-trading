@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { recordSpend, recordAiCall, recordAiError } from "./aiMetrics";
 import { bumpFunnel } from "./funnelMetrics";
+import { buildSignalContext } from "@/lib/signalContext";
 
 export type Side = "LONG" | "SHORT";
 
@@ -92,6 +93,42 @@ Rules:
   No extra text.
 `.trim();
 
+  // --- Context enrichment (A1) --------------------------------------------
+  const timeframe = signal.timeframe || "1Min";
+  const needsContext =
+    signal.vwap == null ||
+    signal.trendScore == null ||
+    signal.volumeScore == null ||
+    signal.liquidityScore == null;
+
+  let ctx: any = null;
+  if (needsContext) {
+    try {
+      ctx = await buildSignalContext({
+        ticker: signal.ticker,
+        timeframe,
+        limit: 90,
+      });
+    } catch (e: any) {
+      console.log("[aiScoring] context build failed (non-fatal):", e?.message ?? String(e));
+      ctx = null;
+    }
+  }
+
+  const contextBlock = ctx
+    ? `Context (computed from Alpaca bars):
+- barsUsed: ${ctx.barsUsed}
+- vwap: ${ctx.vwap ?? "null"}
+- trend: ${ctx.trend} (slopePctPerBar: ${ctx.trendSlopePct?.toFixed?.(4) ?? ctx.trendSlopePct})
+- avgVolume: ${ctx.avgVolume ?? "null"}
+- lastVolume: ${ctx.lastVolume ?? "null"}
+- relVolume: ${ctx.relVolume ?? "null"}
+- avgRangePct: ${ctx.rangePctAvg ?? "null"}
+- liquidityNote: ${ctx.liquidityNote}
+`
+    : `Context: unavailable (bar fetch or computation failed).`;
+  // ------------------------------------------------------------------------
+
   const userPrompt = `
 Evaluate this VWAP pullback setup:
 
@@ -112,6 +149,8 @@ Liquidity score: ${signal.liquidityScore ?? "n/a"}
 Playbook score: ${signal.playbookScore ?? "n/a"}
 Volume score: ${signal.volumeScore ?? "n/a"}
 Catalyst score: ${signal.catalystScore ?? "n/a"}
+
+${contextBlock}
 
   Return ONLY JSON.
 `.trim();
