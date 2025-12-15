@@ -131,14 +131,16 @@ export async function POST(req: Request) {
   };
 
   let scored: ScoredSignal = placeholderScored;
+  let finalSignal: StoredSignal = placeholder;
 
   try {
     scored = await scoreSignalWithAI(rawSignal);
-      const updated: StoredSignal = {
-        ...scored,
-        status: "PENDING",
-      };
-      await replaceSignal(updated);
+    finalSignal = {
+      ...placeholder,
+      ...scored,
+      status: "SCORED",
+    };
+    await replaceSignal(finalSignal);
   } catch (err: any) {
     console.error("AI scoring failed:", err);
   }
@@ -161,5 +163,5 @@ export async function POST(req: Request) {
     }
   }
 
-  return NextResponse.json({ signal: scored });
+  return NextResponse.json({ signal: finalSignal });
 }
