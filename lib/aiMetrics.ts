@@ -1,4 +1,5 @@
 import { redis } from "@/lib/redis";
+import { getBudgetState, addSpend } from "@/lib/aiBudget";
 
 export type AiMetrics = {
   date: string; // YYYY-MM-DD (ET)
@@ -53,6 +54,10 @@ export async function getAiMetrics(date = etDateKey()): Promise<AiMetrics> {
   };
 }
 
+export async function getAiBudget(date = etDateKey()) {
+  return await getBudgetState(date);
+}
+
 export async function recordHeartbeat(): Promise<void> {
   if (!redis) return;
   await redis.set(HEARTBEAT_KEY, isoNow());
@@ -100,4 +105,12 @@ export async function recordAiError(model: string, message: string): Promise<voi
   current.errors = errCounts;
 
   await redis.set(key, current);
+}
+
+export async function recordSpend(model: string, amountUsd: number): Promise<void> {
+  try {
+    await addSpend({ model, amountUsd });
+  } catch (e: any) {
+    console.log("[aiMetrics] recordSpend failed (non-fatal):", e?.message ?? String(e));
+  }
 }

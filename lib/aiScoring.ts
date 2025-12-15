@@ -1,6 +1,5 @@
 import OpenAI from "openai";
-import { recordSpend } from "./aiBudget";
-import { recordAiCall, recordAiError } from "./aiMetrics";
+import { recordSpend, recordAiCall, recordAiError } from "./aiMetrics";
 import { bumpFunnel } from "./funnelMetrics";
 
 export type Side = "LONG" | "SHORT";
@@ -40,6 +39,15 @@ type ModelResponse = {
 
 function supportsCustomTemperature(model: string) {
   return !model.startsWith("gpt-5");
+}
+
+const MODEL_COSTS: Record<string, number> = {
+  "gpt-5-mini": 0.005,
+  "gpt-5.1": 0.026,
+};
+
+function estimateCost(model: string) {
+  return MODEL_COSTS[model] ?? 0.01;
 }
 
 function gradeFromScore(score: number): "A" | "B" | "C" | "D" | "F" {
@@ -132,7 +140,11 @@ Catalyst score: ${signal.catalystScore ?? "n/a"}
     throw err;
   }
 
-  recordSpend(model);
+  try {
+    await recordSpend(model, estimateCost(model));
+  } catch (e: any) {
+    console.log("[aiScoring] recordSpend failed (non-fatal):", e?.message ?? String(e));
+  }
   bumpFunnel({ gptScored: 1, gptScoredByModel: { [model]: 1 } });
 
   const content = completion.choices[0]?.message?.content ?? "{}";
