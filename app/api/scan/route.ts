@@ -108,14 +108,16 @@ type RejectKey =
   | "rangeTooSmall"
   | "tooFarFromVWAP"
   | "trendNotOk"
+  | "notCandidate"
+  | "missingBarFields"
   | "exception"
-  | "notCandidate";
+  | "other";
 
 type GateResult =
   | { ok: false; reason: RejectKey; note?: string }
   | { ok: true };
 
-function createRejectTracker() {
+function createRejectTracker(sampleLimit = 12) {
   const counts: Record<RejectKey, number> = {
     noBars: 0,
     tooFewBars: 0,
@@ -125,8 +127,10 @@ function createRejectTracker() {
     rangeTooSmall: 0,
     tooFarFromVWAP: 0,
     trendNotOk: 0,
-    exception: 0,
     notCandidate: 0,
+    missingBarFields: 0,
+    exception: 0,
+    other: 0,
   };
   const samples: Array<{ ticker: string; reason: RejectKey; note?: string }> = [];
   const seenTickers: string[] = [];
@@ -134,7 +138,7 @@ function createRejectTracker() {
 
   function bump(ticker: string, reason: RejectKey, note?: string) {
     counts[reason] = (counts[reason] ?? 0) + 1;
-    if (samples.length < 12) {
+    if (samples.length < sampleLimit) {
       samples.push({ ticker, reason, note });
     }
   }
@@ -460,11 +464,11 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
 function detectAiSeedCandidate(
   symbol: string,
   bars: AlpacaBar[],
-  tracker: ReturnType<typeof createRejectTracker>
+  reject: (ticker: string, reason: string, note?: string) => void
 ): CandidateSignal | null {
   const gate = evaluateAiSeedGates(bars);
   if (!gate.ok) {
-    tracker.bump(symbol, gate.reason, gate.note);
+    reject(symbol, gate.reason, gate.note);
     return null;
   }
 
@@ -513,7 +517,17 @@ export async function GET(req: Request) {
       ? "ai-seed"
       : "vwap"; // default/alias for vwap
   const aiSeedMode = mode === "ai-seed";
-  const aiSeedTracker = createRejectTracker();
+  const aiSeedTracker = createRejectTracker(40);
+  const reject = (ticker: string, reason: string, note?: string) => {
+    if (!aiSeedMode) return;
+    const normalizedReason = Object.prototype.hasOwnProperty.call(
+      aiSeedTracker.counts,
+      reason
+    )
+      ? (reason as RejectKey)
+      : "other";
+    aiSeedTracker.bump(ticker, normalizedReason, note);
+  };
 
   if (aiSeedMode) {
     // Market-aware: don’t run ai-seed off-hours when minute bars go thin
@@ -566,7 +580,15 @@ export async function GET(req: Request) {
         if (aiSeedMode) aiSeedTracker.trackTicker(symbol);
         const bars = await fetchRecentBars(symbol, "1Min", 60);
         if (!bars || bars.length === 0) {
-          if (aiSeedMode) aiSeedTracker.bump(symbol, "noBars");
+          reject(symbol, "noBars");
+          return null;
+        }
+
+        if (
+          aiSeedMode &&
+          bars.some((b) => b == null || b.v == null || (b.vw == null && b.c == null))
+        ) {
+          reject(symbol, "missingBarFields", "missing v or (vw/c)");
           return null;
         }
 
@@ -574,7 +596,7 @@ export async function GET(req: Request) {
         const avgVol = bars.reduce((sum, b) => sum + b.v, 0) / bars.length || 0;
 
         if (last.c < minPrice) {
-          if (aiSeedMode) aiSeedTracker.bump(symbol, "priceOutOfRange", `price=${last.c.toFixed(2)}`);
+          reject(symbol, "priceOutOfRange", `price=${last.c.toFixed(2)}`);
           return null;
         }
         const totalVol = bars.reduce((sum, b) => sum + (b.v ?? 0), 0);
@@ -582,7 +604,7 @@ export async function GET(req: Request) {
         const avgVolShares = avgVolPerMin;
         const avgDollarVol = avgVolShares * last.c;
         if (aiSeedMode && avgVolPerMin < 50) {
-          aiSeedTracker.bump(
+          reject(
             symbol,
             "volumeTooLow",
             `avgVolShares=${Math.round(avgVolShares)} avgDollarVol=${Math.round(
@@ -664,21 +686,19 @@ export async function GET(req: Request) {
             };
           }
         } else if (mode === "ai-seed") {
-          const candidate = detectAiSeedCandidate(symbol, bars, aiSeedTracker);
+          const candidate = detectAiSeedCandidate(symbol, bars, reject);
           if (candidate) return candidate;
-          aiSeedTracker.bump(symbol, "notCandidate", "notCandidate");
+          reject(symbol, "notCandidate", "notCandidate");
         }
         return null;
       } catch (err) {
-        if (aiSeedMode) {
-          const note =
-            err instanceof Error
-              ? err.message?.slice(0, 160)
-              : typeof err === "string"
-              ? err.slice(0, 160)
-              : "unknown";
-          aiSeedTracker.bump(symbol, "exception", note);
-        }
+        const note =
+          err instanceof Error
+            ? err.message?.slice(0, 160)
+            : typeof err === "string"
+            ? err.slice(0, 160)
+            : "unknown";
+        reject(symbol, "exception", note);
         console.error("[SCAN] Error scanning symbol", symbol, err);
         return null;
       }
