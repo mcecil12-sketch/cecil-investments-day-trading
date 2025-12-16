@@ -530,8 +530,10 @@ export async function GET(req: Request) {
           if (aiSeedMode) aiSeedTracker.bump(symbol, "priceOutOfRange", `price=${last.c.toFixed(2)}`);
           return null;
         }
-        if (avgVol < minVolume) {
-          if (aiSeedMode) aiSeedTracker.bump(symbol, "volumeTooLow", `avgVol=${Math.round(avgVol)}`);
+        const totalVol = bars.reduce((sum, b) => sum + (b.v ?? 0), 0);
+        const avgVolPerMin = bars.length ? totalVol / bars.length : 0;
+        if (aiSeedMode && avgVolPerMin < 50) {
+          aiSeedTracker.bump(symbol, "volumeTooLow", `avgVolPerMin=${Math.round(avgVolPerMin)}`);
           return null;
         }
 
