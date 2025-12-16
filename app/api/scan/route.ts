@@ -86,6 +86,50 @@ const DEFAULT_MIN_PRICE = 3;
 const DEFAULT_MIN_AVG_VOLUME = 300_000;
 const DEFAULT_LIMIT = 600;
 const MAX_SIGNALS_PER_SCAN = 50;
+const AI_SEED_MIN_BARS = 12;
+const AI_SEED_MIN_REL_VOL = 0.3;
+const AI_SEED_MIN_RANGE_PCT = 0.08;
+const AI_SEED_MAX_VWAP_DISTANCE = 2;
+const AI_SEED_MIN_TREND_DELTA = -0.005;
+
+type RejectKey =
+  | "noBars"
+  | "tooFewBars"
+  | "priceOutOfRange"
+  | "volumeTooLow"
+  | "relVolTooLow"
+  | "rangeTooSmall"
+  | "tooFarFromVWAP"
+  | "trendNotOk"
+  | "other";
+
+type GateResult =
+  | { ok: false; reason: RejectKey; note?: string }
+  | { ok: true };
+
+function createRejectTracker() {
+  const counts: Record<RejectKey, number> = {
+    noBars: 0,
+    tooFewBars: 0,
+    priceOutOfRange: 0,
+    volumeTooLow: 0,
+    relVolTooLow: 0,
+    rangeTooSmall: 0,
+    tooFarFromVWAP: 0,
+    trendNotOk: 0,
+    other: 0,
+  };
+  const samples: Array<{ ticker: string; reason: RejectKey; note?: string }> = [];
+
+  function bump(ticker: string, reason: RejectKey, note?: string) {
+    counts[reason] = (counts[reason] ?? 0) + 1;
+    if (samples.length < 12) {
+      samples.push({ ticker, reason, note });
+    }
+  }
+
+  return { counts, samples, bump };
+}
 
 function getBaseUrlFromEnv(): string {
   if (process.env.NEXT_PUBLIC_BASE_URL) {
@@ -325,8 +369,65 @@ function detectPremarketVwapFeatures(bars: AlpacaBar[]) {
   };
 }
 
-function detectAiSeedCandidate(symbol: string, bars: AlpacaBar[]): CandidateSignal | null {
-  if (!bars || bars.length === 0) return null;
+function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
+  if (!bars || bars.length === 0) {
+    return { ok: false, reason: "noBars" };
+  }
+  if (bars.length < AI_SEED_MIN_BARS) {
+    return { ok: false, reason: "tooFewBars", note: `bars=${bars.length}` };
+  }
+
+  const last = bars[bars.length - 1];
+  const avgVol = bars.reduce((sum, b) => sum + b.v, 0) / Math.max(1, bars.length);
+  if (last.c < DEFAULT_MIN_PRICE) {
+    return { ok: false, reason: "priceOutOfRange", note: `price=${last.c.toFixed(2)}` };
+  }
+  if (avgVol < DEFAULT_MIN_AVG_VOLUME) {
+    return { ok: false, reason: "volumeTooLow", note: `avgVol=${Math.round(avgVol)}` };
+  }
+
+  const relVol = avgVol > 0 ? last.v / avgVol : 0;
+  if (relVol < AI_SEED_MIN_REL_VOL) {
+    return { ok: false, reason: "relVolTooLow", note: `relVol=${relVol.toFixed(2)}` };
+  }
+
+  const rangePct = ((last.h - last.l) / last.c) * 100;
+  if (rangePct < AI_SEED_MIN_RANGE_PCT * 100) {
+    return { ok: false, reason: "rangeTooSmall", note: `rangePct=${rangePct.toFixed(2)}` };
+  }
+
+  const vwap = computeVWAP(bars);
+  if (vwap > 0) {
+    const distPct = Math.abs((last.c - vwap) / vwap) * 100;
+    if (distPct > AI_SEED_MAX_VWAP_DISTANCE) {
+      return {
+        ok: false,
+        reason: "tooFarFromVWAP",
+        note: `vwDist=${distPct.toFixed(2)}`,
+      };
+    }
+  }
+
+  const prev = bars[bars.length - 2];
+  if (prev && last.c - prev.c < AI_SEED_MIN_TREND_DELTA * prev.c) {
+    const deltaPct = ((last.c - prev.c) / prev.c) * 100;
+    return { ok: false, reason: "trendNotOk", note: `trend=${deltaPct.toFixed(2)}%` };
+  }
+
+  return { ok: true };
+}
+
+function detectAiSeedCandidate(
+  symbol: string,
+  bars: AlpacaBar[],
+  tracker: ReturnType<typeof createRejectTracker>
+): CandidateSignal | null {
+  const gate = evaluateAiSeedGates(bars);
+  if (!gate.ok) {
+    tracker.bump(symbol, gate.reason, gate.note);
+    return null;
+  }
+
   const last = bars[bars.length - 1];
   const avgVol = bars.reduce((sum, b) => sum + b.v, 0) / Math.max(1, bars.length);
   const entryPrice = last.c;
@@ -353,6 +454,8 @@ function detectAiSeedCandidate(symbol: string, bars: AlpacaBar[]): CandidateSign
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const search = url.searchParams;
+
+  const aiSeedTracker = createRejectTracker();
 
   bumpFunnel({ scansRun: 1 });
 
@@ -474,7 +577,7 @@ export async function GET(req: Request) {
             };
           }
         } else if (mode === "ai-seed") {
-          const candidate = detectAiSeedCandidate(symbol, bars);
+          const candidate = detectAiSeedCandidate(symbol, bars, aiSeedTracker);
           if (candidate) return candidate;
         }
         return null;
@@ -538,6 +641,14 @@ export async function GET(req: Request) {
     sample: topCandidates.slice(0, 5),
   };
 
+  const aiSeedDebug =
+    mode === "ai-seed"
+      ? {
+          rejectCounts: aiSeedTracker.counts,
+          rejectSamples: aiSeedTracker.samples,
+        }
+      : null;
+
   if (result.candidateCount) {
     bumpFunnel({ candidatesFound: result.candidateCount });
   }
@@ -552,5 +663,6 @@ export async function GET(req: Request) {
     candidatesFound: candidates.length,
     signalsPosted: posted.length,
     gptQueued: posted.length,
+    aiSeedDebug,
   });
 }
