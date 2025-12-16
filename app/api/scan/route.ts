@@ -109,7 +109,7 @@ type RejectKey =
   | "tooFarFromVWAP"
   | "trendNotOk"
   | "exception"
-  | "other";
+  | "notCandidate";
 
 type GateResult =
   | { ok: false; reason: RejectKey; note?: string }
@@ -126,7 +126,7 @@ function createRejectTracker() {
     tooFarFromVWAP: 0,
     trendNotOk: 0,
     exception: 0,
-    other: 0,
+    notCandidate: 0,
   };
   const samples: Array<{ ticker: string; reason: RejectKey; note?: string }> = [];
   const seenTickers: string[] = [];
@@ -420,7 +420,9 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
     return {
       ok: false,
       reason: "volumeTooLow",
-      note: `avg$Vol=${Math.round(avgDollarVol)} avgVolShares=${Math.round(avgVolShares)}`,
+      note: `avgVolShares=${Math.round(avgVolShares)} avgDollarVol=${Math.round(
+        avgDollarVol
+      )} minShares=${MIN_AVG_VOL_SHARES} minDollar=${MIN_AVG_DOLLAR_VOL}`,
     };
   }
 
@@ -513,6 +515,33 @@ export async function GET(req: Request) {
   const aiSeedMode = mode === "ai-seed";
   const aiSeedTracker = createRejectTracker();
 
+  if (aiSeedMode) {
+    // Market-aware: don’t run ai-seed off-hours when minute bars go thin
+    const clockUrl = `${ALPACA_BASE_URL.replace(/\/+$/, "")}/v2/clock`;
+    const clock = await fetch(clockUrl, {
+      headers: {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+      },
+      cache: "no-store",
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+
+    if (clock && clock.is_open === false) {
+      return NextResponse.json(
+        {
+          status: "ok",
+          mode,
+          marketClosed: true,
+          note: "ai-seed skipped: market closed (avoid false volumeTooLow after-hours)",
+          clock,
+        },
+        { headers: { "Cache-Control": "no-store" } }
+      );
+    }
+  }
+
   const limit =
     Number(search.get("limit") ?? DEFAULT_LIMIT) || DEFAULT_LIMIT;
   const minPrice =
@@ -550,8 +579,16 @@ export async function GET(req: Request) {
         }
         const totalVol = bars.reduce((sum, b) => sum + (b.v ?? 0), 0);
         const avgVolPerMin = bars.length ? totalVol / bars.length : 0;
+        const avgVolShares = avgVolPerMin;
+        const avgDollarVol = avgVolShares * last.c;
         if (aiSeedMode && avgVolPerMin < 50) {
-          aiSeedTracker.bump(symbol, "volumeTooLow", `avgVolPerMin=${Math.round(avgVolPerMin)}`);
+          aiSeedTracker.bump(
+            symbol,
+            "volumeTooLow",
+            `avgVolShares=${Math.round(avgVolShares)} avgDollarVol=${Math.round(
+              avgDollarVol
+            )} minShares=${MIN_AVG_VOL_SHARES} minDollar=${MIN_AVG_DOLLAR_VOL}`
+          );
           return null;
         }
 
@@ -629,7 +666,7 @@ export async function GET(req: Request) {
         } else if (mode === "ai-seed") {
           const candidate = detectAiSeedCandidate(symbol, bars, aiSeedTracker);
           if (candidate) return candidate;
-          aiSeedTracker.bump(symbol, "other", "notCandidate");
+          aiSeedTracker.bump(symbol, "notCandidate", "notCandidate");
         }
         return null;
       } catch (err) {
