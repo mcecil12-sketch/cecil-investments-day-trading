@@ -101,6 +101,7 @@ type RejectKey =
   | "rangeTooSmall"
   | "tooFarFromVWAP"
   | "trendNotOk"
+  | "exception"
   | "other";
 
 type GateResult =
@@ -117,9 +118,12 @@ function createRejectTracker() {
     rangeTooSmall: 0,
     tooFarFromVWAP: 0,
     trendNotOk: 0,
+    exception: 0,
     other: 0,
   };
   const samples: Array<{ ticker: string; reason: RejectKey; note?: string }> = [];
+  const seenTickers: string[] = [];
+  let processedCount = 0;
 
   function bump(ticker: string, reason: RejectKey, note?: string) {
     counts[reason] = (counts[reason] ?? 0) + 1;
@@ -128,7 +132,23 @@ function createRejectTracker() {
     }
   }
 
-  return { counts, samples, bump };
+  function trackTicker(ticker: string) {
+    processedCount += 1;
+    if (seenTickers.length < 12) seenTickers.push(ticker);
+  }
+
+  return {
+    counts,
+    samples,
+    bump,
+    trackTicker,
+    get processedCount() {
+      return processedCount;
+    },
+    get seenTickers() {
+      return seenTickers;
+    },
+  };
 }
 
 function getBaseUrlFromEnv(): string {
@@ -455,8 +475,6 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const search = url.searchParams;
 
-  const aiSeedTracker = createRejectTracker();
-
   bumpFunnel({ scansRun: 1 });
 
   const hdrs = headers();
@@ -474,6 +492,8 @@ export async function GET(req: Request) {
       : rawMode === "ai-seed"
       ? "ai-seed"
       : "vwap"; // default/alias for vwap
+  const aiSeedMode = mode === "ai-seed";
+  const aiSeedTracker = createRejectTracker();
 
   const limit =
     Number(search.get("limit") ?? DEFAULT_LIMIT) || DEFAULT_LIMIT;
@@ -496,14 +516,24 @@ export async function GET(req: Request) {
 
     const promises: Promise<CandidateSignal | null>[] = chunk.map(async (symbol) => {
       try {
+        if (aiSeedMode) aiSeedTracker.trackTicker(symbol);
         const bars = await fetchRecentBars(symbol, "1Min", 60);
-        if (!bars || bars.length === 0) return null;
+        if (!bars || bars.length === 0) {
+          if (aiSeedMode) aiSeedTracker.bump(symbol, "noBars");
+          return null;
+        }
 
         const last = bars[bars.length - 1];
         const avgVol = bars.reduce((sum, b) => sum + b.v, 0) / bars.length || 0;
 
-        if (last.c < minPrice) return null;
-        if (avgVol < minVolume) return null;
+        if (last.c < minPrice) {
+          if (aiSeedMode) aiSeedTracker.bump(symbol, "priceOutOfRange", `price=${last.c.toFixed(2)}`);
+          return null;
+        }
+        if (avgVol < minVolume) {
+          if (aiSeedMode) aiSeedTracker.bump(symbol, "volumeTooLow", `avgVol=${Math.round(avgVol)}`);
+          return null;
+        }
 
         if (mode === "vwap") {
           const res = detectVwapPullbackFeatures(bars);
@@ -579,9 +609,19 @@ export async function GET(req: Request) {
         } else if (mode === "ai-seed") {
           const candidate = detectAiSeedCandidate(symbol, bars, aiSeedTracker);
           if (candidate) return candidate;
+          aiSeedTracker.bump(symbol, "other", "notCandidate");
         }
         return null;
       } catch (err) {
+        if (aiSeedMode) {
+          const note =
+            err instanceof Error
+              ? err.message?.slice(0, 160)
+              : typeof err === "string"
+              ? err.slice(0, 160)
+              : "unknown";
+          aiSeedTracker.bump(symbol, "exception", note);
+        }
         console.error("[SCAN] Error scanning symbol", symbol, err);
         return null;
       }
@@ -642,8 +682,10 @@ export async function GET(req: Request) {
   };
 
   const aiSeedDebug =
-    mode === "ai-seed"
+    aiSeedMode
       ? {
+          processedCount: aiSeedTracker.processedCount,
+          seenTickers: aiSeedTracker.seenTickers,
           rejectCounts: aiSeedTracker.counts,
           rejectSamples: aiSeedTracker.samples,
         }
