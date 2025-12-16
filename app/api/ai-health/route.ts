@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getAiMetrics } from "@/lib/aiMetrics";
+import { fetchAlpacaClock, type AlpacaClock } from "@/lib/alpacaClock";
 
 type HealthStatus =
   | "HEALTHY"
@@ -16,22 +17,43 @@ function minutesAgo(iso: string | null): number | null {
   return Math.floor((Date.now() - t) / 60000);
 }
 
+const OFFLINE_MINUTES = 15;
+
+function formatETTime(iso?: string) {
+  if (!iso) return null;
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: "America/New_York",
+  }).format(new Date(iso));
+}
+
 export async function GET() {
   const metrics = await getAiMetrics();
   const mins = minutesAgo(metrics.lastHeartbeat);
 
-  // Operator-friendly thresholds
-  const OFFLINE_MIN = 15;
+  let clock: AlpacaClock | null = null;
+  let marketOpen = true;
+  try {
+    clock = await fetchAlpacaClock();
+    marketOpen = clock.is_open;
+  } catch (err) {
+    console.warn("[ai-health] unable to fetch market clock", err);
+  }
 
-  const status: HealthStatus =
-    mins === null
-      ? "OFFLINE"
-      : mins > OFFLINE_MIN
-      ? "OFFLINE"
-      : "HEALTHY";
+  // Operator-friendly thresholds
+  const status: HealthStatus = !marketOpen
+    ? "MARKET_CLOSED"
+    : mins === null || mins > OFFLINE_MINUTES
+    ? "OFFLINE"
+    : "HEALTHY";
 
   const reason =
-    status === "OFFLINE"
+    status === "MARKET_CLOSED"
+      ? clock
+        ? `market closed (next open ${formatETTime(clock.next_open) ?? "soon"})`
+        : "market closed"
+      : status === "OFFLINE"
       ? `last heartbeat ~${mins ?? "?"}m ago`
       : `heartbeat ~${mins}m ago`;
 
@@ -47,6 +69,8 @@ export async function GET() {
     reason,
     budget,
     metrics,
+    marketOpen,
+    clock,
     timestamp: new Date().toISOString(),
   });
 }
