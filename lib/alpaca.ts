@@ -72,7 +72,6 @@ async function alpacaFetch(url: string, init: RequestInit = {}) {
     ...init,
     headers,
     cache: "no-store",
-    next: { revalidate: 0 },
   });
 }
 

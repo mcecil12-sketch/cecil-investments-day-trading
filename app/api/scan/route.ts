@@ -546,5 +546,11 @@ export async function GET(req: Request) {
     bumpFunnel({ signalsPosted: result.postedCount });
   }
 
-  return NextResponse.json(result);
+  return NextResponse.json({
+    ...result,
+    scansRun: 1,
+    candidatesFound: candidates.length,
+    signalsPosted: posted.length,
+    gptQueued: posted.length,
+  });
 }

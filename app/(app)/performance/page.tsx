@@ -1,5 +1,7 @@
 "use client";
 
+export const dynamic = "force-dynamic";
+
 import React, { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { useTrading } from "@/tradingContext";
@@ -85,7 +87,10 @@ export default function PerformancePage() {
 
   const loadStats = useCallback(async () => {
     try {
-      const res = await fetch("/api/trades/summary");
+      const res = await fetch("/api/trades/summary", {
+        cache: "no-store",
+        next: { revalidate: 0 },
+      });
       if (!res.ok) throw new Error(`Stats failed (${res.status})`);
       const data = await res.json();
       setStats(data?.stats ?? null);
@@ -104,7 +109,10 @@ export default function PerformancePage() {
     let cancelled = false;
     const load = async () => {
       try {
-        const res = await fetch("/api/settings");
+        const res = await fetch("/api/settings", {
+          cache: "no-store",
+          next: { revalidate: 0 },
+        });
         if (!res.ok) throw new Error("Failed to load settings");
         const data = await res.json();
         if (!cancelled) setSettingsData(data?.settings ?? null);
