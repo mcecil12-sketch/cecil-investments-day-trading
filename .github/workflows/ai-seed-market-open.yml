@@ -1,0 +1,44 @@
+name: ai-seed (market open)
+
+on:
+  schedule:
+    # 09:35 ET (winter) = 14:35 UTC, Mon-Fri
+    - cron: "35 14 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  run-ai-seed:
+    runs-on: ubuntu-latest
+    env:
+      BASE: ${{ secrets.SCANNER_BASE_URL }}
+      PIN:  ${{ secrets.SCANNER_PIN }}
+    steps:
+      - name: Validate secrets present
+        run: |
+          if [ -z "${BASE}" ] || [ -z "${PIN}" ]; then
+            echo "Missing SCANNER_BASE_URL or SCANNER_PIN secrets."
+            exit 1
+          fi
+
+      - name: Auth + Scan + Stats (single run)
+        run: |
+          set -euo pipefail
+          CJ="$(mktemp)"
+          trap "rm -f $CJ" EXIT
+
+          echo "== AUTH =="
+          curl -sS -c "$CJ" -X POST "$BASE/api/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"pin\":\"$PIN\"}"
+
+          echo
+          echo "== SCAN (ai-seed) =="
+          curl -sS -b "$CJ" "$BASE/api/scan?mode=ai-seed"
+
+          echo
+          echo "== FUNNEL STATS =="
+          curl -sS -b "$CJ" "$BASE/api/funnel-stats"
+
+          echo
+          echo "== AI METRICS =="
+          curl -sS -b "$CJ" "$BASE/api/ai/metrics"
