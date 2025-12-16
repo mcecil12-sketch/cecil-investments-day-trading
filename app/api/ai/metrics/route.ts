@@ -1,19 +1,23 @@
-import fs from "fs";
-import path from "path";
 import { NextResponse } from "next/server";
+import { readTodayAiMetrics } from "@/lib/aiMetrics";
 
-const BUDGET_PATH = path.join(process.cwd(), "data", "ai-budget.json");
-const METRICS_PATH = path.join(process.cwd(), "data", "ai-metrics.json");
+export const dynamic = "force-dynamic";
 
-function safeRead(p: string) {
-  if (!fs.existsSync(p)) return null;
-  return JSON.parse(fs.readFileSync(p, "utf-8"));
-}
+const CACHE_HEADERS = {
+  "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+  Pragma: "no-cache",
+  Expires: "0",
+};
 
 export async function GET() {
-  return NextResponse.json({
-    budget: safeRead(BUDGET_PATH),
-    metrics: safeRead(METRICS_PATH),
-    timestamp: new Date().toISOString(),
-  });
+  const { budget, metrics } = await readTodayAiMetrics();
+
+  return NextResponse.json(
+    {
+      budget,
+      metrics,
+      timestamp: new Date().toISOString(),
+    },
+    { headers: CACHE_HEADERS }
+  );
 }
