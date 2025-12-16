@@ -398,15 +398,27 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
   }
 
   const last = bars[bars.length - 1];
-  const avgVol = bars.reduce((sum, b) => sum + b.v, 0) / Math.max(1, bars.length);
+  const totalVol = bars.reduce((sum, b) => sum + (b.v ?? 0), 0);
+  const avgVolShares = totalVol / Math.max(1, bars.length);
+  const avgDollarVol =
+    bars.length === 0
+      ? 0
+      : bars.reduce(
+          (sum, b) => sum + (b.v ?? 0) * (b.vw ?? b.c ?? b.o ?? 0),
+          0
+        ) / bars.length;
   if (last.c < DEFAULT_MIN_PRICE) {
     return { ok: false, reason: "priceOutOfRange", note: `price=${last.c.toFixed(2)}` };
   }
-  if (avgVol < DEFAULT_MIN_AVG_VOLUME) {
-    return { ok: false, reason: "volumeTooLow", note: `avgVol=${Math.round(avgVol)}` };
+  if (avgVolShares < 50) {
+    return {
+      ok: false,
+      reason: "volumeTooLow",
+      note: `avgVolShares=${Math.round(avgVolShares)} avg$Vol=${Math.round(avgDollarVol)}`,
+    };
   }
 
-  const relVol = avgVol > 0 ? last.v / avgVol : 0;
+  const relVol = avgVolShares > 0 ? last.v / avgVolShares : 0;
   if (relVol < AI_SEED_MIN_REL_VOL) {
     return { ok: false, reason: "relVolTooLow", note: `relVol=${relVol.toFixed(2)}` };
   }
@@ -449,7 +461,7 @@ function detectAiSeedCandidate(
   }
 
   const last = bars[bars.length - 1];
-  const avgVol = bars.reduce((sum, b) => sum + b.v, 0) / Math.max(1, bars.length);
+  const avgVol = bars.reduce((sum, b) => sum + (b.v ?? 0), 0) / Math.max(1, bars.length);
   const entryPrice = last.c;
   const stopPrice = entryPrice * 0.99;
   const targetPrice = entryPrice * 1.02;
