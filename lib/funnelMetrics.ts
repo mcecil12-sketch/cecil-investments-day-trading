@@ -25,7 +25,7 @@ type FunnelDay = {
   fills: number;
 };
 
-function todayKey() {
+export function getFunnelDayKey() {
   return new Date().toISOString().slice(0, 10);
 }
 
@@ -72,7 +72,7 @@ function getDay(days: FunnelDay[], date: string) {
 
 export function bumpFunnel(event: Partial<FunnelDay>) {
   const store = loadAll();
-  const date = todayKey();
+  const date = getFunnelDayKey();
   const day = getDay(store.days, date);
 
   for (const [k, v] of Object.entries(event)) {
@@ -97,7 +97,7 @@ export function bumpFunnel(event: Partial<FunnelDay>) {
 
 export function readTodayFunnel(): FunnelDay {
   const store = loadAll();
-  const date = todayKey();
+  const date = getFunnelDayKey();
   const day = getDay(store.days, date);
   return day;
 }
