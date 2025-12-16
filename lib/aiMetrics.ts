@@ -1,5 +1,6 @@
 import { redis } from "@/lib/redis";
 import { getBudgetState, addSpend } from "@/lib/aiBudget";
+import { getFunnelDayKey } from "@/lib/funnelMetrics";
 
 export type AiMetrics = {
   date: string; // YYYY-MM-DD (ET)
@@ -13,18 +14,8 @@ function isoNow() {
   return new Date().toISOString();
 }
 
-function etDateKey(d = new Date()): string {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(d);
-
-  const y = parts.find((p) => p.type === "year")?.value ?? "1970";
-  const m = parts.find((p) => p.type === "month")?.value ?? "01";
-  const day = parts.find((p) => p.type === "day")?.value ?? "01";
-  return `${y}-${m}-${day}`;
+function etDateKey(): string {
+  return getFunnelDayKey();
 }
 
 function metricsKey(date: string) {
@@ -54,13 +45,25 @@ export async function getAiMetrics(date = etDateKey()): Promise<AiMetrics> {
   };
 }
 
-export async function getAiBudget(date = etDateKey()) {
-  return await getBudgetState(date);
-}
-
 export async function recordHeartbeat(): Promise<void> {
   if (!redis) return;
   await redis.set(HEARTBEAT_KEY, isoNow());
+}
+
+export async function writeAiHeartbeat(): Promise<void> {
+  if (!redis) return;
+  const date = etDateKey();
+  const key = metricsKey(date);
+  const current =
+    (await redis.get<AiMetrics>(key)) ?? {
+      date,
+      calls: 0,
+      byModel: {},
+      lastHeartbeat: null,
+      errors: {},
+    };
+  current.lastHeartbeat = isoNow();
+  await redis.set(key, current);
 }
 
 export async function recordAiCall(model: string): Promise<void> {
@@ -113,4 +116,13 @@ export async function recordSpend(model: string, amountUsd: number): Promise<voi
   } catch (e: any) {
     console.log("[aiMetrics] recordSpend failed (non-fatal):", e?.message ?? String(e));
   }
+}
+
+export async function readTodayAiMetrics() {
+  const date = etDateKey();
+  const [budget, metrics] = await Promise.all([
+    getBudgetState(date),
+    getAiMetrics(date),
+  ]);
+  return { budget, metrics };
 }
