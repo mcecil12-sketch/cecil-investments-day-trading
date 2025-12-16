@@ -81,6 +81,11 @@ function scorePattern(pattern: PatternType, f: PatternFeatures): number {
   return score;
 }
 
+function avg(nums: number[]): number {
+  if (!nums.length) return 0;
+  return nums.reduce((a, b) => a + b, 0) / nums.length;
+}
+
 // Default filters tuned to surface more candidates by easing price/volume gates.
 const DEFAULT_MIN_PRICE = 3;
 const DEFAULT_MIN_AVG_VOLUME = 300_000;
@@ -91,6 +96,8 @@ const AI_SEED_MIN_REL_VOL = 0.3;
 const AI_SEED_MIN_RANGE_PCT = 0.08;
 const AI_SEED_MAX_VWAP_DISTANCE = 2;
 const AI_SEED_MIN_TREND_DELTA = -0.005;
+const MIN_AVG_VOL_SHARES = 300_000;
+const MIN_AVG_DOLLAR_VOL = 2_500_000;
 
 type RejectKey =
   | "noBars"
@@ -398,23 +405,22 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
   }
 
   const last = bars[bars.length - 1];
-  const totalVol = bars.reduce((sum, b) => sum + (b.v ?? 0), 0);
-  const avgVolShares = totalVol / Math.max(1, bars.length);
-  const avgDollarVol =
-    bars.length === 0
-      ? 0
-      : bars.reduce(
-          (sum, b) => sum + (b.v ?? 0) * (b.vw ?? b.c ?? b.o ?? 0),
-          0
-        ) / bars.length;
+  const avgVolShares = avg(bars.map((b) => Number(b.v ?? 0)));
+  const avgDollarVol = avg(
+    bars.map(
+      (b) => Number(b.v ?? 0) * Number((b.vw ?? b.c ?? 0) || 0)
+    )
+  );
+  const failsDollarVol = avgDollarVol < MIN_AVG_DOLLAR_VOL;
+  const failsSharesVol = avgVolShares < MIN_AVG_VOL_SHARES;
   if (last.c < DEFAULT_MIN_PRICE) {
     return { ok: false, reason: "priceOutOfRange", note: `price=${last.c.toFixed(2)}` };
   }
-  if (avgVolShares < 50) {
+  if (failsDollarVol || failsSharesVol) {
     return {
       ok: false,
       reason: "volumeTooLow",
-      note: `avgVolShares=${Math.round(avgVolShares)} avg$Vol=${Math.round(avgDollarVol)}`,
+      note: `avg$Vol=${Math.round(avgDollarVol)} avgVolShares=${Math.round(avgVolShares)}`,
     };
   }
 
@@ -461,7 +467,7 @@ function detectAiSeedCandidate(
   }
 
   const last = bars[bars.length - 1];
-  const avgVol = bars.reduce((sum, b) => sum + (b.v ?? 0), 0) / Math.max(1, bars.length);
+  const avgVol = avg(bars.map((b) => Number(b.v ?? 0)));
   const entryPrice = last.c;
   const stopPrice = entryPrice * 0.99;
   const targetPrice = entryPrice * 1.02;
