@@ -26,9 +26,11 @@ export type RawSignal = {
   signalContext?: SignalContext;
 };
 
+export type AiGrade = "A+" | "A" | "B" | "C" | "D" | "F";
+
 export type ScoredSignal = RawSignal & {
   aiScore: number; // 0–10, numeric
-  aiGrade: "A" | "B" | "C" | "D" | "F";
+  aiGrade: AiGrade;
   aiSummary: string; // short explanation
   totalScore: number;
   status?: string;
@@ -37,7 +39,7 @@ export type ScoredSignal = RawSignal & {
 
 type ModelResponse = {
   score: number;
-  grade: "A" | "B" | "C" | "D" | "F";
+  grade: AiGrade;
   summary: string;
 };
 
@@ -54,12 +56,16 @@ function estimateCost(model: string) {
   return MODEL_COSTS[model] ?? 0.01;
 }
 
-function gradeFromScore(score: number): "A" | "B" | "C" | "D" | "F" {
-  if (score >= 9) return "A";
+export function gradeFromScore(score: number): AiGrade {
+  if (score >= 9) return "A+";
   if (score >= 7.5) return "B";
   if (score >= 6) return "C";
   if (score >= 4) return "D";
   return "F";
+}
+
+export function formatAiSummary(grade: AiGrade, score: number) {
+  return `Scored ${grade} (${score}). No detailed summary returned.`;
 }
 
 const MIN_BARS_FOR_AI = Number(process.env.MIN_BARS_FOR_AI ?? 20);
@@ -197,21 +203,43 @@ Return ONLY valid JSON with:
       ? Math.min(10, Math.max(0, parsed.score))
       : 0;
 
-  const grade = parsed.grade ?? gradeFromScore(normalizedScore);
-  const summary = parsed.summary ?? "No summary provided by AI.";
+  const rawGrade = typeof parsed.grade === "string" && parsed.grade.trim()
+    ? (parsed.grade.trim() as AiGrade)
+    : gradeFromScore(normalizedScore);
+  const rawSummary = typeof parsed.summary === "string" ? parsed.summary : "";
+
+  const _scoreNum = Number.isFinite(Number(normalizedScore)) ? Number(normalizedScore) : 0;
+  const _grade: AiGrade =
+    rawGrade && rawGrade.trim()
+      ? (rawGrade as AiGrade)
+      : _scoreNum >= 9
+      ? "A+"
+      : _scoreNum >= 8
+      ? "A"
+      : _scoreNum >= 7
+      ? "B"
+      : _scoreNum >= 6
+      ? "C"
+      : _scoreNum >= 5
+      ? "D"
+      : "F";
+  const _summary =
+    typeof rawSummary === "string" && rawSummary.trim().length
+      ? rawSummary.trim()
+      : formatAiSummary(_grade, _scoreNum);
 
   const result: ScoredSignal = {
     ...signal,
-    aiScore: normalizedScore,
-    aiGrade: grade,
-    aiSummary: summary,
-    totalScore: normalizedScore,
+    aiScore: _scoreNum,
+    aiGrade: _grade,
+    aiSummary: _summary,
+    totalScore: _scoreNum,
   };
 
   console.log("[aiScoring] Result:", {
     ticker: result.ticker,
-    score: result.aiScore,
-    grade: result.aiGrade,
+    score: _scoreNum,
+    grade: _grade,
   });
 
   try {

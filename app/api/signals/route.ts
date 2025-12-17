@@ -1,10 +1,28 @@
 import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-import { scoreSignalWithAI, RawSignal, ScoredSignal } from "@/lib/aiScoring";
+import {
+  scoreSignalWithAI,
+  RawSignal,
+  ScoredSignal,
+  gradeFromScore,
+  formatAiSummary,
+  AiGrade,
+} from "@/lib/aiScoring";
 import { sendPullbackAlert } from "@/lib/notify";
 import { bumpFunnel } from "@/lib/funnelMetrics";
 import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
+
+const PLACEHOLDER_SUMMARIES = new Set([
+  "AI scoring pending",
+  "No summary provided by AI.",
+]);
+
+function isPlaceholderSummary(value?: string) {
+  if (!value) return true;
+  const trimmed = value.trim();
+  return trimmed.length === 0 || PLACEHOLDER_SUMMARIES.has(trimmed);
+}
 
 async function appendSignal(signal: StoredSignal) {
   const signals = await readSignals();
@@ -137,9 +155,30 @@ export async function POST(req: Request) {
 
   try {
     scored = await scoreSignalWithAI(rawSignal);
+    const safeScore =
+      Number.isFinite(scored.aiScore ?? NaN) && scored.aiScore != null
+        ? scored.aiScore
+        : 0;
+    const safeGrade =
+      (typeof scored.aiGrade === "string" && scored.aiGrade.trim())
+        ? (scored.aiGrade.trim() as AiGrade)
+        : gradeFromScore(safeScore);
+    const rawSummary =
+      typeof scored.aiSummary === "string" ? scored.aiSummary.trim() : "";
+    const safeSummary =
+      rawSummary.length > 0 && !isPlaceholderSummary(rawSummary)
+        ? rawSummary
+        : formatAiSummary(safeGrade, safeScore);
     finalSignal = {
       ...placeholder,
       ...scored,
+      aiScore: safeScore,
+      aiGrade: safeGrade,
+      aiSummary: safeSummary,
+      totalScore:
+        typeof scored.totalScore === "number" && Number.isFinite(scored.totalScore)
+          ? scored.totalScore
+          : safeScore,
       status: "SCORED",
     };
     await replaceSignal(finalSignal);
