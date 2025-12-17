@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { recordSpend, recordAiCall, recordAiError } from "./aiMetrics";
+import { recordSpend, recordAiCall, recordAiError, writeAiHeartbeat } from "./aiMetrics";
 import { bumpFunnel } from "./funnelMetrics";
 import { buildSignalContext, SignalContext } from "@/lib/signalContext";
 
@@ -213,6 +213,12 @@ Return ONLY valid JSON with:
     score: result.aiScore,
     grade: result.aiGrade,
   });
+
+  try {
+    await writeAiHeartbeat();
+  } catch (err) {
+    console.warn("[aiScoring] heartbeat update failed", err);
+  }
 
   return result;
 }
