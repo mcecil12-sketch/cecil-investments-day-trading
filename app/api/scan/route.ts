@@ -96,7 +96,7 @@ const AI_SEED_MIN_REL_VOL = 0.3;
 const AI_SEED_MIN_RANGE_PCT = 0.08;
 const AI_SEED_MAX_VWAP_DISTANCE = 2;
 const AI_SEED_MIN_TREND_DELTA = -0.005;
-const MIN_AVG_VOL_SHARES = 300_000;
+const MIN_AVG_VOL_SHARES = Number(process.env.MIN_AVG_VOL_SHARES ?? 75_000);
 const MIN_AVG_DOLLAR_VOL = 2_500_000;
 
 type RejectKey =
@@ -417,10 +417,11 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
   );
   const failsDollarVol = avgDollarVol < MIN_AVG_DOLLAR_VOL;
   const failsSharesVol = avgVolShares < MIN_AVG_VOL_SHARES;
+  const volumeTooLow = failsDollarVol && failsSharesVol;
   if (last.c < DEFAULT_MIN_PRICE) {
     return { ok: false, reason: "priceOutOfRange", note: `price=${last.c.toFixed(2)}` };
   }
-  if (failsDollarVol || failsSharesVol) {
+  if (volumeTooLow) {
     return {
       ok: false,
       reason: "volumeTooLow",
@@ -689,6 +690,7 @@ export async function GET(req: Request) {
           const candidate = detectAiSeedCandidate(symbol, bars, reject);
           if (candidate) return candidate;
           reject(symbol, "notCandidate", "notCandidate");
+          return null;
         }
         return null;
       } catch (err) {
