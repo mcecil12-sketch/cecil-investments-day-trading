@@ -4,6 +4,7 @@ import "./globals.css";
 import { TradingProvider } from "./tradingContext";
 import { AutoManagePoller } from "@/components/AutoManagePoller";
 import { AppShell } from "@/components/AppShell";
+import { HeartbeatPoller } from "@/components/HeartbeatPoller";
 import { AiHeartbeatPing } from "@/components/AiHeartbeatPing";
 
 export const metadata: Metadata = {
@@ -31,6 +32,7 @@ export default function RootLayout({
       </head>
       <body>
         <TradingProvider>
+          <HeartbeatPoller />
           <AiHeartbeatPing />
           <AutoManagePoller />
           <AppShell>{children}</AppShell>

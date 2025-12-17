@@ -9,6 +9,13 @@ jobs:
   run-scanners:
     runs-on: ubuntu-latest
     steps:
+      - name: Refresh AI heartbeat
+        run: |
+          curl -sS "${{ secrets.SCANNER_BASE_URL }}/api/ai-heartbeat" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"source":"github-actions"}' || true
+
       - name: Hit VWAP pullback scanner
         run: |
           curl -sS "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=vwap" || true
