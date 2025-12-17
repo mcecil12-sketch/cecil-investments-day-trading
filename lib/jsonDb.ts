@@ -4,7 +4,12 @@ import { redis } from "@/lib/redis";
 
 export type SignalSide = "LONG" | "SHORT";
 
-export type StoredSignalStatus = "PENDING" | "APPROVED" | "DISMISSED" | "SCORED";
+export type StoredSignalStatus =
+  | "PENDING"
+  | "APPROVED"
+  | "DISMISSED"
+  | "SCORED"
+  | "ARCHIVED";
 
 export type StoredSignal = {
   id: string;
