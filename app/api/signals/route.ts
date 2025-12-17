@@ -12,6 +12,7 @@ import {
 import { sendPullbackAlert } from "@/lib/notify";
 import { bumpFunnel } from "@/lib/funnelMetrics";
 import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
+import { touchHeartbeat } from "@/lib/aiHeartbeat";
 
 const PLACEHOLDER_SUMMARIES = new Set([
   "AI scoring pending",
@@ -182,6 +183,7 @@ export async function POST(req: Request) {
       status: "SCORED",
     };
     await replaceSignal(finalSignal);
+    await touchHeartbeat();
   } catch (err: any) {
     console.error("AI scoring failed:", err);
   }
