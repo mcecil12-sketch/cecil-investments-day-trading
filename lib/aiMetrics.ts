@@ -10,9 +10,19 @@ export type AiMetrics = {
   errors: Record<string, number>;
 };
 
+// Single source of truth for the Redis key that stores daily metrics.
+export function aiMetricsKey(date: string) {
+  return `ai:metrics:v1:${date}`;
+}
+
+export function aiMetricsKeyToday() {
+  const date = etDateKey();
+  return { date, key: aiMetricsKey(date) };
+}
+
 export async function saveAiMetrics(metrics: AiMetrics): Promise<void> {
   if (!redis) return;
-  await redis.set(metricsKey(metrics.date), metrics);
+  await redis.set(aiMetricsKey(metrics.date), metrics);
 }
 
 /**
@@ -37,10 +47,6 @@ function etDateKey(): string {
   return getFunnelDayKey();
 }
 
-function metricsKey(date: string) {
-  return `ai:metrics:v1:${date}`;
-}
-
 const HEARTBEAT_KEY = "ai:heartbeat:v1";
 
 export async function getAiMetrics(date = etDateKey()): Promise<AiMetrics> {
@@ -54,7 +60,7 @@ export async function getAiMetrics(date = etDateKey()): Promise<AiMetrics> {
 
   if (!redis) return base;
 
-  const m = (await redis.get<AiMetrics>(metricsKey(date))) ?? base;
+  const m = (await redis.get<AiMetrics>(aiMetricsKey(date))) ?? base;
   const hb = (await redis.get<string>(HEARTBEAT_KEY)) ?? null;
 
   return {
@@ -72,7 +78,7 @@ export async function recordHeartbeat(): Promise<void> {
 export async function writeAiHeartbeat(): Promise<void> {
   if (!redis) return;
   const date = etDateKey();
-  const key = metricsKey(date);
+  const key = aiMetricsKey(date);
   const current =
     (await redis.get<AiMetrics>(key)) ?? {
       date,
@@ -89,7 +95,7 @@ export async function recordAiCall(model: string): Promise<void> {
   if (!redis) return;
 
   const date = etDateKey();
-  const key = metricsKey(date);
+  const key = aiMetricsKey(date);
 
   const current =
     (await redis.get<AiMetrics>(key)) ?? {
@@ -111,7 +117,7 @@ export async function recordAiError(model: string, message: string): Promise<voi
   if (!redis) return;
 
   const date = etDateKey();
-  const key = metricsKey(date);
+  const key = aiMetricsKey(date);
 
   const current =
     (await redis.get<AiMetrics>(key)) ?? {
@@ -144,4 +150,8 @@ export async function readTodayAiMetrics() {
     getAiMetrics(date),
   ]);
   return { budget, metrics };
+}
+
+export async function getAiBudget(date = etDateKey()) {
+  return getBudgetState(date);
 }
