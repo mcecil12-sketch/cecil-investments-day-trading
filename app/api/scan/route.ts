@@ -93,11 +93,15 @@ const DEFAULT_LIMIT = 600;
 const MAX_SIGNALS_PER_SCAN = 50;
 const AI_SEED_MIN_BARS = 12;
 const AI_SEED_MIN_REL_VOL = 0.3;
-const AI_SEED_MIN_RANGE_PCT = 0.08;
+const MIN_RANGE_PCT = Number(process.env.MIN_RANGE_PCT ?? 0.05);
 const AI_SEED_MAX_VWAP_DISTANCE = 2;
 const AI_SEED_MIN_TREND_DELTA = -0.005;
 const MIN_AVG_VOL_SHARES = Number(process.env.MIN_AVG_VOL_SHARES ?? 75_000);
 const MIN_AVG_DOLLAR_VOL = 2_500_000;
+const AI_SEED_REQUIRE_SETUP = (process.env.AI_SEED_REQUIRE_SETUP ?? "0") === "1";
+const AI_SEED_REQUIRE_RANGE = (process.env.AI_SEED_REQUIRE_RANGE ?? "0") === "1";
+const AI_SEED_MAX_POST = Number(process.env.AI_SEED_MAX_POST ?? 20);
+const AI_SEED_MAX_QUEUE = Number(process.env.AI_SEED_MAX_QUEUE ?? 10);
 
 type RejectKey =
   | "noBars"
@@ -437,7 +441,7 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
   }
 
   const rangePct = ((last.h - last.l) / last.c) * 100;
-  if (rangePct < AI_SEED_MIN_RANGE_PCT * 100) {
+  if (rangePct < MIN_RANGE_PCT * 100 && AI_SEED_REQUIRE_RANGE) {
     return { ok: false, reason: "rangeTooSmall", note: `rangePct=${rangePct.toFixed(2)}` };
   }
 
@@ -689,7 +693,11 @@ export async function GET(req: Request) {
         } else if (mode === "ai-seed") {
           const candidate = detectAiSeedCandidate(symbol, bars, reject);
           if (candidate) return candidate;
-          reject(symbol, "notCandidate", "notCandidate");
+          if (AI_SEED_REQUIRE_SETUP) {
+            reject(symbol, "notCandidate", "notCandidate");
+            return null;
+          }
+          // Without strict setup enforcement, let GPT judge these candidates.
           return null;
         }
         return null;
@@ -720,7 +728,12 @@ export async function GET(req: Request) {
   const topCandidates = filtered.slice(0, MAX_SIGNALS_PER_SCAN);
 
   const posted: OutgoingSignal[] = [];
+  let postedSignals = 0;
+  let queuedSignals = 0;
   for (const candidate of topCandidates) {
+    if (aiSeedMode && (postedSignals >= AI_SEED_MAX_POST || queuedSignals >= AI_SEED_MAX_QUEUE)) {
+      break;
+    }
     try {
       const payload = toOutgoing(candidate);
       const res = await fetch(`${baseUrl}/api/signals`, {
@@ -745,6 +758,10 @@ export async function GET(req: Request) {
 
       postedCount += 1;
       posted.push(payload);
+      if (aiSeedMode) {
+        postedSignals += 1;
+        queuedSignals += 1;
+      }
     } catch (err) {
       console.error("[SCAN] Failed posting candidate", candidate.ticker, err);
     }
