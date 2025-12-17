@@ -10,6 +10,25 @@ export type AiMetrics = {
   errors: Record<string, number>;
 };
 
+export async function saveAiMetrics(metrics: AiMetrics): Promise<void> {
+  if (!redis) return;
+  await redis.set(metricsKey(metrics.date), metrics);
+}
+
+/**
+ * Update lastHeartbeat in the persisted daily metrics record.
+ * This MUST write to the same storage/key that getAiMetrics() reads.
+ */
+export async function touchHeartbeat(nowIso: string) {
+  const m = await getAiMetrics();
+  const next: AiMetrics = {
+    ...m,
+    lastHeartbeat: nowIso,
+  };
+  await saveAiMetrics(next);
+  return next;
+}
+
 function isoNow() {
   return new Date().toISOString();
 }
