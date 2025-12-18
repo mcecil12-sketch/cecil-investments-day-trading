@@ -106,7 +106,7 @@ export async function POST(req: Request) {
     );
   }
 
-  await bumpTodayFunnel({ signalsReceived: 1, shownInApp: 1 });
+  await bumpTodayFunnel({ signalsReceived: 1 });
 
   const now = new Date().toISOString();
 
@@ -219,8 +219,13 @@ export async function POST(req: Request) {
     grade: scored.aiGrade,
   });
 
-  if (typeof scored.totalScore === "number" && scored.totalScore >= 8) {
-    await bumpTodayFunnel({ qualified: 1 });
+  const grade = finalSignal.aiGrade ?? finalSignal.grade ?? null;
+  const isQualified =
+    typeof grade === "string" &&
+    (grade.startsWith("A") || grade.startsWith("B"));
+
+  if (isQualified) {
+    await bumpTodayFunnel({ qualified: 1, shownInApp: 1 });
   }
 
   if (scored.aiGrade === "A" || scored.aiScore >= 9) {

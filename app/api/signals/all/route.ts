@@ -1,14 +1,25 @@
 import { NextResponse } from "next/server";
 import { readSignals } from "@/lib/jsonDb";
 
-export async function GET() {
-  const signals = await readSignals();
-
-  const out = signals.map((s) => ({
+function normalizeSignal(s: any) {
+  return {
     ...s,
     reasoning: s.reasoning ?? "",
     priority: typeof s.priority === "number" ? s.priority : 4.8,
-  }));
+    grade: s.grade ?? s.aiGrade ?? null,
+    score: s.score ?? s.totalScore ?? s.aiScore ?? null,
+  };
+}
 
-  return NextResponse.json({ signals: out });
+export async function GET() {
+  const signals = await readSignals();
+  const normalized = signals.map(normalizeSignal);
+  return NextResponse.json(
+    { signals: normalized },
+    {
+      headers: {
+        "Cache-Control": "no-store",
+      },
+    }
+  );
 }

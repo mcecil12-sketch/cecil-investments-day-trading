@@ -29,6 +29,8 @@ export type StoredSignal = {
   aiSummary?: string;
   totalScore?: number;
   priority?: number;
+  grade?: string | null;
+  score?: number | null;
   status: StoredSignalStatus;
 };
 
