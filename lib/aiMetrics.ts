@@ -36,13 +36,37 @@ export async function saveAiMetrics(metrics: AiMetrics): Promise<void> {
  */
 export async function touchHeartbeat(nowIso: string) {
   const { key, date } = aiMetricsKeyToday();
-  const current = await getAiMetrics();
+  if (!redis) {
+    return {
+      date,
+      calls: 0,
+      byModel: {},
+      lastHeartbeat: nowIso,
+      errors: {},
+    } as AiMetrics;
+  }
+
+  const base: AiMetrics = {
+    date,
+    calls: 0,
+    byModel: {},
+    lastHeartbeat: null,
+    errors: {},
+  };
+
+  const current = (await redis.get<AiMetrics>(key)) ?? base;
+
   const next: AiMetrics = {
+    ...base,
     ...current,
     date,
     lastHeartbeat: nowIso,
+    calls: current.calls ?? 0,
+    byModel: (current.byModel ?? {}) as Record<string, number>,
+    errors: (current.errors ?? {}) as Record<string, number>,
   };
-  await redis?.set(key, next);
+
+  await Promise.all([redis.set(HEARTBEAT_KEY, nowIso), redis.set(key, next)]);
   return next;
 }
 
@@ -73,7 +97,7 @@ export async function getAiMetrics(date = etDateKey()): Promise<AiMetrics> {
   return {
     ...m,
     date,
-    lastHeartbeat: hb,
+    lastHeartbeat: hb ?? m.lastHeartbeat ?? null,
   };
 }
 
@@ -110,6 +134,7 @@ export async function recordAiCall(model: string): Promise<void> {
       calls: 0,
       byModel: {},
       lastHeartbeat: null,
+      errors: {},
     };
 
   current.calls = (current.calls ?? 0) + 1;
