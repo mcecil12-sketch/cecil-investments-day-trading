@@ -15,6 +15,12 @@ import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
 import { touchHeartbeat } from "@/lib/aiHeartbeat";
 import { notifyOnce } from "@/lib/notifyOnce";
 
+function isQualifiedGrade(grade: unknown) {
+  if (typeof grade !== "string") return false;
+  const norm = grade.trim().toUpperCase();
+  return norm.startsWith("A") || norm.startsWith("B");
+}
+
 const PLACEHOLDER_SUMMARIES = new Set([
   "AI scoring pending",
   "No summary provided by AI.",
@@ -220,12 +226,18 @@ export async function POST(req: Request) {
   });
 
   const grade = finalSignal.aiGrade ?? finalSignal.grade ?? null;
-  const isQualified =
-    typeof grade === "string" &&
-    (grade.startsWith("A") || grade.startsWith("B"));
-
-  if (isQualified) {
-    await bumpTodayFunnel({ qualified: 1, shownInApp: 1 });
+  try {
+    if (finalSignal.status === "SCORED") {
+      await bumpTodayFunnel({ gptScored: 1 });
+    }
+    if (finalSignal.status !== "ARCHIVED") {
+      await bumpTodayFunnel({ shownInApp: 1 });
+    }
+    if (isQualifiedGrade(grade)) {
+      await bumpTodayFunnel({ qualified: 1 });
+    }
+  } catch (err) {
+    console.log("[funnel] bump failed (non-fatal)", err);
   }
 
   if (scored.aiGrade === "A" || scored.aiScore >= 9) {

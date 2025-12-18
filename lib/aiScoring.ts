@@ -186,7 +186,7 @@ Return ONLY valid JSON with:
   } catch (e: any) {
     console.log("[aiScoring] recordSpend failed (non-fatal):", e?.message ?? String(e));
   }
-  await bumpTodayFunnel({ gptScored: 1, gptScoredByModel: { [model]: 1 } });
+  await bumpTodayFunnel({ gptScoredByModel: { [model]: 1 } });
 
   const content = completion.choices[0]?.message?.content ?? "{}";
 
