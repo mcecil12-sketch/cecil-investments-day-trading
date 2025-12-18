@@ -16,8 +16,13 @@ export function aiMetricsKey(date: string) {
 }
 
 export function aiMetricsKeyToday() {
-  const date = etDateKey();
-  return { date, key: aiMetricsKey(date) };
+  const date = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+  return { key: aiMetricsKey(date), date };
 }
 
 export async function saveAiMetrics(metrics: AiMetrics): Promise<void> {
@@ -30,12 +35,14 @@ export async function saveAiMetrics(metrics: AiMetrics): Promise<void> {
  * This MUST write to the same storage/key that getAiMetrics() reads.
  */
 export async function touchHeartbeat(nowIso: string) {
-  const m = await getAiMetrics();
+  const { key, date } = aiMetricsKeyToday();
+  const current = await getAiMetrics();
   const next: AiMetrics = {
-    ...m,
+    ...current,
+    date,
     lastHeartbeat: nowIso,
   };
-  await saveAiMetrics(next);
+  await redis?.set(key, next);
   return next;
 }
 
