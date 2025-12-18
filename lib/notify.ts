@@ -1,5 +1,47 @@
 const PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json";
 
+export async function notify(title: string, message: string) {
+  const user = process.env.PUSHOVER_USER_KEY;
+  const token =
+    process.env.PUSHOVER_API_TOKEN ||
+    process.env.PUSHOVER_APP_TOKEN;
+  if (!user || !token) {
+    const missing = {
+      user: Boolean(user),
+      token: Boolean(token),
+    };
+    console.log("[notify] missing env; skipping", missing);
+    return { ok: false, skipped: true, missing };
+  }
+
+  const body = new URLSearchParams({
+    token,
+    user,
+    title,
+    message,
+  });
+
+  const resp = await fetch(PUSHOVER_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  const text = await resp.text();
+  let json: any = null;
+  try {
+    json = JSON.parse(text);
+  } catch {}
+
+  if (!resp.ok) {
+    console.log("[notify] pushover error", { status: resp.status, body: json ?? text });
+    return { ok: false, status: resp.status, body: json ?? text };
+  }
+
+  console.log("[notify] pushover ok", json ?? text);
+  return { ok: true, status: resp.status, body: json ?? text };
+}
+
 export async function sendPullbackAlert(opts: {
   ticker: string;
   side: "LONG" | "SHORT";
@@ -8,16 +50,7 @@ export async function sendPullbackAlert(opts: {
   score?: number;
   reason?: string;
 }) {
-  const token =
-    process.env.PUSHOVER_API_TOKEN ||
-    process.env.PUSHOVER_APP_TOKEN;
-  const user = process.env.PUSHOVER_USER_KEY;
   const url = process.env.PULLBACK_ALERT_URL;
-
-  if (!token || !user) {
-    console.warn("[notify] missing PUSHOVER_USER_KEY or PUSHOVER_API_TOKEN; skipping");
-    return;
-  }
 
   const { ticker, side, entryPrice, stopPrice, score, reason } = opts;
 
@@ -35,34 +68,10 @@ export async function sendPullbackAlert(opts: {
 
   const message = bodyLines.join("\n");
 
-  const formData = new URLSearchParams();
-  formData.append("token", token);
-  formData.append("user", user);
-  formData.append("title", title);
-  formData.append("message", message);
+  const result = await notify(title, message);
 
-  // Optional: pick a louder sound (see Pushover docs for names: "siren", "bike", etc.)
-  // formData.append("sound", "siren");
-
-  if (url) {
-    formData.append("url", url);
-    formData.append("url_title", "Open Cecil Trading · Today");
+  if (!result.ok) {
+    console.warn("[notify] sendPullbackAlert failed", result);
   }
-
-  try {
-    const res = await fetch(PUSHOVER_API_URL, {
-      method: "POST",
-      body: formData,
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      console.error("[notify] Pushover error:", res.status, text);
-    }
-  } catch (err) {
-    console.error("[notify] Pushover request failed", err);
-  }
+  return result;
 }
