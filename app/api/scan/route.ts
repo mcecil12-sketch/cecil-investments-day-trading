@@ -2,7 +2,7 @@
 import { NextResponse } from "next/server";
 import { headers } from "next/headers";
 import { AlpacaBar, fetchRecentBars } from "@/lib/alpaca";
-import { bumpFunnel } from "@/lib/funnelMetrics";
+import { bumpTodayFunnel } from "@/lib/funnelRedis";
 
 const DEFAULT_WATCHLIST = ["SPY", "QQQ", "TSLA", "NVDA", "META", "AMD"];
 
@@ -504,7 +504,7 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const search = url.searchParams;
 
-  bumpFunnel({ scansRun: 1 });
+  await bumpTodayFunnel({ scansRun: 1 });
 
   const hdrs = headers();
   const authCookie = hdrs.get("cookie") || "";
@@ -788,11 +788,11 @@ export async function GET(req: Request) {
       : null;
 
   if (result.candidateCount) {
-    bumpFunnel({ candidatesFound: result.candidateCount });
+    await bumpTodayFunnel({ candidatesFound: result.candidateCount });
   }
 
   if (result.postedCount) {
-    bumpFunnel({ signalsPosted: result.postedCount });
+    await bumpTodayFunnel({ signalsPosted: result.postedCount });
   }
 
   return NextResponse.json({

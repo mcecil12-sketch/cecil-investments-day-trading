@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import { recordSpend, recordAiCall, recordAiError, writeAiHeartbeat } from "./aiMetrics";
-import { bumpFunnel } from "./funnelMetrics";
+import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { buildSignalContext, SignalContext } from "@/lib/signalContext";
 
 export type Side = "LONG" | "SHORT";
@@ -186,7 +186,7 @@ Return ONLY valid JSON with:
   } catch (e: any) {
     console.log("[aiScoring] recordSpend failed (non-fatal):", e?.message ?? String(e));
   }
-  bumpFunnel({ gptScored: 1, gptScoredByModel: { [model]: 1 } });
+  await bumpTodayFunnel({ gptScored: 1, gptScoredByModel: { [model]: 1 } });
 
   const content = completion.choices[0]?.message?.content ?? "{}";
 

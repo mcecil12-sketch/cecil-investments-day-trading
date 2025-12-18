@@ -1,6 +1,6 @@
 import { redis } from "@/lib/redis";
 import { getBudgetState, addSpend } from "@/lib/aiBudget";
-import { getFunnelDayKey } from "@/lib/funnelMetrics";
+import { getTradingDayKey } from "@/lib/tradingDay";
 
 export type AiMetrics = {
   date: string; // YYYY-MM-DD (ET)
@@ -75,7 +75,7 @@ function isoNow() {
 }
 
 function etDateKey(): string {
-  return getFunnelDayKey();
+  return getTradingDayKey();
 }
 
 const HEARTBEAT_KEY = "ai:heartbeat:v1";

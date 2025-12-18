@@ -10,7 +10,7 @@ import {
   AiGrade,
 } from "@/lib/aiScoring";
 import { sendPullbackAlert } from "@/lib/notify";
-import { bumpFunnel } from "@/lib/funnelMetrics";
+import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
 import { touchHeartbeat } from "@/lib/aiHeartbeat";
 import { notifyOnce } from "@/lib/notifyOnce";
@@ -106,7 +106,7 @@ export async function POST(req: Request) {
     );
   }
 
-  bumpFunnel({ signalsReceived: 1 });
+  await bumpTodayFunnel({ signalsReceived: 1, shownInApp: 1 });
 
   const now = new Date().toISOString();
 
@@ -220,7 +220,7 @@ export async function POST(req: Request) {
   });
 
   if (typeof scored.totalScore === "number" && scored.totalScore >= 8) {
-    bumpFunnel({ qualified: 1 });
+    await bumpTodayFunnel({ qualified: 1 });
   }
 
   if (scored.aiGrade === "A" || scored.aiScore >= 9) {

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { readTodayFunnel } from "@/lib/funnelMetrics";
+import { readTodayFunnel } from "@/lib/funnelRedis";
 
 export const dynamic = "force-dynamic";
 
@@ -10,7 +10,7 @@ const CACHE_HEADERS = {
 };
 
 export async function GET() {
-  const today = readTodayFunnel();
+  const today = await readTodayFunnel();
   return NextResponse.json(
     {
       today,
