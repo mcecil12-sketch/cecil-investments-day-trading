@@ -44,7 +44,12 @@ export default function LoginPage() {
       }
 
       // On success, go to resolved target
+      router.refresh();
       router.replace(redirectTarget);
+
+      if (typeof window !== "undefined") {
+        window.location.assign(redirectTarget);
+      }
     } catch (err: any) {
       console.error("Login error:", err);
       setError(err?.message || "Login failed.");
