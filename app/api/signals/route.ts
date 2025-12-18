@@ -13,6 +13,7 @@ import { sendPullbackAlert } from "@/lib/notify";
 import { bumpFunnel } from "@/lib/funnelMetrics";
 import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
 import { touchHeartbeat } from "@/lib/aiHeartbeat";
+import { notifyOnce } from "@/lib/notifyOnce";
 
 const PLACEHOLDER_SUMMARIES = new Set([
   "AI scoring pending",
@@ -184,6 +185,30 @@ export async function POST(req: Request) {
     };
     await replaceSignal(finalSignal);
     await touchHeartbeat();
+
+    const minScore = Number(process.env.APPROVAL_MIN_AI_SCORE ?? "7.5");
+    const aiScore = typeof finalSignal.aiScore === "number" ? finalSignal.aiScore : 0;
+    const isApprovalQueueItem = finalSignal.status === "SCORED" && aiScore >= minScore;
+
+    if (isApprovalQueueItem) {
+      const dedupeKey = `notify:approval:v1:${finalSignal.id}`;
+      const once = await notifyOnce(dedupeKey);
+      if (once.shouldNotify) {
+        await sendPullbackAlert({
+          ticker: finalSignal.ticker,
+          side: finalSignal.side,
+          entryPrice: finalSignal.entryPrice,
+          stopPrice: finalSignal.stopPrice ?? null,
+          score: aiScore,
+          reason: `In approval queue (score ≥ ${minScore}).`,
+        });
+      } else {
+        console.log("[notify] skipped approval alert (deduped)", {
+          id: finalSignal.id,
+          reason: once.reason,
+        });
+      }
+    }
   } catch (err: any) {
     console.error("AI scoring failed:", err);
   }
