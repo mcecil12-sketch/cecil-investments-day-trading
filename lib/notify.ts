@@ -8,12 +8,14 @@ export async function sendPullbackAlert(opts: {
   score?: number;
   reason?: string;
 }) {
-  const token = process.env.PUSHOVER_API_TOKEN;
+  const token =
+    process.env.PUSHOVER_API_TOKEN ||
+    process.env.PUSHOVER_APP_TOKEN;
   const user = process.env.PUSHOVER_USER_KEY;
   const url = process.env.PULLBACK_ALERT_URL;
 
   if (!token || !user) {
-    console.warn("[notify] Pushover env vars missing, skipping alert");
+    console.warn("[notify] missing PUSHOVER_USER_KEY or PUSHOVER_API_TOKEN; skipping");
     return;
   }
 
