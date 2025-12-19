@@ -2,7 +2,7 @@ name: Market Scanner
 
 on:
   schedule:
-    - cron: "*/5 13-20 * * 1-5"
+    - cron: "*/5 * * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -27,6 +27,14 @@ jobs:
       - name: Hit compression/NR7 scanner
         run: |
           curl -sS "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=compression" || true
+
+      - name: Hit ai-seed scanner with retries
+        run: |
+          set -e
+          echo "UTC now: $(date -u)"
+          echo "Hitting: $SCANNER_BASE_URL/api/scan?mode=ai-seed"
+          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
+            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=ai-seed"
 
       # Uncomment to backstop premarket via Actions as well
       # - name: Hit premarket VWAP scanner
