@@ -18,34 +18,46 @@ jobs:
 
       - name: Hit VWAP pullback scanner
         run: |
+          RUN_ID="gh-${{ github.run_id }}-${{ github.run_attempt }}"
           curl -sS -L --retry 3 --retry-delay 3 --retry-all-errors \
             -H "x-scanner-token: ${{ secrets.SCANNER_TOKEN }}" \
+            -H "x-scan-source: github-actions" \
+            -H "x-scan-run-id: ${RUN_ID}" \
             -w "HTTP_STATUS=%{http_code}\n" \
-            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=vwap" || true
+            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=vwap" | tail -200 || true
 
       - name: Hit breakout scanner
         run: |
+          RUN_ID="gh-${{ github.run_id }}-${{ github.run_attempt }}"
           curl -sS -L --retry 3 --retry-delay 3 --retry-all-errors \
             -H "x-scanner-token: ${{ secrets.SCANNER_TOKEN }}" \
+            -H "x-scan-source: github-actions" \
+            -H "x-scan-run-id: ${RUN_ID}" \
             -w "HTTP_STATUS=%{http_code}\n" \
-            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=breakout" || true
+            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=breakout" | tail -200 || true
 
       - name: Hit compression/NR7 scanner
         run: |
+          RUN_ID="gh-${{ github.run_id }}-${{ github.run_attempt }}"
           curl -sS -L --retry 3 --retry-delay 3 --retry-all-errors \
             -H "x-scanner-token: ${{ secrets.SCANNER_TOKEN }}" \
+            -H "x-scan-source: github-actions" \
+            -H "x-scan-run-id: ${RUN_ID}" \
             -w "HTTP_STATUS=%{http_code}\n" \
-            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=compression" || true
+            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=compression" | tail -200 || true
 
       - name: Hit ai-seed scanner with retries
         run: |
           set -e
+          RUN_ID="gh-${{ github.run_id }}-${{ github.run_attempt }}"
           echo "UTC now: $(date -u)"
           echo "Hitting: $SCANNER_BASE_URL/api/scan?mode=ai-seed"
           curl -fsS -L --retry 5 --retry-delay 5 --retry-all-errors \
             -H "x-scanner-token: ${{ secrets.SCANNER_TOKEN }}" \
+            -H "x-scan-source: github-actions" \
+            -H "x-scan-run-id: ${RUN_ID}" \
             -w "HTTP_STATUS=%{http_code}\n" \
-            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=ai-seed"
+            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=ai-seed" | tail -200
 
       # Uncomment to backstop premarket via Actions as well
       # - name: Hit premarket VWAP scanner

@@ -2,7 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { headers } from "next/headers";
 import { AlpacaBar, fetchRecentBars } from "@/lib/alpaca";
-import { bumpTodayFunnel } from "@/lib/funnelRedis";
+import { bumpScanRun, bumpScanSkip, bumpTodayFunnel } from "@/lib/funnelRedis";
 
 const DEFAULT_WATCHLIST = ["SPY", "QQQ", "TSLA", "NVDA", "META", "AMD"];
 
@@ -501,14 +501,10 @@ function detectAiSeedCandidate(
 // --- Main handler ------------------------------------------------------------
 
 export async function GET(req: NextRequest) {
-  try {
-    await bumpTodayFunnel({ scansRun: 1 });
-  } catch (err) {
-    console.log("[funnel] bump scansRun failed (non-fatal)", err);
-  }
-
   const url = new URL(req.url);
   const search = url.searchParams;
+  const scanSource = req.headers.get("x-scan-source") ?? "unknown";
+  const scanRunId = req.headers.get("x-scan-run-id") ?? null;
 
   const hdrs = headers();
   const authCookie = hdrs.get("cookie") || "";
@@ -553,7 +549,10 @@ export async function GET(req: NextRequest) {
 
     if (clock && clock.is_open === false) {
       try {
-        await bumpTodayFunnel({ scansSkipped: 1 });
+        await bumpScanSkip(mode, {
+          source: scanSource,
+          runId: scanRunId,
+        });
       } catch (err) {
         console.log("[funnel] bump scansSkipped failed (non-fatal)", err);
       }
@@ -569,6 +568,11 @@ export async function GET(req: NextRequest) {
       );
     }
   }
+
+  await bumpScanRun(mode, {
+    source: scanSource,
+    runId: scanRunId,
+  });
 
   const limit =
     Number(search.get("limit") ?? DEFAULT_LIMIT) || DEFAULT_LIMIT;

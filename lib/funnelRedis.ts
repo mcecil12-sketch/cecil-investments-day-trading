@@ -1,126 +1,157 @@
 import { redis } from "@/lib/redis";
-import { getTradingDayKey } from "@/lib/tradingDay";
 
-export type FunnelCounters = {
-  scansRun: number;
-  scansSkipped: number;
-  candidatesFound: number;
-  signalsPosted: number;
-  signalsReceived: number;
-  gptScored: number;
-  qualified: number;
-  shownInApp: number;
-  approvals: number;
-  ordersPlaced: number;
-  fills: number;
+const KEY_PREFIX = "funnel:v2:";
+const TTL_SECONDS = 60 * 60 * 48;
+
+const NUMERIC_COUNTERS = [
+  "scansRun",
+  "scansSkipped",
+  "candidatesFound",
+  "signalsPosted",
+  "signalsReceived",
+  "gptScored",
+  "qualified",
+  "shownInApp",
+  "approvals",
+  "ordersPlaced",
+  "fills",
+] as const;
+
+type NumericCounterKey = (typeof NUMERIC_COUNTERS)[number];
+
+type FunnelCounters = Record<NumericCounterKey, number>;
+
+type BumpFields = Partial<FunnelCounters> & {
+  gptScoredByModel?: Record<string, number>;
 };
 
-export type FunnelStats = FunnelCounters & {
+type BumpOptions = {
+  mode?: string | null;
+  source?: string | null;
+  runId?: string | null;
+  status?: string | null;
+};
+
+export type FunnelToday = FunnelCounters & {
   date: string;
   updatedAt: string;
+  scanRunsByMode: Record<string, number>;
+  scanSkipsByMode: Record<string, number>;
+  lastScanAt: string | null;
+  lastScanMode: string | null;
+  lastScanSource: string | null;
+  lastScanRunId: string | null;
+  lastScanStatus: string | null;
   gptScoredByModel: Record<string, number>;
 };
 
-const TTL_SECONDS = 60 * 60 * 48;
-
-const BASE_COUNTERS: FunnelCounters = {
-  scansRun: 0,
-  scansSkipped: 0,
-  candidatesFound: 0,
-  signalsPosted: 0,
-  signalsReceived: 0,
-  gptScored: 0,
-  qualified: 0,
-  shownInApp: 0,
-  approvals: 0,
-  ordersPlaced: 0,
-  fills: 0,
-};
-
-function keyForDay(date: string) {
-  return `funnel:${date}`;
+function etDate(d = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
 }
 
-function makeEmpty(date: string): FunnelStats {
+function defaultToday(date: string): FunnelToday {
+  const now = new Date().toISOString();
   return {
-    ...BASE_COUNTERS,
     date,
-    updatedAt: new Date().toISOString(),
+    updatedAt: now,
+    scanRunsByMode: {},
+    scanSkipsByMode: {},
+    lastScanAt: null,
+    lastScanMode: null,
+    lastScanSource: null,
+    lastScanRunId: null,
+    lastScanStatus: null,
     gptScoredByModel: {},
+    ...NUMERIC_COUNTERS.reduce((acc, key) => {
+      acc[key] = 0;
+      return acc;
+    }, {} as FunnelCounters),
   };
 }
 
-export function getTodayKey() {
-  const date = getTradingDayKey();
-  return { date, key: keyForDay(date) };
+function targetKey(date: string) {
+  return `${KEY_PREFIX}${date}`;
 }
 
-export async function readTodayFunnel(): Promise<FunnelStats> {
-  const { date, key } = getTodayKey();
-  if (!redis) {
-    return makeEmpty(date);
-  }
-  const stored = (await redis.get<FunnelStats>(key)) ?? makeEmpty(date);
-  return {
-    ...makeEmpty(date),
-    ...stored,
-    date,
-    updatedAt: stored.updatedAt ?? new Date().toISOString(),
-    gptScoredByModel: { ...(stored.gptScoredByModel ?? {}) },
-  };
+async function persistToday(today: FunnelToday) {
+  if (!redis) return;
+  await redis.set(targetKey(today.date), today, { ex: TTL_SECONDS });
+}
+
+export async function readTodayFunnel(): Promise<FunnelToday> {
+  const date = etDate();
+  const key = targetKey(date);
+  if (!redis) return defaultToday(date);
+  const stored = (await redis.get<FunnelToday>(key)) ?? defaultToday(date);
+  return stored;
 }
 
 export async function bumpTodayFunnel(
-  updates: Partial<FunnelCounters> & {
-    gptScoredByModel?: Record<string, number>;
-  }
-): Promise<FunnelStats> {
-  const { date, key } = getTodayKey();
+  fields: BumpFields,
+  opts: BumpOptions = {}
+): Promise<FunnelToday> {
+  const date = etDate();
+  const key = targetKey(date);
   const now = new Date().toISOString();
-  const { gptScoredByModel, ...rest } = updates;
-  const countersUpdate = rest as Partial<FunnelCounters>;
+  const base = redis ? (await redis.get<FunnelToday>(key)) ?? defaultToday(date) : defaultToday(date);
 
-  if (!redis) {
-    const fallback = makeEmpty(date);
-    for (const [field, value] of Object.entries(countersUpdate)) {
-      if (typeof value !== "number") continue;
-      const keyField = field as keyof FunnelCounters;
-      fallback[keyField] = (fallback[keyField] ?? 0) + value;
-    }
-    if (gptScoredByModel) {
-      for (const [model, value] of Object.entries(gptScoredByModel)) {
-        if (typeof value !== "number") continue;
-        fallback.gptScoredByModel[model] =
-          (fallback.gptScoredByModel[model] ?? 0) + value;
-      }
-    }
-    fallback.updatedAt = now;
-    return fallback;
-  }
-
-  const base = (await redis.get<FunnelStats>(key)) ?? makeEmpty(date);
-  const next: FunnelStats = {
-    ...makeEmpty(date),
+  const next: FunnelToday = {
     ...base,
-    date,
-    updatedAt: now,
+    scanRunsByMode: { ...(base.scanRunsByMode ?? {}) },
+    scanSkipsByMode: { ...(base.scanSkipsByMode ?? {}) },
     gptScoredByModel: { ...(base.gptScoredByModel ?? {}) },
+    updatedAt: now,
+    date,
   };
 
-  for (const [field, value] of Object.entries(countersUpdate)) {
-    if (typeof value !== "number") continue;
-    const keyField = field as keyof FunnelCounters;
-    next[keyField] = (next[keyField] ?? 0) + value;
-  }
-
-  if (gptScoredByModel) {
-    for (const [model, value] of Object.entries(gptScoredByModel)) {
-      if (typeof value !== "number") continue;
-      next.gptScoredByModel[model] =
-        (next.gptScoredByModel[model] ?? 0) + value;
+  for (const key of NUMERIC_COUNTERS) {
+    const delta = fields[key];
+    if (typeof delta === "number" && delta !== 0) {
+      next[key] = (next[key] ?? 0) + delta;
     }
   }
 
-  await redis.set(key, next, { ex: TTL_SECONDS });
+  if (fields.gptScoredByModel) {
+    for (const [model, value] of Object.entries(fields.gptScoredByModel)) {
+      if (typeof value !== "number") continue;
+      next.gptScoredByModel[model] = (next.gptScoredByModel[model] ?? 0) + value;
+    }
+  }
+
+  if (opts.mode) {
+    if (fields.scansRun) {
+      next.scanRunsByMode[opts.mode] = (next.scanRunsByMode[opts.mode] ?? 0) + fields.scansRun;
+    }
+    if (fields.scansSkipped) {
+      next.scanSkipsByMode[opts.mode] = (next.scanSkipsByMode[opts.mode] ?? 0) + fields.scansSkipped;
+    }
+    next.lastScanMode = opts.mode;
+  }
+
+  if (opts.source) next.lastScanSource = opts.source;
+  if (opts.runId) next.lastScanRunId = opts.runId;
+  if (opts.status) next.lastScanStatus = opts.status;
+  next.lastScanAt = now;
+
+  await persistToday(next);
   return next;
+}
+
+export async function bumpScanRun(mode: string, opts: BumpOptions = {}) {
+  return bumpTodayFunnel(
+    { scansRun: 1 },
+    { ...opts, mode, status: opts.status ?? "RUN" }
+  );
+}
+
+export async function bumpScanSkip(mode: string, opts: BumpOptions = {}) {
+  return bumpTodayFunnel(
+    { scansRun: 1, scansSkipped: 1 },
+    { ...opts, mode, status: opts.status ?? "SKIP" }
+  );
 }
