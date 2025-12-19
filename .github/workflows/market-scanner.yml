@@ -11,29 +11,40 @@ jobs:
     steps:
       - name: Refresh AI heartbeat
         run: |
-          curl -sS "${{ secrets.SCANNER_BASE_URL }}/api/ai-heartbeat" \
+          curl -sS -L -w "HTTP_STATUS=%{http_code}\n" "${{ secrets.SCANNER_BASE_URL }}/api/ai-heartbeat" \
             -X POST \
             -H "Content-Type: application/json" \
             -d '{"source":"github-actions"}' || true
 
       - name: Hit VWAP pullback scanner
         run: |
-          curl -sS "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=vwap" || true
+          curl -sS -L --retry 3 --retry-delay 3 --retry-all-errors \
+            -H "x-scanner-token: ${{ secrets.SCANNER_TOKEN }}" \
+            -w "HTTP_STATUS=%{http_code}\n" \
+            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=vwap" || true
 
       - name: Hit breakout scanner
         run: |
-          curl -sS "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=breakout" || true
+          curl -sS -L --retry 3 --retry-delay 3 --retry-all-errors \
+            -H "x-scanner-token: ${{ secrets.SCANNER_TOKEN }}" \
+            -w "HTTP_STATUS=%{http_code}\n" \
+            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=breakout" || true
 
       - name: Hit compression/NR7 scanner
         run: |
-          curl -sS "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=compression" || true
+          curl -sS -L --retry 3 --retry-delay 3 --retry-all-errors \
+            -H "x-scanner-token: ${{ secrets.SCANNER_TOKEN }}" \
+            -w "HTTP_STATUS=%{http_code}\n" \
+            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=compression" || true
 
       - name: Hit ai-seed scanner with retries
         run: |
           set -e
           echo "UTC now: $(date -u)"
           echo "Hitting: $SCANNER_BASE_URL/api/scan?mode=ai-seed"
-          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors \
+          curl -fsS -L --retry 5 --retry-delay 5 --retry-all-errors \
+            -H "x-scanner-token: ${{ secrets.SCANNER_TOKEN }}" \
+            -w "HTTP_STATUS=%{http_code}\n" \
             "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=ai-seed"
 
       # Uncomment to backstop premarket via Actions as well

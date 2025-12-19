@@ -1,3 +1,5 @@
+"use server";
+
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
@@ -10,6 +12,13 @@ const PUBLIC_PATHS = [
   "/api/ai-heartbeat",
 ];
 
+function isScannerAuthed(req: NextRequest) {
+  const token = process.env.SCANNER_TOKEN;
+  if (!token) return false;
+  const header = req.headers.get("x-scanner-token");
+  return Boolean(header && header === token);
+}
+
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
@@ -18,6 +27,10 @@ export function middleware(req: NextRequest) {
     pathname.startsWith("/api/health") ||
     PUBLIC_PATHS.some((p) => pathname.startsWith(p))
   ) {
+    return NextResponse.next();
+  }
+
+  if (pathname.startsWith("/api/scan") && isScannerAuthed(req)) {
     return NextResponse.next();
   }
 
