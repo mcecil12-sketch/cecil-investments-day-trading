@@ -1,5 +1,5 @@
 // app/api/scan/route.ts
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { headers } from "next/headers";
 import { AlpacaBar, fetchRecentBars } from "@/lib/alpaca";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
@@ -500,11 +500,15 @@ function detectAiSeedCandidate(
 
 // --- Main handler ------------------------------------------------------------
 
-export async function GET(req: Request) {
+export async function GET(req: NextRequest) {
+  try {
+    await bumpTodayFunnel({ scansRun: 1 });
+  } catch (err) {
+    console.log("[funnel] bump scansRun failed (non-fatal)", err);
+  }
+
   const url = new URL(req.url);
   const search = url.searchParams;
-
-  await bumpTodayFunnel({ scansRun: 1 });
 
   const hdrs = headers();
   const authCookie = hdrs.get("cookie") || "";
@@ -548,6 +552,11 @@ export async function GET(req: Request) {
       .catch(() => null);
 
     if (clock && clock.is_open === false) {
+      try {
+        await bumpTodayFunnel({ scansSkipped: 1 });
+      } catch (err) {
+        console.log("[funnel] bump scansSkipped failed (non-fatal)", err);
+      }
       return NextResponse.json(
         {
           status: "ok",

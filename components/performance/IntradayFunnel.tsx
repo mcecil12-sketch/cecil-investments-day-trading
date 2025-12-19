@@ -6,6 +6,7 @@ type FunnelDay = {
   date: string;
   updatedAt: string;
   scansRun: number;
+  scansSkipped: number;
   candidatesFound: number;
   signalsPosted: number;
   signalsReceived: number;
@@ -54,6 +55,10 @@ export function IntradayFunnel() {
         <div className="funnel-row">
           <span>Scans run</span>
           <span className="funnel-val">{today.scansRun}</span>
+        </div>
+        <div className="funnel-row">
+          <span>Scans skipped</span>
+          <span className="funnel-val">{today.scansSkipped}</span>
         </div>
         <div className="funnel-row">
           <span>Candidates found</span>

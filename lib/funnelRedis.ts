@@ -3,6 +3,7 @@ import { getTradingDayKey } from "@/lib/tradingDay";
 
 export type FunnelCounters = {
   scansRun: number;
+  scansSkipped: number;
   candidatesFound: number;
   signalsPosted: number;
   signalsReceived: number;
@@ -24,6 +25,7 @@ const TTL_SECONDS = 60 * 60 * 48;
 
 const BASE_COUNTERS: FunnelCounters = {
   scansRun: 0,
+  scansSkipped: 0,
   candidatesFound: 0,
   signalsPosted: 0,
   signalsReceived: 0,
