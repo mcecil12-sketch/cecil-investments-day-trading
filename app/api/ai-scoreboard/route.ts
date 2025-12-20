@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
+import { minScoreToQualify } from "@/lib/aiQualify";
 
 export const dynamic = "force-dynamic";
 
@@ -66,7 +67,19 @@ export async function GET(req: Request) {
     }
   }
 
-  const qualified = scored.filter((s) => (s.status ?? "").toUpperCase() === "QUALIFIED").length;
+  const min = minScoreToQualify();
+
+  const qualifiedByThreshold = scored.filter(
+    (s) =>
+      (s.status || "").toUpperCase() === "SCORED" &&
+      typeof s.score === "number" &&
+      s.score >= min
+  ).length;
+
+  const qualifiedByStatus = scored.filter(
+    (s) => (s.status || "").toUpperCase() === "QUALIFIED"
+  ).length;
+
   const total = scored.length;
 
   const recent = scored
@@ -77,8 +90,11 @@ export async function GET(req: Request) {
   return NextResponse.json({
     ok: true,
     totalScored: total,
-    qualified,
-    qualifiedRate: total ? qualified / total : 0,
+    qualified: qualifiedByThreshold,
+    qualifiedRate: total ? qualifiedByThreshold / total : 0,
+    qualifiedByThreshold,
+    qualifiedByStatus,
+    minScoreToQualify: min,
     avgScore: n ? sum / n : null,
     gradeCounts,
     recent,
