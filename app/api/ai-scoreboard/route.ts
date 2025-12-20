@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
-import { redis } from "@/lib/redis";
 
 export const dynamic = "force-dynamic";
 
@@ -9,9 +8,10 @@ type Signal = {
   ticker: string;
   createdAt?: string;
   status?: string;
+  // canonical fields (aiScore/grade/score)
+  aiScore?: number;
   score?: number;
   grade?: string;
-  ai?: { score?: number; grade?: string };
 };
 
 function toNum(x: any) {
@@ -25,18 +25,33 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
 
-  const key = "signals:all:v1";
-  const raw = await redis?.get<Signal[]>(key);
-  const list: Signal[] = Array.isArray(raw) ? raw : [];
+  const url = new URL(req.url);
+  const base = `${url.protocol}//${url.host}`;
+  const resp = await fetch(`${base}/api/signals/all`, {
+    headers: {
+      cookie: req.headers.get("cookie") || "",
+    },
+    cache: "no-store",
+  });
+
+  if (!resp.ok) {
+    return NextResponse.json(
+      { ok: false, error: "failed_to_load_signals", status: resp.status },
+      { status: 500 }
+    );
+  }
+
+  const raw = await resp.json();
+  const list: Signal[] = Array.isArray(raw) ? raw : raw?.signals ?? [];
 
   const scored = list
-    .filter((s) => (s.ai?.score ?? s.score) !== undefined || (s.ai?.grade ?? s.grade))
+    .filter((s) => s && (s.aiScore != null || s.grade != null || s.score != null))
     .map((s) => ({
       ticker: s.ticker,
       createdAt: s.createdAt,
       status: s.status,
-      score: toNum(s.ai?.score ?? s.score),
-      grade: (s.ai?.grade ?? s.grade ?? null) as string | null,
+      score: toNum(s.aiScore ?? s.score),
+      grade: (s.grade ?? null) as string | null,
     }));
 
   const gradeCounts: Record<string, number> = {};
@@ -51,8 +66,13 @@ export async function GET(req: Request) {
     }
   }
 
-  const qualified = scored.filter((s) => (s.status ?? "").toUpperCase().includes("QUAL")).length;
+  const qualified = scored.filter((s) => (s.status ?? "").toUpperCase() === "QUALIFIED").length;
   const total = scored.length;
+
+  const recent = scored
+    .filter((s) => (s.status ?? "").toUpperCase() !== "ARCHIVED")
+    .slice(-20)
+    .reverse();
 
   return NextResponse.json({
     ok: true,
@@ -61,7 +81,7 @@ export async function GET(req: Request) {
     qualifiedRate: total ? qualified / total : 0,
     avgScore: n ? sum / n : null,
     gradeCounts,
-    recent: scored.slice(-20).reverse(),
-    keyUsed: key,
+    recent,
+    source: "api/signals/all",
   });
 }
