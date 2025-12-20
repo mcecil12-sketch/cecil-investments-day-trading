@@ -38,6 +38,10 @@ export function qualifyByGrade(grade: AiGrade): boolean {
   return gradeRank[grade] >= gradeRank[min];
 }
 
+export function minScoreToQualify() {
+  return envNum("AI_MIN_SCORE_TO_QUALIFY", 7.0);
+}
+
 export function shouldQualify(input: { score?: number | null; grade?: AiGrade | string | null }) {
   const mode = (process.env.AI_QUALIFY_MODE || "score").toLowerCase();
   const score = typeof input.score === "number" ? input.score : null;
@@ -49,3 +53,6 @@ export function shouldQualify(input: { score?: number | null; grade?: AiGrade | 
   return false;
 }
 
+export function minScoreToQualify() {
+  return envNum("AI_MIN_SCORE_TO_QUALIFY", 7.0);
+}
