@@ -52,7 +52,3 @@ export function shouldQualify(input: { score?: number | null; grade?: AiGrade | 
   if (grade) return qualifyByGrade(grade);
   return false;
 }
-
-export function minScoreToQualify() {
-  return envNum("AI_MIN_SCORE_TO_QUALIFY", 7.0);
-}
