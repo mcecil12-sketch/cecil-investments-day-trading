@@ -11,15 +11,10 @@ import {
 } from "@/lib/aiScoring";
 import { sendPullbackAlert } from "@/lib/notify";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
+import { shouldQualify } from "@/lib/aiQualify";
 import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
 import { touchHeartbeat } from "@/lib/aiHeartbeat";
 import { notifyOnce } from "@/lib/notifyOnce";
-
-function isQualifiedGrade(grade: unknown) {
-  if (typeof grade !== "string") return false;
-  const norm = grade.trim().toUpperCase();
-  return norm.startsWith("A") || norm.startsWith("B");
-}
 
 const PLACEHOLDER_SUMMARIES = new Set([
   "AI scoring pending",
@@ -226,6 +221,10 @@ export async function POST(req: Request) {
   });
 
   const grade = finalSignal.aiGrade ?? finalSignal.grade ?? null;
+  const qualified = shouldQualify({
+    score: finalSignal.aiScore ?? null,
+    grade,
+  });
   try {
     if (finalSignal.status === "SCORED") {
       await bumpTodayFunnel({ gptScored: 1 });
@@ -233,7 +232,7 @@ export async function POST(req: Request) {
     if (finalSignal.status !== "ARCHIVED") {
       await bumpTodayFunnel({ shownInApp: 1 });
     }
-    if (isQualifiedGrade(grade)) {
+    if (qualified) {
       await bumpTodayFunnel({ qualified: 1 });
     }
   } catch (err) {

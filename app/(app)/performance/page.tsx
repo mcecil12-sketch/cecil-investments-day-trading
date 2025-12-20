@@ -7,6 +7,7 @@ import Link from "next/link";
 import { useTrading } from "@/tradingContext";
 import { AiHealthPill } from "@/components/performance/AiHealthPill";
 import { IntradayFunnel } from "@/components/performance/IntradayFunnel";
+import { PerformanceCards } from "@/components/PerformanceCards";
 
 type Stats = {
   totalTrades?: number;
@@ -242,6 +243,8 @@ export default function PerformancePage() {
             />
           </div>
         </header>
+
+        <PerformanceCards />
 
         <main className="max-w-6xl mx-auto px-4 pt-6 pb-24 space-y-6">
           {statsError && (
