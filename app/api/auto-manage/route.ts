@@ -155,11 +155,20 @@ async function manageTrade(
   try {
     const quote = await getLatestQuote(symbol);
     // prefer mid-price if available, else last/ask/bid
+    const q: any = quote as any;
+    const last = q.lastPrice ?? q.lp ?? q.last ?? q.p ?? q.price;
+    const ask = q.askPrice ?? q.ap;
+    const bid = q.bidPrice ?? q.bp;
+    const q: any = quote as any;
+    const last = q.lastPrice ?? q.lp ?? q.last ?? q.p ?? q.price;
+    const ask = q.askPrice ?? q.ap;
+    const bid = q.bidPrice ?? q.bp;
     const mid =
-      (quote as any).lastPrice ??
-      ((quote as any).askPrice && (quote as any).bidPrice
-        ? ((quote as any).askPrice + (quote as any).bidPrice) / 2
-        : undefined);
+      (last != null ? Number(last) : undefined) ??
+      (ask != null && bid != null ? (Number(ask) + Number(bid)) / 2 : undefined) ??
+      (ask != null ? Number(ask) : undefined) ??
+      (bid != null ? Number(bid) : undefined);
+
     if (!mid || !isFinite(mid)) {
       console.warn("[/api/auto-manage] No usable price for", symbol, quote);
       return { trade };
