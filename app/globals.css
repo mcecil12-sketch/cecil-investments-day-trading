@@ -401,25 +401,33 @@ body {
 
 /* --- AppShell + BottomNav structural layout (PERMANENT FIX) ------------- */
 :root {
-  --nav-h: 72px; /* visual height excluding safe-area */
+  --bottom-nav-h: 80px;
+  --bottom-nav-pad: 16px;
   --nav-safe: env(safe-area-inset-bottom, 0px);
-  --nav-accent: #3b82f6; /* blue (matches common "unlock" button vibe) */
+  --nav-accent: #3b82f6;
 }
 
-/* Make sure the page can host a fixed footer without layout surprises */
 html,
 body {
   height: 100%;
+  min-height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
 }
 
-/* Shell reserves space for fixed nav so it's never "below the fold" */
 .app-shell {
   min-height: 100dvh;
   background: #000;
+  display: flex;
+  flex-direction: column;
 }
-.app-shell-main {
-  min-height: 100dvh;
-  padding-bottom: calc(var(--nav-h) + var(--nav-safe));
+
+.app-shell-content {
+  flex: 1;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: calc(var(--bottom-nav-h) + var(--nav-safe));
 }
 
 /* Fixed bottom nav */
@@ -429,22 +437,23 @@ body {
   right: 0;
   bottom: 0;
   z-index: 9999;
-  height: calc(var(--nav-h) + var(--nav-safe));
+  height: calc(var(--bottom-nav-h) + var(--nav-safe));
   padding-bottom: var(--nav-safe);
   background: rgba(10, 10, 10, 0.92);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   border-top: 1px solid rgba(255, 255, 255, 0.1);
+  transform: translateZ(0);
 }
 
 /* Inner row: evenly distributed */
 .bottom-nav-inner {
-  height: var(--nav-h);
+  height: var(--bottom-nav-h);
   display: flex;
   align-items: center;
   justify-content: space-around;
   gap: 6px;
-  padding: 10px 14px; /* side padding so it’s not tight to edges */
+  padding: 10px 14px;
 }
 
 /* Tabs */
@@ -481,81 +490,6 @@ body {
 }
 .bottom-nav-tab.is-active .bottom-nav-label {
   color: var(--nav-accent);
-}
-
-/* --- iOS Safari bottom-toolbar / safe-area fixes --- */
-:root{
-  --bottom-nav-h: 64px;
-}
-
-/* Use dynamic viewport height on mobile so layout doesn't jump when Safari UI expands/collapses */
-html, body {
-  height: 100%;
-}
-
-.app-shell {
-  min-height: 100dvh;
-  /* Reserve space for fixed bottom nav + iOS safe area */
-  padding-bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom, 0px));
-}
-
-/* Content area should not hide behind fixed bottom nav */
-.app-shell-content {
-  padding-bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom, 0px));
-}
-
-/* Fixed bottom nav that respects iOS safe area */
-.bottom-nav {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 0;
-
-  height: var(--bottom-nav-h);
-  padding-bottom: env(safe-area-inset-bottom, 0px);
-
-  /* Ensure it stays above browser UI and page content */
-  z-index: 1000;
-
-  /* Prevent accidental overlay jitter */
-  transform: translateZ(0);
-  -webkit-transform: translateZ(0);
-}
-
-
-/* ===== HARD STOP: page-level scrolling ===== */
-body > * {
-  overflow: hidden !important;
-}
-
-main, section {
-  overflow: visible;
-  height: auto;
-}
-
-/* ===== Bottom nav comfort fix ===== */
-:root {
-  --bottom-nav-h: 80px;       /* was too tight */
-  --bottom-nav-pad: 16px;
-}
-
-.bottom-nav {
-  height: var(--bottom-nav-h);
-  padding-top: var(--bottom-nav-pad);
-  padding-bottom: calc(var(--bottom-nav-pad) + env(safe-area-inset-bottom, 0px));
-}
-
-.app-shell {
-  height: 100dvh;
-  height: -webkit-fill-available;
-  overflow: hidden;
-}
-
-.app-shell-content {
-  flex: 1;
-  overflow-y: auto;
-  -webkit-overflow-scrolling: touch;
-  padding-bottom: calc(var(--bottom-nav-h) + env(safe-area-inset-bottom, 0px));
 }
 
 /* Today: compact AI health placement */
