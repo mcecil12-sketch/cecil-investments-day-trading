@@ -8,6 +8,7 @@ import { useTrading } from "@/tradingContext";
 import { AiHealthPill } from "@/components/performance/AiHealthPill";
 import { IntradayFunnel } from "@/components/performance/IntradayFunnel";
 import { PerformanceCards } from "@/components/PerformanceCards";
+import { MarketReadyPill } from "@/components/MarketReadyPill";
 
 type Stats = {
   totalTrades?: number;
@@ -243,6 +244,8 @@ export default function PerformancePage() {
             />
           </div>
         </header>
+
+        <MarketReadyPill />
 
         <PerformanceCards />
 
