@@ -96,8 +96,13 @@ export async function GET(req: Request) {
   const lastScanSource = funnelToday?.lastScanSource ?? null;
   const minsSinceLastScan = minutesSince(lastScanAt);
 
-  const marketStatus = (aiHealth?.market?.status || aiHealth?.marketStatus || aiHealth?.market || "").toString();
   const aiStatus = (aiHealth?.status || "").toString();
+
+  let marketStatus = (aiHealth?.market?.status || aiHealth?.marketStatus || "").toString();
+  if (!marketStatus) {
+    if (aiStatus.toUpperCase() === "MARKET_CLOSED") marketStatus = "CLOSED";
+  }
+  if (!marketStatus) marketStatus = "UNKNOWN";
 
   const marketOpen = marketStatus.toUpperCase() === "OPEN";
   const aiHealthy = aiStatus.toUpperCase() === "HEALTHY";
