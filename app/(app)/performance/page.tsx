@@ -247,17 +247,36 @@ export default function PerformancePage() {
 
         <MarketReadyPill />
 
-        <PerformanceCards />
-
         <main className="max-w-6xl mx-auto px-4 pt-6 pb-24 space-y-6">
           {statsError && (
             <p className="text-xs text-[var(--ci-negative)]">{statsError}</p>
           )}
 
-          <div className="space-y-6">
-            <AiHealthPill />
-            <IntradayFunnel />
-          </div>
+          {/* EXEC SUMMARY (top): AI health + Intraday funnel */}
+          <section className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-neutral-100">
+                Exec summary
+              </h2>
+              <span className="text-[11px] text-neutral-500">
+                Health + funnel at a glance
+              </span>
+            </div>
+
+            <div className="space-y-4">
+              <AiHealthPill />
+              <IntradayFunnel />
+            </div>
+          </section>
+
+          {/* Snapshot: condensed cards below funnel */}
+          <section className="space-y-3">
+            <h2 className="text-sm font-semibold text-neutral-100">Snapshot</h2>
+            <p className="text-[11px] text-neutral-500">
+              Quick operational view (scanner, scoring, readiness).
+            </p>
+            <PerformanceCards />
+          </section>
 
           {/* High-level performance tiles */}
           <section className="space-y-3">
@@ -336,6 +355,28 @@ export default function PerformancePage() {
                 label="Auto-stops today"
                 value={stats?.autoStopsAppliedToday ?? "—"}
               />
+            </div>
+          </section>
+
+          {/* Drill-down: keep verbose funnel/scoring details lower on the page */}
+          <section className="space-y-3">
+            <h2 className="text-sm font-semibold text-neutral-100">
+              Funnel details
+            </h2>
+            <p className="text-[11px] text-neutral-500">
+              Expanded scan attribution, grade distribution, and troubleshooting info.
+            </p>
+            <div className="rounded-2xl border border-slate-800/80 bg-slate-900/40 p-3 md:p-4">
+              <details>
+                <summary className="cursor-pointer select-none text-[12px] font-semibold text-slate-200">
+                  Show details
+                </summary>
+                <div className="mt-3 text-xs text-slate-300 space-y-3">
+                  <div className="text-slate-400">
+                    (Place any extra verbose diagnostics here as we add them—keeps the top clean.)
+                  </div>
+                </div>
+              </details>
             </div>
           </section>
         </main>
