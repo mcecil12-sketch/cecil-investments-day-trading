@@ -1,10 +1,9 @@
 import { NextResponse } from "next/server";
 
-const API_KEY = process.env.ALPACA_API_KEY;
-const API_SECRET = process.env.ALPACA_API_SECRET;
-const TRADING_BASE_URL =
-  process.env.ALPACA_TRADING_BASE_URL ??
-  "https://paper-api.alpaca.markets";
+const API_KEY = process.env.ALPACA_API_KEY ?? process.env.ALPACA_API_KEY_ID;
+const API_SECRET = process.env.ALPACA_API_SECRET ?? process.env.ALPACA_API_SECRET_KEY;
+const TRADING_BASE_URL_RAW = process.env.ALPACA_TRADING_BASE_URL ?? process.env.ALPACA_BASE_URL ?? "https://paper-api.alpaca.markets";
+const TRADING_BASE_URL = TRADING_BASE_URL_RAW.replace(/\/v2\/?$/, "");
 
 /**
  * Expected payload from frontend:

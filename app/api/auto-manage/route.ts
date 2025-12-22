@@ -159,10 +159,6 @@ async function manageTrade(
     const last = q.lastPrice ?? q.lp ?? q.last ?? q.p ?? q.price;
     const ask = q.askPrice ?? q.ap;
     const bid = q.bidPrice ?? q.bp;
-    const q: any = quote as any;
-    const last = q.lastPrice ?? q.lp ?? q.last ?? q.p ?? q.price;
-    const ask = q.askPrice ?? q.ap;
-    const bid = q.bidPrice ?? q.bp;
     const mid =
       (last != null ? Number(last) : undefined) ??
       (ask != null && bid != null ? (Number(ask) + Number(bid)) / 2 : undefined) ??
