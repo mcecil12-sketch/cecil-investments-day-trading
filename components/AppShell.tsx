@@ -5,11 +5,9 @@ import { BottomNav } from "@/components/BottomNav";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   return (
-    <div className="app-shell">
-      <main className="app-shell-content">{children}</main>
-      <nav className="bottom-nav">
-        <BottomNav />
-      </nav>
+    <div className="relative min-h-screen bg-black text-white">
+      <main className="pb-24">{children}</main>
+      <BottomNav />
     </div>
   );
 }
