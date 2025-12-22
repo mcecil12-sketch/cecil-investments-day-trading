@@ -9,6 +9,53 @@ type Check = {
   detail?: string;
 };
 
+async function fetchAlpacaClock(): Promise<
+  | { ok: true; is_open: boolean; timestamp?: string; next_open?: string; next_close?: string }
+  | { ok: false; error: string; status?: number }
+> {
+  const base =
+    process.env.ALPACA_BASE_URL ||
+    process.env.ALPACA_TRADING_BASE_URL ||
+    "https://paper-api.alpaca.markets";
+
+  const key =
+    process.env.ALPACA_API_KEY ||
+    process.env.ALPACA_API_KEY_ID ||
+    process.env.ALPACA_KEY_ID ||
+    "";
+
+  const secret =
+    process.env.ALPACA_API_SECRET ||
+    process.env.ALPACA_API_SECRET_KEY ||
+    process.env.ALPACA_SECRET_KEY ||
+    "";
+
+  if (!key || !secret) {
+    return { ok: false, error: "missing_alpaca_keys" };
+  }
+
+  const resp = await fetch(`${base.replace(/\/$/, "")}/v2/clock`, {
+    headers: {
+      "APCA-API-KEY-ID": key,
+      "APCA-API-SECRET-KEY": secret,
+    },
+    cache: "no-store",
+  });
+
+  if (!resp.ok) {
+    return { ok: false, error: "alpaca_clock_failed", status: resp.status };
+  }
+
+  const json = await resp.json();
+  return {
+    ok: true,
+    is_open: Boolean(json?.is_open),
+    timestamp: json?.timestamp,
+    next_open: json?.next_open,
+    next_close: json?.next_close,
+  };
+}
+
 function etDateString(d: Date): string {
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",
@@ -98,11 +145,8 @@ export async function GET(req: Request) {
 
   const aiStatus = (aiHealth?.status || "").toString();
 
-  let marketStatus = (aiHealth?.market?.status || aiHealth?.marketStatus || "").toString();
-  if (!marketStatus) {
-    if (aiStatus.toUpperCase() === "MARKET_CLOSED") marketStatus = "CLOSED";
-  }
-  if (!marketStatus) marketStatus = "UNKNOWN";
+  const clock = await fetchAlpacaClock();
+  const marketStatus = clock.ok ? (clock.is_open ? "OPEN" : "CLOSED") : "UNKNOWN";
 
   const marketOpen = marketStatus.toUpperCase() === "OPEN";
   const aiHealthy = aiStatus.toUpperCase() === "HEALTHY";
@@ -111,8 +155,10 @@ export async function GET(req: Request) {
   const SIGNALS_STALE_MINUTES = Number(process.env.READINESS_SIGNALS_STALE_MINUTES ?? 15);
 
   const scannerRecent =
-    !marketOpen ||
-    (minsSinceLastScan != null && minsSinceLastScan <= SCAN_STALE_MINUTES);
+    !marketOpen || (minsSinceLastScan != null && minsSinceLastScan <= SCAN_STALE_MINUTES);
+
+  const scannerRunningWhenOpen =
+    !marketOpen || (String(lastScanStatus || "").toUpperCase() === "RUN");
 
   const lastScoredAt = scoredToday.length
     ? scoredToday
@@ -140,6 +186,13 @@ export async function GET(req: Request) {
       detail: `ai=${aiStatus || "UNKNOWN"}`,
     },
     {
+      name: "scanner_running",
+      ok: scannerRunningWhenOpen,
+      detail: !marketOpen
+        ? "market closed; scanner run not required"
+        : `lastScanStatus=${lastScanStatus || "?"} mode=${lastScanMode || "?"} source=${lastScanSource || "?"}`,
+    },
+    {
       name: "scanner_recent",
       ok: scannerRecent,
       detail: !marketOpen
@@ -163,7 +216,17 @@ export async function GET(req: Request) {
     ready,
     timestamp: new Date().toISOString(),
     etDate: todayEt,
-    market: { status: marketStatus || "UNKNOWN" },
+    market: {
+      status: marketStatus || "UNKNOWN",
+      clock: clock.ok
+        ? {
+            is_open: clock.is_open,
+            timestamp: clock.timestamp,
+            next_open: clock.next_open,
+            next_close: clock.next_close,
+          }
+        : { error: clock.error, status: (clock as any).status ?? null },
+    },
     ai: { status: aiStatus || "UNKNOWN" },
     scanner: {
       lastScanAt,
