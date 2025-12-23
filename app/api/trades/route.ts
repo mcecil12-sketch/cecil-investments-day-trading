@@ -8,10 +8,12 @@ type Direction = "LONG" | "SHORT";
 
 export type TradeStatus =
   | "NEW"
+  | "OPEN"
   | "BROKER_PENDING"
   | "BROKER_FILLED"
   | "BROKER_REJECTED"
-  | "BROKER_ERROR";
+  | "BROKER_ERROR"
+  | "ERROR";
 
 export type ManagementStatus =
   | "UNMANAGED"
@@ -48,11 +50,17 @@ export interface TradeRecord extends IncomingTrade {
   createdAt: string;
   updatedAt: string;
   status: TradeStatus;
+  qty?: number;
+  filledQty?: number;
+  avgFillPrice?: number;
 
   // Broker info
   brokerOrderId?: string;
   brokerStatus?: string;
   brokerRaw?: any;
+  alpacaOrderId?: string;
+  alpacaStatus?: string;
+  stopOrderId?: string;
   error?: string;
 
   // Auto-management info
@@ -79,10 +87,45 @@ function mapDirection(side: Direction): "buy" | "sell" {
   return side === "LONG" ? "buy" : "sell";
 }
 
+function mapQty(trade: TradeRecord) {
+  const explicitQty = trade.qty ?? trade.quantity;
+  if (typeof explicitQty === "number" && explicitQty > 0) {
+    return explicitQty;
+  }
+  const brokerQty = Number(trade.brokerRaw?.qty ?? trade.brokerRaw?.quantity ?? 0);
+  return brokerQty || null;
+}
+
+function mapFilledQty(trade: TradeRecord) {
+  if (typeof trade.filledQty === "number") {
+    return trade.filledQty;
+  }
+  const brokerFilled = Number(trade.brokerRaw?.filled_qty ?? trade.brokerRaw?.filledQty ?? 0);
+  return brokerFilled || null;
+}
+
+function mapAvgFillPrice(trade: TradeRecord) {
+  if (typeof trade.avgFillPrice === "number") {
+    return trade.avgFillPrice;
+  }
+  const rawAvg = trade.brokerRaw?.filled_avg_price ?? trade.brokerRaw?.avg_fill_price;
+  if (rawAvg != null) {
+    const num = Number(rawAvg);
+    return Number.isFinite(num) ? num : null;
+  }
+  return null;
+}
+
 export async function GET() {
   try {
     const trades = await readTrades<TradeRecord>();
-    return NextResponse.json({ trades });
+    const serialized = trades.map((trade) => ({
+      ...trade,
+      qty: mapQty(trade),
+      filledQty: mapFilledQty(trade),
+      avgFillPrice: mapAvgFillPrice(trade),
+    }));
+    return NextResponse.json({ trades: serialized });
   } catch (err: any) {
     console.error("[trades] GET error", err);
     return NextResponse.json(
