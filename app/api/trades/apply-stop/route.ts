@@ -94,11 +94,10 @@ export async function POST(req: Request) {
     });
 
     if (!o.ok) {
-      return NextResponse.json({ ok: false, error: "Failed to load parent order", detail: o.text || null, alpacaOrderId }, { status: 500 });
+      // Parent order might be missing/expired/etc. We can still place a stop using the trade ticker.
     }
 
-    const parent = safeJsonParse(o.text || "{}");
-    const symbol = parent.ok && parent.value && typeof parent.value.symbol === "string" ? parent.value.symbol : trade.ticker;
+    const symbol = trade.ticker;
 
     const stop = await alpacaRequest({
       method: "POST",
