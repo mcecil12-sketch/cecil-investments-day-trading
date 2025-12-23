@@ -15,6 +15,7 @@ export type RawSignal = {
   timeframe: string;
   source: string;
   createdAt: string;
+  reasoning?: string;
   // include any fields your scanner already sets:
   vwap?: number;
   pullbackPct?: number;

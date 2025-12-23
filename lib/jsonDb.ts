@@ -9,6 +9,7 @@ export type StoredSignalStatus =
   | "APPROVED"
   | "DISMISSED"
   | "SCORED"
+  | "ERROR"
   | "ARCHIVED";
 
 export type StoredSignal = {
@@ -32,6 +33,9 @@ export type StoredSignal = {
   grade?: string | null;
   score?: number | null;
   status: StoredSignalStatus;
+  qualified?: boolean;
+  shownInApp?: boolean;
+  error?: string | null;
 };
 
 const LOCAL_DATA_DIR = path.join(process.cwd(), "data");

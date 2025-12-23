@@ -98,6 +98,7 @@ export async function POST(req: Request) {
     timeframe = "1Min",
     source = "VWAP_PULLBACK",
     rawMeta = {},
+    reasoning,
   } = body;
 
   if (!ticker || !side || !entryPrice || !stopPrice || !targetPrice) {
@@ -128,6 +129,7 @@ export async function POST(req: Request) {
     playbookScore: rawMeta.playbookScore,
     volumeScore: rawMeta.volumeScore,
     catalystScore: rawMeta.catalystScore,
+    reasoning: reasoning ?? rawMeta.reasoning,
   };
 
   const placeholder: StoredSignal = {
@@ -137,6 +139,11 @@ export async function POST(req: Request) {
     aiSummary: "AI scoring pending",
     totalScore: 0,
     status: "PENDING",
+    reasoning: rawSignal.reasoning ?? "AI scoring pending",
+    score: 0,
+    grade: "F",
+    qualified: false,
+    shownInApp: false,
   };
 
   await appendSignal(placeholder);
@@ -158,37 +165,55 @@ export async function POST(req: Request) {
 
   try {
     scored = await scoreSignalWithAI(rawSignal);
-    const safeScore =
-      Number.isFinite(scored.aiScore ?? NaN) && scored.aiScore != null
-        ? scored.aiScore
-        : 0;
-    const safeGrade =
-      (typeof scored.aiGrade === "string" && scored.aiGrade.trim())
+    const safeScore = Number.isFinite(scored.aiScore ?? NaN)
+      ? scored.aiScore!
+      : null;
+    const hasScore = safeScore != null;
+    const gradeCandidate =
+      typeof scored.aiGrade === "string" && scored.aiGrade.trim()
         ? (scored.aiGrade.trim() as AiGrade)
-        : gradeFromScore(safeScore);
+        : null;
+
+    if (!hasScore || gradeCandidate == null) {
+      throw new Error("AI scoring response missing score or grade");
+    }
+
     const rawSummary =
       typeof scored.aiSummary === "string" ? scored.aiSummary.trim() : "";
     const safeSummary =
       rawSummary.length > 0 && !isPlaceholderSummary(rawSummary)
         ? rawSummary
-        : formatAiSummary(safeGrade, safeScore);
+        : formatAiSummary(gradeCandidate, safeScore);
+    const totalScoreValue =
+      typeof scored.totalScore === "number" && Number.isFinite(scored.totalScore)
+        ? scored.totalScore
+        : safeScore;
     finalSignal = {
       ...placeholder,
       ...scored,
       aiScore: safeScore,
-      aiGrade: safeGrade,
+      aiGrade: gradeCandidate,
       aiSummary: safeSummary,
-      totalScore:
-        typeof scored.totalScore === "number" && Number.isFinite(scored.totalScore)
-          ? scored.totalScore
-          : safeScore,
+      totalScore: totalScoreValue,
       status: "SCORED",
+      score: safeScore,
+      grade: gradeCandidate,
+      reasoning: placeholder.reasoning ?? safeSummary,
+      shownInApp: true,
     };
     await replaceSignal(finalSignal);
     await touchHeartbeat();
 
     const minScore = Number(process.env.APPROVAL_MIN_AI_SCORE ?? "7.5");
     const aiScore = typeof finalSignal.aiScore === "number" ? finalSignal.aiScore : 0;
+    const qualified = shouldQualify({
+      score: finalSignal.aiScore ?? null,
+      grade: finalSignal.aiGrade ?? null,
+    });
+    finalSignal = {
+      ...finalSignal,
+      qualified,
+    };
     const isApprovalQueueItem = finalSignal.status === "SCORED" && aiScore >= minScore;
 
     if (isApprovalQueueItem) {
@@ -212,6 +237,19 @@ export async function POST(req: Request) {
     }
   } catch (err: any) {
     console.error("AI scoring failed:", err);
+    const message = err?.message ?? "AI scoring failed";
+    finalSignal = {
+      ...placeholder,
+      status: "ERROR",
+      error: message,
+      score: placeholder.aiScore ?? 0,
+      grade: placeholder.aiGrade ?? "F",
+      qualified: false,
+      shownInApp: false,
+      reasoning: placeholder.reasoning ?? "AI scoring failed",
+    };
+    await replaceSignal(finalSignal);
+    return NextResponse.json({ signal: finalSignal });
   }
 
   console.log("[signals] New signal scored", {
@@ -221,10 +259,13 @@ export async function POST(req: Request) {
   });
 
   const grade = finalSignal.aiGrade ?? finalSignal.grade ?? null;
-  const qualified = shouldQualify({
-    score: finalSignal.aiScore ?? null,
-    grade,
-  });
+  const qualified =
+    typeof finalSignal.qualified === "boolean"
+      ? finalSignal.qualified
+      : shouldQualify({
+          score: finalSignal.aiScore ?? null,
+          grade,
+        });
   try {
     if (finalSignal.status === "SCORED") {
       await bumpTodayFunnel({ gptScored: 1 });
