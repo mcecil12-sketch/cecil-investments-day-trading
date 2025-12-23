@@ -4,7 +4,7 @@ import { redis } from "@/lib/redis";
 
 const DATA_PATH = path.join(process.cwd(), "data");
 const TRADES_FILE = path.join(DATA_PATH, "trades.json");
-const REDIS_KEY = "trades:v1";
+const REDIS_KEY = `trades:v1:${process.env.VERCEL_ENV ?? "local"}`;
 
 async function ensureFile(): Promise<void> {
   try {
