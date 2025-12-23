@@ -175,7 +175,8 @@ export async function POST(req: Request) {
     trades[idx] = updatedTrade;
     await writeTrades(trades);
 
-    await appendActivity({
+    try {
+await appendActivity({
       type: "MANUAL_STOP_APPLIED",
       tradeId,
       ticker: trade.ticker,
@@ -183,7 +184,11 @@ export async function POST(req: Request) {
       meta: { stopLegId, stopOrderId: stopOrderIdUsed },
     });
 
-    return NextResponse.json(
+    } catch (err) {
+  console.error("[apply-stop] appendActivity failed", err);
+}
+
+return NextResponse.json(
       {
         ok: true,
         trade: updatedTrade,
@@ -195,6 +200,13 @@ export async function POST(req: Request) {
     );
   } catch (err) {
     console.error("POST /api/trades/apply-stop error:", err);
-    return NextResponse.json({ ok: false, error: "Failed to apply stop" }, { status: 500 });
-  }
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Failed to apply stop",
+        detail: (err as any)?.message ?? String(err),
+      },
+      { status: 500 }
+    );
+}
 }
