@@ -330,3 +330,17 @@ export async function getLatestQuote(symbol: string): Promise<LatestQuote> {
   }
   return { ...data.quote, symbol: data.quote.symbol ?? symbol };
 }
+
+export async function alpacaRequest(args: {
+  method: string;
+  path: string;
+  body?: any;
+}): Promise<{ ok: boolean; status: number; text: string }> {
+  const res = await alpacaFetch(tradingUrl(args.path), {
+    method: args.method,
+    headers: { "Content-Type": "application/json" },
+    body: args.body ? JSON.stringify(args.body) : undefined,
+  });
+  const text = await res.text().catch(() => "");
+  return { ok: res.ok, status: res.status, text };
+}
