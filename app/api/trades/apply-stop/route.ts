@@ -18,6 +18,7 @@ type Trade = {
   stopSuggestionReason?: string;
   alpacaOrderId?: string;
   alpacaStatus?: string;
+  brokerOrderId?: string;
   updatedAt?: string;
   lastStopAppliedAt?: string;
 };
@@ -43,9 +44,10 @@ export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => null);
     const tradeId = body?.tradeId as string | undefined;
+    const bodyStopPrice = body?.stopPrice;
     if (!tradeId) {
       return NextResponse.json(
-        { error: "tradeId is required" },
+        { ok: false, error: "tradeId is required" },
         { status: 400 }
       );
     }
@@ -60,15 +62,38 @@ export async function POST(req: Request) {
     }
 
     const trade = trades[idx];
-    if (!trade.alpacaOrderId) {
+    const orderId = trade.brokerOrderId ?? trade.alpacaOrderId ?? null;
+    if (!orderId) {
       return NextResponse.json(
-        { error: "Trade has no alpacaOrderId" },
+        {
+          ok: false,
+          error: "Trade has no broker order id",
+          tradeId,
+          fields: {
+            alpacaOrderId: trade.alpacaOrderId ?? null,
+            brokerOrderId: trade.brokerOrderId ?? null,
+          },
+        },
         { status: 400 }
       );
     }
-    if (trade.suggestedStopPrice == null) {
+
+    const requestedStop =
+      typeof bodyStopPrice === "number" && Number.isFinite(bodyStopPrice)
+        ? bodyStopPrice
+        : trade.suggestedStopPrice;
+
+    if (requestedStop == null || !Number.isFinite(requestedStop)) {
       return NextResponse.json(
-        { error: "No suggestedStopPrice for trade" },
+        {
+          ok: false,
+          error: "No stop price provided",
+          tradeId,
+          fields: {
+            stopPrice: trade.stopPrice ?? null,
+            suggestedStopPrice: trade.suggestedStopPrice ?? null,
+          },
+        },
         { status: 400 }
       );
     }
@@ -80,7 +105,7 @@ export async function POST(req: Request) {
     });
 
     // Fetch parent order with legs
-    const order = await getOrder(trade.alpacaOrderId);
+    const order = await getOrder(orderId);
     const legs = order.legs || [];
     const stopLeg = (legs as any[]).find(
       (leg: any) =>
@@ -102,7 +127,7 @@ export async function POST(req: Request) {
     }
 
     const oldStop = stopLeg.stop_price;
-    const newStop = trade.suggestedStopPrice;
+    const newStop = requestedStop;
 
     console.log("[apply-stop] replacing stop", {
       tradeId,
@@ -125,6 +150,7 @@ export async function POST(req: Request) {
       updatedAt: nowIso,
       lastStopAppliedAt: nowIso,
       alpacaStatus: replaced.status ?? trade.alpacaStatus,
+      alpacaOrderId: orderId,
     };
 
     trades[idx] = updatedTrade;
@@ -144,11 +170,19 @@ export async function POST(req: Request) {
       stopLegId: stopLeg.id,
     });
 
-    return NextResponse.json({ trade: updatedTrade }, { status: 200 });
+    return NextResponse.json(
+      {
+        ok: true,
+        trade: updatedTrade,
+        orderId,
+        stopLegId: stopLeg.id,
+      },
+      { status: 200 }
+    );
   } catch (err) {
     console.error("POST /api/trades/apply-stop error:", err);
     return NextResponse.json(
-      { error: "Failed to apply stop" },
+      { ok: false, error: "Failed to apply stop" },
       { status: 500 }
     );
   }
