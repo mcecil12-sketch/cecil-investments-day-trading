@@ -1,7 +1,12 @@
 import { NextResponse } from "next/server";
 import { promises as fs } from "fs";
 import path from "path";
-import { getOrder, replaceOrder } from "@/lib/alpaca";
+import {
+  getOrder,
+  replaceOrder,
+  createOrder,
+  type AlpacaOrder,
+} from "@/lib/alpaca";
 import { appendActivity } from "@/lib/activity";
 
 type TradeStatus = "OPEN" | "CLOSED" | "PENDING" | "PARTIAL" | string;
@@ -19,6 +24,7 @@ type Trade = {
   alpacaOrderId?: string;
   alpacaStatus?: string;
   brokerOrderId?: string;
+  stopOrderId?: string;
   updatedAt?: string;
   lastStopAppliedAt?: string;
 };
@@ -115,31 +121,62 @@ export async function POST(req: Request) {
         leg.side.toLowerCase() !== order.side?.toLowerCase()
     );
 
-    if (!stopLeg?.id) {
-      console.error("[apply-stop] stop leg not found", {
-        tradeId,
-        alpacaOrderId: trade.alpacaOrderId,
-      });
-      return NextResponse.json(
-        { error: "Stop leg not found in order" },
-        { status: 500 }
-      );
-    }
-
-    const oldStop = stopLeg.stop_price;
+    const oldStop = stopLeg?.stop_price;
     const newStop = requestedStop;
 
     console.log("[apply-stop] replacing stop", {
       tradeId,
       ticker: trade.ticker,
-      stopLegId: stopLeg.id,
+      stopLegId: stopLeg?.id,
+      stopOrderId: trade.stopOrderId ?? null,
       oldStop,
       newStop,
     });
 
-    const replaced = await replaceOrder(stopLeg.id, {
-      stop_price: newStop,
-    });
+    let replaced: AlpacaOrder;
+    let stopLegId: string | null = stopLeg?.id ?? null;
+    let stopOrderIdUsed: string | null = null;
+
+    if (stopLeg?.id) {
+      replaced = await replaceOrder(stopLeg.id, {
+        stop_price: newStop,
+      });
+    } else {
+      const qty = (trade as any).quantity ?? trade.size;
+      if (!qty) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "Missing trade quantity/size",
+            tradeId,
+            fields: {
+              quantity: (trade as any).quantity ?? null,
+              size: trade.size ?? null,
+            },
+          },
+          { status: 400 }
+        );
+      }
+      const stopSide = trade.side === "LONG" ? "sell" : "buy";
+      if (trade.stopOrderId) {
+        replaced = await replaceOrder(trade.stopOrderId, {
+          stop_price: newStop,
+        });
+        stopOrderIdUsed = trade.stopOrderId;
+      } else {
+        const created = await createOrder({
+          symbol: trade.ticker.toUpperCase(),
+          qty,
+          side: stopSide,
+          type: "stop",
+          time_in_force: "day",
+          stop_price: newStop,
+        });
+        stopOrderIdUsed = created.id;
+        trade.stopOrderId = stopOrderIdUsed;
+        replaced = created as any;
+      }
+    }
 
     const nowIso = new Date().toISOString();
     const updatedTrade: Trade = {
@@ -150,7 +187,8 @@ export async function POST(req: Request) {
       updatedAt: nowIso,
       lastStopAppliedAt: nowIso,
       alpacaStatus: replaced.status ?? trade.alpacaStatus,
-      alpacaOrderId: orderId,
+      alpacaOrderId: trade.alpacaOrderId ?? orderId,
+      stopOrderId: trade.stopOrderId,
     };
 
     trades[idx] = updatedTrade;
@@ -161,13 +199,14 @@ export async function POST(req: Request) {
       tradeId,
       ticker: trade.ticker,
       message: `Stop moved ${oldStop} -> ${newStop}`,
-      meta: { stopLegId: stopLeg.id },
+      meta: { stopLegId: stopLeg?.id ?? null, stopOrderId: stopOrderIdUsed },
     });
 
     console.log("[apply-stop] updated trade", {
       tradeId,
       alpacaOrderId: trade.alpacaOrderId,
-      stopLegId: stopLeg.id,
+      stopLegId,
+      stopOrderId: stopOrderIdUsed,
     });
 
     return NextResponse.json(
@@ -175,7 +214,8 @@ export async function POST(req: Request) {
         ok: true,
         trade: updatedTrade,
         orderId,
-        stopLegId: stopLeg.id,
+        stopLegId,
+        stopOrderId: stopOrderIdUsed,
       },
       { status: 200 }
     );

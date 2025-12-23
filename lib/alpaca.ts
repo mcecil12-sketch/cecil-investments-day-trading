@@ -225,6 +225,21 @@ export async function submitOrder(
   return JSON.parse(text);
 }
 
+export async function createOrder(
+  payload: Record<string, any>
+): Promise<AlpacaOrder> {
+  const res = await alpacaFetch(tradingUrl("/orders"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text || "Failed to create order");
+  }
+  return res.json();
+}
+
 // ---------------- Trading helpers ----------------
 
 export type AlpacaOrder = {
