@@ -1,27 +1,12 @@
 import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
-import { alpacaRequest } from "@/lib/alpaca";
+import { alpacaRequest, createOrder, getOrder, getPositions } from "@/lib/alpaca";
 
 type ApplyStopBody = {
   tradeId: string;
   stopPrice: number;
 };
-
-function safeJsonParse(s: string) {
-  try {
-    return { ok: true as const, value: JSON.parse(s) };
-  } catch {
-    return { ok: false as const, value: null };
-  }
-}
-
-function isAlpacaNotOpen(errText: string) {
-  const p = safeJsonParse(errText);
-  const msg = p.ok && p.value && typeof p.value.message === "string" ? p.value.message : "";
-  const code = p.ok && p.value && typeof p.value.code === "number" ? p.value.code : null;
-  return code === 42210000 && msg.toLowerCase().includes("not open");
-}
 
 export async function POST(req: Request) {
   const auth = await requireAuth(req);
@@ -49,111 +34,112 @@ export async function POST(req: Request) {
 
   const trade = trades[idx];
 
-  const alpacaOrderId = (trade.alpacaOrderId || trade.brokerOrderId || null) as string | null;
-  if (!alpacaOrderId) {
+  const nowIso = new Date().toISOString();
+
+  const tickerRaw = trade?.ticker;
+  const ticker = typeof tickerRaw === "string" ? tickerRaw.toUpperCase() : tickerRaw;
+  const side = (trade?.side ?? "").toUpperCase();
+  if (!ticker || !side) {
     return NextResponse.json(
-      {
-        ok: false,
-        error: "Trade has no broker order id",
-        tradeId,
-        fields: { alpacaOrderId: trade.alpacaOrderId ?? null, brokerOrderId: trade.brokerOrderId ?? null },
-      },
+      { ok: false, error: "Trade missing ticker/side" },
       { status: 400 }
     );
   }
+  if (side !== "LONG" && side !== "SHORT") {
+    return NextResponse.json({ ok: false, error: "Invalid trade side" }, { status: 400 });
+  }
 
-  const nowIso = new Date().toISOString();
+  const alpacaOrderId = (trade.alpacaOrderId || trade.brokerOrderId || null) as string | null;
+
+  const existingStops = new Set<string>();
+  if (trade.stopOrderId) {
+    existingStops.add(trade.stopOrderId);
+  }
+
+  if (alpacaOrderId) {
+    try {
+      const parent = await getOrder(alpacaOrderId);
+      const legs = parent.legs || [];
+      const stopLeg = (legs as any[]).find(
+        (leg: any) =>
+          leg &&
+          typeof leg.stop_price !== "undefined" &&
+          leg.side &&
+          leg.side.toLowerCase() !== (parent.side ?? "").toLowerCase()
+      );
+      if (stopLeg?.id) {
+        existingStops.add(stopLeg.id);
+      }
+    } catch (err) {
+      console.warn("[apply-stop] unable to fetch parent order, continuing", err);
+    }
+  }
 
   try {
-    let clearedStopId: string | null = trade.stopOrderId ?? null;
-
-    if (trade.stopOrderId) {
-      const del = await alpacaRequest({
+    for (const stopId of existingStops) {
+      const resp = await alpacaRequest({
         method: "DELETE",
-        path: `/v2/orders/${trade.stopOrderId}`,
+        path: `/v2/orders/${stopId}`,
       });
-
-      if (!del.ok) {
-        const txt = del.text || "";
-        if (isAlpacaNotOpen(txt) || del.status === 404) {
-          clearedStopId = null;
-        } else {
-          return NextResponse.json(
-            { ok: false, error: "Failed to cancel existing stop", detail: txt || null, stopOrderId: trade.stopOrderId },
-            { status: 500 }
-          );
-        }
-      } else {
-        clearedStopId = null;
+      if (!resp.ok && resp.status !== 404) {
+        throw new Error(resp.text || `cancel failed ${resp.status}`);
       }
     }
 
-    const o = await alpacaRequest({
-      method: "GET",
-      path: `/v2/orders/${alpacaOrderId}`,
-    });
-
-    if (!o.ok) {
-      // Parent order might be missing/expired/etc. We can still place a stop using the trade ticker.
+    const qtyFromTrade =
+      Number(trade.quantity ?? trade.qty ?? trade.size ?? trade.positionSize ?? trade.shares) ||
+      Number(trade.brokerRaw?.qty ?? trade.brokerRaw?.quantity ?? 0);
+    let qty = qtyFromTrade;
+    if (!qty || qty <= 0) {
+      const positions = await getPositions(trade.ticker);
+      const normalized = Array.isArray(positions)
+        ? positions.find((p) => p?.symbol?.toUpperCase() === trade.ticker?.toUpperCase())
+        : positions;
+      qty = Number((normalized as any)?.qty ?? 0);
+    }
+    if (!qty || qty <= 0) {
+      return NextResponse.json(
+        { ok: false, error: "Unable to determine quantity for stop" },
+        { status: 400 }
+      );
     }
 
-    const symbol = trade.ticker;
-
-    const stop = await alpacaRequest({
-      method: "POST",
-      path: `/v2/orders`,
-      body: {
-        symbol,
-        qty: String(trade.quantity ?? 1),
-        side: trade.side === "LONG" ? "sell" : "buy",
-        type: "stop",
-        time_in_force: "day",
-        stop_price: String(stopPrice),
-      },
+    const stopSide = trade.side?.toUpperCase() === "SHORT" ? "buy" : "sell";
+    const stopOrder = await createOrder({
+      symbol: ticker,
+      qty,
+      side: stopSide,
+      type: "stop",
+      time_in_force: "day",
+      stop_price: stopPrice,
+      extended_hours: false,
     });
-
-    if (!stop.ok) {
-      const detailStr = stop.text || null;
-
-      const updatedTrade = {
-        ...trade,
-        stopPrice,
-        stopOrderId: clearedStopId,
-        lastStopAppliedAt: trade.lastStopAppliedAt ?? null,
-        updatedAt: nowIso,
-      };
-
-      trades[idx] = updatedTrade;
-      await writeTrades(trades);
-
-      return NextResponse.json({ ok: false, error: "Failed to apply stop", detail: detailStr }, { status: 500 });
-    }
-
-    const stopJson = safeJsonParse(stop.text || "{}");
-    const stopLegId =
-      stopJson.ok && stopJson.value && typeof stopJson.value.id === "string" ? stopJson.value.id : null;
 
     const updatedTrade = {
       ...trade,
+      quantity: qty,
       stopPrice,
-      stopOrderId: stopLegId,
+      stopOrderId: stopOrder.id,
       lastStopAppliedAt: nowIso,
-      alpacaOrderId,
-      brokerOrderId: trade.brokerOrderId ?? alpacaOrderId,
-      alpacaStatus: trade.alpacaStatus ?? null,
       updatedAt: nowIso,
+      error: undefined,
     };
 
     trades[idx] = updatedTrade;
     await writeTrades(trades);
 
+    return NextResponse.json({ ok: true, trade: updatedTrade }, { status: 200 });
+  } catch (err: any) {
+    const detail = err?.message ?? String(err);
+    const updatedTrade = {
+      ...trade,
+      error: detail,
+      updatedAt: nowIso,
+    };
+    trades[idx] = updatedTrade;
+    await writeTrades(trades);
     return NextResponse.json(
-      { ok: true, trade: updatedTrade, orderId: alpacaOrderId, stopLegId, stopOrderId: stopLegId },
-      { status: 200 }
-    );
-  } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: "Failed to apply stop", detail: e?.message ? String(e.message) : null },
+      { ok: false, error: "Failed to apply stop", detail },
       { status: 500 }
     );
   }
