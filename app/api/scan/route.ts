@@ -518,6 +518,7 @@ export async function GET(req: NextRequest) {
       ? "ai-seed"
       : "vwap"; // default/alias for vwap
 const aiSeedMode = mode === "ai-seed";
+const debugScan = req.headers.get("x-debug-scan") === "1";
 const totals = {
   totalCandidates: 0,
   candidatesAfterBasicFilters: 0,
@@ -562,9 +563,9 @@ const reject = (ticker: string, reason: string, note?: string) => {
   rejectsAggregated[key] = (rejectsAggregated[key] ?? 0) + 1;
 };
 
-const logSummary = () => {
-  if (!aiSeedMode) return;
-  console.log("[scan] ai-seed summary", {
+const buildSummary = () => {
+  if (!aiSeedMode) return null;
+  return {
     mode,
     source: scanSource,
     runId: scanRunId,
@@ -572,7 +573,14 @@ const logSummary = () => {
     rejects: rejectsAggregated,
     signalsCreated: totals.signalsCreated,
     signalsPosted: totals.signalsPosted,
-  });
+  };
+};
+
+const logSummary = () => {
+  const summary = buildSummary();
+  if (!summary) return null;
+  console.log("[scan] ai-seed summary", summary);
+  return summary;
 };
 
   if (aiSeedMode) {
@@ -598,17 +606,18 @@ const logSummary = () => {
         console.log("[funnel] bump scansSkipped failed (non-fatal)", err);
       }
       reject("market", "marketClosed", "market closed (skip)");
-      logSummary();
-      return NextResponse.json(
-        {
-          status: "ok",
-          mode,
-          marketClosed: true,
-          note: "ai-seed skipped: market closed (avoid false volumeTooLow after-hours)",
-          clock,
-        },
-        { headers: { "Cache-Control": "no-store" } }
-      );
+      const summarySnapshot = logSummary();
+      const skipPayload: Record<string, any> = {
+        status: "ok",
+        mode,
+        marketClosed: true,
+        note: "ai-seed skipped: market closed (avoid false volumeTooLow after-hours)",
+        clock,
+      };
+      if (debugScan && summarySnapshot) {
+        skipPayload.debugSummary = summarySnapshot;
+      }
+      return NextResponse.json(skipPayload, { headers: { "Cache-Control": "no-store" } });
     }
   }
 
@@ -861,7 +870,7 @@ const logSummary = () => {
     await bumpTodayFunnel({ signalsPosted: result.postedCount });
   }
 
-  logSummary();
+  const summarySnapshot = logSummary();
 
   return NextResponse.json({
     ...result,
@@ -870,5 +879,6 @@ const logSummary = () => {
     signalsPosted: posted.length,
     gptQueued: posted.length,
     aiSeedDebug,
+    ...(debugScan && summarySnapshot ? { debugSummary: summarySnapshot } : {}),
   });
 }
