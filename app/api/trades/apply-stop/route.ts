@@ -1,13 +1,7 @@
 import { NextResponse } from "next/server";
-import { promises as fs } from "fs";
-import path from "path";
-import {
-  getOrder,
-  replaceOrder,
-  createOrder,
-  type AlpacaOrder,
-} from "@/lib/alpaca";
+import { getOrder, replaceOrder, createOrder, type AlpacaOrder } from "@/lib/alpaca";
 import { appendActivity } from "@/lib/activity";
+import { readTrades, writeTrades } from "@/lib/tradesStore";
 
 type TradeStatus = "OPEN" | "CLOSED" | "PENDING" | "PARTIAL" | string;
 
@@ -28,23 +22,6 @@ type Trade = {
   updatedAt?: string;
   lastStopAppliedAt?: string;
 };
-
-const TRADES_FILE = path.join(process.cwd(), "data", "trades.json");
-
-async function readTrades(): Promise<Trade[]> {
-  try {
-    const raw = await fs.readFile(TRADES_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as Trade[]) : [];
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return [];
-    throw err;
-  }
-}
-
-async function writeTrades(trades: Trade[]): Promise<void> {
-  await fs.writeFile(TRADES_FILE, JSON.stringify(trades, null, 2), "utf8");
-}
 
 export async function POST(req: Request) {
   try {

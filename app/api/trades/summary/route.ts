@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { promises as fs } from "fs";
-import path from "path";
+import { readTrades } from "@/lib/tradesStore";
 
 type TradeStatus = "OPEN" | "CLOSED" | string;
 
@@ -19,19 +18,6 @@ type Trade = {
   realizedR?: number;
   lastStopAppliedAt?: string;
 };
-
-const TRADES_FILE = path.join(process.cwd(), "data", "trades.json");
-
-async function readTrades(): Promise<Trade[]> {
-  try {
-    const raw = await fs.readFile(TRADES_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as Trade[]) : [];
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return [];
-    throw err;
-  }
-}
 
 function isToday(iso?: string): boolean {
   if (!iso) return false;
@@ -64,7 +50,7 @@ function computeMaxDrawdown(pnls: number[]): number {
 
 export async function GET() {
   try {
-    const trades = await readTrades();
+    const trades = await readTrades<Trade>();
     const todaysTrades = trades.filter((t) => isToday(t.openedAt));
 
     const closedToday = todaysTrades.filter(
@@ -128,10 +114,14 @@ export async function GET() {
       },
       { status: 200 }
     );
-  } catch (err) {
+  } catch (err: any) {
     console.error("GET /api/trades/summary error:", err);
     return NextResponse.json(
-      { error: "Failed to compute trade stats" },
+      {
+        ok: false,
+        error: "Failed to compute trade stats",
+        detail: err?.message ?? String(err),
+      },
       { status: 500 }
     );
   }

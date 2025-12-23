@@ -1,11 +1,8 @@
 import { NextResponse } from "next/server";
-import fs from "fs/promises";
-import path from "path";
 import { submitOrder } from "@/lib/alpaca";
+import { readTrades, writeTrades } from "@/lib/tradesStore";
 
 export const runtime = "nodejs";
-
-const TRADES_PATH = path.join(process.cwd(), "data", "trades.json");
 
 type Direction = "LONG" | "SHORT";
 
@@ -78,38 +75,25 @@ export interface TradeRecord extends IncomingTrade {
   };
 }
 
-async function ensureFile() {
-  try {
-    await fs.access(TRADES_PATH);
-  } catch {
-    await fs.mkdir(path.dirname(TRADES_PATH), { recursive: true });
-    await fs.writeFile(TRADES_PATH, "[]", "utf8");
-  }
-}
-
-async function readTrades(): Promise<TradeRecord[]> {
-  await ensureFile();
-  const raw = await fs.readFile(TRADES_PATH, "utf8");
-  if (!raw.trim()) return [];
-  try {
-    const json = JSON.parse(raw);
-    return Array.isArray(json) ? json : json.trades ?? [];
-  } catch {
-    return [];
-  }
-}
-
-async function writeTrades(trades: TradeRecord[]) {
-  await fs.writeFile(TRADES_PATH, JSON.stringify(trades, null, 2), "utf8");
-}
-
 function mapDirection(side: Direction): "buy" | "sell" {
   return side === "LONG" ? "buy" : "sell";
 }
 
 export async function GET() {
-  const trades = await readTrades();
-  return NextResponse.json({ trades });
+  try {
+    const trades = await readTrades<TradeRecord>();
+    return NextResponse.json({ trades });
+  } catch (err: any) {
+    console.error("[trades] GET error", err);
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Failed to load trades",
+        detail: err?.message ?? String(err),
+      },
+      { status: 500 }
+    );
+  }
 }
 
 export async function POST(req: Request) {
@@ -172,11 +156,19 @@ export async function POST(req: Request) {
         : undefined,
     };
 
-    const trades = await readTrades();
+    const trades = await readTrades<TradeRecord>();
     await writeTrades([newTrade, ...trades]);
 
-    return NextResponse.json({ trade: newTrade }, { status: 201 });
-  } catch (err) {
-    return NextResponse.json({ error: "Failed to create trade" }, { status: 500 });
+    return NextResponse.json({ ok: true, trade: newTrade }, { status: 201 });
+  } catch (err: any) {
+    console.error("[trades] POST error", err);
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Failed to create trade",
+        detail: err?.message ?? String(err),
+      },
+      { status: 500 }
+    );
   }
 }
