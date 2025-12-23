@@ -104,17 +104,13 @@ const AI_SEED_MAX_POST = Number(process.env.AI_SEED_MAX_POST ?? 20);
 const AI_SEED_MAX_QUEUE = Number(process.env.AI_SEED_MAX_QUEUE ?? 10);
 
 type RejectKey =
-  | "noBars"
-  | "tooFewBars"
-  | "priceOutOfRange"
   | "volumeTooLow"
-  | "relVolTooLow"
-  | "rangeTooSmall"
-  | "tooFarFromVWAP"
-  | "trendNotOk"
-  | "notCandidate"
-  | "missingBarFields"
-  | "exception"
+  | "dollarVolumeTooLow"
+  | "liquidityTooLow"
+  | "vwapTooFar"
+  | "trendMismatch"
+  | "missingBars"
+  | "marketClosed"
   | "other";
 
 type GateResult =
@@ -123,17 +119,13 @@ type GateResult =
 
 function createRejectTracker(sampleLimit = 12) {
   const counts: Record<RejectKey, number> = {
-    noBars: 0,
-    tooFewBars: 0,
-    priceOutOfRange: 0,
     volumeTooLow: 0,
-    relVolTooLow: 0,
-    rangeTooSmall: 0,
-    tooFarFromVWAP: 0,
-    trendNotOk: 0,
-    notCandidate: 0,
-    missingBarFields: 0,
-    exception: 0,
+    dollarVolumeTooLow: 0,
+    liquidityTooLow: 0,
+    vwapTooFar: 0,
+    trendMismatch: 0,
+    missingBars: 0,
+    marketClosed: 0,
     other: 0,
   };
   const samples: Array<{ ticker: string; reason: RejectKey; note?: string }> = [];
@@ -406,10 +398,10 @@ function detectPremarketVwapFeatures(bars: AlpacaBar[]) {
 
 function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
   if (!bars || bars.length === 0) {
-    return { ok: false, reason: "noBars" };
+    return { ok: false, reason: "missingBars" };
   }
   if (bars.length < AI_SEED_MIN_BARS) {
-    return { ok: false, reason: "tooFewBars", note: `bars=${bars.length}` };
+    return { ok: false, reason: "missingBars", note: `bars=${bars.length}` };
   }
 
   const last = bars[bars.length - 1];
@@ -421,28 +413,32 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
   );
   const failsDollarVol = avgDollarVol < MIN_AVG_DOLLAR_VOL;
   const failsSharesVol = avgVolShares < MIN_AVG_VOL_SHARES;
-  const volumeTooLow = failsDollarVol && failsSharesVol;
   if (last.c < DEFAULT_MIN_PRICE) {
-    return { ok: false, reason: "priceOutOfRange", note: `price=${last.c.toFixed(2)}` };
+    return { ok: false, reason: "other", note: `price=${last.c.toFixed(2)}` };
   }
-  if (volumeTooLow) {
+  if (failsSharesVol) {
     return {
       ok: false,
       reason: "volumeTooLow",
-      note: `avgVolShares=${Math.round(avgVolShares)} avgDollarVol=${Math.round(
-        avgDollarVol
-      )} minShares=${MIN_AVG_VOL_SHARES} minDollar=${MIN_AVG_DOLLAR_VOL}`,
+      note: `avgVolShares=${Math.round(avgVolShares)} minShares=${MIN_AVG_VOL_SHARES}`,
+    };
+  }
+  if (failsDollarVol) {
+    return {
+      ok: false,
+      reason: "dollarVolumeTooLow",
+      note: `avgDollarVol=${Math.round(avgDollarVol)} minDollar=${MIN_AVG_DOLLAR_VOL}`,
     };
   }
 
   const relVol = avgVolShares > 0 ? last.v / avgVolShares : 0;
   if (relVol < AI_SEED_MIN_REL_VOL) {
-    return { ok: false, reason: "relVolTooLow", note: `relVol=${relVol.toFixed(2)}` };
+    return { ok: false, reason: "liquidityTooLow", note: `relVol=${relVol.toFixed(2)}` };
   }
 
   const rangePct = ((last.h - last.l) / last.c) * 100;
   if (rangePct < MIN_RANGE_PCT * 100 && AI_SEED_REQUIRE_RANGE) {
-    return { ok: false, reason: "rangeTooSmall", note: `rangePct=${rangePct.toFixed(2)}` };
+    return { ok: false, reason: "other", note: `rangePct=${rangePct.toFixed(2)}` };
   }
 
   const vwap = computeVWAP(bars);
@@ -451,7 +447,7 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
     if (distPct > AI_SEED_MAX_VWAP_DISTANCE) {
       return {
         ok: false,
-        reason: "tooFarFromVWAP",
+        reason: "vwapTooFar",
         note: `vwDist=${distPct.toFixed(2)}`,
       };
     }
@@ -460,7 +456,7 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
   const prev = bars[bars.length - 2];
   if (prev && last.c - prev.c < AI_SEED_MIN_TREND_DELTA * prev.c) {
     const deltaPct = ((last.c - prev.c) / prev.c) * 100;
-    return { ok: false, reason: "trendNotOk", note: `trend=${deltaPct.toFixed(2)}%` };
+    return { ok: false, reason: "trendMismatch", note: `trend=${deltaPct.toFixed(2)}%` };
   }
 
   return { ok: true };
@@ -521,18 +517,63 @@ export async function GET(req: NextRequest) {
       : rawMode === "ai-seed"
       ? "ai-seed"
       : "vwap"; // default/alias for vwap
-  const aiSeedMode = mode === "ai-seed";
-  const aiSeedTracker = createRejectTracker(40);
-  const reject = (ticker: string, reason: string, note?: string) => {
-    if (!aiSeedMode) return;
-    const normalizedReason = Object.prototype.hasOwnProperty.call(
-      aiSeedTracker.counts,
-      reason
-    )
-      ? (reason as RejectKey)
-      : "other";
-    aiSeedTracker.bump(ticker, normalizedReason, note);
-  };
+const aiSeedMode = mode === "ai-seed";
+const totals = {
+  totalCandidates: 0,
+  candidatesAfterBasicFilters: 0,
+  signalsCreated: 0,
+  signalsPosted: 0,
+};
+const rejectsAggregated: Record<RejectKey, number> = {
+  volumeTooLow: 0,
+  dollarVolumeTooLow: 0,
+  liquidityTooLow: 0,
+  vwapTooFar: 0,
+  trendMismatch: 0,
+  missingBars: 0,
+  marketClosed: 0,
+  other: 0,
+};
+const aiSeedTracker = createRejectTracker(40);
+
+const mapReasonToKey = (reason: string): RejectKey => {
+  switch (reason) {
+    case "volumeTooLow":
+    case "dollarVolumeTooLow":
+    case "liquidityTooLow":
+    case "vwapTooFar":
+    case "trendMismatch":
+    case "missingBars":
+    case "marketClosed":
+    case "other":
+      return reason as RejectKey;
+    case "noBars":
+    case "missingBarFields":
+      return "missingBars";
+    default:
+      return "other";
+  }
+};
+
+const reject = (ticker: string, reason: string, note?: string) => {
+  if (!aiSeedMode) return;
+  const key = mapReasonToKey(reason);
+  aiSeedTracker.bump(ticker, key, note);
+  rejectsAggregated[key] = (rejectsAggregated[key] ?? 0) + 1;
+};
+
+const logSummary = () => {
+  if (!aiSeedMode) return;
+  console.log("[scan] ai-seed summary", {
+    mode,
+    source: scanSource,
+    runId: scanRunId,
+    totals,
+    rejects: rejectsAggregated,
+    signalsCreated: totals.signalsCreated,
+    signalsPosted: totals.signalsPosted,
+  });
+};
 
   if (aiSeedMode) {
     // Market-aware: don’t run ai-seed off-hours when minute bars go thin
@@ -556,6 +597,8 @@ export async function GET(req: NextRequest) {
       } catch (err) {
         console.log("[funnel] bump scansSkipped failed (non-fatal)", err);
       }
+      reject("market", "marketClosed", "market closed (skip)");
+      logSummary();
       return NextResponse.json(
         {
           status: "ok",
@@ -595,7 +638,10 @@ export async function GET(req: NextRequest) {
 
     const promises: Promise<CandidateSignal | null>[] = chunk.map(async (symbol) => {
       try {
-        if (aiSeedMode) aiSeedTracker.trackTicker(symbol);
+        if (aiSeedMode) {
+          aiSeedTracker.trackTicker(symbol);
+          totals.totalCandidates += 1;
+        }
         const bars = await fetchRecentBars(symbol, "1Min", 60);
         if (!bars || bars.length === 0) {
           reject(symbol, "noBars");
@@ -705,7 +751,10 @@ export async function GET(req: NextRequest) {
           }
         } else if (mode === "ai-seed") {
           const candidate = detectAiSeedCandidate(symbol, bars, reject);
-          if (candidate) return candidate;
+          if (candidate) {
+            totals.candidatesAfterBasicFilters += 1;
+            return candidate;
+          }
           if (AI_SEED_REQUIRE_SETUP) {
             reject(symbol, "notCandidate", "notCandidate");
             return null;
@@ -748,6 +797,9 @@ export async function GET(req: NextRequest) {
       break;
     }
     try {
+      if (aiSeedMode) {
+        totals.signalsCreated += 1;
+      }
       const payload = toOutgoing(candidate);
       const res = await fetch(`${baseUrl}/api/signals`, {
         method: "POST",
@@ -774,6 +826,7 @@ export async function GET(req: NextRequest) {
       if (aiSeedMode) {
         postedSignals += 1;
         queuedSignals += 1;
+        totals.signalsPosted += 1;
       }
     } catch (err) {
       console.error("[SCAN] Failed posting candidate", candidate.ticker, err);
@@ -807,6 +860,8 @@ export async function GET(req: NextRequest) {
   if (result.postedCount) {
     await bumpTodayFunnel({ signalsPosted: result.postedCount });
   }
+
+  logSummary();
 
   return NextResponse.json({
     ...result,
