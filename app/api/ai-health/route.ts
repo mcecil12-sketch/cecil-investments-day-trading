@@ -72,5 +72,11 @@ export async function GET() {
     marketOpen,
     clock,
     timestamp: new Date().toISOString(),
+    vercel: {
+      VERCEL: process.env.VERCEL ?? null,
+      VERCEL_ENV: process.env.VERCEL_ENV ?? null,
+      VERCEL_GIT_COMMIT_SHA: process.env.VERCEL_GIT_COMMIT_SHA ?? null,
+      VERCEL_GIT_COMMIT_REF: process.env.VERCEL_GIT_COMMIT_REF ?? null,
+    },
   });
 }
