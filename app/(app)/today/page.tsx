@@ -302,6 +302,52 @@ export default function TodayPage() {
     loadSignals();
   }, [loadSignals]);
 
+  const loadApprovalTrades = useCallback(async () => {
+    setLoadingApprovalTrades(true);
+    setApprovalTradesError(null);
+    try {
+      const res = await fetch("/api/trades", { cache: "no-store" });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`Failed to load trades (${res.status}): ${text}`);
+      }
+      const data = await res.json().catch(() => ({}));
+      const trades = Array.isArray((data as any)?.trades) ? (data as any).trades : [];
+
+      const queued = trades.filter((t: any) => {
+        const status = String(t?.status || "");
+        const approvalStatus = String(t?.approvalStatus || "");
+        return (
+          t?.needsApproval === true ||
+          t?.pendingApproval === true ||
+          /PENDING|QUEUE|APPROV|REVIEW/i.test(approvalStatus) ||
+          /BROKER_PENDING|PENDING/i.test(status)
+        );
+      });
+
+      queued.sort((a: any, b: any) => {
+        const ta = String(a?.createdAt || a?.openedAt || a?.submittedAt || "");
+        const tb = String(b?.createdAt || b?.openedAt || b?.submittedAt || "");
+        return tb.localeCompare(ta);
+      });
+
+      setApprovalTrades(queued);
+    } catch (err: any) {
+      console.error("[today] loadApprovalTrades error", err);
+      setApprovalTradesError(err?.message || "Failed to load approval queue");
+      setApprovalTrades([]);
+    } finally {
+      setLoadingApprovalTrades(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadApprovalTrades();
+    const interval = setInterval(loadApprovalTrades, 15000);
+    return () => clearInterval(interval);
+  }, [loadApprovalTrades]);
+
+
   const refreshSignals = () => {
     loadSignals();
   };
@@ -770,7 +816,73 @@ export default function TodayPage() {
           </div>
         </header>
 
+
         <main className="max-w-6xl mx-auto px-4 pt-6 pb-24 space-y-6">
+          <section className="space-y-3">
+            <div className="flex items-end justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-neutral-100">Approval queue (trades)</h2>
+                <p className="text-[11px] text-neutral-500">Broker-pending or approval-needed trades</p>
+              </div>
+              <a href="/trades" className="text-[11px] text-slate-300 underline-offset-2 hover:text-slate-100">View all trades</a>
+            </div>
+
+            {approvalTradesError && (
+              <p className="text-xs text-[var(--ci-negative)]">{approvalTradesError}</p>
+            )}
+
+            {loadingApprovalTrades && approvalTrades.length === 0 && (
+              <p className="muted-text">Loading approval queue…</p>
+            )}
+
+            {!loadingApprovalTrades && approvalTrades.length === 0 && (
+              <p className="empty-text">No broker-pending / approval-needed trades right now.</p>
+            )}
+
+            {approvalTrades.slice(0, 10).map((t: any) => (
+              <div
+                key={t.id}
+                className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 md:p-6 shadow-[0_0_12px_rgba(255,255,255,0.03)] space-y-2"
+              >
+                <div className="flex items-center justify-between">
+                  <div className="pill-row">
+                    <span className="pill ticker-pill">{t.ticker}</span>
+                    {t.side && (
+                      <span className={`pill side-pill ${(String(t.side)).toLowerCase()}`}>{t.side}</span>
+                    )}
+                    <span className="pill source-pill">{t.status || t.approvalStatus || "—"}</span>
+                  </div>
+                  {(t.createdAt || t.openedAt || t.submittedAt) && (
+                    <div className="muted-text small">
+                      {new Date(t.createdAt || t.openedAt || t.submittedAt).toLocaleString()}
+                    </div>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+                  <div>
+                    <div className="label">Entry</div>
+                    <div className="value">{typeof t.entryPrice === "number" ? t.entryPrice.toFixed(2) : "—"}</div>
+                  </div>
+                  <div>
+                    <div className="label">Stop</div>
+                    <div className="value">{typeof t.stopPrice === "number" ? t.stopPrice.toFixed(2) : "—"}</div>
+                  </div>
+                  <div>
+                    <div className="label">Qty</div>
+                    <div className="value">{t.quantity ?? t.size ?? "—"}</div>
+                  </div>
+                  <div>
+                    <div className="label">Signal</div>
+                    <div className="value">{t.signalId ? "linked" : "unlinked"}</div>
+                  </div>
+                </div>
+
+                {t.error && <div className="text-xs text-[var(--ci-negative)]">{String(t.error)}</div>}
+              </div>
+            ))}
+          </section>
+
           {/* Pending approvals */}
           <section className="space-y-3">
             <h2 className="text-sm font-semibold text-neutral-100">
