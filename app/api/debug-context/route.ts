@@ -38,17 +38,33 @@ export async function GET(req: Request) {
     const endIso = endDate.toISOString();
     const feed = process.env.ALPACA_DATA_FEED || "sip";
 
-    const result = await fetchRecentBarsWithUrl({
-      ticker,
-      timeframe,
-      adjustment: "raw",
-      start: startIso,
-      end: endIso,
-      windowMinutes,
-      feed,
-    });
+    const fetchWindow = async (start: string, end: string) => {
+      return fetchRecentBarsWithUrl({
+        ticker,
+        timeframe,
+        adjustment: "raw",
+        start,
+        end,
+        feed,
+      });
+    };
 
-    const { bars, json, url } = result;
+    let windowResult = await fetchWindow(startIso, endIso);
+    let bars = windowResult.bars;
+    let barsUrlAttempted = windowResult.url;
+
+    if (!marketOpen && bars.length === 0) {
+      for (const backHours of [6, 12]) {
+        const endShift = new Date(endDate.getTime() - backHours * 60 * 60_000);
+        const startShift = new Date(endShift.getTime() - windowMinutes * 60_000);
+        const attempt = await fetchWindow(startShift.toISOString(), endShift.toISOString());
+        if (attempt.bars.length > 0) {
+          bars = attempt.bars;
+          barsUrlAttempted = attempt.url;
+          break;
+        }
+      }
+    }
 
     const barsArray = Array.isArray(bars) ? bars : [];
     const firstBar = barsArray[0] ?? null;
@@ -64,7 +80,7 @@ export async function GET(req: Request) {
       timeframe,
       serverNow: new Date().toISOString(),
       alpacaClock: clock,
-      barsUrlAttempted: url,
+      barsUrlAttempted,
       barsUsed: barsArray.length,
       firstBar,
       lastBar,
