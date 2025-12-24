@@ -51,7 +51,7 @@ export async function POST(req: Request) {
     }
 
     fixed += 1;
-    const base: RepairSignal = { ...signal, updatedAt: nowIso };
+    const base: StoredSignal = { ...signal, updatedAt: nowIso };
 
     if (mode === "archive") {
       return { ...base, archived: true, archivedAt: nowIso };
@@ -61,7 +61,7 @@ export async function POST(req: Request) {
       ...base,
       status: "ERROR",
       error: "legacy_scored_missing_fields",
-    };
+    } as StoredSignal;
   });
 
   if (fixed) {
