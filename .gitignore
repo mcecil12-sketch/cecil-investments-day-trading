@@ -44,3 +44,7 @@ next-env.d.ts
 data/*.json
 cookies.txt
 cookies*.txt
+
+# local auth cookies
+cookies-prod.txt
+cookies.txt
