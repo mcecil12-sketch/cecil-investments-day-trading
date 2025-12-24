@@ -33,6 +33,12 @@ export async function POST(req: Request) {
   let fixed = 0;
   const sample: Array<{ id: string; ticker: string; createdAt: string }> = [];
 
+  type RepairSignal = StoredSignal & {
+    updatedAt?: string;
+    archived?: boolean;
+    archivedAt?: string;
+  };
+
   const repaired = signals.map((signal) => {
     if (fixed >= limit) return signal;
     if (signal.status !== "SCORED") return signal;
@@ -45,18 +51,17 @@ export async function POST(req: Request) {
     }
 
     fixed += 1;
-    const updated: StoredSignal = { ...signal };
-    updated.updatedAt = nowIso;
+    const base: RepairSignal = { ...signal, updatedAt: nowIso };
 
     if (mode === "archive") {
-      updated.archived = true;
-      updated.archivedAt = nowIso;
-    } else {
-      updated.status = "ERROR";
-      updated.error = "legacy_scored_missing_fields";
+      return { ...base, archived: true, archivedAt: nowIso };
     }
 
-    return updated;
+    return {
+      ...base,
+      status: "ERROR",
+      error: "legacy_scored_missing_fields",
+    };
   });
 
   if (fixed) {

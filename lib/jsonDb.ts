@@ -23,6 +23,9 @@ export type StoredSignal = {
   source?: string;
   reasoning?: string;
   createdAt: string;
+  updatedAt?: string;
+  archived?: boolean;
+  archivedAt?: string;
 
   // AI fields
   aiScore?: number;

@@ -1,1 +1,26 @@
-[]
+[
+  {
+    "type": "MANUAL_STOP_APPLIED",
+    "tradeId": "5014f7e9-a28b-476d-a3f0-3c756dd8cc87",
+    "ticker": "SPY",
+    "message": "Stop moved undefined -> 123.45",
+    "meta": {
+      "stopLegId": null,
+      "stopOrderId": "e8e21eff-a586-4966-b6f2-6b192527064a"
+    },
+    "id": "07c51ac2-8d66-4ae7-af68-25ec54a723b7",
+    "timestamp": "2025-12-23T04:27:59.684Z"
+  },
+  {
+    "type": "MANUAL_STOP_APPLIED",
+    "tradeId": "76c70543-eebc-474b-9cc2-0d100c586852",
+    "ticker": "SPY",
+    "message": "Stop moved n/a -> 123.45",
+    "meta": {
+      "stopLegId": null,
+      "stopOrderId": "6fca3f8c-826c-4b75-a7a3-ecddb73cf052"
+    },
+    "id": "69f7ba7f-3f32-421a-bdfe-629914866fe6",
+    "timestamp": "2025-12-23T05:11:59.412Z"
+  }
+]
