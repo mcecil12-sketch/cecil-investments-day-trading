@@ -10,6 +10,7 @@ const PUBLIC_PATHS = [
   "/api/ai-health",
   "/api/funnel-stats",
   "/api/ai-heartbeat",
+  "/api/diag-build",
 ];
 
 function isScannerAuthed(req: NextRequest) {
