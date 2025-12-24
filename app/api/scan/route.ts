@@ -903,3 +903,7 @@ const logSummary = () => {
     ...(debugScan && summarySnapshot ? { debugSummary: summarySnapshot } : {}),
   });
 }
+
+export async function POST(req: NextRequest) {
+  return GET(req);
+}
