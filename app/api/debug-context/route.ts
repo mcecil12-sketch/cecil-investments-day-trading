@@ -6,10 +6,6 @@ import { NextResponse } from "next/server";
 import { fetchRecentBarsWithUrl, hasAlpacaCreds, ALPACA_FEED } from "@/lib/alpaca";
 import { fetchAlpacaClock } from "@/lib/alpacaClock";
 
-function isoMinutesAgo(minutes: number) {
-  return new Date(Date.now() - minutes * 60 * 1000).toISOString();
-}
-
 export async function GET(req: Request) {
   try {
     const u = new URL(req.url);
@@ -17,9 +13,23 @@ export async function GET(req: Request) {
     const ticker = (u.searchParams.get("ticker") || "SPY").toUpperCase();
     const timeframe = u.searchParams.get("timeframe") || "1Min";
 
-    const windowMinutes = Number(u.searchParams.get("windowMinutes") ?? "30");
-    const endIso = new Date().toISOString();
-    const startIso = isoMinutesAgo(windowMinutes);
+    const windowMinutes = Math.max(
+      15,
+      Number(u.searchParams.get("windowMinutes") ?? "180") || 180
+    );
+
+    const now = new Date();
+    const clock = await fetchAlpacaClock().catch(() => null);
+    const marketOpen = Boolean(clock?.is_open);
+
+    const endDate = marketOpen
+      ? now
+      : clock?.next_open
+      ? new Date(new Date(clock.next_open).getTime() - 60_000)
+      : now;
+    const startDate = new Date(endDate.getTime() - windowMinutes * 60_000);
+    const startIso = startDate.toISOString();
+    const endIso = endDate.toISOString();
     const feed = process.env.ALPACA_DATA_FEED || "sip";
 
     const result = await fetchRecentBarsWithUrl({
@@ -33,8 +43,6 @@ export async function GET(req: Request) {
     });
 
     const { bars, json, url } = result;
-
-    const clock = await fetchAlpacaClock().catch(() => null);
 
     const barsArray = Array.isArray(bars) ? bars : [];
     const firstBar = barsArray[0] ?? null;
