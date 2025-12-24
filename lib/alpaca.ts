@@ -109,6 +109,7 @@ export async function fetchRecentBarsWithUrl(args: {
   end?: string;
   adjustment?: "raw" | "split" | "dividend" | "all";
   windowMinutes?: number;
+  feed?: string;
 }) {
   const ticker = args.ticker.toUpperCase();
   const endIso = args.end || new Date().toISOString();
@@ -128,7 +129,7 @@ export async function fetchRecentBarsWithUrl(args: {
     limit: args.limit,
     start: startIso,
     end: endIso,
-    feed: ALPACA_FEED,
+    feed: args.feed ?? ALPACA_FEED,
     adjustment: args.adjustment,
   });
 
