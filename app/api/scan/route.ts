@@ -612,6 +612,7 @@ const buildSummary = () => {
     rejects: rejectsAggregated,
     signalsCreated: totals.signalsCreated,
     signalsPosted: totals.signalsPosted,
+    rejectSamples: aiSeedTracker.samples,
   };
 };
 
