@@ -183,6 +183,9 @@ export default function TodayPage() {
   const { settings, dailyPnL, addTrade } = useTrading();
   const [signals, setSignals] = useState<IncomingSignal[]>([]);
   const [loadingSignals, setLoadingSignals] = useState(false);
+  const [approvalTrades, setApprovalTrades] = useState<any[]>([]);
+  const [loadingApprovalTrades, setLoadingApprovalTrades] = useState(false);
+  const [approvalTradesError, setApprovalTradesError] = useState<string | null>(null);
 
   // Session-level risk override (drives chosenRisk used for sizing)
   const [riskDollars, setRiskDollars] = useState<number>(() => settings.oneR || 150);
