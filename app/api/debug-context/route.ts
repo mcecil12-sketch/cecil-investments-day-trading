@@ -8,26 +8,32 @@ import { fetchAlpacaClock } from "@/lib/alpacaClock";
 
 export async function GET(req: Request) {
   try {
-    const u = new URL(req.url);
+    const { searchParams } = new URL(req.url);
 
-    const ticker = (u.searchParams.get("ticker") || "SPY").toUpperCase();
-    const timeframe = u.searchParams.get("timeframe") || "1Min";
-
+    const ticker = (searchParams.get("ticker") || "SPY").toUpperCase();
+    const timeframe = searchParams.get("timeframe") || "1Min";
     const windowMinutes = Math.max(
       15,
-      Number(u.searchParams.get("windowMinutes") ?? "180") || 180
+      Number(searchParams.get("windowMinutes") || "180") || 180
     );
+    const startOverride = searchParams.get("start");
+    const endOverride = searchParams.get("end");
 
     const now = new Date();
     const clock = await fetchAlpacaClock().catch(() => null);
     const marketOpen = Boolean(clock?.is_open);
 
-    const endDate = marketOpen
+    const endDate = endOverride
+      ? new Date(endOverride)
+      : marketOpen
       ? now
       : clock?.next_open
       ? new Date(new Date(clock.next_open).getTime() - 60_000)
       : now;
-    const startDate = new Date(endDate.getTime() - windowMinutes * 60_000);
+
+    const startDate = startOverride
+      ? new Date(startOverride)
+      : new Date(endDate.getTime() - windowMinutes * 60_000);
     const startIso = startDate.toISOString();
     const endIso = endDate.toISOString();
     const feed = process.env.ALPACA_DATA_FEED || "sip";
