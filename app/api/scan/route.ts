@@ -117,6 +117,15 @@ type GateResult =
   | { ok: false; reason: RejectKey; note?: string }
   | { ok: true };
 
+type BarDiagnostics = {
+  barCount: number;
+  firstTimestamp: string | null;
+  lastTimestamp: string | null;
+  avgVolume: number;
+  volumeSum: number;
+  ageMinutes: number | null;
+};
+
 function createRejectTracker(sampleLimit = 12) {
   const counts: Record<RejectKey, number> = {
     volumeTooLow: 0,
@@ -128,14 +137,19 @@ function createRejectTracker(sampleLimit = 12) {
     marketClosed: 0,
     other: 0,
   };
-  const samples: Array<{ ticker: string; reason: RejectKey; note?: string }> = [];
+  const samples: Array<{ ticker: string; reason: RejectKey; note?: string; bars?: BarDiagnostics }> = [];
   const seenTickers: string[] = [];
   let processedCount = 0;
 
-  function bump(ticker: string, reason: RejectKey, note?: string) {
+  function bump(
+    ticker: string,
+    reason: RejectKey,
+    note?: string,
+    bars?: BarDiagnostics
+  ) {
     counts[reason] = (counts[reason] ?? 0) + 1;
     if (samples.length < sampleLimit) {
-      samples.push({ ticker, reason, note });
+      samples.push({ ticker, reason, note, bars });
     }
   }
 
@@ -155,6 +169,26 @@ function createRejectTracker(sampleLimit = 12) {
     get seenTickers() {
       return seenTickers;
     },
+  };
+}
+
+function summarizeBars(bars?: AlpacaBar[]): BarDiagnostics {
+  const arr = Array.isArray(bars) ? bars : [];
+  const firstBar = arr[0];
+  const lastBar = arr[arr.length - 1];
+  const volumeSum = arr.reduce((sum, bar) => sum + (bar?.v ?? 0), 0);
+  const avgVolume = arr.length ? volumeSum / arr.length : 0;
+  const ageMinutes =
+    lastBar && lastBar.t
+      ? Math.max(0, (Date.now() - Date.parse(lastBar.t)) / 60000)
+      : null;
+  return {
+    barCount: arr.length,
+    firstTimestamp: firstBar?.t ?? null,
+    lastTimestamp: lastBar?.t ?? null,
+    avgVolume,
+    volumeSum,
+    ageMinutes,
   };
 }
 
@@ -556,10 +590,15 @@ const mapReasonToKey = (reason: string): RejectKey => {
   }
 };
 
-const reject = (ticker: string, reason: string, note?: string) => {
+const reject = (
+  ticker: string,
+  reason: string,
+  note?: string,
+  bars?: BarDiagnostics
+) => {
   if (!aiSeedMode) return;
   const key = mapReasonToKey(reason);
-  aiSeedTracker.bump(ticker, key, note);
+  aiSeedTracker.bump(ticker, key, note, bars);
   rejectsAggregated[key] = (rejectsAggregated[key] ?? 0) + 1;
 };
 
@@ -665,11 +704,13 @@ const logSummary = () => {
         const bars = await fetchRecentBars(symbol, "1Min", 60);
         const lastBar = bars?.[bars.length - 1];
         const barCount = bars?.length ?? 0;
+        const barSummary = summarizeBars(bars);
         if (!bars || barCount < AI_SEED_MIN_BARS) {
           reject(
             symbol,
             "missingBars",
-            `bars=${barCount} lastBar=${lastBar?.t ?? null}`
+            `bars=${barCount} lastBar=${lastBar?.t ?? null}`,
+            barSummary
           );
           return null;
         }
@@ -678,7 +719,7 @@ const logSummary = () => {
           aiSeedMode &&
           bars.some((b) => b == null || b.v == null || (b.vw == null && b.c == null))
         ) {
-          reject(symbol, "missingBarFields", "missing v or (vw/c)");
+          reject(symbol, "missingBarFields", "missing v or (vw/c)", barSummary);
           return null;
         }
 
@@ -689,7 +730,8 @@ const logSummary = () => {
           reject(
             symbol,
             "other",
-            `priceTooLow=${last.c.toFixed(2)} minPrice=${minPrice.toFixed(2)}`
+            `priceTooLow=${last.c.toFixed(2)} minPrice=${minPrice.toFixed(2)}`,
+            barSummary
           );
           return null;
         }
@@ -703,7 +745,8 @@ const logSummary = () => {
             "volumeTooLow",
             `avgVolShares=${Math.round(avgVolShares)} avgDollarVol=${Math.round(
               avgDollarVol
-            )} minShares=${MIN_AVG_VOL_SHARES} minDollar=${MIN_AVG_DOLLAR_VOL}`
+            )} minShares=${MIN_AVG_VOL_SHARES} minDollar=${MIN_AVG_DOLLAR_VOL}`,
+            barSummary
           );
           return null;
         }
