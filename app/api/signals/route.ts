@@ -9,6 +9,7 @@ import {
   formatAiSummary,
   AiGrade,
 } from "@/lib/aiScoring";
+import { parseAiTradePlan } from "@/lib/tradePlan";
 import { sendPullbackAlert } from "@/lib/notify";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { shouldQualify } from "@/lib/aiQualify";
@@ -144,6 +145,7 @@ export async function POST(req: Request) {
     grade: "F",
     qualified: false,
     shownInApp: false,
+    tradePlan: null,
   };
 
   await appendSignal(placeholder);
@@ -188,6 +190,16 @@ export async function POST(req: Request) {
       typeof scored.totalScore === "number" && Number.isFinite(scored.totalScore)
         ? scored.totalScore
         : safeScore;
+    const tradePlan =
+      scored.tradePlan ??
+      parseAiTradePlan({
+        text: scored.aiSummary ?? "",
+        score: safeScore ?? 0,
+        side,
+        entryPrice: Number(entryPrice),
+        stopPrice: Number(stopPrice),
+        liquidityTag: rawMeta?.liquidityTag ?? rawMeta?.liquidity?.tag,
+      });
     finalSignal = {
       ...placeholder,
       ...scored,
@@ -200,6 +212,7 @@ export async function POST(req: Request) {
       grade: gradeCandidate,
       reasoning: placeholder.reasoning ?? safeSummary,
       shownInApp: true,
+      tradePlan,
     };
     await replaceSignal(finalSignal);
     await touchHeartbeat();

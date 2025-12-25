@@ -1,3 +1,4 @@
+import { buildDefaultTradePlan, parseAiTradePlan, type TradePlan } from "@/lib/tradePlan";
 import OpenAI from "openai";
 import { recordSpend, recordAiCall, recordAiError, writeAiHeartbeat } from "./aiMetrics";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
@@ -36,12 +37,17 @@ export type ScoredSignal = RawSignal & {
   totalScore: number;
   status?: string;
   skipReason?: string;
+  tradePlan?: TradePlan | null;
 };
 
 type ModelResponse = {
-  score: number;
-  grade: AiGrade;
-  summary: string;
+  score?: number;
+  grade?: AiGrade;
+  summary?: string;
+  aiScore?: number;
+  aiGrade?: AiGrade;
+  aiSummary?: string;
+  totalScore?: number;
 };
 
 function supportsCustomTemperature(model: string) {
@@ -110,12 +116,28 @@ Rules:
 
   let context: SignalContext | null = null;
   try {
-    context = await buildSignalContext({
+        context = await buildSignalContext({
       ticker: rawSignal.ticker,
       timeframe,
       limit: 90,
       endTimeIso: rawSignal.createdAt,
     });
+
+    if (context && context.barsUsed < MIN_BARS_FOR_AI) {
+      try {
+        const retry = await buildSignalContext({
+          ticker: rawSignal.ticker,
+          timeframe,
+          limit: 90,
+        });
+        if (retry && retry.barsUsed > (context?.barsUsed ?? 0)) {
+          context = retry;
+        }
+      } catch (e: any) {
+        console.log("[aiScoring] context retry failed (non-fatal):", e?.message ?? String(e));
+      }
+    }
+
   } catch (e: any) {
     console.log("[aiScoring] context build failed (non-fatal):", e?.message ?? String(e));
   }

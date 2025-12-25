@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { redis } from "@/lib/redis";
+import { TradePlan } from "@/lib/tradePlan";
 
 export type SignalSide = "LONG" | "SHORT";
 
@@ -39,6 +40,7 @@ export type StoredSignal = {
   qualified?: boolean;
   shownInApp?: boolean;
   error?: string | null;
+  tradePlan?: TradePlan | null;
 };
 
 const LOCAL_DATA_DIR = path.join(process.cwd(), "data");
