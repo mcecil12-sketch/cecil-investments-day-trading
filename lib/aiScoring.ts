@@ -1,3 +1,4 @@
+import { buildDefaultTradePlan, parseAiTradePlan, type TradePlan } from "@/lib/tradePlan";
 import OpenAI from "openai";
 import { recordSpend, recordAiCall, recordAiError, writeAiHeartbeat } from "./aiMetrics";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
@@ -36,6 +37,7 @@ export type ScoredSignal = RawSignal & {
   totalScore: number;
   status?: string;
   skipReason?: string;
+  tradePlan?: TradePlan | null;
 };
 
 type ModelResponse = {
