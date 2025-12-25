@@ -41,9 +41,13 @@ export type ScoredSignal = RawSignal & {
 };
 
 type ModelResponse = {
-  score: number;
-  grade: AiGrade;
-  summary: string;
+  score?: number;
+  grade?: AiGrade;
+  summary?: string;
+  aiScore?: number;
+  aiGrade?: AiGrade;
+  aiSummary?: string;
+  totalScore?: number;
 };
 
 function supportsCustomTemperature(model: string) {
