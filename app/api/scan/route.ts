@@ -699,11 +699,6 @@ const logSummary = () => {
           upper.endsWith("U") ||
           upper.endsWith("R")
         ) {
-          
-    if (symbol.includes(".")) {
-      reject(symbol, "other", "ticker excluded before bars");
-  return null;
-    }
 reject(symbol, "other", "ticker excluded before bars");
           return null;
         }
