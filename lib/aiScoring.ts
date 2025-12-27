@@ -4,6 +4,20 @@ import { recordSpend, recordAiCall, recordAiError, writeAiHeartbeat } from "./ai
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { buildSignalContext, SignalContext } from "@/lib/signalContext";
 
+function dynamicMinScore(sessionMinutes: number) {
+  const m = Number.isFinite(sessionMinutes) ? sessionMinutes : 60;
+  if (m <= 15) return { c: 6.3, b: 7.2, a: 8.4 };
+  if (m <= 90) return { c: 6.5, b: 7.5, a: 8.5 };
+  return { c: 6.8, b: 7.8, a: 8.7 };
+}
+
+function tierFromScore(score: number, mins: {c:number;b:number;a:number}) {
+  if (score >= mins.a) return "A";
+  if (score >= mins.b) return "B";
+  if (score >= mins.c) return "C";
+  return "REJECT";
+}
+
 export type Side = "LONG" | "SHORT";
 
 export type RawSignal = {

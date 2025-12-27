@@ -92,6 +92,14 @@ const DEFAULT_MIN_AVG_VOLUME = 300_000;
 const DEFAULT_LIMIT = 600;
 const MAX_SIGNALS_PER_SCAN = 50;
 const AI_SEED_MIN_BARS = 20;
+
+  const AI_SEED_OPENING_MINUTES = Number(process.env.AI_SEED_OPENING_MINUTES ?? 12);
+  const AI_SEED_OPENING_PER_MIN_FLOOR_SHARES = Number(process.env.AI_SEED_OPENING_PER_MIN_FLOOR_SHARES ?? 25000);
+  const AI_SEED_OPENING_ALLOW_SPIKE = String(process.env.AI_SEED_OPENING_ALLOW_SPIKE ?? "1") === "1";
+  const AI_SEED_SPIKE_MULT = Number(process.env.AI_SEED_SPIKE_MULT ?? 2.0);
+  const AI_SEED_GPT_LIMIT = Number(process.env.AI_SEED_GPT_LIMIT ?? 60);
+  const AI_SEED_PRESCORE_MIN = Number(process.env.AI_SEED_PRESCORE_MIN ?? 0);
+
 const AI_SEED_MIN_REL_VOL = 0.3;
 const MIN_RANGE_PCT = Number(process.env.MIN_RANGE_PCT ?? 0.05);
 const AI_SEED_MAX_VWAP_DISTANCE = 2;
@@ -591,6 +599,39 @@ const mapReasonToKey = (reason: string): RejectKey => {
   }
 };
 
+function clamp(n: number, lo: number, hi: number) {
+    return Math.max(lo, Math.min(hi, n));
+  }
+
+  function computePreScore(args: {
+    relVol: number;
+    distToVwapPct: number;
+    vwapSlopePct: number;
+    atrPct: number;
+    spreadAbs: number;
+    price: number;
+  }) {
+    const relVolScore = clamp((args.relVol / 5) * 30, 0, 30);
+    const vwapProxScore = clamp((1 - Math.min(Math.abs(args.distToVwapPct), 2.0) / 2.0) * 25, 0, 25);
+    const trendScore = clamp((Math.max(args.vwapSlopePct, 0) / 0.25) * 20, 0, 20);
+    const volScore = clamp((Math.min(args.atrPct, 6) / 6) * 15, 0, 15);
+    const spreadScore = clamp((1 - Math.min(args.spreadAbs, 0.6) / 0.6) * 10, 0, 10);
+    const priceBonus =
+      args.price >= 10 && args.price <= 150 ? 5 : args.price >= 5 ? 2 : 0;
+    const score = relVolScore + vwapProxScore + trendScore + volScore + spreadScore + priceBonus;
+    return Math.round(score);
+  }
+
+  function minutesSinceOpenFromBars(bars: any[]) {
+    if (!bars || !bars.length) return 999;
+    const first = bars[0];
+    const last = bars[bars.length - 1];
+    const t0 = new Date(first.t).getTime();
+    const t1 = new Date(last.t).getTime();
+        if (!isFinite(t0) || !isFinite(t1) || t1 <= t0) return 999;
+    return Math.floor((t1 - t0) / 60000);
+  }
+
 const reject = (
   ticker: string,
   reason: string,
@@ -860,9 +901,32 @@ const logSummary = () => {
   }
 
   // Sort by pattern strength and take top N, dropping zero/negative scores
-  candidates.sort((a, b) => b.patternScore - a.patternScore);
+  const minutesSinceOpen = minutesSinceOpenFromBars(candidates as any);
+  const openingMode = minutesSinceOpen <= AI_SEED_OPENING_MINUTES;
+
+  const enriched = candidates.map((c: any) => {
+    const preScore = computePreScore({
+      relVol: Number(c.relVol ?? 0),
+      distToVwapPct: Number(c.distToVwapPct ?? 0),
+      vwapSlopePct: Number(c.vwapSlopePct ?? 0),
+      atrPct: Number(c.atrPct ?? 0),
+      spreadAbs: Number(c.spreadAbs ?? 0),
+      price: Number(c.price ?? 0),
+    });
+    return { ...c, preScore, openingMode, minutesSinceOpen };
+  });
+
+  const ranked = enriched
+    .filter((c: any) => (c.preScore ?? 0) >= AI_SEED_PRESCORE_MIN)
+    .sort((a: any, b: any) => (b.preScore ?? 0) - (a.preScore ?? 0))
+    .slice(0, AI_SEED_GPT_LIMIT);
+
+  candidates = ranked;
+
+candidates.sort((a, b) => b.patternScore - a.patternScore);
   const filtered = candidates.filter((c) => c.patternScore > 0);
-  const topCandidates = filtered.slice(0, MAX_SIGNALS_PER_SCAN);
+  const topCandidates = filtered.slice(0, 
+    MAX_SIGNALS_PER_SCAN);
 
   const posted: OutgoingSignal[] = [];
   let postedSignals = 0;
