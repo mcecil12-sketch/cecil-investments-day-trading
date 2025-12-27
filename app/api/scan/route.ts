@@ -636,7 +636,7 @@ const logSummary = () => {
       .then((r) => (r.ok ? r.json() : null))
       .catch(() => null);
 
-    if (clock && clock.is_open === false) {
+    if ((clock && clock.is_open === false) && !(debugScan && (search.get("force") === "1"))) {
       try {
         await bumpScanSkip(mode, {
           source: scanSource,
