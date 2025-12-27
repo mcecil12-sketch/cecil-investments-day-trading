@@ -949,5 +949,9 @@ const logSummary = () => {
 }
 
 export async function POST(req: NextRequest) {
-  return GET(req);
+  
+  const url = new URL(req.url);
+  const force = url.searchParams.get("force") === "1";
+  const debug = req.headers.get("x-debug-scan") === "1";
+return GET(req);
 }
