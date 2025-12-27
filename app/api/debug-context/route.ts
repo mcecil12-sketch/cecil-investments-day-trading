@@ -28,7 +28,7 @@ export async function GET(req: Request) {
       : marketOpen
       ? now
       : clock?.next_open
-      ? new Date(new Date(clock.next_open).getTime() - 60_000)
+      ? new Date(clock.timestamp)
       : now;
 
     const startDate = startOverride
