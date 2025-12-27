@@ -1,4 +1,5 @@
-import { fetchRecentBarsWithUrl, AlpacaBar } from "@/lib/alpaca";
+import { fetchRecentBarsWithUrl, AlpacaBar, alpacaHeaders } from "@/lib/alpaca";
+import { fetchAlpacaClock } from "@/lib/alpacaClock";
 import { getRollingWindowMinutes, resolveEndIso } from "@/lib/barWindow";
 
 export type SignalContext = {
@@ -83,6 +84,44 @@ function liquidityNoteFromContext(avgVolume: number | null, price: number | null
 }
 
 const DEBUG_SIGNAL_CONTEXT = process.env.DEBUG_SIGNAL_CONTEXT === "1";
+
+function tradingBaseUrl() {
+  return (
+    process.env.ALPACA_TRADING_BASE_URL ||
+    process.env.ALPACA_BASE_URL ||
+    "https://paper-api.alpaca.markets"
+  ).replace(/\/$/, "");
+}
+
+function isoDateOnly(date: Date) {
+  return date.toISOString().slice(0, 10);
+}
+
+async function fetchLastTradingSessionClose() {
+  try {
+    const now = new Date();
+    const start = new Date(now);
+    start.setDate(start.getDate() - 14);
+    const startStr = isoDateOnly(start);
+    const endStr = isoDateOnly(now);
+    const url = `${tradingBaseUrl()}/v2/calendar?start=${encodeURIComponent(startStr)}&end=${encodeURIComponent(endStr)}`;
+    const res = await fetch(url, {
+      headers: alpacaHeaders(),
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+    const calendar = (await res.json()) as Array<{ date: string; open: string; close: string }>;
+    if (!Array.isArray(calendar) || calendar.length === 0) return null;
+    const last = calendar[calendar.length - 1];
+    if (!last?.date || !last?.close) return null;
+    return { date: last.date, close: last.close };
+  } catch (err) {
+    if (DEBUG_SIGNAL_CONTEXT) {
+      console.warn("[signalContext] calendar lookup failed", err);
+    }
+    return null;
+  }
+}
 
 export async function buildSignalContext(params: {
   ticker: string;
