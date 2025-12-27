@@ -103,31 +103,65 @@ export async function buildSignalContext(params: {
     windowMinutes,
   });
 
-  const sampledBars = bars ?? json?.bars ?? [];
+  let finalBars = (bars ?? json?.bars ?? []) as AlpacaBar[];
+  let fallbackEndIso: string | null = null;
+  let fallbackAttempts = 0;
+  let fallbackUsed = false;
+
+  const stepMs = 360 * 60_000;
+  const maxAttempts = 30;
+  let cursor = Number.isFinite(Number(endIso)) ? Date.parse(endIso) : Date.now();
+  if (Number.isNaN(cursor)) cursor = Date.now();
+
+  if (finalBars.length === 0) {
+    for (let attempt = 0; attempt < maxAttempts && finalBars.length === 0; attempt++) {
+      cursor -= stepMs;
+      const attemptIso = new Date(cursor).toISOString();
+      const attemptResp = await fetchRecentBarsWithUrl({
+        ticker: params.ticker,
+        timeframe: params.timeframe,
+        adjustment: "raw",
+        end: attemptIso,
+        limit,
+        windowMinutes,
+      });
+      fallbackAttempts = attempt + 1;
+      const attemptBars = (attemptResp.bars ?? attemptResp.json?.bars ?? []) as AlpacaBar[];
+      if (attemptBars.length > 0) {
+        finalBars = attemptBars;
+        fallbackUsed = true;
+        fallbackEndIso = attemptIso;
+        break;
+      }
+    }
+  }
 
   if (DEBUG_SIGNAL_CONTEXT) {
-    const lastBarTime = sampledBars.length ? sampledBars[sampledBars.length - 1].t : null;
+    const lastBarTime = finalBars.length ? finalBars[finalBars.length - 1].t : null;
     console.log("[signalContext]", {
       ticker: params.ticker,
       timeframe: params.timeframe,
-      barsUsed: sampledBars.length,
+      barsUsed: finalBars.length,
       endIso,
       windowMinutes,
       lastBarTime,
       url,
+      fallbackUsed,
+      fallbackAttempts,
+      fallbackEndIso,
     });
   }
 
-  const vwap = computeVWAP(sampledBars);
-  const { trend, slopePct } = computeTrend(sampledBars);
-  const { avg, last, rel } = computeVolumes(sampledBars);
-  const rangePctAvg = computeAvgRangePct(sampledBars);
-  const lastClose = sampledBars.length ? sampledBars[sampledBars.length - 1].c : null;
+  const vwap = computeVWAP(finalBars);
+  const { trend, slopePct } = computeTrend(finalBars);
+  const { avg, last, rel } = computeVolumes(finalBars);
+  const rangePctAvg = computeAvgRangePct(finalBars);
+  const lastClose = finalBars.length ? finalBars[finalBars.length - 1].c : null;
   const liquidityNote = liquidityNoteFromContext(avg, lastClose ?? null);
 
   return {
     timeframe: params.timeframe,
-    barsUsed: sampledBars.length,
+    barsUsed: finalBars.length,
     vwap: vwap ?? null,
     trend,
     trendSlopePct: slopePct,
