@@ -96,8 +96,9 @@ const AI_SEED_MIN_REL_VOL = 0.3;
 const MIN_RANGE_PCT = Number(process.env.MIN_RANGE_PCT ?? 0.05);
 const AI_SEED_MAX_VWAP_DISTANCE = 2;
 const AI_SEED_MIN_TREND_DELTA = -0.005;
-const MIN_AVG_VOL_SHARES = Number(process.env.MIN_AVG_VOL_SHARES ?? 3_000);
-const MIN_AVG_DOLLAR_VOL = 2_500_000;
+const MIN_AVG_VOL_SHARES = Number(process.env.MIN_AVG_VOL_SHARES ?? 600);
+const MIN_AVG_DOLLAR_VOL = Number(process.env.MIN_AVG_DOLLAR_VOL ?? 500_000);
+
 const AI_SEED_REQUIRE_SETUP = (process.env.AI_SEED_REQUIRE_SETUP ?? "0") === "1";
 const AI_SEED_REQUIRE_RANGE = (process.env.AI_SEED_REQUIRE_RANGE ?? "0") === "1";
 const AI_SEED_MAX_POST = Number(process.env.AI_SEED_MAX_POST ?? 20);
@@ -693,13 +694,13 @@ const logSummary = () => {
         }
         const upper = symbol.toUpperCase();
         if (
-          upper.includes(".") ||
-          upper.endsWith("W") ||
-          upper.endsWith("WS") ||
-          upper.endsWith("U") ||
-          upper.endsWith("R")
+  upper.includes(".") ||
+  upper.endsWith("-WS") ||
+  upper.endsWith("-W")  ||
+  upper.endsWith("-U")  ||
+  upper.endsWith("-R")
         ) {
-reject(symbol, "other", "ticker excluded before bars");
+          reject(symbol, "other", "ticker excluded before bars");
           return null;
         }
         const bars = await fetchRecentBars(symbol, "1Min", 60);
