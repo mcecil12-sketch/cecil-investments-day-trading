@@ -10,22 +10,9 @@ export async function GET(request: Request) {
 
   try {
     const ctx = await buildSignalContext({ ticker, timeframe });
-
     return NextResponse.json(
-      {
-        ok: true,
-        ticker,
-        timeframe,
-        ctxKeys: Object.keys(ctx || {}),
-        ctx,
-      },
-      {
-        headers: {
-          "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
-          Pragma: "no-cache",
-          Expires: "0",
-        },
-      }
+      { ok: true, ticker, timeframe, ctxKeys: Object.keys(ctx || {}), ctx },
+      { headers: { "Cache-Control": "no-store" } }
     );
   } catch (e: any) {
     return NextResponse.json(
