@@ -699,7 +699,12 @@ const logSummary = () => {
           upper.endsWith("U") ||
           upper.endsWith("R")
         ) {
-          reject(symbol, "other", "ticker excluded before bars");
+          
+    if (symbol.includes(".")) {
+      reject(symbol, "other", "ticker excluded before bars");
+  return null;
+    }
+reject(symbol, "other", "ticker excluded before bars");
           return null;
         }
         const bars = await fetchRecentBars(symbol, "1Min", 60);
