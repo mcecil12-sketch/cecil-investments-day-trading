@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
-import { getAutoConfig, tierForScore, riskMultForTier } from "@/lib/autoEntry/config";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { alpacaRequest, createOrder } from "@/lib/alpaca";
 import { redis } from "@/lib/redis";
+import { getAutoConfig, tierForScore, riskMultForTier } from "@/lib/autoEntry/config";
+import { resolveDecisionPrice, computeBracket, type QuoteLike, type Side } from "@/lib/autoEntry/pricing";
 
 export const dynamic = "force-dynamic";
-
 async function hasOpenOrdersForSymbol(symbol: string) {
   const qs = `status=open&symbols=${encodeURIComponent(symbol)}&limit=50`;
   const resp = await alpacaRequest({ method: "GET", path: `/v2/orders?${qs}` });
@@ -30,6 +30,52 @@ function headerToken(req: Request) {
   return req.headers.get("x-auto-entry-token") || "";
 }
 
+
+async function fetchQuoteForSymbol(symbol: string): Promise<QuoteLike | null> {
+  const encoded = encodeURIComponent(symbol);
+  const quoteResp = await alpacaRequest({ method: "GET", path: `/v2/stocks/${encoded}/quotes/latest` });
+  const quoteLike: QuoteLike = { last: null, mid: null, bid: null, ask: null };
+  let hasQuote = false;
+
+  if (quoteResp.ok) {
+    try {
+      const parsed = JSON.parse(quoteResp.text || "{}");
+      const qt = (parsed as any)?.quote || (parsed as any)?.quotes?.[0] || parsed;
+      if (qt) {
+        const bidVal = safeNum(qt?.bp ?? qt?.bid_price ?? qt?.bid);
+        const askVal = safeNum(qt?.ap ?? qt?.ask_price ?? qt?.ask);
+        const lastVal = safeNum(
+          qt?.last?.price ?? qt?.last_price ?? qt?.last_trade?.price ?? qt?.p ?? qt?.price
+        );
+        if (bidVal) quoteLike.bid = bidVal;
+        if (askVal) quoteLike.ask = askVal;
+        if (lastVal) quoteLike.last = lastVal;
+        if (quoteLike.bid && quoteLike.ask) {
+          quoteLike.mid = (quoteLike.bid + quoteLike.ask) / 2;
+        }
+        hasQuote = Boolean(quoteLike.bid || quoteLike.ask || quoteLike.last || quoteLike.mid);
+      }
+    } catch {}
+  }
+
+  if (!hasQuote) {
+    const tradeResp = await alpacaRequest({ method: "GET", path: `/v2/stocks/${encoded}/trades/latest` });
+    if (tradeResp.ok) {
+      try {
+        const parsed = JSON.parse(tradeResp.text || "{}");
+        const tr = (parsed as any)?.trade || (parsed as any)?.trades?.[0] || parsed;
+        const px = safeNum(tr?.p ?? tr?.price);
+        if (px) {
+          quoteLike.last = px;
+          hasQuote = true;
+        }
+      } catch {}
+    }
+  }
+
+  return hasQuote ? quoteLike : null;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -47,6 +93,7 @@ async function setnxLock(key: string, ttlSec: number) {
   const ok = await redis.set(key, "1", { nx: true, ex: ttlSec });
   return Boolean(ok);
 }
+
 
 function computeQty(entryPrice: number, stopPrice: number, riskDollars: number) {
   const diff = Math.abs(entryPrice - stopPrice);
@@ -123,30 +170,12 @@ export async function POST(req: Request) {
 
   const trade = trades[idx];
 
-  const open = await hasOpenOrdersForSymbol(trade.ticker);
-  if (!open.ok) {
-    return NextResponse.json(
-      { ok: false, status: open.status, error: open.text || "alpaca open orders lookup failed", tradeId: trade.id },
-      { status: 500 }
-    );
-  }
-  if (open.orders.length > 0) {
-    return NextResponse.json(
-      { ok: true, skipped: true, reason: "open_order_exists", tradeId: trade.id, openOrders: open.orders.map((o: any) => ({ id: o.id, symbol: o.symbol, side: o.side, type: o.type, status: o.status })) },
-      { status: 200 }
-    );
-  }
-
   const tradeId = String(trade.id || "");
-  if (!tradeId) {
-    return NextResponse.json({ ok: false, error: "trade missing id" }, { status: 400 });
-  }
+  if (!tradeId) return NextResponse.json({ ok: false, error: "trade missing id" }, { status: 400 });
 
   const lockKey = `auto:exec:lock:${tradeId}`;
   const locked = await setnxLock(lockKey, 60 * 10);
-  if (!locked) {
-    return NextResponse.json({ ok: true, skipped: true, reason: "already_locked", tradeId }, { status: 200 });
-  }
+  if (!locked) return NextResponse.json({ ok: true, skipped: true, reason: "already_locked", tradeId }, { status: 200 });
 
   const ticker = String(trade.ticker || "").toUpperCase();
   const side = String(trade.side || "LONG").toUpperCase();
@@ -157,17 +186,58 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: "trade missing ticker/side/entryPrice/stopPrice", tradeId }, { status: 400 });
   }
 
+  const open = await hasOpenOrdersForSymbol(ticker);
+  if (!open.ok) {
+    return NextResponse.json({ ok: false, status: open.status, error: open.text || "alpaca open orders lookup failed", tradeId }, { status: 500 });
+  }
+  if (open.orders.length > 0) {
+    return NextResponse.json(
+      { ok: true, skipped: true, reason: "open_order_exists", tradeId, openOrders: open.orders.map((o: any) => ({ id: o.id, symbol: o.symbol, side: o.side, type: o.type, status: o.status })) },
+      { status: 200 }
+    );
+  }
+
   const score = safeNum(trade.ai?.score ?? trade.score ?? 0, 0);
   const tier = tierForScore(score) || "C";
   const riskMult = riskMultForTier(tier);
   const riskDollars = cfg.baseRiskDollars * riskMult;
-
   const qty = computeQty(entryPrice, stopPrice, riskDollars);
 
+  const sideDirection = side === "LONG" ? "buy" : "sell";
   const startedAt = nowIso();
+  const sideEnum: Side = side === "LONG" ? "LONG" : "SHORT";
+
+  const quote = await fetchQuoteForSymbol(ticker);
+  const decision = resolveDecisionPrice({ seedEntryPrice: entryPrice, quote });
+
+  const stopDistance = Math.abs(entryPrice - stopPrice);
+  const rr = 1;
+
+  const tpRaw = sideEnum === "LONG"
+    ? entryPrice + stopDistance * rr
+    : entryPrice - stopDistance * rr;
+
+  const tp = Math.round(tpRaw * 100) / 100;
+  const bracketStop = Math.round(stopPrice * 100) / 100;
+
+  const dbg: any = {
+    ticker,
+    side,
+    entryPrice,
+    stopPrice,
+    quote,
+    decisionPrice: decision.decisionPrice,
+    decisionSource: decision.source,
+    stopDistance,
+    takeProfitPrice: tp,
+    bracketStopPrice: bracketStop,
+    qty,
+    riskDollars,
+    tier,
+    score,
+  };
 
   try {
-    const sideDirection = side === "LONG" ? "buy" : "sell";
     const order = await createOrder({
       symbol: ticker,
       qty,
@@ -175,25 +245,15 @@ export async function POST(req: Request) {
       type: "market",
       time_in_force: "day",
       order_class: "bracket",
-      stop_loss: { stop_price: stopPrice },
+      take_profit: { limit_price: tp },
+      stop_loss: { stop_price: bracketStop },
     });
 
-    const legs = Array.isArray(order?.legs) ? order.legs : [];
-    const findLeg = (keywords: string[]) =>
-      legs.find((leg) => {
-        const type = String(leg?.type ?? "").toLowerCase();
-        return keywords.some((kw) => type.includes(kw));
-      });
-    const stopChild = order?.stop_loss ?? findLeg(["stop_loss", "stop"]);
-    const takeProfitChild = order?.take_profit ?? findLeg(["take_profit", "limit", "profit"]);
+    const legs = Array.isArray((order as any)?.legs) ? (order as any).legs : [];
+    const stopChild = (order as any)?.stop_loss ?? legs.find((l: any) => String(l?.type || "").toLowerCase().includes("stop"));
+    const takeProfitChild = (order as any)?.take_profit ?? legs.find((l: any) => String(l?.type || "").toLowerCase().includes("limit"));
     const stopOrderId = stopChild?.id ?? null;
     const takeProfitOrderId = takeProfitChild?.id ?? null;
-    const normalizedLegs = legs.map((leg: any) => ({
-      id: leg?.id ?? null,
-      type: leg?.type ?? null,
-      side: leg?.side ?? null,
-      status: leg?.status ?? null,
-    }));
 
     const updated = {
       ...trade,
@@ -201,10 +261,10 @@ export async function POST(req: Request) {
       status: "OPEN",
       submitToBroker: true,
       brokerOrderId: order.id,
-      brokerStatus: order.status,
+      brokerStatus: (order as any).status,
       brokerRaw: order,
       alpacaOrderId: order.id,
-      alpacaStatus: order.status,
+      alpacaStatus: (order as any).status,
       stopOrderId,
       takeProfitOrderId,
       lastStopAppliedAt: startedAt,
@@ -230,25 +290,26 @@ export async function POST(req: Request) {
         trade: updated,
         broker: {
           id: order.id,
-          status: order.status,
-          order_class: order.order_class ?? "bracket",
-          legs: normalizedLegs,
+          status: (order as any).status,
+          order_class: (order as any).order_class ?? "bracket",
           stopOrderId,
           takeProfitOrderId,
         },
+        debug: dbg,
       },
       { status: 200 }
     );
-  } catch (err: any) {
-    const message = err?.message ?? String(err);
-    const failed = {
+  } catch (e: any) {
+    const message = String(e?.message || e || "unknown_error");
+    const stack = String(e?.stack || "");
+    const updated = {
       ...trade,
       status: "ERROR",
       error: message,
-      updatedAt: nowIso(),
+      updatedAt: startedAt,
     };
-    trades[idx] = failed;
+    trades[idx] = updated;
     await writeTrades(trades);
-    return NextResponse.json({ ok: false, error: message, tradeId }, { status: 500 });
+    return NextResponse.json({ ok: false, error: message, stack, tradeId, debug: dbg }, { status: 500 });
   }
 }
