@@ -2,8 +2,34 @@ import { NextResponse } from "next/server";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { alpacaRequest, createOrder } from "@/lib/alpaca";
 import { redis } from "@/lib/redis";
+import { requireAuth } from "@/lib/auth";
 import { getAutoConfig, tierForScore, riskMultForTier } from "@/lib/autoEntry/config";
 import { resolveDecisionPrice, computeBracket, type QuoteLike, type Side } from "@/lib/autoEntry/pricing";
+import { withRedisLock } from "@/lib/locks";
+
+function ensureBracketLegsValid(params: {
+  side: "LONG" | "SHORT";
+  basePrice: number;
+  takeProfitLimit: number;
+  stopLossStop: number;
+}) {
+  const { side, basePrice } = params;
+  let tp = Number(params.takeProfitLimit);
+  let sl = Number(params.stopLossStop);
+
+  const base = Number(basePrice);
+  const min = 0.01;
+
+  if (side === "LONG") {
+    if (!(tp >= base + min)) tp = Number((base + min).toFixed(2));
+    if (!(sl <= base - min)) sl = Number((base - min).toFixed(2));
+  } else {
+    if (!(tp <= base - min)) tp = Number((base - min).toFixed(2));
+    if (!(sl >= base + min)) sl = Number((base + min).toFixed(2));
+  }
+
+  return { takeProfitLimit: tp, stopLossStop: sl };
+}
 
 export const dynamic = "force-dynamic";
 async function hasOpenOrdersForSymbol(symbol: string) {
@@ -27,7 +53,10 @@ function safeNum(v: any, fb = 0) {
 }
 
 function headerToken(req: Request) {
-  return req.headers.get("x-auto-entry-token") || "";
+  const h = req.headers.get("x-auto-entry-token") || "";
+  if (h) return h;
+  const auth = req.headers.get("authorization") || req.headers.get("Authorization") || "";
+  return auth.replace(/^Bearer\s+/i, "").trim();
 }
 
 
@@ -82,6 +111,10 @@ function nowIso() {
 
 async function ensureToken(req: Request) {
   const cfg = getAutoConfig();
+
+  const cookieOk = await requireAuth(req);
+  if (cookieOk.ok) return { ok: true as const, cfg };
+
   if (!cfg.token) return { ok: false as const, status: 500, error: "AUTO_ENTRY_TOKEN missing" };
   const got = headerToken(req);
   if (!got || got !== cfg.token) return { ok: false as const, status: 401, error: "unauthorized" };
@@ -173,10 +206,6 @@ export async function POST(req: Request) {
   const tradeId = String(trade.id || "");
   if (!tradeId) return NextResponse.json({ ok: false, error: "trade missing id" }, { status: 400 });
 
-  const lockKey = `auto:exec:lock:${tradeId}`;
-  const locked = await setnxLock(lockKey, 60 * 10);
-  if (!locked) return NextResponse.json({ ok: true, skipped: true, reason: "already_locked", tradeId }, { status: 200 });
-
   const ticker = String(trade.ticker || "").toUpperCase();
   const side = String(trade.side || "LONG").toUpperCase();
   const entryPrice = safeNum(trade.entryPrice, 0);
@@ -185,6 +214,10 @@ export async function POST(req: Request) {
   if (!ticker || (side !== "LONG" && side !== "SHORT") || entryPrice <= 0 || stopPrice <= 0) {
     return NextResponse.json({ ok: false, error: "trade missing ticker/side/entryPrice/stopPrice", tradeId }, { status: 400 });
   }
+
+  const lockKey = `lock:auto-entry:${ticker}`;
+  const locked = await setnxLock(lockKey, 60 * 10);
+  if (!locked) return NextResponse.json({ ok: true, skipped: true, reason: "already_locked", tradeId }, { status: 200 });
 
   const open = await hasOpenOrdersForSymbol(ticker);
   if (!open.ok) {
@@ -204,6 +237,7 @@ export async function POST(req: Request) {
   const qty = computeQty(entryPrice, stopPrice, riskDollars);
 
   const sideDirection = side === "LONG" ? "buy" : "sell";
+  const redisLockKey = `lock:auto-entry:${ticker}`;
   const startedAt = nowIso();
   const sideEnum: Side = side === "LONG" ? "LONG" : "SHORT";
 
@@ -217,8 +251,17 @@ export async function POST(req: Request) {
     ? entryPrice + stopDistance * rr
     : entryPrice - stopDistance * rr;
 
-  const tp = Math.round(tpRaw * 100) / 100;
-  const bracketStop = Math.round(stopPrice * 100) / 100;
+  let tp = Math.round(tpRaw * 100) / 100;
+  let bracketStop = Math.round(stopPrice * 100) / 100;
+
+  const bracketGuard = ensureBracketLegsValid({
+    side: sideEnum,
+    basePrice: entryPrice,
+    takeProfitLimit: tp,
+    stopLossStop: bracketStop,
+  });
+  tp = bracketGuard.takeProfitLimit;
+  bracketStop = bracketGuard.stopLossStop;
 
   const dbg: any = {
     ticker,
@@ -237,17 +280,33 @@ export async function POST(req: Request) {
     score,
   };
 
+  const lock = await withRedisLock({
+    key: redisLockKey,
+    ttlSeconds: 90,
+    owner: `execute:${tradeId}`,
+    fn: async () => {
+      return await createOrder({
+        symbol: ticker,
+        qty,
+        side: sideDirection,
+        type: "market",
+        time_in_force: "day",
+        order_class: "bracket",
+        take_profit: { limit_price: tp },
+        stop_loss: { stop_price: bracketStop },
+      });
+    },
+  });
+
+  if (!lock.ok) {
+    return NextResponse.json(
+      { ok: false, error: lock.error, tradeId, lockKey: redisLockKey },
+      { status: lock.error === "LOCKED" ? 409 : 500 }
+    );
+  }
+
   try {
-    const order = await createOrder({
-      symbol: ticker,
-      qty,
-      side: sideDirection,
-      type: "market",
-      time_in_force: "day",
-      order_class: "bracket",
-      take_profit: { limit_price: tp },
-      stop_loss: { stop_price: bracketStop },
-    });
+    const order = lock.value;
 
     const legs = Array.isArray((order as any)?.legs) ? (order as any).legs : [];
     const stopChild = (order as any)?.stop_loss ?? legs.find((l: any) => String(l?.type || "").toLowerCase().includes("stop"));
