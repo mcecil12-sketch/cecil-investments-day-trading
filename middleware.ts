@@ -12,6 +12,7 @@ const PUBLIC_PATHS = [
   "/api/funnel-stats",
   "/api/ai-heartbeat",
   "/api/diag-build",
+  "/api/locks",
 ];
 
 function isScannerAuthed(req: NextRequest) {
