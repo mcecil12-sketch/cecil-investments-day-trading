@@ -39,6 +39,8 @@ export function getAutoConfig() {
   const cooldownMin = autoEnvNum("AUTO_ENTRY_COOLDOWN_MIN", 20);
   const cutoffMinutesToClose = autoEnvNum("AUTO_ENTRY_CUTOFF_MINUTES_TO_CLOSE", 5);
 
+  const baseRiskDollars = autoEnvNum("AUTO_BASE_RISK_DOLLARS", 50);
+
   const token = autoEnvStr("AUTO_ENTRY_TOKEN", "");
 
   return {
@@ -52,6 +54,7 @@ export function getAutoConfig() {
     maxPerDay,
     cooldownMin,
     cutoffMinutesToClose,
+    baseRiskDollars,
     token,
   };
 }

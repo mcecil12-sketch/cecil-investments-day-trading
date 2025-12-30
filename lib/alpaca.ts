@@ -198,6 +198,34 @@ export interface AlpacaOrderResponse {
   [key: string]: any;
 }
 
+function resolveAlpacaBaseUrl(path: string) {
+  const rawTrading =
+    process.env.ALPACA_TRADING_BASE_URL ??
+    process.env.ALPACA_BASE_URL ??
+    process.env.ALPACA_PAPER_BASE_URL ??
+    "https://paper-api.alpaca.markets";
+  const tradingBase = stripV2(rawTrading);
+
+  const dataBase = DATA_BASE;
+
+  const p = (path || "").split("?")[0];
+
+  const tradingPrefixes = [
+    "/v2/orders",
+    "/v2/positions",
+    "/v2/account",
+    "/v2/clock",
+    "/v2/calendar",
+    "/v2/assets",
+  ];
+
+  for (const pref of tradingPrefixes) {
+    if (p.startsWith(pref)) return tradingBase;
+  }
+
+  return dataBase;
+}
+
 export async function submitOrder(
   params: SubmitOrderParams
 ): Promise<AlpacaOrderResponse> {
@@ -337,7 +365,9 @@ export async function alpacaRequest(args: {
   path: string;
   body?: any;
 }): Promise<{ ok: boolean; status: number; text: string }> {
-  const res = await alpacaFetch(tradingUrl(args.path), {
+  const path = args.path.startsWith("/") ? args.path : `/${args.path}`;
+  const baseUrl = resolveAlpacaBaseUrl(path);
+  const res = await alpacaFetch(`${baseUrl}${path}`, {
     method: args.method,
     headers: { "Content-Type": "application/json" },
     body: args.body ? JSON.stringify(args.body) : undefined,
