@@ -1,3 +1,33 @@
+function round2(n: number) {
+  return Math.round(n * 100) / 100;
+}
+
+function minTick(n: number, tick = 0.01) {
+  return round2(Math.round(n / tick) * tick);
+}
+
+function ensureMinDistanceFromBase(params: {
+  side: Side;
+  basePrice: number;
+  takeProfitPrice: number;
+  stopPrice: number;
+  minOffset: number;
+}) {
+  const { side, basePrice, minOffset } = params;
+  let tp = params.takeProfitPrice;
+  let sl = params.stopPrice;
+
+  if (side === "LONG") {
+    if (!(tp >= basePrice + minOffset)) tp = basePrice + minOffset;
+    if (!(sl <= basePrice - minOffset)) sl = basePrice - minOffset;
+  } else {
+    if (!(tp <= basePrice - minOffset)) tp = basePrice - minOffset;
+    if (!(sl >= basePrice + minOffset)) sl = basePrice + minOffset;
+  }
+
+  return { takeProfitPrice: tp, stopPrice: sl };
+}
+
 export type Side = "LONG" | "SHORT";
 
 export type QuoteLike = {
@@ -29,28 +59,80 @@ export function resolveDecisionPrice(args: {
   throw new Error("No usable decision price (no quote + no seed)");
 }
 
-export function computeBracket(args: {
+function clampBracketPrices(opts: {
+  side: Side;
+  basePrice: number;
+  takeProfitPrice: number;
+  stopPrice: number;
+  tick?: number;
+}) {
+  const tick = opts.tick ?? 0.01;
+  const base = opts.basePrice;
+
+  let tp = minTick(opts.takeProfitPrice, tick);
+  let st = minTick(opts.stopPrice, tick);
+
+  if (opts.side === "LONG") {
+    const minTp = minTick(base + tick, tick);
+    const maxStop = minTick(base - tick, tick);
+    if (!(tp >= minTp)) tp = minTp;
+    if (!(st <= maxStop)) st = maxStop;
+  } else {
+    const maxTp = minTick(base - tick, tick);
+    const minStop = minTick(base + tick, tick);
+    if (!(tp <= maxTp)) tp = maxTp;
+    if (!(st >= minStop)) st = minStop;
+  }
+
+  return { takeProfitPrice: tp, stopPrice: st };
+}
+
+export function computeBracket({
+  side,
+  decisionPrice,
+  stopDistance,
+  rr,
+}: {
   side: Side;
   decisionPrice: number;
   stopDistance: number;
   rr: number;
-}): { entryPrice: number; stopPrice: number; takeProfitPrice: number } {
-  const { side, decisionPrice, stopDistance, rr } = args;
+}) {
   if (!(decisionPrice > 0)) throw new Error("decisionPrice must be > 0");
   if (!(stopDistance > 0)) throw new Error("stopDistance must be > 0");
   if (!(rr > 0)) throw new Error("rr must be > 0");
 
   const entryPrice = round2(decisionPrice);
+  const normalizedStopDistance = round2(stopDistance);
 
-  const stopPrice =
+  let stopPrice =
     side === "LONG"
-      ? round2(entryPrice - stopDistance)
-      : round2(entryPrice + stopDistance);
+      ? round2(entryPrice - normalizedStopDistance)
+      : round2(entryPrice + normalizedStopDistance);
 
-  const takeProfitPrice =
+  let takeProfitPrice =
     side === "LONG"
-      ? round2(entryPrice + stopDistance * rr)
-      : round2(entryPrice - stopDistance * rr);
+      ? round2(entryPrice + normalizedStopDistance * rr)
+      : round2(entryPrice - normalizedStopDistance * rr);
+
+  const minOffsetGuard = ensureMinDistanceFromBase({
+    side,
+    basePrice: entryPrice,
+    takeProfitPrice,
+    stopPrice,
+    minOffset: 0.01,
+  });
+  takeProfitPrice = minOffsetGuard.takeProfitPrice;
+  stopPrice = minOffsetGuard.stopPrice;
+
+  const clamped = clampBracketPrices({
+    side,
+    basePrice: entryPrice,
+    takeProfitPrice,
+    stopPrice,
+  });
+  takeProfitPrice = clamped.takeProfitPrice;
+  stopPrice = clamped.stopPrice;
 
   return { entryPrice, stopPrice, takeProfitPrice };
 }
@@ -58,8 +140,4 @@ export function computeBracket(args: {
 function num(v: any): number | null {
   const n = typeof v === "number" ? v : v == null ? NaN : Number(v);
   return Number.isFinite(n) ? n : null;
-}
-
-function round2(n: number) {
-  return Math.round(n * 100) / 100;
 }

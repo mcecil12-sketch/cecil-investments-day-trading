@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getAutoConfig } from "@/lib/autoEntry/config";
 import { alpacaRequest } from "@/lib/alpaca";
+import { requireAuth } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -10,6 +11,10 @@ function headerToken(req: Request) {
 
 async function ensureToken(req: Request) {
   const cfg = getAutoConfig();
+
+  const cookieOk = await requireAuth(req);
+  if (cookieOk.ok) return { ok: true as const };
+
   if (!cfg.token) return { ok: false as const, status: 500, error: "AUTO_ENTRY_TOKEN missing" };
   const got = headerToken(req);
   if (!got || got !== cfg.token) return { ok: false as const, status: 401, error: "unauthorized" };
