@@ -59,8 +59,6 @@ body {
 /* App shell ----------------------------------------------------- */
 
 .app-page {
-  min-height: 100vh;
-  padding-bottom: 4.5rem; /* room for bottom nav */
   background: var(--ci-bg);
   color: var(--ci-text);
 }

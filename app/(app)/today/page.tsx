@@ -684,7 +684,7 @@ export default function TodayPage() {
   return (
     <>
       <AutoManagePoller />
-      <div className="min-h-screen pb-24">
+      <div className="min-h-screen">
         <div className="max-w-6xl mx-auto px-4 pb-6">
           {/* --- Slim header bar --------------------------------------------------- */}
         <header className="mb-3">
