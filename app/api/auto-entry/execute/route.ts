@@ -32,6 +32,7 @@ function ensureBracketLegsValid(params: {
 }
 
 export const dynamic = "force-dynamic";
+const AUTO_ENTRY_TP_MIN_ABS = Number(process.env.AUTO_ENTRY_TP_MIN_ABS ?? "0.05");
 async function hasOpenOrdersForSymbol(symbol: string) {
   const qs = `status=open&symbols=${encodeURIComponent(symbol)}&limit=50`;
   const resp = await alpacaRequest({ method: "GET", path: `/v2/orders?${qs}` });
@@ -270,10 +271,18 @@ export async function POST(req: Request) {
   } else {
     const maxTp = Number((entryPrice - TP_MIN_OFFSET_FORCE).toFixed(2));
     if (tp > maxTp) tp = maxTp;
-
-  tp = Number(Number(tp).toFixed(2));
-  bracketStop = Number(Number(bracketStop).toFixed(2));
   }
+
+  if (sideDirection === "buy") {
+    const minTpAbs = Number((entryPrice + AUTO_ENTRY_TP_MIN_ABS).toFixed(2));
+    if (tp < minTpAbs) tp = minTpAbs;
+  } else {
+    const maxTpAbs = Number((entryPrice - AUTO_ENTRY_TP_MIN_ABS).toFixed(2));
+    if (tp > maxTpAbs) tp = maxTpAbs;
+  }
+
+  tp = Number(tp.toFixed(2));
+  bracketStop = Number(bracketStop.toFixed(2));
 
   const dbg: any = {
     ticker,
@@ -297,22 +306,37 @@ export async function POST(req: Request) {
     ttlSeconds: 90,
     owner: `execute:${tradeId}`,
     fn: async () => {
-      return await createOrder({
+      const tick = 0.01;
+      const roundUp = (x: number) => Number((Math.ceil(x / tick) * tick).toFixed(2));
+      const roundDown = (x: number) => Number((Math.floor(x / tick) * tick).toFixed(2));
+
+      const minTpLong = roundUp(entryPrice + tick);
+      const maxTpShort = roundDown(entryPrice - tick);
+
+      const wantTp =
+        sideDirection === "buy"
+          ? tp >= minTpLong
+          : tp <= maxTpShort;
+
+      const payload: any = {
         symbol: ticker,
         qty,
         side: sideDirection,
         type: "market",
         time_in_force: "day",
-        order_class: "bracket",
-        take_profit: { limit_price: tp },
+        order_class: wantTp ? "bracket" : "oto",
         stop_loss: { stop_price: bracketStop },
-      });
+      };
+
+      if (wantTp) payload.take_profit = { limit_price: tp };
+
+      return await createOrder(payload);
     },
   });
 
   if (!lock.ok) {
     return NextResponse.json(
-      { ok: false, error: lock.error, tradeId, lockKey: redisLockKey },
+      { ok: false, error: lock.error, tradeId, lockKey: redisLockKey, debug: dbg },
       { status: lock.error === "LOCKED" ? 409 : 500 }
     );
   }

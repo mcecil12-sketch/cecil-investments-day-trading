@@ -75,6 +75,45 @@ async function alpacaFetch(url: string, init: RequestInit = {}) {
   });
 }
 
+function enforceBracketBasePriceConstraint(order: any) {
+  try {
+    if (!order || order.order_class !== "bracket") return order;
+    const side = String(order.side || "").toLowerCase();
+    const base = Number(
+      order.limit_price ??
+        order.stop_price ??
+        order.base_price ??
+        order.entry_price ??
+        order.trail_price ??
+        0
+    );
+    const tp = Number(order?.take_profit?.limit_price);
+    const sl = Number(order?.stop_loss?.stop_price);
+
+    if (!(base > 0)) return order;
+
+    const min = 0.01;
+    if (side === "buy") {
+      if (Number.isFinite(tp) && tp < base + min) {
+        order.take_profit = { ...(order.take_profit || {}), limit_price: Number((base + min).toFixed(2)) };
+      }
+      if (Number.isFinite(sl) && sl > base - min) {
+        order.stop_loss = { ...(order.stop_loss || {}), stop_price: Number((base - min).toFixed(2)) };
+      }
+    } else if (side === "sell") {
+      if (Number.isFinite(tp) && tp > base - min) {
+        order.take_profit = { ...(order.take_profit || {}), limit_price: Number((base - min).toFixed(2)) };
+      }
+      if (Number.isFinite(sl) && sl < base + min) {
+        order.stop_loss = { ...(order.stop_loss || {}), stop_price: Number((base + min).toFixed(2)) };
+      }
+    }
+  } catch {
+    // silently ignore
+  }
+  return order;
+}
+
 const WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
 
 export function computeBarsWindow(endTimeIso?: string) {
@@ -266,7 +305,8 @@ export async function createOrder(
     const text = await res.text().catch(() => "");
     throw new Error(text || "Failed to create order");
   }
-  return res.json();
+  const order = await res.json();
+  return enforceBracketBasePriceConstraint(order);
 }
 
 // ---------------- Trading helpers ----------------

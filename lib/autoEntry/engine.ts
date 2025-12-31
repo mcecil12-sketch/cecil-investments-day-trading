@@ -30,7 +30,10 @@ type EnsureTokenFailure =
 type EnsureTokenResult = EnsureTokenSuccess | EnsureTokenFailure;
 
 function headerToken(req: Request) {
-  return req.headers.get("x-auto-entry-token") || "";
+  const h = req.headers.get("x-auto-entry-token") || "";
+  if (h) return h;
+  const auth = req.headers.get("authorization") || req.headers.get("Authorization") || "";
+  return auth.replace(/^Bearer\s+/i, "").trim();
 }
 
 function ensureToken(req: Request): EnsureTokenResult {
