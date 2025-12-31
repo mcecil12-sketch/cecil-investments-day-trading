@@ -24,7 +24,9 @@
     ],
     "baseUrl": ".",
     "paths": {
-      "@/tradingContext": ["./app/tradingContext.tsx"],
+      "@/tradingContext": [
+        "./app/tradingContext.tsx"
+      ],
       "@/*": [
         "./*"
       ]
@@ -36,7 +38,8 @@
     "**/*.tsx",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts",
-    "**/*.mts"
+    "**/*.mts",
+    "**/*.d.ts"
   ],
   "exclude": [
     "node_modules"
