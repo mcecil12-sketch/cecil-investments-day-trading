@@ -31,6 +31,15 @@ function ensureBracketLegsValid(params: {
   return { takeProfitLimit: tp, stopLossStop: sl };
 }
 
+
+function isAutoPendingTrade(t: any) {
+  return (
+    t?.status === "AUTO_PENDING" ||
+    t?.autoEntryStatus === "AUTO_PENDING" ||
+    (t?.autoEntry === true && t?.status === "NEW")
+  );
+}
+
 export const dynamic = "force-dynamic";
 const AUTO_ENTRY_TP_MIN_ABS = Number(process.env.AUTO_ENTRY_TP_MIN_ABS ?? "0.05");
 async function hasOpenOrdersForSymbol(symbol: string) {
@@ -197,7 +206,7 @@ export async function POST(req: Request) {
   }
 
   const trades = await readTrades<any>();
-  const idx = trades.findIndex((t: any) => t && t.status === "AUTO_PENDING" && t.source === "auto-entry");
+  const idx = trades.findIndex((t: any) => t && isAutoPendingTrade(t) && t.source === "auto-entry");
   if (idx === -1) {
     return NextResponse.json({ ok: true, skipped: true, reason: "no_AUTO_PENDING_trades" }, { status: 200 });
   }
