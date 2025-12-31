@@ -263,13 +263,16 @@ export async function POST(req: Request) {
   tp = bracketGuard.takeProfitLimit;
   bracketStop = bracketGuard.stopLossStop;
 
-  const TP_MIN_OFFSET_FORCE = 0.02;
+  const TP_MIN_OFFSET_FORCE = 0.50;
   if (sideEnum === "LONG") {
     const minTp = Number((entryPrice + TP_MIN_OFFSET_FORCE).toFixed(2));
     if (tp < minTp) tp = minTp;
   } else {
     const maxTp = Number((entryPrice - TP_MIN_OFFSET_FORCE).toFixed(2));
     if (tp > maxTp) tp = maxTp;
+
+  tp = Number(Number(tp).toFixed(2));
+  bracketStop = Number(Number(bracketStop).toFixed(2));
   }
 
   const dbg: any = {
