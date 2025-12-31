@@ -1,12 +1,1 @@
-{
-  "crons": [
-    {
-      "path": "/api/scan?mode=premarket",
-      "schedule": "30 12 * * 1-5"
-    },
-    {
-      "path": "/api/scan?mode=vwap",
-      "schedule": "0 17 * * 1-5"
-    }
-  ]
-}
+{}
