@@ -331,7 +331,7 @@ export async function GET() {
               paper: isPaper,
               title: `Trade closed ${t.ticker}`,
               message: closeMessage,
-              dedupeKey: "TRADE_CLOSED",
+              dedupeKey: `TRADE_CLOSED:${t.id}`,
               dedupeTtlSec: 86400,
               meta: {
                 realizedR,
@@ -349,7 +349,7 @@ export async function GET() {
                 paper: isPaper,
                 title: `Stop hit ${t.ticker}`,
                 message: `${t.ticker} stopped out for ${pnl.toFixed(2)} loss`,
-                dedupeKey: "STOP_HIT",
+                dedupeKey: `STOP_HIT:${t.id}`,
                 dedupeTtlSec: 86400,
                 meta: {
                   realizedPnL: pnl,

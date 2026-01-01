@@ -726,7 +726,7 @@ export async function POST(req: Request) {
       title: `Auto entry failed ${ticker}`,
       message: `Execution error: ${message}`,
       paper: true,
-      dedupeKey: "AUTO_ENTRY_FAILED",
+      dedupeKey: `AUTO_ENTRY_FAILED:${tradeId}`,
       dedupeTtlSec: 600,
     });
     return NextResponse.json(
