@@ -205,6 +205,10 @@ type GuardSummary = {
   autoDisabledReason: string | null;
   maxOpenPositions: number;
   openPositions: number;
+  lastLossAt: string | null;
+  cooldownAfterLossMin: number;
+  cooldownRemainingMin: number | null;
+  tickerCooldownMin: number;
 };
 
 function buildGuardSummary(params: {
@@ -223,6 +227,10 @@ function buildGuardSummary(params: {
     autoDisabledReason: params.guardState.autoDisabledReason,
     maxOpenPositions: params.guardConfig.maxOpenPositions,
     openPositions: params.openPositions,
+    lastLossAt: params.guardState.lastLossAt,
+    cooldownAfterLossMin: params.guardConfig.cooldownAfterLossMin,
+    cooldownRemainingMin: null,
+    tickerCooldownMin: params.guardConfig.tickerCooldownMin,
   };
 }
 
@@ -329,6 +337,7 @@ export async function POST(req: Request) {
   const sinceLoss = minutesSince(guardState.lastLossAt);
   if (sinceLoss != null && sinceLoss < guardConfig.cooldownAfterLossMin) {
     const minsRemaining = Math.ceil(guardConfig.cooldownAfterLossMin - sinceLoss);
+    guardSummary.cooldownRemainingMin = minsRemaining;
     counts.skipped += 1;
     return NextResponse.json(
       {
