@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { alpacaRequest, createOrder } from "@/lib/alpaca";
 import { redis } from "@/lib/redis";
+import { recordAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
 import { requireAuth } from "@/lib/auth";
 import { getGuardrailConfig, etDateString, minutesSince } from "@/lib/autoEntry/guardrails";
 import { getAutoConfig, tierForScore, riskMultForTier } from "@/lib/autoEntry/config";
@@ -322,6 +323,7 @@ export async function POST(req: Request) {
 
   if (!marketOpen) {
     counts.skipped += 1;
+    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "market_closed", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
       { ok: true, skipped: true, reason: "market_closed", counts, guardrails: guardSummary },
       { status: 200 }
@@ -466,6 +468,7 @@ export async function POST(req: Request) {
   const locked = await setnxLock(lockKey, 60 * 10);
   if (!locked) {
     counts.skipped += 1;
+    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "already_locked", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
       { ok: true, skipped: true, reason: "already_locked", tradeId, counts, guardrails: guardSummary },
       { status: 200 }
@@ -664,6 +667,7 @@ export async function POST(req: Request) {
     await guardrailsStore.clearAutoDisabled(etDate);
     guardSummary.autoDisabledReason = null;
 
+    await recordAutoEntryTelemetry({ etDate, at: startedAt, outcome: "SUCCESS", reason: "placed", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     await fireNotification({
       type: "AUTO_ENTRY_PLACED",
       tradeId,
@@ -719,6 +723,7 @@ export async function POST(req: Request) {
     };
     trades[idx] = updated;
     await writeTrades(trades);
+    await recordAutoEntryTelemetry({ etDate, at: startedAt, outcome: "FAIL", reason: "execute_error", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     await fireNotification({
       type: "AUTO_ENTRY_FAILED",
       tradeId,
