@@ -6,6 +6,16 @@ import { appendActivity } from "@/lib/activity";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { etDateString } from "@/lib/autoEntry/guardrails";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
+import { NotificationEvent } from "@/lib/notifications/types";
+import { sendNotification } from "@/lib/notifications/notify";
+
+async function fireNotification(event: NotificationEvent) {
+  try {
+    await sendNotification(event);
+  } catch (err) {
+    console.error("[notify] trades manage event failed", err);
+  }
+}
 
 type TradeStatus = "OPEN" | "CLOSED" | "PENDING" | "PARTIAL" | string;
 
@@ -303,6 +313,50 @@ export async function GET() {
               } catch (err) {
                 console.error("[manage] guardrail recordLoss failed", { err });
               }
+            }
+
+            const aiTier = (t as any)?.ai?.tier ?? (t as any)?.tier;
+            const isPaper = (t as any).paper !== false;
+            const formattedR =
+              realizedR != null ? ` (${realizedR.toFixed(2)}R)` : "";
+            const resultLabel = pnl >= 0 ? "gain" : "loss";
+            const closeMessage = `${t.side} ${t.ticker} closed with ${resultLabel} ${pnl.toFixed(
+              2
+            )}${formattedR}`;
+            const closedEvent: NotificationEvent = {
+              type: "TRADE_CLOSED",
+              tradeId: t.id,
+              ticker: t.ticker,
+              tier: aiTier,
+              paper: isPaper,
+              title: `Trade closed ${t.ticker}`,
+              message: closeMessage,
+              dedupeKey: "TRADE_CLOSED",
+              dedupeTtlSec: 86400,
+              meta: {
+                realizedR,
+                realizedPnL: pnl,
+                exitPrice,
+              },
+            };
+            await fireNotification(closedEvent);
+            if (pnl < 0) {
+              const stopEvent: NotificationEvent = {
+                type: "STOP_HIT",
+                tradeId: t.id,
+                ticker: t.ticker,
+                tier: aiTier,
+                paper: isPaper,
+                title: `Stop hit ${t.ticker}`,
+                message: `${t.ticker} stopped out for ${pnl.toFixed(2)} loss`,
+                dedupeKey: "STOP_HIT",
+                dedupeTtlSec: 86400,
+                meta: {
+                  realizedPnL: pnl,
+                  exitPrice,
+                },
+              };
+              await fireNotification(stopEvent);
             }
           }
         }

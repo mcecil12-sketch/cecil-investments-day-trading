@@ -9,6 +9,8 @@ import { resolveDecisionPrice, computeBracket, type QuoteLike, type Side } from 
 import { withRedisLock } from "@/lib/locks";
 import { fetchAlpacaClock } from "@/lib/alpacaClock";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
+import { sendNotification } from "@/lib/notifications/notify";
+import { NotificationEvent } from "@/lib/notifications/types";
 
 function ensureBracketLegsValid(params: {
   side: "LONG" | "SHORT";
@@ -211,6 +213,8 @@ type GuardSummary = {
   tickerCooldownMin: number;
 };
 
+const APP_BASE_URL = (process.env.APP_URL || "").replace(/\/$/, "");
+
 function buildGuardSummary(params: {
   guardState: guardrailsStore.GuardrailState;
   guardConfig: import("@/lib/autoEntry/guardrails").GuardrailConfig;
@@ -232,6 +236,27 @@ function buildGuardSummary(params: {
     cooldownRemainingMin: null,
     tickerCooldownMin: params.guardConfig.tickerCooldownMin,
   };
+}
+
+async function fireNotification(event: NotificationEvent) {
+  try {
+    await sendNotification(event);
+  } catch (err) {
+    console.error("[notify] auto entry event failed", err);
+  }
+}
+
+async function emitAutoDisabledNotification(tradeId: string, reason: string, ticker: string) {
+  await fireNotification({
+    type: "AUTO_ENTRY_DISABLED",
+    tradeId,
+    ticker,
+    title: `Auto entry disabled ${ticker}`,
+    message: `Auto entry has been disabled: ${reason}`,
+    paper: true,
+    dedupeKey: "AUTO_ENTRY_DISABLED",
+    dedupeTtlSec: 3600,
+  });
 }
 
 export async function POST(req: Request) {
@@ -305,6 +330,15 @@ export async function POST(req: Request) {
 
   if (guardState.autoDisabledReason) {
     counts.skipped += 1;
+    await fireNotification({
+      type: "AUTO_ENTRY_DISABLED",
+      ticker: "AUTO_ENTRY",
+      title: "Auto entry disabled",
+      message: `Circuit breaker: ${guardState.autoDisabledReason}`,
+      paper: true,
+      dedupeKey: `AUTO_ENTRY_DISABLED:${guardState.autoDisabledReason}`,
+      dedupeTtlSec: 3600,
+    });
     return NextResponse.json(
       {
         ok: true,
@@ -568,6 +602,7 @@ export async function POST(req: Request) {
     if (failureCount >= guardConfig.maxConsecutiveFailures) {
       await guardrailsStore.setAutoDisabled(etDate, "max_consecutive_failures");
       guardSummary.autoDisabledReason = "max_consecutive_failures";
+      await emitAutoDisabledNotification(tradeId, "max_consecutive_failures", ticker);
     }
     return NextResponse.json(
       {
@@ -629,6 +664,26 @@ export async function POST(req: Request) {
     await guardrailsStore.clearAutoDisabled(etDate);
     guardSummary.autoDisabledReason = null;
 
+    await fireNotification({
+      type: "AUTO_ENTRY_PLACED",
+      tradeId,
+      ticker,
+      tier,
+      paper: true,
+      title: `Auto entry placed ${ticker}`,
+      message: `Submitted ${qty} ${ticker} ${sideDirection} @ ${entryPrice.toFixed(
+        2
+      )} stop ${bracketStop.toFixed(2)} tp ${tp.toFixed(2)}`,
+      dedupeKey: `AUTO_ENTRY_PLACED:${tradeId}`,
+      dedupeTtlSec: 600,
+      meta: {
+        score,
+        riskDollars,
+        takeProfit: tp,
+        stop: bracketStop,
+      },
+    });
+
     return NextResponse.json(
       {
         ok: true,
@@ -654,6 +709,7 @@ export async function POST(req: Request) {
     if (failureCount >= guardConfig.maxConsecutiveFailures) {
       await guardrailsStore.setAutoDisabled(etDate, "max_consecutive_failures");
       guardSummary.autoDisabledReason = "max_consecutive_failures";
+      await emitAutoDisabledNotification(tradeId, "max_consecutive_failures", ticker);
     }
     const updated = {
       ...trade,
@@ -663,6 +719,16 @@ export async function POST(req: Request) {
     };
     trades[idx] = updated;
     await writeTrades(trades);
+    await fireNotification({
+      type: "AUTO_ENTRY_FAILED",
+      tradeId,
+      ticker,
+      title: `Auto entry failed ${ticker}`,
+      message: `Execution error: ${message}`,
+      paper: true,
+      dedupeKey: "AUTO_ENTRY_FAILED",
+      dedupeTtlSec: 600,
+    });
     return NextResponse.json(
       { ok: false, error: message, stack, tradeId, debug: dbg, counts, guardrails: guardSummary },
       { status: 500 }
