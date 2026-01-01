@@ -3,9 +3,12 @@ import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { alpacaRequest, createOrder } from "@/lib/alpaca";
 import { redis } from "@/lib/redis";
 import { requireAuth } from "@/lib/auth";
+import { getGuardrailConfig, etDateString, minutesSince } from "@/lib/autoEntry/guardrails";
 import { getAutoConfig, tierForScore, riskMultForTier } from "@/lib/autoEntry/config";
 import { resolveDecisionPrice, computeBracket, type QuoteLike, type Side } from "@/lib/autoEntry/pricing";
 import { withRedisLock } from "@/lib/locks";
+import { fetchAlpacaClock } from "@/lib/alpacaClock";
+import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 
 function ensureBracketLegsValid(params: {
   side: "LONG" | "SHORT";
@@ -192,6 +195,37 @@ async function cancelConflictingOrders(symbol: string, entrySide: "buy" | "sell"
   return { cancelled: results, openCount: open.length };
 }
 
+type GuardSummary = {
+  enabled: boolean;
+  autoEntryToggleReason: string | null;
+  entriesToday: number;
+  maxEntriesPerDay: number;
+  consecutiveFailures: number;
+  maxConsecutiveFailures: number;
+  autoDisabledReason: string | null;
+  maxOpenPositions: number;
+  openPositions: number;
+};
+
+function buildGuardSummary(params: {
+  guardState: guardrailsStore.GuardrailState;
+  guardConfig: import("@/lib/autoEntry/guardrails").GuardrailConfig;
+  toggleState: { enabled: boolean; reason: string | null };
+  openPositions: number;
+}): GuardSummary {
+  return {
+    enabled: params.toggleState.enabled,
+    autoEntryToggleReason: params.toggleState.reason,
+    entriesToday: params.guardState.entriesToday,
+    maxEntriesPerDay: params.guardConfig.maxEntriesPerDay,
+    consecutiveFailures: params.guardState.consecutiveFailures,
+    maxConsecutiveFailures: params.guardConfig.maxConsecutiveFailures,
+    autoDisabledReason: params.guardState.autoDisabledReason,
+    maxOpenPositions: params.guardConfig.maxOpenPositions,
+    openPositions: params.openPositions,
+  };
+}
+
 export async function POST(req: Request) {
   const auth = await ensureToken(req);
   if (!auth.ok) return NextResponse.json(auth, { status: auth.status });
@@ -203,21 +237,111 @@ export async function POST(req: Request) {
     executed: 0,
     skipped: 0,
   };
+  const guardConfig = getGuardrailConfig();
+  const etDate = etDateString(new Date());
+  const [guardState, toggleState] = await Promise.all([
+    guardrailsStore.getGuardrailsState(etDate),
+    guardrailsStore.getAutoEntryEnabledState(guardConfig),
+  ]);
+
+  const trades = await readTrades<any>();
+  const openPositions = trades.filter(
+    (t) =>
+      Boolean(t?.status === "OPEN") &&
+      (t?.source === "auto-entry" || t?.source === "AUTO")
+  ).length;
+
+  let guardSummary = buildGuardSummary({
+    guardState,
+    guardConfig,
+    toggleState,
+    openPositions,
+  });
 
   if (!cfg.enabled) {
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "AUTO_TRADING_ENABLED=false", counts },
+      { ok: true, skipped: true, reason: "AUTO_TRADING_ENABLED=false", counts, guardrails: guardSummary },
       { status: 200 }
     );
   }
   if (!cfg.paperOnly) {
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "AUTO_TRADING_PAPER_ONLY=false (blocked in Phase 4)", counts },
+      { ok: true, skipped: true, reason: "AUTO_TRADING_PAPER_ONLY=false (blocked in Phase 4)", counts, guardrails: guardSummary },
       { status: 200 }
     );
   }
 
-  const trades = await readTrades<any>();
+  if (!toggleState.enabled) {
+    counts.skipped += 1;
+    return NextResponse.json(
+      { ok: true, skipped: true, reason: "auto_entry_disabled", counts, guardrails: guardSummary },
+      { status: 200 }
+    );
+  }
+
+  let marketOpen = true;
+  try {
+    const clock = await fetchAlpacaClock();
+    marketOpen = Boolean(clock.is_open);
+  } catch {
+    marketOpen = false;
+  }
+
+  if (!marketOpen) {
+    counts.skipped += 1;
+    return NextResponse.json(
+      { ok: true, skipped: true, reason: "market_closed", counts, guardrails: guardSummary },
+      { status: 200 }
+    );
+  }
+
+  if (guardState.autoDisabledReason) {
+    counts.skipped += 1;
+    return NextResponse.json(
+      {
+        ok: true,
+        skipped: true,
+        reason: "circuit_breaker",
+        detail: guardState.autoDisabledReason,
+        counts,
+        guardrails: guardSummary,
+      },
+      { status: 200 }
+    );
+  }
+
+  if (openPositions >= guardConfig.maxOpenPositions) {
+    counts.skipped += 1;
+    return NextResponse.json(
+      { ok: true, skipped: true, reason: "max_open_positions", counts, guardrails: guardSummary },
+      { status: 200 }
+    );
+  }
+
+  if (guardState.entriesToday >= guardConfig.maxEntriesPerDay) {
+    counts.skipped += 1;
+    return NextResponse.json(
+      { ok: true, skipped: true, reason: "max_entries_per_day", counts, guardrails: guardSummary },
+      { status: 200 }
+    );
+  }
+
+  const sinceLoss = minutesSince(guardState.lastLossAt);
+  if (sinceLoss != null && sinceLoss < guardConfig.cooldownAfterLossMin) {
+    const minsRemaining = Math.ceil(guardConfig.cooldownAfterLossMin - sinceLoss);
+    counts.skipped += 1;
+    return NextResponse.json(
+      {
+        ok: true,
+        skipped: true,
+        reason: "cooldown_after_loss",
+        detail: `${minsRemaining}m`,
+        counts,
+        guardrails: guardSummary,
+      },
+      { status: 200 }
+    );
+  }
   let idx = -1;
   for (let i = 0; i < trades.length; i += 1) {
     const candidate = trades[i];
@@ -258,18 +382,36 @@ export async function POST(req: Request) {
   if (idx === -1) {
     counts.skipped += 1;
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "no_AUTO_PENDING_trades", counts },
+      { ok: true, skipped: true, reason: "no_AUTO_PENDING_trades", counts, guardrails: guardSummary },
       { status: 200 }
     );
   }
 
   const trade = trades[idx];
+  const ticker = String(trade.ticker || "").toUpperCase();
+  const side = String(trade.side || "LONG").toUpperCase();
+
+  const lastTickerEntry = guardState.tickerEntries[ticker];
+  const sinceTicker = minutesSince(lastTickerEntry);
+  if (sinceTicker != null && sinceTicker < guardConfig.tickerCooldownMin) {
+    const minsRemaining = Math.ceil(guardConfig.tickerCooldownMin - sinceTicker);
+    counts.skipped += 1;
+    return NextResponse.json(
+      {
+        ok: true,
+        skipped: true,
+        reason: "ticker_cooldown",
+        detail: `${minsRemaining}m`,
+        counts,
+        guardrails: guardSummary,
+      },
+      { status: 200 }
+    );
+  }
 
   const tradeId = String(trade.id || "");
   if (!tradeId) return NextResponse.json({ ok: false, error: "trade missing id" }, { status: 400 });
 
-  const ticker = String(trade.ticker || "").toUpperCase();
-  const side = String(trade.side || "LONG").toUpperCase();
   const entryPrice = safeNum(trade.entryPrice, 0);
   const stopPrice = safeNum(trade.stopPrice, 0);
 
@@ -282,19 +424,28 @@ export async function POST(req: Request) {
   if (!locked) {
     counts.skipped += 1;
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "already_locked", tradeId, counts },
+      { ok: true, skipped: true, reason: "already_locked", tradeId, counts, guardrails: guardSummary },
       { status: 200 }
     );
   }
 
   const open = await hasOpenOrdersForSymbol(ticker);
   if (!open.ok) {
-    return NextResponse.json({ ok: false, status: open.status, error: open.text || "alpaca open orders lookup failed", tradeId }, { status: 500 });
+    return NextResponse.json(
+      {
+        ok: false,
+        status: open.status,
+        error: open.text || "alpaca open orders lookup failed",
+        tradeId,
+        guardrails: guardSummary,
+      },
+      { status: 500 }
+    );
   }
   if (open.orders.length > 0) {
     counts.skipped += 1;
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "open_order_exists", tradeId, openOrders: open.orders.map((o: any) => ({ id: o.id, symbol: o.symbol, side: o.side, type: o.type, status: o.status })), counts },
+      { ok: true, skipped: true, reason: "open_order_exists", tradeId, openOrders: open.orders.map((o: any) => ({ id: o.id, symbol: o.symbol, side: o.side, type: o.type, status: o.status })), counts, guardrails: guardSummary },
       { status: 200 }
     );
   }
@@ -403,8 +554,21 @@ export async function POST(req: Request) {
   });
 
   if (!lock.ok) {
+    const failureCount = await guardrailsStore.recordFailure(etDate, "alpaca_error");
+    guardSummary.consecutiveFailures = failureCount;
+    if (failureCount >= guardConfig.maxConsecutiveFailures) {
+      await guardrailsStore.setAutoDisabled(etDate, "max_consecutive_failures");
+      guardSummary.autoDisabledReason = "max_consecutive_failures";
+    }
     return NextResponse.json(
-      { ok: false, error: lock.error, tradeId, lockKey: redisLockKey, debug: dbg },
+      {
+        ok: false,
+        error: lock.error,
+        tradeId,
+        lockKey: redisLockKey,
+        debug: dbg,
+        guardrails: guardSummary,
+      },
       { status: lock.error === "LOCKED" ? 409 : 500 }
     );
   }
@@ -448,6 +612,14 @@ export async function POST(req: Request) {
     await writeTrades(trades);
     counts.executed += 1;
 
+    await guardrailsStore.bumpEntry(etDate, ticker);
+    guardSummary.entriesToday += 1;
+    guardSummary.openPositions += 1;
+    await guardrailsStore.resetFailures(etDate);
+    guardSummary.consecutiveFailures = 0;
+    await guardrailsStore.clearAutoDisabled(etDate);
+    guardSummary.autoDisabledReason = null;
+
     return NextResponse.json(
       {
         ok: true,
@@ -461,12 +633,19 @@ export async function POST(req: Request) {
         },
         debug: dbg,
         counts,
+        guardrails: guardSummary,
       },
       { status: 200 }
     );
   } catch (e: any) {
     const message = String(e?.message || e || "unknown_error");
     const stack = String(e?.stack || "");
+    const failureCount = await guardrailsStore.recordFailure(etDate, "execute_error");
+    guardSummary.consecutiveFailures = failureCount;
+    if (failureCount >= guardConfig.maxConsecutiveFailures) {
+      await guardrailsStore.setAutoDisabled(etDate, "max_consecutive_failures");
+      guardSummary.autoDisabledReason = "max_consecutive_failures";
+    }
     const updated = {
       ...trade,
       status: "ERROR",
@@ -475,6 +654,9 @@ export async function POST(req: Request) {
     };
     trades[idx] = updated;
     await writeTrades(trades);
-    return NextResponse.json({ ok: false, error: message, stack, tradeId, debug: dbg, counts }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: message, stack, tradeId, debug: dbg, counts, guardrails: guardSummary },
+      { status: 500 }
+    );
   }
 }

@@ -2,6 +2,8 @@ export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
+import { getGuardrailConfig, etDateString, minutesSince } from "@/lib/autoEntry/guardrails";
+import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 
 type Check = {
   name: string;
@@ -56,23 +58,6 @@ async function fetchAlpacaClock(): Promise<
   };
 }
 
-function etDateString(d: Date): string {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  return fmt.format(d);
-}
-
-function minutesSince(iso?: string | null): number | null {
-  if (!iso) return null;
-  const t = Date.parse(iso);
-  if (!Number.isFinite(t)) return null;
-  return (Date.now() - t) / 60000;
-}
-
 export async function GET(req: Request) {
   const authed = await requireAuth(req);
   if (!authed.ok) {
@@ -113,6 +98,11 @@ export async function GET(req: Request) {
   const signalsPayload = await signalsResp.json();
 
   const todayEt = etDateString(new Date());
+  const guardConfig = getGuardrailConfig();
+  const [guardState, toggleState] = await Promise.all([
+    guardrailsStore.getGuardrailsState(todayEt),
+    guardrailsStore.getAutoEntryEnabledState(guardConfig),
+  ]);
 
   const signals: any[] = Array.isArray(signalsPayload)
     ? signalsPayload
@@ -245,6 +235,18 @@ export async function GET(req: Request) {
       avgScore: avgScoreToday,
       maxScore: maxScoreToday,
       lastScoredAt,
+    },
+    autoEntry: {
+      enabled: toggleState.enabled,
+      envEnabled: guardConfig.enabled,
+      toggleReason: toggleState.reason,
+      entriesToday: guardState.entriesToday,
+      maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+      consecutiveFailures: guardState.consecutiveFailures,
+      maxConsecutiveFailures: guardConfig.maxConsecutiveFailures,
+      autoDisabledReason: guardState.autoDisabledReason,
+      maxOpenPositions: guardConfig.maxOpenPositions,
+      lastLossAt: guardState.lastLossAt,
     },
     checks,
     reasons,
