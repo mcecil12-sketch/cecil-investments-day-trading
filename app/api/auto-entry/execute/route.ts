@@ -197,18 +197,70 @@ export async function POST(req: Request) {
   if (!auth.ok) return NextResponse.json(auth, { status: auth.status });
 
   const cfg = auth.cfg;
+  const counts = {
+    checked: 0,
+    invalidMarked: 0,
+    executed: 0,
+    skipped: 0,
+  };
 
   if (!cfg.enabled) {
-    return NextResponse.json({ ok: true, skipped: true, reason: "AUTO_TRADING_ENABLED=false" }, { status: 200 });
+    return NextResponse.json(
+      { ok: true, skipped: true, reason: "AUTO_TRADING_ENABLED=false", counts },
+      { status: 200 }
+    );
   }
   if (!cfg.paperOnly) {
-    return NextResponse.json({ ok: true, skipped: true, reason: "AUTO_TRADING_PAPER_ONLY=false (blocked in Phase 4)" }, { status: 200 });
+    return NextResponse.json(
+      { ok: true, skipped: true, reason: "AUTO_TRADING_PAPER_ONLY=false (blocked in Phase 4)", counts },
+      { status: 200 }
+    );
   }
 
   const trades = await readTrades<any>();
-  const idx = trades.findIndex((t: any) => t && isAutoPendingTrade(t) && (t.source === "auto-entry" || t.source === "AUTO"));
+  let idx = -1;
+  for (let i = 0; i < trades.length; i += 1) {
+    const candidate = trades[i];
+    if (!candidate || !isAutoPendingTrade(candidate)) continue;
+    if (!(candidate.source === "auto-entry" || candidate.source === "AUTO")) continue;
+    counts.checked += 1;
+
+    const entryPrice = safeNum(candidate.entryPrice, 0);
+    const stopPrice = safeNum(candidate.stopPrice, 0);
+    const sideStr = String(candidate.side || "LONG").toUpperCase();
+    const isLong = sideStr === "LONG";
+    let invalidError: string | null = null;
+
+    if (entryPrice <= 0 || stopPrice <= 0) {
+      invalidError = "auto_entry_invalid_missing_prices";
+    } else if (isLong && stopPrice >= entryPrice) {
+      invalidError = "auto_entry_invalid_bad_stop";
+    }
+
+    if (invalidError) {
+      counts.invalidMarked += 1;
+      trades[i] = {
+        ...candidate,
+        status: "ERROR",
+        brokerStatus: candidate.brokerStatus,
+        error: invalidError,
+        autoEntryStatus: "AUTO_ERROR",
+        updatedAt: nowIso(),
+      };
+      await writeTrades(trades);
+      continue;
+    }
+
+    idx = i;
+    break;
+  }
+
   if (idx === -1) {
-    return NextResponse.json({ ok: true, skipped: true, reason: "no_AUTO_PENDING_trades" }, { status: 200 });
+    counts.skipped += 1;
+    return NextResponse.json(
+      { ok: true, skipped: true, reason: "no_AUTO_PENDING_trades", counts },
+      { status: 200 }
+    );
   }
 
   const trade = trades[idx];
@@ -227,15 +279,22 @@ export async function POST(req: Request) {
 
   const lockKey = `lock:auto-entry:${ticker}`;
   const locked = await setnxLock(lockKey, 60 * 10);
-  if (!locked) return NextResponse.json({ ok: true, skipped: true, reason: "already_locked", tradeId }, { status: 200 });
+  if (!locked) {
+    counts.skipped += 1;
+    return NextResponse.json(
+      { ok: true, skipped: true, reason: "already_locked", tradeId, counts },
+      { status: 200 }
+    );
+  }
 
   const open = await hasOpenOrdersForSymbol(ticker);
   if (!open.ok) {
     return NextResponse.json({ ok: false, status: open.status, error: open.text || "alpaca open orders lookup failed", tradeId }, { status: 500 });
   }
   if (open.orders.length > 0) {
+    counts.skipped += 1;
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "open_order_exists", tradeId, openOrders: open.orders.map((o: any) => ({ id: o.id, symbol: o.symbol, side: o.side, type: o.type, status: o.status })) },
+      { ok: true, skipped: true, reason: "open_order_exists", tradeId, openOrders: open.orders.map((o: any) => ({ id: o.id, symbol: o.symbol, side: o.side, type: o.type, status: o.status })), counts },
       { status: 200 }
     );
   }
@@ -387,6 +446,7 @@ export async function POST(req: Request) {
 
     trades[idx] = updated;
     await writeTrades(trades);
+    counts.executed += 1;
 
     return NextResponse.json(
       {
@@ -400,6 +460,7 @@ export async function POST(req: Request) {
           takeProfitOrderId,
         },
         debug: dbg,
+        counts,
       },
       { status: 200 }
     );
@@ -414,6 +475,6 @@ export async function POST(req: Request) {
     };
     trades[idx] = updated;
     await writeTrades(trades);
-    return NextResponse.json({ ok: false, error: message, stack, tradeId, debug: dbg }, { status: 500 });
+    return NextResponse.json({ ok: false, error: message, stack, tradeId, debug: dbg, counts }, { status: 500 });
   }
 }
