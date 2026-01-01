@@ -4,6 +4,8 @@ import path from "path";
 import { getPositions, getOrder, replaceOrder } from "@/lib/alpaca";
 import { appendActivity } from "@/lib/activity";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
+import { etDateString } from "@/lib/autoEntry/guardrails";
+import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 
 type TradeStatus = "OPEN" | "CLOSED" | "PENDING" | "PARTIAL" | string;
 
@@ -294,6 +296,14 @@ export async function GET() {
               updatedAt: nowIso,
             };
             changed = true;
+            if (pnl < 0) {
+              const guardDate = etDateString(new Date());
+              try {
+                await guardrailsStore.recordLoss(guardDate, nowIso);
+              } catch (err) {
+                console.error("[manage] guardrail recordLoss failed", { err });
+              }
+            }
           }
         }
       } catch (err) {

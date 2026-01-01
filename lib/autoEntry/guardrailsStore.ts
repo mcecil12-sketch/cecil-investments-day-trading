@@ -112,6 +112,11 @@ export async function resetGuardrails(etDate: string, opts?: { resetEntries?: bo
   }
 }
 
+export async function recordLoss(etDate: string, atIso: string) {
+  if (!redis) return;
+  await redis.hset(guardKey(etDate), { lastLossAt: atIso });
+}
+
 function parseBooleanFlag(value: string | null | undefined): boolean | null {
   if (value == null) return null;
   const normalized = value.toString().toLowerCase();
