@@ -19,4 +19,5 @@ export type NotificationEvent = {
   meta?: Record<string, any>;
   dedupeKey?: string;
   dedupeTtlSec?: number;
+  skipDedupe?: boolean;
 };

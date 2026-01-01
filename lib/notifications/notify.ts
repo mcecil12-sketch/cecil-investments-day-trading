@@ -3,7 +3,7 @@ import { NotificationEvent } from "./types";
 import { shouldSendNotification } from "./dedupe";
 import { sendPushoverNotification } from "./pushover";
 
-export async function sendNotification(event: NotificationEvent) {
+export async function notify(event: NotificationEvent) {
   const config = getNotificationConfig();
   if (!config.enabled) {
     return { sent: false, skippedReason: "notifications_disabled" };
@@ -29,7 +29,7 @@ export async function sendNotification(event: NotificationEvent) {
   ];
   const eventKey = dedupeKeyParts.filter(Boolean).join(":");
   const ttl = event.dedupeTtlSec ?? config.dedupeTtl;
-  if (eventKey) {
+  if (eventKey && !event.skipDedupe) {
     const allowed = await shouldSendNotification(eventKey, ttl);
     if (!allowed) {
       return { sent: false, skippedReason: "deduped" };
@@ -65,3 +65,5 @@ export async function sendNotification(event: NotificationEvent) {
     return { sent: false, skippedReason: "pushover_exception" };
   }
 }
+
+export { notify as sendNotification };
