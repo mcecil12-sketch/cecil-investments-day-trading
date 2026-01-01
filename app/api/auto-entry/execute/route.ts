@@ -206,7 +206,7 @@ export async function POST(req: Request) {
   }
 
   const trades = await readTrades<any>();
-  const idx = trades.findIndex((t: any) => t && isAutoPendingTrade(t) && t.source === "auto-entry");
+  const idx = trades.findIndex((t: any) => t && isAutoPendingTrade(t) && (t.source === "auto-entry" || t.source === "AUTO"));
   if (idx === -1) {
     return NextResponse.json({ ok: true, skipped: true, reason: "no_AUTO_PENDING_trades" }, { status: 200 });
   }
