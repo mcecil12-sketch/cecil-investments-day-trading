@@ -129,10 +129,37 @@ export async function readAutoEntryTelemetry(etDate: string, limit: number = 50,
 
   const rawRows = rows ?? [];
 
+  const parseRun = (item: any) => {
+    if (!item && item !== 0) return null;
+    if (typeof item === "object") {
+      const obj: any = item;
+      if (obj.outcome || obj.reason || obj.runId || obj.at) return obj;
+      if (typeof obj.toString === "function") {
+        try {
+          const txt = obj.toString("utf8");
+          if (typeof txt === "string") return JSON.parse(txt);
+        } catch {}
+      }
+    }
+    if (typeof item === "string") {
+      const trimmed = item.trim();
+      if (trimmed.startsWith("{")) {
+        try {
+          return JSON.parse(trimmed);
+        } catch {}
+      }
+    }
+    const fallback = String(item);
+    if (fallback.trim().startsWith("{")) {
+      try {
+        return JSON.parse(fallback);
+      } catch {}
+    }
+    return null;
+  };
+
   const runs = (rawRows || [])
-    .map((x: any) => {
-      try { return JSON.parse(String(x)); } catch { return null; }
-    })
+    .map((x: any) => parseRun(x))
     .filter(Boolean);
 
   const debugArr = Array.isArray(rawRows) ? rawRows : [];
