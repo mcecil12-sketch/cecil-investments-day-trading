@@ -5,12 +5,20 @@ import { sendPushoverNotification } from "./pushover";
 
 export async function notify(event: NotificationEvent) {
   const approvalsDisabled =
-    String(process.env.DISABLE_APPROVAL_NOTIFICATIONS ?? "0").toLowerCase() === "1";
-  if (
-    approvalsDisabled &&
-    ["APPROVAL_REQUIRED", "PULLBACK_READY", "SIGNAL_APPROVAL"].includes(event.type)
-  ) {
-    return { sent: false, skippedReason: "approval_notifications_disabled" };
+    process.env.DISABLE_APPROVAL_NOTIFICATIONS === "1";
+  const type = String(event?.type || "");
+  const isApprovalType =
+    type === "APPROVAL_REQUIRED" ||
+    type === "SIGNAL_APPROVAL" ||
+    type === "PULLBACK_READY" ||
+    type === "APPROVAL" ||
+    type === "READY_FOR_APPROVAL";
+
+  if (approvalsDisabled && isApprovalType) {
+    return {
+      sent: false,
+      skippedReason: "approval_notifications_disabled",
+    };
   }
 
   const config = getNotificationConfig();
