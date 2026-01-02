@@ -20,10 +20,11 @@ export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
     const limitRaw = Number(url.searchParams.get("limit") ?? "50");
+    const debug = String(url.searchParams.get("debug") || "") === "1";
     const limit = Math.min(200, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 50));
 
     const etDate = etDateString(new Date());
-    const data = await readAutoEntryTelemetry(etDate, limit);
+    const data = await readAutoEntryTelemetry(etDate, limit, debug);
 
     return NextResponse.json({ ok: true, ...data }, { status: 200 });
   } catch (err: any) {

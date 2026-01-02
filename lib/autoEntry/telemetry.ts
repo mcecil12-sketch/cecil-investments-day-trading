@@ -23,6 +23,11 @@ function runsKey(etDate: string) {
   return `${PREFIX}:runs:${etDate}`;
 }
 
+function truncErr(x: any, n = 180) {
+  const t = String(x?.message || x || "");
+  return t.length > n ? t.slice(0, n) + "…" : t;
+}
+
 function unwrapRedisResult<T>(x: any): T {
   if (x && typeof x === "object" && "result" in x) return (x as any).result as T;
   return x as T;
@@ -99,6 +104,14 @@ export async function recordAutoEntryTelemetry(e: AutoEntryTelemetryEvent) {
     await safeLpush(rk, JSON.stringify(e));
     await safeLtrim(rk, 0, 199);
 
+    try {
+      await redis.hset(dk, {
+        runsListLastWriteAt: e.at,
+        runsListLastWriteOk: "1",
+        runsListLastWriteErr: "",
+      });
+    } catch {}
+
     await redis.expire(dk, 60 * 60 * 24 * 35);
     await redis.expire(rk, 60 * 60 * 24 * 35);
   } catch {
@@ -106,7 +119,7 @@ export async function recordAutoEntryTelemetry(e: AutoEntryTelemetryEvent) {
   }
 }
 
-export async function readAutoEntryTelemetry(etDate: string, limit: number = 50) {
+export async function readAutoEntryTelemetry(etDate: string, limit: number = 50, debug: boolean = false) {
   if (!redis) return { etDate, summary: {}, runs: [] };
   const dk = dayKey(etDate);
   const rk = runsKey(etDate);
@@ -114,11 +127,24 @@ export async function readAutoEntryTelemetry(etDate: string, limit: number = 50)
   const summary = await redis.hgetall(dk);
   const rows = await safeLrange(rk, 0, Math.max(0, limit - 1));
 
-  const runs = (rows || [])
+  const rawRows = rows ?? [];
+
+  const runs = (rawRows || [])
     .map((x: any) => {
       try { return JSON.parse(String(x)); } catch { return null; }
     })
     .filter(Boolean);
 
-  return { etDate, summary, runs };
+  const debugArr = Array.isArray(rawRows) ? rawRows : [];
+  const debugInfo = debug
+    ? {
+        debugRunsKey: rk,
+        debugRawRunsType: rawRows === null ? "null" : Array.isArray(rawRows) ? "array" : typeof rawRows,
+        debugRawRunsLen: Array.isArray(rawRows) ? rawRows.length : 0,
+        debugParsedRunsLen: runs.length,
+        debugPreview:
+          typeof debugArr?.[0] === "string" ? String(debugArr[0]).slice(0, 140) : "",
+      }
+    : {};
+  return { etDate, summary, runs, ...debugInfo };
 }
