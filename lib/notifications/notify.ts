@@ -4,9 +4,9 @@ import { shouldSendNotification } from "./dedupe";
 import { sendPushoverNotification } from "./pushover";
 
 export async function notify(event: NotificationEvent) {
-  const approvalsDisabled =
-    process.env.DISABLE_APPROVAL_NOTIFICATIONS === "1";
-  const type = String(event?.type || "");
+  const approvalsDisabled = process.env.DISABLE_APPROVAL_NOTIFICATIONS === "1";
+  const type = String((event as any)?.type || "");
+
   const isApprovalType =
     type === "APPROVAL_REQUIRED" ||
     type === "SIGNAL_APPROVAL" ||
