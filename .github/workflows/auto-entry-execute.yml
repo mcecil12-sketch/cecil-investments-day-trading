@@ -1,0 +1,33 @@
+name: Auto-Entry Execute
+
+on:
+  schedule:
+    # Runs every 5 minutes on weekdays, roughly covering US market hours in UTC.
+    # Execute route will skip when market is closed.
+    - cron: "*/5 14-21 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call auto-entry execute
+        env:
+          PROD: https://cecil-investments-day-trading.vercel.app
+          AUTO_ENTRY_TOKEN: ${{ secrets.AUTO_ENTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          RUN_ID="gh-auto-entry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)"
+
+          BODY="$(curl -sS -X POST "$PROD/api/auto-entry/execute" \
+            -H "Content-Type: application/json" \
+            -H "x-auto-entry-token: $AUTO_ENTRY_TOKEN" \
+            -H "x-run-source: github-actions" \
+            -H "x-run-id: $RUN_ID" \
+            -d '{}' )"
+
+          echo "$BODY"
+
+          echo "$BODY" | jq -r '.' >/dev/null
