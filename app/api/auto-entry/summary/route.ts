@@ -1,10 +1,12 @@
 import { NextResponse } from "next/server";
-import { redis } from "@/lib/redis";
 import { etDateString } from "@/lib/autoEntry/guardrails";
+import { readAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
 
 export const dynamic = "force-dynamic";
 
-type Summary = {
+type Bucket = {
+  start: string;
+  end: string;
   runs: number;
   success: number;
   fail: number;
@@ -20,6 +22,23 @@ type Summary = {
 function toNum(x: any) {
   const n = Number(x);
   return Number.isFinite(n) ? n : 0;
+}
+
+function emptyBucket(start: string, end: string): Bucket {
+  return {
+    start,
+    end,
+    runs: 0,
+    success: 0,
+    fail: 0,
+    skipped: 0,
+    skipByReason: {},
+    lastRunAt: null,
+    lastOutcome: null,
+    lastReason: null,
+    lastSource: null,
+    lastRunId: null,
+  };
 }
 
 function startOfWeekET(isoDate: string) {
@@ -49,60 +68,31 @@ function dateRange(startIso: string, endIso: string) {
   return out;
 }
 
-async function readSummaryForDate(etDate: string): Promise<any> {
-  if (!redis) return null;
-  const key = `autoEntry:telemetry:summary:v1:${etDate}`;
-  try {
-    const raw: any = await (redis as any).hgetall(key);
-    const obj = raw && typeof raw === "object" && "result" in raw ? (raw as any).result : raw;
-    return obj && typeof obj === "object" ? obj : null;
-  } catch {
-    return null;
-  }
-}
+function mergeBucket(acc: Bucket, daySummary: any): Bucket {
+  if (!daySummary || typeof daySummary !== "object") return acc;
 
-function emptySummary(): Summary {
-  return {
-    runs: 0,
-    success: 0,
-    fail: 0,
-    skipped: 0,
-    skipByReason: {},
-    lastRunAt: null,
-    lastOutcome: null,
-    lastReason: null,
-    lastSource: null,
-    lastRunId: null,
-  };
-}
+  acc.runs += toNum(daySummary.runs);
+  acc.skipped += toNum(daySummary.skipped);
 
-function merge(acc: Summary, day: any): Summary {
-  if (!day) return acc;
-
-  const runs = toNum(day.runs);
-  const skipped = toNum(day.skipped);
-  const success = toNum(day.success ?? day["outcome:SUCCESS"] ?? 0);
-  const fail = toNum(day.fail ?? day["outcome:FAIL"] ?? 0);
-
-  acc.runs += runs;
-  acc.skipped += skipped;
+  const success = toNum(daySummary.success ?? daySummary["outcome:SUCCESS"] ?? 0);
+  const fail = toNum(daySummary.fail ?? daySummary["outcome:FAIL"] ?? 0);
   acc.success += success;
   acc.fail += fail;
 
-  for (const [k, v] of Object.entries(day)) {
+  for (const [k, v] of Object.entries(daySummary)) {
     if (typeof k === "string" && k.startsWith("skip:")) {
       const reason = k.slice("skip:".length);
       acc.skipByReason[reason] = (acc.skipByReason[reason] || 0) + toNum(v);
     }
   }
 
-  const at = typeof day.lastRunAt === "string" ? day.lastRunAt : null;
+  const at = typeof daySummary.lastRunAt === "string" ? daySummary.lastRunAt : null;
   if (at && (!acc.lastRunAt || at > acc.lastRunAt)) {
     acc.lastRunAt = at;
-    acc.lastOutcome = typeof day.lastOutcome === "string" ? day.lastOutcome : null;
-    acc.lastReason = typeof day.lastReason === "string" ? day.lastReason : null;
-    acc.lastSource = typeof day.lastSource === "string" ? day.lastSource : null;
-    acc.lastRunId = typeof day.lastRunId === "string" ? day.lastRunId : null;
+    acc.lastOutcome = typeof daySummary.lastOutcome === "string" ? daySummary.lastOutcome : null;
+    acc.lastReason = typeof daySummary.lastReason === "string" ? daySummary.lastReason : null;
+    acc.lastSource = typeof daySummary.lastSource === "string" ? daySummary.lastSource : null;
+    acc.lastRunId = typeof daySummary.lastRunId === "string" ? daySummary.lastRunId : null;
   }
 
   return acc;
@@ -128,14 +118,17 @@ export async function GET(req: Request) {
 
   for (const [name, start, end] of periods) {
     const dates = dateRange(start, end);
-    let acc = emptySummary();
+    let acc = emptyBucket(start, end);
     const days: any[] = [];
+
     for (const d of dates) {
-      const s = await readSummaryForDate(d);
-      acc = merge(acc, s);
-      if (debug) days.push({ etDate: d, summary: s });
+      const r = await readAutoEntryTelemetry(d, 0, false);
+      const sum = r?.summary || {};
+      acc = mergeBucket(acc, sum);
+      if (debug) days.push({ etDate: d, summary: sum });
     }
-    out.periods[name] = { start, end, ...acc };
+
+    out.periods[name] = acc;
     if (debug) out.periods[name].days = days;
   }
 
