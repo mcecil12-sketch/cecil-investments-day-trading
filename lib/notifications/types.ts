@@ -3,7 +3,10 @@ export type NotificationEventType =
   | "AUTO_ENTRY_FAILED"
   | "AUTO_ENTRY_DISABLED"
   | "TRADE_CLOSED"
-  | "STOP_HIT";
+  | "STOP_HIT"
+  | "APPROVAL_REQUIRED"
+  | "PULLBACK_READY"
+  | "SIGNAL_APPROVAL";
 
 export type NotificationEvent = {
   type: NotificationEventType;

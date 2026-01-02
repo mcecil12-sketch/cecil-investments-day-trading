@@ -4,6 +4,15 @@ import { shouldSendNotification } from "./dedupe";
 import { sendPushoverNotification } from "./pushover";
 
 export async function notify(event: NotificationEvent) {
+  const approvalsDisabled =
+    String(process.env.DISABLE_APPROVAL_NOTIFICATIONS ?? "0").toLowerCase() === "1";
+  if (
+    approvalsDisabled &&
+    ["APPROVAL_REQUIRED", "PULLBACK_READY", "SIGNAL_APPROVAL"].includes(event.type)
+  ) {
+    return { sent: false, skippedReason: "approval_notifications_disabled" };
+  }
+
   const config = getNotificationConfig();
   if (!config.enabled) {
     return { sent: false, skippedReason: "notifications_disabled" };
