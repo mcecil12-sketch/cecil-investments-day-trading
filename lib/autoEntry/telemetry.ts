@@ -23,6 +23,52 @@ function runsKey(etDate: string) {
   return `${PREFIX}:runs:${etDate}`;
 }
 
+function unwrapRedisResult<T>(x: any): T {
+  if (x && typeof x === "object" && "result" in x) return (x as any).result as T;
+  return x as T;
+}
+
+async function safeLpush(key: string, value: string) {
+  if (!redis) return;
+  const client: any = redis;
+  try {
+    if (typeof client.lpush === "function") {
+      await client.lpush(key, value);
+      return;
+    }
+  } catch {}
+  try {
+    if (typeof client.rpush === "function") {
+      await client.rpush(key, value);
+      return;
+    }
+  } catch {}
+}
+
+async function safeLtrim(key: string, start: number, stop: number) {
+  if (!redis) return;
+  const client: any = redis;
+  try {
+    if (typeof client.ltrim === "function") {
+      await client.ltrim(key, start, stop);
+      return;
+    }
+  } catch {}
+}
+
+async function safeLrange(key: string, start: number, stop: number): Promise<string[]> {
+  if (!redis) return [];
+  const client: any = redis;
+  try {
+    if (typeof client.lrange === "function") {
+      const raw = await client.lrange(key, start, stop);
+      const value = unwrapRedisResult<any>(raw);
+      return Array.isArray(value) ? value : [];
+    }
+  } catch {}
+  return [];
+}
+
 export async function recordAutoEntryTelemetry(e: AutoEntryTelemetryEvent) {
   try {
     if (!redis) return;
@@ -50,8 +96,8 @@ export async function recordAutoEntryTelemetry(e: AutoEntryTelemetryEvent) {
       lastRunId: e.runId ?? "",
     });
 
-    await redis.lpush(rk, JSON.stringify(e));
-    await redis.ltrim(rk, 0, 199);
+    await safeLpush(rk, JSON.stringify(e));
+    await safeLtrim(rk, 0, 199);
 
     await redis.expire(dk, 60 * 60 * 24 * 35);
     await redis.expire(rk, 60 * 60 * 24 * 35);
@@ -66,7 +112,7 @@ export async function readAutoEntryTelemetry(etDate: string, limit: number = 50)
   const rk = runsKey(etDate);
 
   const summary = await redis.hgetall(dk);
-  const rows = await redis.lrange(rk, 0, Math.max(0, limit - 1));
+  const rows = await safeLrange(rk, 0, Math.max(0, limit - 1));
 
   const runs = (rows || [])
     .map((x: any) => {
