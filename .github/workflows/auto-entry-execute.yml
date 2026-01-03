@@ -2,15 +2,17 @@ name: Auto-Entry Execute
 
 on:
   schedule:
-    # Runs every 5 minutes on weekdays, roughly covering US market hours in UTC.
-    # Execute route will skip when market is closed.
     - cron: "*/5 14-21 * * 1-5"
   workflow_dispatch: {}
+
+concurrency:
+  group: autotrade-execute
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - name: Call auto-entry execute
         env:
@@ -29,5 +31,29 @@ jobs:
             -d '{}' )"
 
           echo "$BODY"
-
           echo "$BODY" | jq -r '.' >/dev/null
+
+      - name: Call auto-manage run (3x ~2m cadence)
+        env:
+          PROD: https://cecil-investments-day-trading.vercel.app
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          for i in 1 2 3; do
+            RUN_ID="gh-auto-manage-$i-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)"
+
+            BODY="$(curl -sS -X POST "$PROD/api/auto-manage/run" \
+              -H "Content-Type: application/json" \
+              -H "x-cron-token: $CRON_TOKEN" \
+              -H "x-run-source: github-actions" \
+              -H "x-run-id: $RUN_ID" \
+              -d '{}' )"
+
+            echo "$BODY"
+            echo "$BODY" | jq -r '.' >/dev/null
+
+            if [ "$i" -lt 3 ]; then
+              sleep 120
+            fi
+          done
