@@ -13,6 +13,11 @@ import {
   Bar,
 } from "recharts";
 
+type DrillRange = "today" | "week" | "month" | "all";
+
+type TradesResp = { ok: boolean; range: DrillRange; count: number; trades: any[] };
+type DailyResp = { ok: boolean; range: DrillRange; daily: { date: string; pnl: number }[] };
+
 type PortfolioResp = {
   ok: boolean;
   startingBalance: number;
@@ -51,8 +56,26 @@ export default function PerformancePage() {
   const [data, setData] = useState<PortfolioResp | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [range, setRange] = useState<DrillRange>("week");
+  const [drillTrades, setDrillTrades] = useState<any[]>([]);
+  const [drillDaily, setDrillDaily] = useState<{ date: string; pnl: number }[]>([]);
 
-  async function load() {
+    async function loadDrill(r: DrillRange) {
+    try {
+      const [tr, dr] = await Promise.all([
+        fetch(`/api/performance/trades?range=${r}`, { cache: "no-store" }),
+        fetch(`/api/performance/daily?range=${r}`, { cache: "no-store" }),
+      ]);
+      const tj = (await tr.json()) as TradesResp;
+      const dj = (await dr.json()) as DailyResp;
+      if (tj?.ok) setDrillTrades(tj.trades || []);
+      if (dj?.ok) setDrillDaily(dj.daily || []);
+    } catch {
+      // non-fatal
+    }
+  }
+
+async function load() {
     try {
       setLoading(true);
       setErr(null);
@@ -69,12 +92,16 @@ export default function PerformancePage() {
 
   useEffect(() => {
     load();
-    const t = setInterval(load, 60_000);
+    loadDrill(range);
+    const t = setInterval(() => {
+      load();
+      loadDrill(range);
+    }, 60_000);
     return () => clearInterval(t);
-  }, []);
+  }, [range]);
 
   const equitySeries = useMemo(() => (data?.equityCurve ?? []).map((p) => ({ date: (p as any).date ?? (p as any).t, equity: (p as any).equity })), [data]);
-  const pnlSeries = useMemo(() => data?.dailyPnL ?? [], [data]);
+    const pnlSeries = useMemo(() => drillDaily ?? [], [drillDaily]);
 
   const pnlColor = useMemo(() => {
     const pnl = data?.totalPnL ?? 0;
@@ -86,6 +113,26 @@ export default function PerformancePage() {
       <div className="mb-4 flex items-end justify-between">
         <div>
           <div className="text-xl font-semibold tracking-tight">Performance</div>
+
+      <div className="mb-3 flex items-center gap-2">
+        {(["today","week","month","all"] as DrillRange[]).map((r) => (
+          <button
+            key={r}
+            onClick={() => {
+              setRange(r);
+              loadDrill(r);
+            }}
+            className={
+              "rounded-lg border px-3 py-1.5 text-sm " +
+              (range === r
+                ? "border-white/20 bg-white/10 text-white"
+                : "border-white/10 bg-white/5 text-white/70 hover:bg-white/10")
+            }
+          >
+            {r === "today" ? "Today" : r === "week" ? "Week" : r === "month" ? "Month" : "All"}
+          </button>
+        ))}
+      </div>
           <div className="text-sm text-white/60">Portfolio P&amp;L and trends over time</div>
         </div>
         <button
@@ -219,6 +266,54 @@ export default function PerformancePage() {
               </div>
             </div>
           </div>
+
+          <div className="mt-4 rounded-xl border border-white/10 bg-white/5 p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <div>
+                <div className="text-sm font-semibold">Trades</div>
+                <div className="text-xs text-white/60">Closed trades (realized) — range: {range}</div>
+              </div>
+              <div className="text-xs text-white/50">{drillTrades.length} rows</div>
+            </div>
+
+            {drillTrades.length === 0 ? (
+              <div className="rounded-lg border border-white/10 bg-black/20 p-3 text-sm text-white/60">
+                No closed trades in this range yet.
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-left text-sm">
+                  <thead className="text-xs text-white/60">
+                    <tr>
+                      <th className="py-2 pr-3">Ticker</th>
+                      <th className="py-2 pr-3">Side</th>
+                      <th className="py-2 pr-3">Closed</th>
+                      <th className="py-2 pr-3">P/L</th>
+                      <th className="py-2 pr-3">R</th>
+                      <th className="py-2 pr-3">Source</th>
+                      <th className="py-2 pr-3">Paper</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {drillTrades.map((t: any) => (
+                      <tr key={t.id} className="border-t border-white/10">
+                        <td className="py-2 pr-3 font-semibold">{t.ticker}</td>
+                        <td className="py-2 pr-3">{t.side}</td>
+                        <td className="py-2 pr-3 text-white/70">{t.closedAt ? new Date(t.closedAt).toLocaleString() : "-"}</td>
+                        <td className={"py-2 pr-3 " + ((t.realizedPnL ?? 0) >= 0 ? "text-green-400" : "text-red-400")}>
+                          {fmtMoney(Number(t.realizedPnL ?? 0))}
+                        </td>
+                        <td className="py-2 pr-3 text-white/70">{t.realizedR == null ? "-" : fmtNum(Number(t.realizedR))}</td>
+                        <td className="py-2 pr-3 text-white/70">{t.source ?? "-"}</td>
+                        <td className="py-2 pr-3 text-white/70">{t.paper == null ? "-" : String(Boolean(t.paper))}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
 
           <div className="mt-4 rounded-xl border border-white/10 bg-white/5 p-4">
             <div className="flex items-center justify-between">
