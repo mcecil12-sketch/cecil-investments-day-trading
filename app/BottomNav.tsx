@@ -9,7 +9,7 @@ export default function BottomNav() {
   const items = [
     {
       href: "/today",
-      label: "Today",
+      label: "Home",
       icon: (
         <svg
           width="20"
