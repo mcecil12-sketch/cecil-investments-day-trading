@@ -17,6 +17,14 @@ const PUBLIC_PATHS = [
   "/api/ops/status",
 ];
 
+
+function isCronAuthed(req: NextRequest) {
+  const token = process.env.CRON_TOKEN;
+  if (!token) return false;
+  const header = req.headers.get("x-cron-token");
+  return Boolean(header && header === token);
+}
+
 function isScannerAuthed(req: NextRequest) {
   const token = process.env.SCANNER_TOKEN;
   if (!token) return false;
@@ -36,6 +44,10 @@ export function middleware(req: NextRequest) {
   }
 
   if (pathname.startsWith("/api/scan") && isScannerAuthed(req)) {
+    return NextResponse.next();
+  }
+
+  if (pathname === "/api/auto-manage/run" && isCronAuthed(req)) {
     return NextResponse.next();
   }
 
