@@ -12,7 +12,7 @@ type TabDef = {
 };
 
 const TABS: TabDef[] = [
-  { href: "/today", label: "Today", Icon: HomeIcon },
+  { href: "/today", label: "Home", Icon: HomeIcon },
   { href: "/trades", label: "Trades", Icon: LineChartIcon },
   { href: "/performance", label: "Performance", Icon: BarChart3Icon },
   { href: "/settings", label: "Settings", Icon: SettingsIcon },
