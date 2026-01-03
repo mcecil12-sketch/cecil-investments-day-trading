@@ -18,7 +18,11 @@ type PortfolioResp = {
   startingBalance: number;
   currentBalance: number;
   totalPnL: number;
-  equityCurve: { date: string; equity: number }[];
+  realizedPnL?: number;
+  unrealizedPnL?: number;
+  positionsCount?: number;
+  maxDrawdown?: number;
+  equityCurve: { t: string; equity: number }[];
   dailyPnL: { date: string; pnl: number }[];
   tradeStats: {
     totalClosedTrades: number;
@@ -69,7 +73,7 @@ export default function PerformancePage() {
     return () => clearInterval(t);
   }, []);
 
-  const equitySeries = useMemo(() => data?.equityCurve ?? [], [data]);
+  const equitySeries = useMemo(() => (data?.equityCurve ?? []).map((p) => ({ date: (p as any).date ?? (p as any).t, equity: (p as any).equity })), [data]);
   const pnlSeries = useMemo(() => data?.dailyPnL ?? [], [data]);
 
   const pnlColor = useMemo(() => {
@@ -106,7 +110,7 @@ export default function PerformancePage() {
 
       {!loading && !err && data && (
         <>
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-8">
             <div className="rounded-xl border border-white/10 bg-white/5 p-4">
               <div className="text-xs text-white/60">Current balance</div>
               <div className="mt-1 text-lg font-semibold">{fmtMoney(data.currentBalance)}</div>
@@ -120,6 +124,34 @@ export default function PerformancePage() {
                 {data.startingBalance ? fmtPct(data.totalPnL / data.startingBalance) : "-"}
               </div>
             </div>
+
+
+            <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+              <div className="text-xs text-white/60">Realized P&amp;L</div>
+              <div className="mt-1 text-lg font-semibold">{fmtMoney((data.realizedPnL ?? 0) as number)}</div>
+              <div className="mt-1 text-xs text-white/50">Closed trades only</div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+              <div className="text-xs text-white/60">Unrealized P&amp;L</div>
+              <div className={"mt-1 text-lg font-semibold " + ((data.unrealizedPnL ?? 0) >= 0 ? "text-green-400" : "text-red-400")}>
+                {fmtMoney((data.unrealizedPnL ?? 0) as number)}
+              </div>
+              <div className="mt-1 text-xs text-white/50">Open positions</div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+              <div className="text-xs text-white/60">Open positions</div>
+              <div className="mt-1 text-lg font-semibold">{fmtNum((data.positionsCount ?? 0) as number)}</div>
+              <div className="mt-1 text-xs text-white/50">From Alpaca</div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+              <div className="text-xs text-white/60">Max drawdown</div>
+              <div className="mt-1 text-lg font-semibold">{fmtMoney((data.maxDrawdown ?? 0) as number)}</div>
+              <div className="mt-1 text-xs text-white/50">Equity curve</div>
+            </div>
+
 
             <div className="rounded-xl border border-white/10 bg-white/5 p-4">
               <div className="text-xs text-white/60">Win rate</div>
@@ -146,7 +178,7 @@ export default function PerformancePage() {
               <div className="h-64">
                 {equitySeries.length === 0 ? (
                   <div className="flex h-full items-center justify-center text-sm text-white/60">
-                    No closed trades yet — equity curve will appear after the first realized P&amp;L.
+                    Equity curve will expand as trades close. Current view includes a live equity snapshot.
                   </div>
                 ) : (
                   <ResponsiveContainer width="100%" height="100%">
@@ -193,8 +225,7 @@ export default function PerformancePage() {
               <div>
                 <div className="text-sm font-semibold">Notes</div>
                 <div className="text-xs text-white/60">
-                  This view currently tracks realized P&amp;L from CLOSED trades. Next: unrealized P&amp;L,
-                  drawdown, and drilldowns by day/week/trade.
+                  This view includes live unrealized P&amp;L (Alpaca positions) plus realized P&amp;L from CLOSED trades. Next: drilldowns by day/week/trade.
                 </div>
               </div>
               <div className="text-xs text-white/50">Updated {new Date().toLocaleTimeString()}</div>
