@@ -14,6 +14,8 @@ type Trade = {
   openedAt: string;
   closedAt?: string;
   createdAt?: string;
+  executedAt?: string;
+  updatedAt?: string;
   status: TradeStatus;
   realizedPnL?: number;
   realizedR?: number;
@@ -52,9 +54,10 @@ function computeMaxDrawdown(pnls: number[]): number {
 export async function GET() {
   try {
     const trades = await readTrades<Trade>();
-    const todaysTrades = trades.filter((t) => isToday(t.openedAt ?? t.createdAt));
-
-    const closedToday = todaysTrades.filter(
+    const todaysTrades = trades.filter((t) =>
+  isToday(t.openedAt ?? t.createdAt ?? (t as any).executedAt ?? (t as any).updatedAt)
+);
+const closedToday = todaysTrades.filter(
       (t) => t.status === "CLOSED" && typeof t.realizedPnL === "number"
     );
 
