@@ -154,7 +154,8 @@ export async function GET() {
           to: nextStatus,
         });
         const nextTrade = { ...t, status: nextStatus, updatedAt: nowIso };
-        if (nextStatus === "CLOSED" && t.alpacaOrderId && !t.realizedPnL) {
+        if (nextStatus === "CLOSED" && !nextTrade.closedAt) nextTrade.closedAt = nowIso;
+        if (nextStatus === "CLOSED" && t.alpacaOrderId && typeof t.realizedPnL !== "number") {
           closedWithOrder.push(nextTrade);
         }
         return nextTrade;
@@ -302,6 +303,7 @@ export async function GET() {
             updatedTrades[idx] = {
               ...updatedTrades[idx],
               realizedPnL: pnl,
+              closedAt: updatedTrades[idx].closedAt ?? nowIso,
               realizedR,
               updatedAt: nowIso,
             };
