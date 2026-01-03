@@ -2,6 +2,7 @@ import { getAutoManageConfig } from "@/lib/autoManage/config";
 import { recordAutoManage } from "@/lib/autoManage/telemetry";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { getLatestQuote, alpacaRequest } from "@/lib/alpaca";
+import { syncStopForTrade } from "@/lib/autoManage/stopSync";
 
 export type AutoManageResult = {
   ok: true;
@@ -81,6 +82,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string }): 
   let checked = 0;
   let updated = 0;
   let flattened = 0;
+  let hadFailures = false;
 
   const next = [...all];
   const max = Math.min(cfg.maxPerRun, open.length);
@@ -151,6 +153,42 @@ export async function runAutoManage(opts: { source?: string; runId?: string }): 
     const idx = next.findIndex((x: any) => x.id === id);
     if (idx >= 0) {
       const changedStop = Math.abs(nextStop - stop) > 1e-6;
+      let stopSyncOk = true;
+      let stopSyncNote = "";
+
+      if (changedStop) {
+        const res = await syncStopForTrade(next[idx], nextStop);
+        if (res.ok) {
+          next[idx] = {
+            ...next[idx],
+            quantity: res.qty,
+            stopPrice: nextStop,
+            stopOrderId: res.stopOrderId,
+            autoManage: {
+              ...(next[idx].autoManage || {}),
+              lastStopSyncAt: now,
+              lastStopSyncStatus: "OK",
+              lastStopSyncCancelled: res.cancelled,
+            },
+            updatedAt: now,
+            error: undefined,
+          };
+        } else {
+          stopSyncOk = false;
+          stopSyncNote = `${res.error}${res.detail ? ":" + res.detail : ""}`;
+          next[idx] = {
+            ...next[idx],
+            autoManage: {
+              ...(next[idx].autoManage || {}),
+              lastStopSyncAt: now,
+              lastStopSyncStatus: "FAIL",
+              lastStopSyncError: stopSyncNote,
+            },
+            updatedAt: now,
+          };
+        }
+      }
+
       next[idx] = {
         ...next[idx],
         lastPrice: px,
@@ -162,8 +200,15 @@ export async function runAutoManage(opts: { source?: string; runId?: string }): 
           lastRule: unrealizedR >= 2 ? "LOCK_2R" : unrealizedR >= 1 ? "BE_1R" : "NONE",
           trailEnabled: cfg.trailEnabled,
         },
-        ...(changedStop ? { stopPrice: nextStop } : {}),
       };
+
+      if (!stopSyncOk) {
+        notes.push(`stop_sync_fail:${ticker}:${stopSyncNote}`);
+        hadFailures = true;
+      } else if (changedStop) {
+        notes.push(`stop_sync_ok:${ticker}`);
+      }
+
       updated++;
     }
   }
@@ -172,7 +217,8 @@ export async function runAutoManage(opts: { source?: string; runId?: string }): 
 
   await recordAutoManage({
     ts: now,
-    outcome: "SUCCESS",
+    outcome: hadFailures ? "FAIL" : "SUCCESS",
+    reason: hadFailures ? "stop_sync_failed" : undefined,
     source: opts.source,
     runId: opts.runId,
     checked,
