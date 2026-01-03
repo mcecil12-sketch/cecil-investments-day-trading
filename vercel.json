@@ -1,0 +1,6 @@
+{
+  "crons": [
+    { "path": "/api/cron/auto-entry", "schedule": "*/5 14-21 * * 1-5" },
+    { "path": "/api/cron/auto-manage", "schedule": "*/2 14-21 * * 1-5" }
+  ]
+}

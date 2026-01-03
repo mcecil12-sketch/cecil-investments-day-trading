@@ -5,6 +5,7 @@ import type { NextRequest } from "next/server";
 
 const PUBLIC_PATHS = [
   "/api/auto-entry",
+  "/api/cron",
   "/login",
   "/api/login",
   "/api/ai-stats",
@@ -13,6 +14,7 @@ const PUBLIC_PATHS = [
   "/api/ai-heartbeat",
   "/api/diag-build",
   "/api/locks",
+  "/api/ops/status",
 ];
 
 function isScannerAuthed(req: NextRequest) {
