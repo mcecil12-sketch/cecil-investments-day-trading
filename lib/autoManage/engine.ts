@@ -53,10 +53,11 @@ function riskPerShare(entry: number, stop: number) {
   return r > 0 ? r : null;
 }
 
-export async function runAutoManage(opts: { source?: string; runId?: string }): Promise<AutoManageResult> {
+export async function runAutoManage(opts: { source?: string; runId?: string; force?: boolean }): Promise<AutoManageResult> {
   const cfg = getAutoManageConfig();
   const now = new Date().toISOString();
   const notes: string[] = [];
+  const force = !!opts.force;
 
   if (!cfg.enabled) {
     await recordAutoManage({ ts: now, outcome: "SKIP", reason: "disabled", source: opts.source, runId: opts.runId });
@@ -74,7 +75,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string }): 
     return { ok: true, skipped: true, reason: "no_open_trades", checked: 0, updated: 0, flattened: 0, enabled: true, now, market: clock, cfg };
   }
 
-  if (marketClosed && !cfg.eodFlatten) {
+  if (marketClosed && !cfg.eodFlatten && !force) {
     await recordAutoManage({ ts: now, outcome: "SKIP", reason: "market_closed", source: opts.source, runId: opts.runId });
     return { ok: true, skipped: true, reason: "market_closed", checked: 0, updated: 0, flattened: 0, enabled: true, now, market: clock, cfg };
   }
