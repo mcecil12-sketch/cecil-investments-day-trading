@@ -23,6 +23,14 @@ const num = (v: any) => {
   return Number.isFinite(n) ? n : null;
 };
 
+const roundTo = (n: number, d: number) => {
+  const p = Math.pow(10, d);
+  return Math.round(n * p) / p;
+};
+
+const r2 = (n: number) => roundTo(n, 2);
+const r3 = (n: number) => roundTo(n, 3);
+
 async function getClockSafe() {
   const r = await alpacaRequest({ method: "GET", path: "/v2/clock" });
   if (!r.ok) return null;
@@ -134,8 +142,8 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     }
 
     const pnlPerShare = side === "SHORT" ? (entry - px) : (px - entry);
-    const unrealizedPnL = pnlPerShare * qty;
-    const unrealizedR = pnlPerShare / rps;
+    const unrealizedPnL = r2(pnlPerShare * qty);
+    const unrealizedR = r3(pnlPerShare / rps);
 
     let nextStop = stop;
 
@@ -190,15 +198,27 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
         }
       }
 
+      const noteRule = unrealizedR >= 2 ? "LOCK_2R" : unrealizedR >= 1 ? "BE_1R" : "NONE";
+      const stopFrom = r2(stop);
+      const stopTo = r2(nextStop);
+      const px2 = r2(px);
+      let syncTag = "";
+      if (changedStop) {
+        syncTag = stopSyncOk ? " sync:OK" : " sync:FAIL";
+      }
+      notes.push(
+        `t:${ticker} r:${unrealizedR.toFixed(3)} px:${px2.toFixed(2)} stop:${stopFrom.toFixed(2)}→${stopTo.toFixed(2)} rule:${noteRule}${syncTag}`
+      );
+
       next[idx] = {
         ...next[idx],
-        lastPrice: px,
+        lastPrice: r2(px),
         unrealizedPnL,
         unrealizedR,
         autoManage: {
           ...(next[idx].autoManage || {}),
           lastRunAt: now,
-          lastRule: unrealizedR >= 2 ? "LOCK_2R" : unrealizedR >= 1 ? "BE_1R" : "NONE",
+          lastRule: noteRule,
           trailEnabled: cfg.trailEnabled,
         },
       };
@@ -227,5 +247,6 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     flattened,
   });
 
-  return { ok: true, checked, updated, flattened, enabled: true, now, market: clock, notes, cfg };
+  const notesCapped = notes.slice(0, 50);
+  return { ok: true, checked, updated, flattened, enabled: true, now, market: clock, notes: notesCapped, cfg };
 }
