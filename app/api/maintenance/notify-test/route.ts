@@ -10,6 +10,9 @@ const VALID_TYPES: NotificationEventType[] = [
   "AUTO_ENTRY_DISABLED",
   "TRADE_CLOSED",
   "STOP_HIT",
+  "APPROVAL_REQUIRED",
+  "SIGNAL_APPROVAL",
+  "PULLBACK_READY",
 ];
 
 export const runtime = "nodejs";
@@ -65,7 +68,7 @@ export async function POST(req: Request) {
     ticker: body.ticker ? String(body.ticker) : undefined,
     dedupeKey: dedupeKey ?? undefined,
     dedupeTtlSec: dedupeKey ? dedupeTtl : undefined,
-    skipDedupe: Boolean(dedupeKey),
+    skipDedupe: true,
     meta: {
       manual: true,
     },
