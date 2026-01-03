@@ -1,386 +1,226 @@
 "use client";
 
-export const dynamic = "force-dynamic";
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+  BarChart,
+  Bar,
+} from "recharts";
 
-import React, { useEffect, useState, useCallback } from "react";
-import Link from "next/link";
-import { useTrading } from "@/tradingContext";
-import { AiHealthPill } from "@/components/performance/AiHealthPill";
-import { IntradayFunnel } from "@/components/performance/IntradayFunnel";
-import { PerformanceCards } from "@/components/PerformanceCards";
-import { MarketReadyPill } from "@/components/MarketReadyPill";
-
-type Stats = {
-  totalTrades?: number;
-  wins?: number;
-  losses?: number;
-  breakeven?: number;
-  totalRealizedPnL?: number;
-  maxDrawdown?: number;
-  avgRealizedR?: number | null;
-  bestR?: number | null;
-  worstR?: number | null;
-  autoStopsAppliedToday?: number;
+type PortfolioResp = {
+  ok: boolean;
+  startingBalance: number;
+  currentBalance: number;
+  totalPnL: number;
+  equityCurve: { date: string; equity: number }[];
+  dailyPnL: { date: string; pnl: number }[];
+  tradeStats: {
+    totalClosedTrades: number;
+    winRate: number;
+    avgWin: number;
+    avgLoss: number;
+  };
 };
 
-type SettingsData = {
-  maxTradesPerDay?: number;
-};
-
-function StatPill(props: {
-  label: string;
-  value: React.ReactNode;
-  tone?: "neutral" | "positive" | "negative";
-}) {
-  const { label, value, tone = "neutral" } = props;
-
-  const toneClass =
-    tone === "positive"
-      ? "value-positive"
-      : tone === "negative"
-      ? "value-negative"
-      : "text-slate-100";
-
-  return (
-    <div className="flex flex-col rounded-2xl border border-slate-800/80 bg-slate-900/70 px-3 py-2 min-w-[110px]">
-      <span className="text-[10px] uppercase tracking-wide text-slate-400">
-        {label}
-      </span>
-      <span className={`mt-0.5 text-sm font-semibold ${toneClass}`}>
-        {value}
-      </span>
-    </div>
-  );
+function fmtMoney(n: number) {
+  if (!Number.isFinite(n)) return "-";
+  return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
 }
 
-function StatTile({
-  label,
-  value,
-  detail,
-}: {
-  label: string;
-  value: React.ReactNode;
-  detail?: React.ReactNode;
-}) {
-  return (
-    <div className="bg-[var(--ci-card)] border border-[var(--ci-border)] rounded-xl p-4 md:p-6 shadow-[0_0_12px_rgba(255,255,255,0.03)] space-y-1">
-      <div className="text-[var(--ci-text-muted)] text-xs uppercase tracking-wide">
-        {label}
-      </div>
-      <div className="text-xl md:text-2xl font-semibold text-slate-50">
-        {value}
-      </div>
-      {detail && (
-        <div className="text-[var(--ci-text-muted)] text-xs">{detail}</div>
-      )}
-    </div>
-  );
+function fmtPct(n: number) {
+  if (!Number.isFinite(n)) return "-";
+  return (n * 100).toFixed(1) + "%";
+}
+
+function fmtNum(n: number) {
+  if (!Number.isFinite(n)) return "-";
+  return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
 export default function PerformancePage() {
-  const { settings, dailyPnL } = useTrading();
-  const [stats, setStats] = useState<Stats | null>(null);
-  const [statsError, setStatsError] = useState<string | null>(null);
-  const [settingsData, setSettingsData] = useState<SettingsData | null>(null);
+  const [data, setData] = useState<PortfolioResp | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
 
-  const oneR = settings.oneR;
-  const dailyMaxLossR = settings.dailyMaxLossR;
-  const dailyMaxLossDollar = dailyMaxLossR * oneR;
-
-  const loadStats = useCallback(async () => {
+  async function load() {
     try {
-      const res = await fetch("/api/trades/summary", {
-        cache: "no-store",
-        next: { revalidate: 0 },
-      });
-      if (!res.ok) throw new Error(`Stats failed (${res.status})`);
-      const data = await res.json();
-      setStats(data?.stats ?? null);
-      setStatsError(null);
-    } catch (err: any) {
-      console.error("[performance] stats load failed", err);
-      setStatsError(err?.message || "Stats unavailable");
+      setLoading(true);
+      setErr(null);
+      const resp = await fetch("/api/performance/portfolio", { cache: "no-store" });
+      const json = (await resp.json()) as PortfolioResp;
+      if (!json?.ok) throw new Error("bad_response");
+      setData(json);
+    } catch (e: any) {
+      setErr(e?.message || "failed");
+    } finally {
+      setLoading(false);
     }
-  }, []);
+  }
 
   useEffect(() => {
-    loadStats();
-  }, [loadStats]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const res = await fetch("/api/settings", {
-          cache: "no-store",
-          next: { revalidate: 0 },
-        });
-        if (!res.ok) throw new Error("Failed to load settings");
-        const data = await res.json();
-        if (!cancelled) setSettingsData(data?.settings ?? null);
-      } catch (err) {
-        console.error("[performance] load settings failed", err);
-      }
-    };
     load();
-    return () => {
-      cancelled = true;
-    };
+    const t = setInterval(load, 60_000);
+    return () => clearInterval(t);
   }, []);
 
-  const lossUsedDollar = dailyPnL < 0 ? Math.abs(dailyPnL) : 0;
-  const lossUsedR = oneR > 0 && lossUsedDollar > 0 ? lossUsedDollar / oneR : 0;
-  const remainingR = Math.max(dailyMaxLossR - lossUsedR, 0);
-  const blockedForDay = lossUsedR >= dailyMaxLossR;
+  const equitySeries = useMemo(() => data?.equityCurve ?? [], [data]);
+  const pnlSeries = useMemo(() => data?.dailyPnL ?? [], [data]);
 
-  const todayPnlRaw = dailyPnL;
-  const netRRaw = oneR > 0 ? todayPnlRaw / oneR : 0;
-  const tradesToday = stats?.totalTrades ?? 0;
-  const dailyTradeLimit = settingsData?.maxTradesPerDay ?? "—";
-  const remainingRiskDollarFormatted = `$${Math.max(
-    dailyMaxLossDollar - lossUsedDollar,
-    0
-  ).toFixed(0)}`;
-
-  const netPnl = stats?.totalRealizedPnL ?? 0;
-  const netR = stats?.avgRealizedR ?? 0;
-
-  const netSentiment =
-    netPnl > 0.01 ? "Net winner" : netPnl < -0.01 ? "Net loser" : "Flat";
-
-  const netSentimentClass =
-    netPnl > 0.01
-      ? "value-positive"
-      : netPnl < -0.01
-      ? "value-negative"
-      : "text-slate-200";
-
-  const todayPnlDisplay = `$${todayPnlRaw.toFixed(2)}`;
-  const netRDisplay = oneR > 0 ? `${netRRaw.toFixed(2)}R` : "—";
-  const tradesTodayDisplay = `${tradesToday} / ${dailyTradeLimit}`;
-  const remainingRiskDisplay = `${remainingR.toFixed(
-    1
-  )}R · ${remainingRiskDollarFormatted}`;
-  const statusDisplay = blockedForDay
-    ? "Daily limit hit"
-    : dailyPnL > 0
-    ? "Green day so far"
-    : dailyPnL < 0
-    ? "Drawdown · stay selective"
-    : "Flat";
+  const pnlColor = useMemo(() => {
+    const pnl = data?.totalPnL ?? 0;
+    return pnl >= 0 ? "text-green-400" : "text-red-400";
+  }, [data]);
 
   return (
-    <>
-      <div className="app-page pb-20">
-        <header className="mb-4">
-          <div className="flex items-center justify-between mb-2">
-            <div>
-              <h1 className="text-sm font-semibold text-slate-50">
-                Performance
-              </h1>
-              <p className="text-[11px] text-slate-400">
-                Paper account session summary
-              </p>
-            </div>
-            <Link
-              href="/today"
-              className="text-[11px] text-slate-400 underline-offset-2 hover:text-slate-200"
-            >
-              Back to Today
-            </Link>
-          </div>
-
-          {/* Session summary pills (mirrors Today header) */}
-          <div className="flex flex-wrap gap-2">
-            <StatPill
-              label="Today P&L"
-              value={todayPnlDisplay}
-              tone={
-                todayPnlRaw > 0
-                  ? "positive"
-                  : todayPnlRaw < 0
-                  ? "negative"
-                  : "neutral"
-              }
-            />
-            <StatPill
-              label="Net R"
-              value={netRDisplay}
-              tone={
-                netRRaw > 0
-                  ? "positive"
-                  : netRRaw < 0
-                  ? "negative"
-                  : "neutral"
-              }
-            />
-            <StatPill label="Trades" value={tradesTodayDisplay} />
-            <StatPill
-              label="Risk left"
-              value={remainingRiskDisplay}
-              tone={remainingR <= 0 ? "negative" : "neutral"}
-            />
-            <StatPill
-              label="Status"
-              value={statusDisplay}
-              tone={
-                statusDisplay === "Daily limit hit"
-                  ? "negative"
-                  : statusDisplay === "Green day so far"
-                  ? "positive"
-                  : "neutral"
-              }
-            />
-            <StatPill
-              label="Sentiment"
-              value={<span className={netSentimentClass}>{netSentiment}</span>}
-              tone={
-                netPnl > 0.01
-                  ? "positive"
-                  : netPnl < -0.01
-                  ? "negative"
-                  : "neutral"
-              }
-            />
-          </div>
-        </header>
-
-        <MarketReadyPill />
-
-        <main className="max-w-6xl mx-auto px-4 pt-6 pb-24 space-y-6">
-          {statsError && (
-            <p className="text-xs text-[var(--ci-negative)]">{statsError}</p>
-          )}
-
-          {/* EXEC SUMMARY (top): AI health + Intraday funnel */}
-          <section className="space-y-3">
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold text-neutral-100">
-                Exec summary
-              </h2>
-              <span className="text-[11px] text-neutral-500">
-                Health + funnel at a glance
-              </span>
-            </div>
-
-            <div className="space-y-4">
-              <AiHealthPill />
-              <IntradayFunnel />
-            </div>
-          </section>
-
-          {/* Snapshot: condensed cards below funnel */}
-          <section className="space-y-3">
-            <h2 className="text-sm font-semibold text-neutral-100">Snapshot</h2>
-            <p className="text-[11px] text-neutral-500">
-              Quick operational view (scanner, scoring, readiness).
-            </p>
-            <PerformanceCards />
-          </section>
-
-          {/* High-level performance tiles */}
-          <section className="space-y-3">
-            <h2 className="text-sm font-semibold text-neutral-100">
-              Session performance
-            </h2>
-            <p className="text-[11px] text-neutral-500">
-              Quick view of your paper trading stats for this session.
-            </p>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-              <StatTile
-                label="Total trades"
-                value={stats?.totalTrades ?? "—"}
-              />
-              <StatTile
-                label="Win rate"
-                value={
-                  stats && stats.totalTrades
-                    ? `${(
-                        ((stats.wins ?? 0) / stats.totalTrades) *
-                        100
-                      ).toFixed(1)}%`
-                    : "—"
-                }
-                detail={
-                  stats
-                    ? `${stats.wins ?? 0}W / ${
-                        stats.losses ?? 0
-                      }L / ${stats.breakeven ?? 0}BE`
-                    : undefined
-                }
-              />
-              <StatTile
-                label="Realized P&L"
-                value={
-                  stats?.totalRealizedPnL != null
-                    ? `$${stats.totalRealizedPnL.toFixed(2)}`
-                    : "—"
-                }
-                detail={
-                  stats?.avgRealizedR != null
-                    ? `≈ ${netR.toFixed(2)}R`
-                    : undefined
-                }
-              />
-              <StatTile
-                label="Avg R / trade"
-                value={
-                  stats?.avgRealizedR != null
-                    ? `${stats.avgRealizedR.toFixed(2)}R`
-                    : "—"
-                }
-              />
-              <StatTile
-                label="Best trade (R)"
-                value={
-                  stats?.bestR != null ? `${stats.bestR.toFixed(2)}R` : "—"
-                }
-              />
-              <StatTile
-                label="Worst trade (R)"
-                value={
-                  stats?.worstR != null ? `${stats.worstR.toFixed(2)}R` : "—"
-                }
-              />
-              <StatTile
-                label="Max drawdown"
-                value={
-                  stats?.maxDrawdown != null
-                    ? `$${stats.maxDrawdown.toFixed(2)}`
-                    : "—"
-                }
-              />
-              <StatTile
-                label="Auto-stops today"
-                value={stats?.autoStopsAppliedToday ?? "—"}
-              />
-            </div>
-          </section>
-
-          {/* Drill-down: keep verbose funnel/scoring details lower on the page */}
-          <section className="space-y-3">
-            <h2 className="text-sm font-semibold text-neutral-100">
-              Funnel details
-            </h2>
-            <p className="text-[11px] text-neutral-500">
-              Expanded scan attribution, grade distribution, and troubleshooting info.
-            </p>
-            <div className="rounded-2xl border border-slate-800/80 bg-slate-900/40 p-3 md:p-4">
-              <details>
-                <summary className="cursor-pointer select-none text-[12px] font-semibold text-slate-200">
-                  Show details
-                </summary>
-                <div className="mt-3 text-xs text-slate-300 space-y-3">
-                  <div className="text-slate-400">
-                    (Place any extra verbose diagnostics here as we add them—keeps the top clean.)
-                  </div>
-                </div>
-              </details>
-            </div>
-          </section>
-        </main>
+    <div className="min-h-screen px-4 pb-28 pt-4">
+      <div className="mb-4 flex items-end justify-between">
+        <div>
+          <div className="text-xl font-semibold tracking-tight">Performance</div>
+          <div className="text-sm text-white/60">Portfolio P&amp;L and trends over time</div>
+        </div>
+        <button
+          onClick={load}
+          className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/80 hover:bg-white/10"
+        >
+          Refresh
+        </button>
       </div>
-    </>
+
+      {loading && (
+        <div className="rounded-xl border border-white/10 bg-white/5 p-4 text-sm text-white/70">
+          Loading portfolio…
+        </div>
+      )}
+
+      {!loading && err && (
+        <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-200">
+          Failed to load: {err}
+        </div>
+      )}
+
+      {!loading && !err && data && (
+        <>
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+            <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+              <div className="text-xs text-white/60">Current balance</div>
+              <div className="mt-1 text-lg font-semibold">{fmtMoney(data.currentBalance)}</div>
+              <div className="mt-1 text-xs text-white/50">Start: {fmtMoney(data.startingBalance)}</div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+              <div className="text-xs text-white/60">Total P/L</div>
+              <div className={"mt-1 text-lg font-semibold " + pnlColor}>{fmtMoney(data.totalPnL)}</div>
+              <div className="mt-1 text-xs text-white/50">
+                {data.startingBalance ? fmtPct(data.totalPnL / data.startingBalance) : "-"}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+              <div className="text-xs text-white/60">Win rate</div>
+              <div className="mt-1 text-lg font-semibold">{fmtPct(data.tradeStats.winRate)}</div>
+              <div className="mt-1 text-xs text-white/50">{data.tradeStats.totalClosedTrades} closed trades</div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+              <div className="text-xs text-white/60">Avg win / loss</div>
+              <div className="mt-1 text-lg font-semibold">
+                {fmtMoney(data.tradeStats.avgWin)} <span className="text-white/30">/</span> {fmtMoney(data.tradeStats.avgLoss)}
+              </div>
+              <div className="mt-1 text-xs text-white/50">Realized only (closed trades)</div>
+            </div>
+          </div>
+
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+              <div className="mb-2">
+                <div className="text-sm font-semibold">Equity curve</div>
+                <div className="text-xs text-white/60">Balance over time</div>
+              </div>
+
+              <div className="h-64">
+                {equitySeries.length === 0 ? (
+                  <div className="flex h-full items-center justify-center text-sm text-white/60">
+                    No closed trades yet — equity curve will appear after the first realized P&amp;L.
+                  </div>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={equitySeries} margin={{ left: 8, right: 8, top: 8, bottom: 8 }}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="date" tick={{ fontSize: 12 }} />
+                      <YAxis tick={{ fontSize: 12 }} tickFormatter={(v) => String(v)} />
+                      <Tooltip formatter={(v: any) => fmtMoney(Number(v))} labelFormatter={(l) => String(l)} />
+                      <Line type="monotone" dataKey="equity" strokeWidth={2} dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                )}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+              <div className="mb-2">
+                <div className="text-sm font-semibold">Daily P&amp;L</div>
+                <div className="text-xs text-white/60">Realized P&amp;L by day</div>
+              </div>
+
+              <div className="h-64">
+                {pnlSeries.length === 0 ? (
+                  <div className="flex h-full items-center justify-center text-sm text-white/60">
+                    No daily P&amp;L yet — this will populate once trades close.
+                  </div>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={pnlSeries} margin={{ left: 8, right: 8, top: 8, bottom: 8 }}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="date" tick={{ fontSize: 12 }} />
+                      <YAxis tick={{ fontSize: 12 }} />
+                      <Tooltip formatter={(v: any) => fmtMoney(Number(v))} labelFormatter={(l) => String(l)} />
+                      <Bar dataKey="pnl" />
+                    </BarChart>
+                  </ResponsiveContainer>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-4 rounded-xl border border-white/10 bg-white/5 p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-semibold">Notes</div>
+                <div className="text-xs text-white/60">
+                  This view currently tracks realized P&amp;L from CLOSED trades. Next: unrealized P&amp;L,
+                  drawdown, and drilldowns by day/week/trade.
+                </div>
+              </div>
+              <div className="text-xs text-white/50">Updated {new Date().toLocaleTimeString()}</div>
+            </div>
+
+            <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+              <div className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="text-[11px] text-white/60">Closed trades</div>
+                <div className="mt-1 text-sm font-semibold">{fmtNum(data.tradeStats.totalClosedTrades)}</div>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="text-[11px] text-white/60">Daily P&amp;L points</div>
+                <div className="mt-1 text-sm font-semibold">{fmtNum(pnlSeries.length)}</div>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="text-[11px] text-white/60">Equity points</div>
+                <div className="mt-1 text-sm font-semibold">{fmtNum(equitySeries.length)}</div>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="text-[11px] text-white/60">Refresh cadence</div>
+                <div className="mt-1 text-sm font-semibold">60s</div>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
   );
 }
