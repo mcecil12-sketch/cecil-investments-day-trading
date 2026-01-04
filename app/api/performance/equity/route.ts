@@ -12,6 +12,7 @@ export async function GET(req: Request) {
   const [points, latest] = await Promise.all([readEquityPoints(dateET, limit), readEquityLatest(dateET)]);
 
   return NextResponse.json({
+    version: "equity_v2_lrange_shape",
     ok: true,
     dateET,
     points: points.points || [],
