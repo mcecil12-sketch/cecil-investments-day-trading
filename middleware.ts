@@ -18,6 +18,13 @@ const PUBLIC_PATHS = [
   "/api/performance/snapshot",
   "/api/performance/equity",
   "/api/performance/analytics",
+  "/api/trades",
+  "/api/trades/summary",
+  "/api/trades/manage",
+  "/api/trades/execute",
+  "/api/trades/approve",
+  "/api/trades/apply-stop",
+
 ];
 
 
