@@ -43,7 +43,7 @@ function pickCloseTs(t: any): string | null {
 }
 
 function normTier(t: any): "A" | "B" | "C" | "REJECT" {
-  const raw = String(t?.tier || "").toUpperCase();
+  const raw = String(t?.tier || t?.ai?.tier || "").toUpperCase();
   if (raw === "A" || raw === "B" || raw === "C" || raw === "REJECT") return raw as any;
   return "REJECT";
 }
@@ -87,7 +87,7 @@ function inferGrade(t: any): string | undefined {
 export function extractClosedTrades(allTrades: any[]): ClosedTrade[] {
   const src = Array.isArray(allTrades) ? allTrades : [];
   return src
-    .filter(isClosed)
+    .filter((t) => isClosed(t) && typeof (t as any)?.realizedPnL === "number")
     .map((t) => {
       const closedAt = pickCloseTs(t);
       return {
@@ -101,8 +101,8 @@ export function extractClosedTrades(allTrades: any[]): ClosedTrade[] {
         closedAt: closedAt || undefined,
         updatedAt: t?.updatedAt,
         tier: inferTier(t),
-        score: inferScore(t) ?? undefined,
-        grade: inferGrade(t),
+        score: (num(t?.score, null) ?? num((t as any)?.ai?.score, null) ?? undefined),
+        grade: (typeof t?.grade === "string" ? t.grade : (typeof (t as any)?.ai?.grade === "string" ? (t as any).ai.grade : undefined)),
         realizedPnL: num(t?.realizedPnL, null) ?? undefined,
         realizedR: num(t?.realizedR, null) ?? undefined,
         entryPrice: num(t?.entryPrice, null) ?? undefined,
