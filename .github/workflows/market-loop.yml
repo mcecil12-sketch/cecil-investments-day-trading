@@ -2,7 +2,7 @@ name: market-loop
 
 on:
   schedule:
-    - cron: "*/5 14-20 * * 1-5"
+    - cron: "*/2 13-21 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -23,6 +23,27 @@ jobs:
           echo "SCANNER_TOKEN_LEN=${#SCANNER_TOKEN}"
           echo "AUTO_ENTRY_TOKEN_LEN=${#AUTO_ENTRY_TOKEN}"
           echo "CRON_TOKEN_LEN=${#CRON_TOKEN}"
+
+          if [ -z "${BASE:-}" ]; then
+            echo "FATAL: PROD_BASE_URL missing"
+            exit 1
+          fi
+
+          ET_HHMM="$(TZ=America/New_York date +%H%M)"
+          ET_MIN="$(TZ=America/New_York date +%M)"
+          echo "ET_HHMM=$ET_HHMM ET_MIN=$ET_MIN"
+
+          IN_OPENING_WINDOW=0
+          if [ "$ET_HHMM" -ge "0930" ] && [ "$ET_HHMM" -le "1030" ]; then
+            IN_OPENING_WINDOW=1
+          fi
+
+          if [ "$IN_OPENING_WINDOW" -ne 1 ]; then
+            if [ $((10#$ET_MIN % 5)) -ne 0 ]; then
+              echo "skip cadence: outside opening window and not on 5-min boundary"
+              exit 0
+            fi
+          fi
 
           echo "=== scan ai-seed ==="
           curl -sS -X POST "$BASE/api/scan?mode=ai-seed" \
