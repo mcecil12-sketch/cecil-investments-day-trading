@@ -8,6 +8,7 @@ import { etDateString } from "@/lib/autoEntry/guardrails";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { NotificationEvent } from "@/lib/notifications/types";
 import { sendNotification } from "@/lib/notifications/notify";
+import { getAllSignals } from "@/lib/signalsStore";
 
 async function fireNotification(event: NotificationEvent) {
   try {
@@ -15,6 +16,45 @@ async function fireNotification(event: NotificationEvent) {
   } catch (err) {
     console.error("[notify] trades manage event failed", err);
   }
+}
+
+let __signalsCache: any[] | null = null;
+
+async function getSignalById(id: string) {
+  if (!id) return null;
+  try {
+    if (__signalsCache == null) {
+      const all = await getAllSignals();
+      __signalsCache = Array.isArray(all) ? all : [];
+    }
+    return (__signalsCache || []).find((x: any) => String(x?.id || "") === String(id)) || null;
+  } catch {
+    return null;
+  }
+}
+
+function inferTradeScore(t: any): number | null {
+  const v = t?.score ?? t?.aiScore ?? t?.ai?.score ?? t?.signalScore;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function inferTradeTier(t: any): any {
+  const raw = String(t?.tier ?? t?.ai?.tier ?? "").toUpperCase();
+  if (raw === "A" || raw === "B" || raw === "C" || raw === "REJECT") return raw;
+  const g = String(t?.grade ?? t?.ai?.grade ?? "").toUpperCase();
+  if (g === "A" || g === "B" || g === "C") return g;
+  const sc = inferTradeScore(t);
+  if (sc == null) return undefined;
+  if (sc >= 8.5) return "A";
+  if (sc >= 7.5) return "B";
+  if (sc >= 6.5) return "C";
+  return "REJECT";
+}
+
+function inferTradeGrade(t: any): string | undefined {
+  const g = t?.grade ?? t?.ai?.grade;
+  return typeof g === "string" && g ? g : undefined;
 }
 
 type TradeStatus = "OPEN" | "CLOSED" | "PENDING" | "PARTIAL" | string;
@@ -41,6 +81,15 @@ type Trade = {
   suggestedStopPrice?: number;
   stopSuggestionReason?: string;
   lastStopAppliedAt?: string;
+  score?: number;
+  aiScore?: number;
+  ai?: { score?: number; grade?: string; tier?: string };
+  tier?: string;
+  grade?: string;
+  signalScore?: number;
+  signalTier?: string;
+  signalGrade?: string;
+  signalId?: string;
 };
 
 async function readSettings(): Promise<{ autoManagementEnabled?: boolean }> {
@@ -300,11 +349,31 @@ export async function GET() {
           // update in updatedTrades
           const idx = updatedTrades.findIndex((x) => x.id === t.id);
           if (idx >= 0) {
+            const base = updatedTrades[idx];
+            let score = base.score ?? base.aiScore ?? base.ai?.score ?? base.signalScore;
+            let grade = base.grade ?? base.ai?.grade;
+            let tier = base.tier ?? base.ai?.tier;
+
+            if (tier == null) tier = inferTradeTier(base);
+            if (grade == null) grade = inferTradeGrade(base);
+
+            if ((score == null || tier == null || grade == null) && base.signalId) {
+              const sig = await getSignalById(String(base.signalId));
+              if (sig) {
+                if (score == null && sig?.score != null) score = sig.score;
+                if (grade == null && sig?.grade != null) grade = sig.grade;
+                if (tier == null && sig?.tier != null) tier = sig.tier;
+              }
+            }
+
             updatedTrades[idx] = {
-              ...updatedTrades[idx],
+              ...base,
               realizedPnL: pnl,
-              closedAt: updatedTrades[idx].closedAt ?? nowIso,
+              closedAt: base.closedAt ?? nowIso,
               realizedR,
+              score: score != null ? Number(score) : base.score,
+              grade: grade != null ? String(grade) : base.grade,
+              tier: tier != null ? String(tier).toUpperCase() as any : base.tier,
               updatedAt: nowIso,
             };
             changed = true;

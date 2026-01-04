@@ -48,6 +48,42 @@ function normTier(t: any): "A" | "B" | "C" | "REJECT" {
   return "REJECT";
 }
 
+
+function inferScore(t: any): number | null {
+  const v =
+    t?.score ??
+    t?.aiScore ??
+    t?.signalScore ??
+    t?.ai?.score ??
+    t?.ai?.aiScore ??
+    t?.signal?.score;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function inferTierFromScore(score: number | null): "A" | "B" | "C" | "REJECT" {
+  if (score == null) return "REJECT";
+  if (score >= 8.5) return "A";
+  if (score >= 7.5) return "B";
+  if (score >= 6.5) return "C";
+  return "REJECT";
+}
+
+function inferTier(t: any): "A" | "B" | "C" | "REJECT" {
+  const rawTier = String(t?.tier ?? t?.ai?.tier ?? t?.signalTier ?? "").toUpperCase();
+  if (rawTier === "A" || rawTier === "B" || rawTier === "C" || rawTier === "REJECT") return rawTier as any;
+
+  const rawGrade = String(t?.grade ?? t?.ai?.grade ?? t?.signalGrade ?? "").toUpperCase();
+  if (rawGrade === "A" || rawGrade === "B" || rawGrade === "C") return rawGrade as any;
+
+  return inferTierFromScore(inferScore(t));
+}
+
+function inferGrade(t: any): string | undefined {
+  const g = t?.grade ?? t?.ai?.grade ?? t?.signalGrade;
+  return typeof g === "string" && g ? g : undefined;
+}
+
 export function extractClosedTrades(allTrades: any[]): ClosedTrade[] {
   const src = Array.isArray(allTrades) ? allTrades : [];
   return src
@@ -64,9 +100,9 @@ export function extractClosedTrades(allTrades: any[]): ClosedTrade[] {
         executedAt: t?.executedAt,
         closedAt: closedAt || undefined,
         updatedAt: t?.updatedAt,
-        tier: normTier(t),
-        score: num(t?.score, null) ?? undefined,
-        grade: typeof t?.grade === "string" ? t.grade : undefined,
+        tier: inferTier(t),
+        score: inferScore(t) ?? undefined,
+        grade: inferGrade(t),
         realizedPnL: num(t?.realizedPnL, null) ?? undefined,
         realizedR: num(t?.realizedR, null) ?? undefined,
         entryPrice: num(t?.entryPrice, null) ?? undefined,
