@@ -83,12 +83,17 @@ export async function readEquityPoints(dateET: string, limit = 200) {
     const rawAny: any = await (redis as any)!.lrange(keyPoints(dateET), 0, Math.max(0, limit - 1));
     const raw = Array.isArray(rawAny) ? rawAny : Array.isArray(rawAny?.result) ? rawAny.result : [];
     const points = (raw || [])
-      .map((s: string) => {
-        try {
-          return JSON.parse(s);
-        } catch {
-          return null;
+      .map((v: any) => {
+        if (v == null) return null;
+        if (typeof v === "string") {
+          try {
+            return JSON.parse(v);
+          } catch {
+            return null;
+          }
         }
+        if (typeof v === "object") return v;
+        return null;
       })
       .filter(Boolean) as EquityPoint[];
 
