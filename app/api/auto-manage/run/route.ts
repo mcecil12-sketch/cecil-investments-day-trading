@@ -3,26 +3,24 @@ import { runAutoManage } from "@/lib/autoManage/engine";
 
 export const dynamic = "force-dynamic";
 
-const hdr = (req: Request, k: string) => req.headers.get(k) || "";
-
-export async function GET(req: Request) {
-  const u = new URL(req.url);
-  const force = u.searchParams.get("force") === "1";
-  const res = await runAutoManage({
-    force,
-    source: hdr(req, "x-run-source") || "unknown",
-    runId: hdr(req, "x-run-id") || "",
-  });
-  return NextResponse.json(res);
-}
-
 export async function POST(req: Request) {
-  const u = new URL(req.url);
-  const force = u.searchParams.get("force") === "1";
-  const res = await runAutoManage({
-    force,
-    source: hdr(req, "x-run-source") || "unknown",
-    runId: hdr(req, "x-run-id") || "",
-  });
-  return NextResponse.json(res);
+  const now = new Date().toISOString();
+  try {
+    const source = req.headers.get("x-run-source") || "unknown";
+    const runId = req.headers.get("x-run-id") || "";
+
+    let force = false;
+    try {
+      const body = await req.json().catch(() => ({}));
+      force = body?.force === true;
+    } catch {}
+
+    const result = await runAutoManage({ source, runId, force });
+    return NextResponse.json(result, { status: 200 });
+  } catch (err: any) {
+    return NextResponse.json(
+      { ok: false, now, error: err?.message || "auto_manage_failed" },
+      { status: 500 }
+    );
+  }
 }
