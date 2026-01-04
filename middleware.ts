@@ -15,6 +15,9 @@ const PUBLIC_PATHS = [
   "/api/diag-build",
   "/api/locks",
   "/api/ops/status",
+  "/api/performance/snapshot",
+  "/api/performance/equity",
+  "/api/performance/analytics",
 ];
 
 
