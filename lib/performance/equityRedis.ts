@@ -54,9 +54,8 @@ export async function recordEquityPoint(p: Partial<EquityPoint>) {
   };
 
   try {
-    const pipe = redis!.multi();
-    pipe.sadd(KEY_DATES, dateET);
-    pipe.hset(keyLatest(dateET), {
+    await redis!.sadd(KEY_DATES, dateET);
+    await redis!.hset(keyLatest(dateET), {
       ts: point.ts,
       hhmm: String(point.hhmm),
       equity: String(point.equity),
@@ -68,9 +67,8 @@ export async function recordEquityPoint(p: Partial<EquityPoint>) {
       source: point.source || "",
       runId: point.runId || "",
     });
-    pipe.lpush(keyPoints(dateET), JSON.stringify(point));
-    pipe.ltrim(keyPoints(dateET), 0, 999);
-    await pipe.exec();
+    await redis!.lpush(keyPoints(dateET), JSON.stringify(point));
+    await redis!.ltrim(keyPoints(dateET), 0, 999);
 
     return { ok: true, stored: true, redis: true, point };
   } catch (e: any) {
