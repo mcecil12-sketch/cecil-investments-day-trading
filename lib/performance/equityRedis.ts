@@ -80,9 +80,10 @@ export async function readEquityPoints(dateET: string, limit = 200) {
   if (!hasRedis()) return { ok: true, redis: false, dateET, points: [] as EquityPoint[] };
 
   try {
-    const raw = await redis!.lrange(keyPoints(dateET), 0, Math.max(0, limit - 1));
+    const rawAny: any = await (redis as any)!.lrange(keyPoints(dateET), 0, Math.max(0, limit - 1));
+    const raw = Array.isArray(rawAny) ? rawAny : Array.isArray(rawAny?.result) ? rawAny.result : [];
     const points = (raw || [])
-      .map((s) => {
+      .map((s: string) => {
         try {
           return JSON.parse(s);
         } catch {
