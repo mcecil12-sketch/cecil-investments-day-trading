@@ -74,3 +74,24 @@ jobs:
             -d '{}' \
             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
+      - name: Snapshot performance equity
+
+        env:
+
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+
+        run: |
+
+          PROD="https://cecil-investments-day-trading.vercel.app"
+
+          curl -sS -X POST "$PROD/api/performance/snapshot" \
+
+            -H "x-cron-token: $CRON_TOKEN" \
+
+            -H "x-run-source: github-actions" \
+
+            -H "x-run-id: gha-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}" \
+
+            -H "Content-Type: application/json" \
+
+            -d '{}'
