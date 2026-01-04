@@ -2,7 +2,6 @@ name: market-loop
 
 on:
   schedule:
-    # Jan (EST) market hours: 9:35–15:55 ET ~= 14:35–20:55 UTC
     - cron: "*/5 14-20 * * 1-5"
   workflow_dispatch:
 
@@ -20,6 +19,10 @@ jobs:
           set -euo pipefail
           RUN_ID="gha-market-loop-$(date +%s)"
           echo "RUN_ID=$RUN_ID"
+          echo "BASE_SET=$([ -n "${BASE:-}" ] && echo 1 || echo 0)"
+          echo "SCANNER_TOKEN_LEN=${#SCANNER_TOKEN}"
+          echo "AUTO_ENTRY_TOKEN_LEN=${#AUTO_ENTRY_TOKEN}"
+          echo "CRON_TOKEN_LEN=${#CRON_TOKEN}"
 
           echo "=== scan ai-seed ==="
           curl -sS -X POST "$BASE/api/scan?mode=ai-seed" \
@@ -27,7 +30,8 @@ jobs:
             -H "x-scanner-token: $SCANNER_TOKEN" \
             -H "x-scan-source: github-actions" \
             -H "x-scan-run-id: $RUN_ID" \
-            -d '{}' | head -c 2000 || true
+            -d '{}' \
+            -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
 
           echo "=== auto-entry execute ==="
@@ -36,7 +40,8 @@ jobs:
             -H "x-auto-entry-token: $AUTO_ENTRY_TOKEN" \
             -H "x-run-source: github-actions" \
             -H "x-run-id: $RUN_ID" \
-            -d '{}' | head -c 2000 || true
+            -d '{}' \
+            -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
 
           echo "=== auto-manage run ==="
@@ -45,5 +50,6 @@ jobs:
             -H "x-cron-token: $CRON_TOKEN" \
             -H "x-run-source: github-actions" \
             -H "x-run-id: $RUN_ID" \
-            -d '{}' | head -c 2000 || true
+            -d '{}' \
+            -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
