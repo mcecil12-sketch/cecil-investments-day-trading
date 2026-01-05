@@ -49,7 +49,6 @@ export async function POST(req: Request) {
       if (!s) return false;
       const createdAt = String(s.createdAt || "");
       if (!createdAt.startsWith(today)) return false;
-      if (s.qualified !== true) return false;
       if (s.shownInApp !== true) return false;
       if (String(s.status || "").toUpperCase() !== "SCORED") return false;
       const score = Number(s.score ?? 0);
