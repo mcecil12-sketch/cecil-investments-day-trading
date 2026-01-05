@@ -132,6 +132,14 @@ type ReadinessResponse = {
     enabled?: boolean;
     paused?: boolean;
     reason?: string | null;
+    entriesToday?: number | null;
+    maxEntriesPerDay?: number | null;
+    maxOpenPositions?: number | null;
+    consecutiveFailures?: number | null;
+    maxConsecutiveFailures?: number | null;
+  };
+  scanner?: {
+    lastScanAt?: string | null;
   };
   meta?: Record<string, any>;
 };
@@ -312,9 +320,9 @@ export default function TodayPage() {
 
   const marketLabel = (() => {
     const isOpen = readiness?.market?.isOpen;
-    const status = readiness?.market?.status;
     if (isOpen === true) return "OPEN";
     if (isOpen === false) return "CLOSED";
+    const status = readiness?.market?.status;
     return status ? String(status).toUpperCase() : "—";
   })();
 
@@ -327,24 +335,48 @@ export default function TodayPage() {
   })();
 
   const guardLabel = (() => {
-    const g = readiness?.guardrails;
-    if (!g) return "—";
-    if (g.killSwitch) return "KILL";
-    if (g.paused) return "BLOCKING";
-    if (g.circuitBreaker) return "BLOCKING";
-    if (g.cooldownActive) return "COOLDOWN";
+    const g = (readiness as any)?.guardrails;
+    if (g) {
+      if (g.killSwitch) return "KILL";
+      if (g.paused) return "BLOCKING";
+      if (g.circuitBreaker) return "BLOCKING";
+      if (g.cooldownActive) return "COOLDOWN";
+      return "CLEAR";
+    }
+
+    const ae = readiness?.autoEntry;
+    if (!ae) return "—";
+    if (
+      typeof ae.consecutiveFailures === "number" &&
+      typeof ae.maxConsecutiveFailures === "number" &&
+      ae.consecutiveFailures >= ae.maxConsecutiveFailures
+    ) {
+      return "BLOCKING";
+    }
     return "CLEAR";
   })();
 
   const guardReason = (() => {
-    const g = readiness?.guardrails;
-    if (!g) return null;
-    if (g.killSwitch) return "Kill switch enabled";
-    if (g.circuitBreaker) return g.circuitBreakerReason || "Circuit breaker";
-    if (g.paused) return g.pauseReason || "Paused";
-    if (g.cooldownActive) {
-      const m = g.cooldownRemainingMinutes;
-      return `Cooldown${typeof m === "number" ? ` (${m}m)` : ""}`;
+    const g = (readiness as any)?.guardrails;
+    if (g) {
+      if (g.killSwitch) return "Kill switch enabled";
+      if (g.circuitBreaker) return g.circuitBreakerReason || "Circuit breaker";
+      if (g.paused) return g.pauseReason || "Paused";
+      if (g.cooldownActive) {
+        const m = g.cooldownRemainingMinutes;
+        return `Cooldown${typeof m === "number" ? ` (${m}m)` : ""}`;
+      }
+      return null;
+    }
+
+    const ae = readiness?.autoEntry;
+    if (
+      ae &&
+      typeof ae.consecutiveFailures === "number" &&
+      typeof ae.maxConsecutiveFailures === "number" &&
+      ae.consecutiveFailures >= ae.maxConsecutiveFailures
+    ) {
+      return "Auto-entry disabled by circuit breaker (too many failures).";
     }
     return null;
   })();
@@ -824,18 +856,31 @@ export default function TodayPage() {
               <StatPill
                 label="Positions"
                 value={
-                  readiness?.guardrails?.openPositions != null &&
-                  readiness?.guardrails?.maxOpenPositions != null
-                    ? `${readiness.guardrails.openPositions} / ${readiness.guardrails.maxOpenPositions}`
+                  (readiness as any)?.guardrails?.openPositions != null &&
+                  (readiness as any)?.guardrails?.maxOpenPositions != null
+                    ? `${(readiness as any).guardrails.openPositions} / ${(readiness as any).guardrails.maxOpenPositions}`
+                    : readiness?.autoEntry?.maxOpenPositions != null
+                    ? `— / ${readiness.autoEntry.maxOpenPositions}`
                     : "—"
                 }
               />
               <StatPill
                 label="Entries"
                 value={
-                  readiness?.guardrails?.entriesToday != null &&
-                  readiness?.guardrails?.maxEntriesPerDay != null
-                    ? `${readiness.guardrails.entriesToday} / ${readiness.guardrails.maxEntriesPerDay}`
+                  readiness?.autoEntry?.entriesToday != null &&
+                  readiness?.autoEntry?.maxEntriesPerDay != null
+                    ? `${readiness.autoEntry.entriesToday} / ${readiness.autoEntry.maxEntriesPerDay}`
+                    : "—"
+                }
+              />
+              <StatPill
+                label="Last scan"
+                value={
+                  readiness?.scanner?.lastScanAt
+                    ? new Date(readiness.scanner.lastScanAt).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })
                     : "—"
                 }
               />
@@ -855,7 +900,7 @@ export default function TodayPage() {
               <h1 className="text-sm font-semibold text-slate-50">
                 Cecil Trading
               </h1>
-              <p className="text-[11px] text-slate-400">Today overview</p>
+              <p className="text-[11px] text-slate-400">Home overview</p>
             </div>
           </div>
           <TodayAiHealth />
