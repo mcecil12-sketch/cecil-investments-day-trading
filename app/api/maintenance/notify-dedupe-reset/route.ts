@@ -7,8 +7,10 @@ export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
     const token = req.headers.get("x-cron-token") || "";
-  if (!process.env.CRON_TOKEN || token !== process.env.CRON_TOKEN) {
-    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+  
+  const authedByCron = Boolean(process.env.CRON_TOKEN) && token === process.env.CRON_TOKEN;
+if (!authedByCron) {
+    
   }
 
 const auth = await requireAuth(req);
