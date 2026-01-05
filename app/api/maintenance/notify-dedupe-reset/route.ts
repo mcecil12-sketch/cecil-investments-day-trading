@@ -6,7 +6,12 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
-  const auth = await requireAuth(req);
+    const token = req.headers.get("x-cron-token") || "";
+  if (!process.env.CRON_TOKEN || token !== process.env.CRON_TOKEN) {
+    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+  }
+
+const auth = await requireAuth(req);
   if (!auth.ok) {
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
