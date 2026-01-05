@@ -106,6 +106,36 @@ type SettingsData = {
   autoEntryNotes?: string;
 };
 
+type ReadinessResponse = {
+  ok?: boolean;
+  market?: {
+    status?: string;
+    isOpen?: boolean;
+    nextOpen?: string | null;
+    nextClose?: string | null;
+  };
+  guardrails?: {
+    enabled?: boolean;
+    paused?: boolean;
+    pauseReason?: string | null;
+    killSwitch?: boolean;
+    cooldownActive?: boolean;
+    cooldownRemainingMinutes?: number | null;
+    entriesToday?: number | null;
+    maxEntriesPerDay?: number | null;
+    openPositions?: number | null;
+    maxOpenPositions?: number | null;
+    circuitBreaker?: boolean;
+    circuitBreakerReason?: string | null;
+  };
+  autoEntry?: {
+    enabled?: boolean;
+    paused?: boolean;
+    reason?: string | null;
+  };
+  meta?: Record<string, any>;
+};
+
 function computeSizing(
   oneR: number,
   entryPrice: number,
@@ -206,6 +236,27 @@ export default function TodayPage() {
   const [autoManageStatus, setAutoManageStatus] = useState<string | null>(null);
   const [autoManageBusy, setAutoManageBusy] = useState(false);
   const [errorSignals, setErrorSignals] = useState<string | null>(null);
+  const [readiness, setReadiness] = useState<ReadinessResponse | null>(null);
+  const [readinessError, setReadinessError] = useState<string | null>(null);
+
+  const loadReadiness = useCallback(async () => {
+    try {
+      const res = await fetch("/api/readiness", { cache: "no-store" });
+      if (!res.ok) throw new Error(`readiness failed (${res.status})`);
+      const data = (await res.json().catch(() => ({}))) as ReadinessResponse;
+      setReadiness(data || null);
+      setReadinessError(null);
+    } catch (err: any) {
+      console.error("[today] readiness load failed", err);
+      setReadinessError(err?.message || "Readiness unavailable");
+    }
+  }, []);
+
+  useEffect(() => {
+    loadReadiness();
+    const iv = setInterval(loadReadiness, 15000);
+    return () => clearInterval(iv);
+  }, [loadReadiness]);
 
   const oneR = settings.oneR;
   const dailyMaxLossR = settings.dailyMaxLossR;
@@ -258,6 +309,45 @@ export default function TodayPage() {
     1
   )}R · ${summary.remainingUsdFormatted}`;
   const statusDisplay = summary.sessionStatusText;
+
+  const marketLabel = (() => {
+    const isOpen = readiness?.market?.isOpen;
+    const status = readiness?.market?.status;
+    if (isOpen === true) return "OPEN";
+    if (isOpen === false) return "CLOSED";
+    return status ? String(status).toUpperCase() : "—";
+  })();
+
+  const autoEntryLabel = (() => {
+    const ae = readiness?.autoEntry;
+    if (!ae) return "—";
+    if (ae.paused) return "PAUSED";
+    if (ae.enabled) return "ENABLED";
+    return "DISABLED";
+  })();
+
+  const guardLabel = (() => {
+    const g = readiness?.guardrails;
+    if (!g) return "—";
+    if (g.killSwitch) return "KILL";
+    if (g.paused) return "BLOCKING";
+    if (g.circuitBreaker) return "BLOCKING";
+    if (g.cooldownActive) return "COOLDOWN";
+    return "CLEAR";
+  })();
+
+  const guardReason = (() => {
+    const g = readiness?.guardrails;
+    if (!g) return null;
+    if (g.killSwitch) return "Kill switch enabled";
+    if (g.circuitBreaker) return g.circuitBreakerReason || "Circuit breaker";
+    if (g.paused) return g.pauseReason || "Paused";
+    if (g.cooldownActive) {
+      const m = g.cooldownRemainingMinutes;
+      return `Cooldown${typeof m === "number" ? ` (${m}m)` : ""}`;
+    }
+    return null;
+  })();
 
   const riskRatio = oneR > 0 ? chosenRisk / oneR : 1;
   let riskBadgeLabel = "Using default 1R";
@@ -686,6 +776,78 @@ export default function TodayPage() {
       <AutoManagePoller />
       <div className="min-h-screen">
         <div className="max-w-6xl mx-auto px-4 pb-6">
+          {/* Ops Header */}
+          <div className="mb-4 rounded-2xl border border-[var(--ci-border)] bg-[var(--ci-card)] p-4 shadow-[0_0_12px_rgba(255,255,255,0.03)]">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-sm font-semibold text-slate-100">
+                Ops — Live status
+              </div>
+              <div className="text-xs text-[var(--ci-text-muted)]">
+                {readinessError ? "Readiness unavailable" : "Updates every 15s"}
+              </div>
+            </div>
+
+            <div className="mt-3 flex flex-wrap gap-2">
+              <StatPill
+                label="Market"
+                value={marketLabel}
+                tone={
+                  marketLabel === "OPEN"
+                    ? "positive"
+                    : marketLabel === "CLOSED"
+                    ? "neutral"
+                    : "neutral"
+                }
+              />
+              <StatPill
+                label="Auto-entry"
+                value={autoEntryLabel}
+                tone={
+                  autoEntryLabel === "ENABLED"
+                    ? "positive"
+                    : autoEntryLabel === "PAUSED"
+                    ? "negative"
+                    : "neutral"
+                }
+              />
+              <StatPill
+                label="Guardrails"
+                value={guardLabel}
+                tone={
+                  guardLabel === "CLEAR"
+                    ? "positive"
+                    : guardLabel === "—"
+                    ? "neutral"
+                    : "negative"
+                }
+              />
+              <StatPill
+                label="Positions"
+                value={
+                  readiness?.guardrails?.openPositions != null &&
+                  readiness?.guardrails?.maxOpenPositions != null
+                    ? `${readiness.guardrails.openPositions} / ${readiness.guardrails.maxOpenPositions}`
+                    : "—"
+                }
+              />
+              <StatPill
+                label="Entries"
+                value={
+                  readiness?.guardrails?.entriesToday != null &&
+                  readiness?.guardrails?.maxEntriesPerDay != null
+                    ? `${readiness.guardrails.entriesToday} / ${readiness.guardrails.maxEntriesPerDay}`
+                    : "—"
+                }
+              />
+            </div>
+
+            {guardReason && (
+              <div className="mt-3 text-xs text-[var(--ci-text-muted)]">
+                <span className="text-slate-300">Why things might be quiet:</span>{" "}
+                {guardReason}
+              </div>
+            )}
+          </div>
           {/* --- Slim header bar --------------------------------------------------- */}
         <header className="mb-3">
           <div className="flex items-center justify-between mb-2">
@@ -901,6 +1063,20 @@ export default function TodayPage() {
                 {spyStatusText}
               </p>
             )}
+            {
+              !loadingSignals &&
+              !loadingApprovalTrades &&
+              (signals?.length || 0) === 0 &&
+              (approvalTrades?.length || 0) === 0 && (
+                <div className="mb-4 rounded-xl border border-[var(--ci-border)] bg-[var(--ci-card)] p-4 text-sm text-[var(--ci-text-muted)]">
+                  {marketLabel === "CLOSED"
+                    ? "Market is closed — scans and entries will resume at the next open."
+                    : guardReason
+                    ? `System is healthy, but guardrails are blocking: ${guardReason}`
+                    : "System is healthy — waiting for AI-qualified setups. Scans run continuously during market hours."}
+                </div>
+              )
+            }
             {loadingSignals && <p className="muted-text">Loading signals…</p>}
             {!loadingSignals && visibleSignals.length === 0 && (
               <p className="empty-text">
