@@ -25,7 +25,8 @@ const PUBLIC_PATHS = [
   "/api/trades/execute",
   "/api/trades/approve",
   "/api/trades/apply-stop",
-
+  "/api/signals",
+  "/api/signals/all",
 ];
 
 
