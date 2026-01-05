@@ -69,7 +69,12 @@ export function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  if (pathname === "/api/auto-manage/run" && isCronAuthed(req)) {
+  
+  if (pathname.startsWith("/api/maintenance/") && isCronAuthed(req)) {
+    return NextResponse.next();
+  }
+
+if (pathname === "/api/auto-manage/run" && isCronAuthed(req)) {
     return NextResponse.next();
   }
 
