@@ -600,3 +600,19 @@ body {
 .ai-pill-error {
   font-weight: 700;
 }
+
+
+:root{
+  --ci-bottom-nav-h: 76px;
+}
+
+
+.ci-shell-main{
+  padding-top: calc(env(safe-area-inset-top) + 12px);
+  padding-left: 16px;
+  padding-right: 16px;
+  padding-bottom: calc(var(--ci-bottom-nav-h) + env(safe-area-inset-bottom) + 16px);
+  max-width: 72rem;
+  margin-left: auto;
+  margin-right: auto;
+}
