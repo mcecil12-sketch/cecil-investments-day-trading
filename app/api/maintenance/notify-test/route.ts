@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { requireAuth } from "@/lib/auth";
 import { NotificationEvent, NotificationEventType } from "@/lib/notifications/types";
 import { notify } from "@/lib/notifications/notify";
 import { shouldSendNotification } from "@/lib/notifications/dedupe";
@@ -25,12 +24,6 @@ export async function POST(req: Request) {
 if (!authedByCron) {
     
   }
-
-const auth = await requireAuth(req);
-  if (!auth.ok) {
-    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
-  }
-
   let body: Partial<{
     title: string;
     message: string;
