@@ -1,10 +1,66 @@
 import { NextResponse } from "next/server";
 import { readSignals } from "@/lib/jsonDb";
 import { readTrades, upsertTrade } from "@/lib/tradesStore";
+import { alpacaRequest } from "@/lib/alpaca";
 import { getAutoConfig, tierForScore } from "@/lib/autoEntry/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+
+function round2(n: number) {
+  return Number(Number(n).toFixed(2));
+}
+
+function ensureLegsLong(basePrice: number, stopPrice: number, takeProfitPrice: number) {
+  const base = Number(basePrice);
+  let sl = Number(stopPrice);
+  let tp = Number(takeProfitPrice);
+  const min = 0.01;
+  if (!(tp >= base + min)) tp = round2(base + min);
+  if (!(sl <= base - min)) sl = round2(base - min);
+  return { stopPrice: sl, takeProfitPrice: tp };
+}
+
+async function fetchBasePrice(ticker: string): Promise<number | null> {
+  const enc = encodeURIComponent(ticker);
+
+  const q = await alpacaRequest({ method: "GET", path: `/v2/stocks/${enc}/quotes/latest` });
+  if (q.ok && q.text) {
+    try {
+      const parsed = JSON.parse(q.text || "{}");
+      const qt = (parsed as any)?.quote || (parsed as any)?.quotes?.[0] || parsed;
+      const ap = Number(qt?.ap ?? qt?.ask_price ?? qt?.ask ?? NaN);
+      const bp = Number(qt?.bp ?? qt?.bid_price ?? qt?.bid ?? NaN);
+      const lp = Number(qt?.lp ?? qt?.last_price ?? qt?.p ?? qt?.price ?? NaN);
+      if (ap > 0 && bp > 0) return (ap + bp) / 2;
+      if (lp > 0) return lp;
+      if (ap > 0) return ap;
+      if (bp > 0) return bp;
+    } catch {}
+  }
+
+  const t = await alpacaRequest({ method: "GET", path: `/v2/stocks/${enc}/trades/latest` });
+  if (t.ok && t.text) {
+    try {
+      const parsed = JSON.parse(t.text || "{}");
+      const tr = (parsed as any)?.trade || (parsed as any)?.trades?.[0] || parsed;
+      const px = Number(tr?.p ?? tr?.price ?? NaN);
+      if (px > 0) return px;
+    } catch {}
+  }
+
+  return null;
+}
+
+function computeSeedPrices(base: number) {
+  const entryPrice = round2(base);
+  const rawStop = round2(base * 0.99);
+  const risk = Math.abs(entryPrice - rawStop);
+  const rawTp = round2(entryPrice + risk * 2.0);
+  const legs = ensureLegsLong(entryPrice, rawStop, rawTp);
+  return { entryPrice, stopPrice: legs.stopPrice, takeProfitPrice: legs.takeProfitPrice };
+}
 
 function etDate(d = new Date()): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(d);
@@ -85,11 +141,23 @@ export async function POST(req: Request) {
       continue;
     }
 
+
+    const base = await fetchBasePrice(ticker);
+    if (!base) {
+      skipped.push({ ticker, signalId, reason: "no_base_price" });
+      continue;
+    }
+    const { entryPrice, stopPrice, takeProfitPrice } = computeSeedPrices(base);
+
     const now = new Date().toISOString();
 
     const trade = {
       id: crypto.randomUUID(),
-      ticker,
+            ticker,
+      side: "LONG",
+      entryPrice,
+      stopPrice,
+      takeProfitPrice,
       status: "AUTO_PENDING",
       source: "AUTO",
       paper: true,
