@@ -60,42 +60,51 @@ async function fetchAlpacaClock(): Promise<
 
 export async function GET(req: Request) {
   const authed = await requireAuth(req);
-  if (!authed.ok) {
-    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
-  }
+  const publicMode = !authed.ok;
 
   const url = new URL(req.url);
   const base = `${url.protocol}//${url.host}`;
   const cookie = req.headers.get("cookie") || "";
 
-  const [aiHealthResp, funnelResp, signalsResp] = await Promise.all([
-    fetch(`${base}/api/ai-health`, { headers: { cookie }, cache: "no-store" }),
-    fetch(`${base}/api/funnel-stats`, { headers: { cookie }, cache: "no-store" }),
-    fetch(`${base}/api/signals/all`, { headers: { cookie }, cache: "no-store" }),
-  ]);
+  let aiHealth: any = { status: "UNKNOWN" };
+  let funnel: any = { today: {} };
+  let signalsPayload: any = { signals: [] };
 
-  if (!aiHealthResp.ok) {
-    return NextResponse.json(
-      { ok: false, error: "upstream_ai_health_failed", status: aiHealthResp.status },
-      { status: 502 }
-    );
-  }
-  if (!funnelResp.ok) {
-    return NextResponse.json(
-      { ok: false, error: "upstream_funnel_failed", status: funnelResp.status },
-      { status: 502 }
-    );
-  }
-  if (!signalsResp.ok) {
-    return NextResponse.json(
-      { ok: false, error: "upstream_signals_failed", status: signalsResp.status },
-      { status: 502 }
-    );
-  }
+  if (!publicMode) {
+    const [aiHealthResp, funnelResp, signalsResp] = await Promise.all([
+      fetch(`${base}/api/ai-health`, { headers: { cookie }, cache: "no-store" }),
+      fetch(`${base}/api/funnel-stats`, { headers: { cookie }, cache: "no-store" }),
+      fetch(`${base}/api/signals/all`, { headers: { cookie }, cache: "no-store" }),
+    ]);
 
-  const aiHealth = await aiHealthResp.json();
-  const funnel = await funnelResp.json();
-  const signalsPayload = await signalsResp.json();
+    if (!aiHealthResp.ok) {
+      return NextResponse.json(
+        { ok: false, error: "upstream_ai_health_failed", status: aiHealthResp.status },
+        { status: 502 }
+      );
+    }
+    if (!funnelResp.ok) {
+      return NextResponse.json(
+        { ok: false, error: "upstream_funnel_failed", status: funnelResp.status },
+        { status: 502 }
+      );
+    }
+    if (!signalsResp.ok) {
+      return NextResponse.json(
+        { ok: false, error: "upstream_signals_failed", status: signalsResp.status },
+        { status: 502 }
+      );
+    }
+
+    aiHealth = await aiHealthResp.json();
+    funnel = await funnelResp.json();
+    signalsPayload = await signalsResp.json();
+  } else {
+    try {
+      const fr = await fetch(`${base}/api/funnel-stats`, { cache: "no-store" });
+      if (fr.ok) funnel = await fr.json();
+    } catch {}
+  }
 
   const todayEt = etDateString(new Date());
   const guardConfig = getGuardrailConfig();
@@ -172,26 +181,26 @@ export async function GET(req: Request) {
     },
     {
       name: "ai_healthy",
-      ok: !marketOpen ? true : aiHealthy,
+      ok: publicMode ? true : !marketOpen ? true : aiHealthy,
       detail: `ai=${aiStatus || "UNKNOWN"}`,
     },
     {
       name: "scanner_running",
-      ok: scannerRunningWhenOpen,
+      ok: publicMode ? true : scannerRunningWhenOpen,
       detail: !marketOpen
         ? "market closed; scanner run not required"
         : `lastScanStatus=${lastScanStatus || "?"} mode=${lastScanMode || "?"} source=${lastScanSource || "?"}`,
     },
     {
       name: "scanner_recent",
-      ok: scannerRecent,
+      ok: publicMode ? true : scannerRecent,
       detail: !marketOpen
         ? "market closed; scanner freshness not required"
         : `lastScan=${lastScanAt || "none"} (${minsSinceLastScan?.toFixed(1) ?? "?"}m) status=${lastScanStatus || "?"}`,
     },
     {
       name: "scoring_flowing",
-      ok: scoringFlowing,
+      ok: publicMode ? true : scoringFlowing,
       detail: !marketOpen
         ? "market closed; scoring freshness not required"
         : `scoredToday=${scoredToday.length} lastScore=${lastScoredAt || "none"} (${minsSinceLastScore?.toFixed(1) ?? "?"}m)`,
@@ -208,6 +217,9 @@ export async function GET(req: Request) {
     etDate: todayEt,
     market: {
       status: marketStatus || "UNKNOWN",
+      isOpen: clock.ok ? Boolean(clock.is_open) : null,
+      nextOpen: clock.ok ? (clock.next_open ?? null) : null,
+      nextClose: clock.ok ? (clock.next_close ?? null) : null,
       clock: clock.ok
         ? {
             is_open: clock.is_open,
@@ -250,5 +262,6 @@ export async function GET(req: Request) {
     },
     checks,
     reasons,
+    mode: publicMode ? "public" : "authed",
   });
 }
