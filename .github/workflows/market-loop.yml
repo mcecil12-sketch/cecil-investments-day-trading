@@ -55,11 +55,19 @@ jobs:
             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
 
-          echo "=== auto-entry seed-from-signals ==="
-          curl -sS -X POST "$BASE/api/auto-entry/seed-from-signals"             -H "Content-Type: application/json"             -H "x-cron-token: $CRON_TOKEN"             -H "x-run-source: github-actions"             -H "x-run-id: $RUN_ID"             -d '{"limit":3,"minScore":7.5}'             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
+                    echo "=== auto-entry seed-from-signals ==="
+          curl -sS -X POST "$BASE/api/auto-entry/seed-from-signals" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: github-actions" \
+            -H "x-run-id: $RUN_ID" \
+            -d '{"limit":3,"minScore":7.5}' \
+            -w "
+HTTP %{http_code}
+" | head -c 4000 || true
           echo
 
-echo "=== auto-entry execute ==="
+          echo "=== auto-entry execute ==="
           curl -sS -X POST "$BASE/api/auto-entry/execute" \
             -H "Content-Type: application/json" \
             -H "x-auto-entry-token: $AUTO_ENTRY_TOKEN" \
