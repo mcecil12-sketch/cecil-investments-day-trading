@@ -1,6 +1,13 @@
 const PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json";
 
 export async function notify(title: string, message: string) {
+  const approvalsDisabled = process.env.DISABLE_APPROVAL_NOTIFICATIONS === "1";
+  const isApproval = /ready for approval|approval/i.test(`${title} ${message}`);
+  if (approvalsDisabled && isApproval) {
+    console.log("[notify] approval notifications disabled; skipping", { title });
+    return { ok: true, skipped: true, skippedReason: "approval_notifications_disabled" } as any;
+  }
+
   const user = process.env.PUSHOVER_USER_KEY;
   const token =
     process.env.PUSHOVER_API_TOKEN ||
