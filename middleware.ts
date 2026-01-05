@@ -46,6 +46,16 @@ function isScannerAuthed(req: NextRequest) {
 
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
+  const scannerToken = req.headers.get("x-scanner-token") || "";
+  const expectedScannerToken = process.env.SCANNER_TOKEN || "";
+  if (
+    expectedScannerToken &&
+    scannerToken &&
+    scannerToken === expectedScannerToken &&
+    (pathname.startsWith("/api/scan") || pathname.startsWith("/api/signals"))
+  ) {
+    return NextResponse.next();
+  }
 
   if (
     pathname.startsWith("/_next") ||
