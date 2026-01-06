@@ -18,6 +18,7 @@ jobs:
         env:
           PROD: https://cecil-investments-day-trading.vercel.app
           AUTO_ENTRY_TOKEN: ${{ secrets.AUTO_ENTRY_TOKEN }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
         run: |
           set -euo pipefail
 
