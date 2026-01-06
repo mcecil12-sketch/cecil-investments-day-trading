@@ -48,3 +48,4 @@ cookies*.txt
 # local auth cookies
 cookies-prod.txt
 cookies.txt
+.env*.local

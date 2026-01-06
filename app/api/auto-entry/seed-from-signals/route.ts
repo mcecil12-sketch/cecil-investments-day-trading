@@ -153,7 +153,7 @@ export async function POST(req: Request) {
 
     const trade = {
       id: crypto.randomUUID(),
-            ticker,
+      ticker,
       side: "LONG",
       entryPrice,
       stopPrice,
