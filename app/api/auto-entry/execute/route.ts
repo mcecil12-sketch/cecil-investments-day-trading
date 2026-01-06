@@ -396,12 +396,13 @@ export async function POST(req: Request) {
 
     const entryPrice = safeNum(candidate.entryPrice, 0);
     const stopPrice = safeNum(candidate.stopPrice, 0);
+    const takeProfitPrice = safeNum(candidate.takeProfitPrice, 0);
     const sideStr = String(candidate.side || "LONG").toUpperCase();
     const isLong = sideStr === "LONG";
     let invalidError: string | null = null;
 
-    if (entryPrice <= 0 || stopPrice <= 0) {
-      invalidError = "auto_entry_invalid_missing_prices";
+    if (entryPrice <= 0 || stopPrice <= 0 || takeProfitPrice <= 0) {
+      invalidError = "auto_entry_invalid_missing_prices_any";
     } else if (isLong && stopPrice >= entryPrice) {
       invalidError = "auto_entry_invalid_bad_stop";
     }
@@ -414,6 +415,7 @@ export async function POST(req: Request) {
         brokerStatus: candidate.brokerStatus,
         error: invalidError,
         autoEntryStatus: "AUTO_ERROR",
+        errorDetails: { entryPrice: candidate.entryPrice ?? null, stopPrice: candidate.stopPrice ?? null, takeProfitPrice: candidate.takeProfitPrice ?? null },
         updatedAt: nowIso(),
       };
       await writeTrades(trades);
