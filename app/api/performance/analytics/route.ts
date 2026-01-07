@@ -28,6 +28,7 @@ export async function GET(req: Request) {
   const range = url.searchParams.get("range") || "all";
 
   const all = await readTrades();
+  // analytics counts only CLOSED trades with realizedPnL present (finalized closes)
   const closed = extractClosedTrades(all || []).filter((t) => rangeFilter(range, t.closedAt || t.updatedAt || t.createdAt));
 
   const analytics = buildAnalytics(closed);
