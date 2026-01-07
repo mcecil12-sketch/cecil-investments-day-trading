@@ -19,6 +19,7 @@ const PUBLIC_PATHS = [
   "/api/performance/snapshot",
   "/api/performance/equity",
   "/api/performance/analytics",
+  "/api/performance/portfolio",
   "/api/trades",
   "/api/trades/summary",
   "/api/trades/manage",

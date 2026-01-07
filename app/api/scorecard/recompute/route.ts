@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { computeDailyScorecard } from "@/lib/scorecard/compute";
 import { writeDailyScorecard } from "@/lib/scorecard/redis";
+import { buildPortfolioSnapshot } from "@/lib/performance/portfolioSnapshot";
 
 export const dynamic = "force-dynamic";
 
@@ -53,11 +54,10 @@ export async function POST(req: Request) {
 
   const headers = { "Content-Type": "application/json" };
   const analyticsUrl = `${baseUrl}/api/performance/analytics?range=all`;
-  const portfolioUrl = `${baseUrl}/api/performance/portfolio`;
 
   const [analyticsRes, portfolioRes] = await Promise.all([
     fetchJson(analyticsUrl, headers),
-    fetchJson(portfolioUrl, headers),
+    buildPortfolioSnapshot(),
   ]);
 
   if (!analyticsRes.ok) {
@@ -66,15 +66,8 @@ export async function POST(req: Request) {
       { status: 500 }
     );
   }
-  if (!portfolioRes.ok) {
-    return NextResponse.json(
-      { ok: false, error: "portfolio_fetch_failed", status: portfolioRes.status, text: portfolioRes.text },
-      { status: 500 }
-    );
-  }
-
   const analytics = analyticsRes.json;
-  const portfolio = portfolioRes.json;
+  const portfolio = portfolioRes;
 
   const startingBalance = Number(portfolio?.startingBalance ?? 100000);
   const totals = analytics?.totals ?? {};
@@ -118,4 +111,3 @@ export async function POST(req: Request) {
     },
   });
 }
-
