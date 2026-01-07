@@ -86,6 +86,22 @@ HTTP %{http_code}
             -d '{}' \
             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
+      - name: Finalize closes
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID="gh-market-loop-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)"
+          echo "=== finalize-closes ==="
+          curl -sS -X POST "$BASE/api/maintenance/finalize-closes?limit=25" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: github-actions" \
+            -H "x-run-id: $RUN_ID" \
+            -d '{}' \
+            -w "\nHTTP %{http_code}\n" | head -c 4000 || true
+          echo
       - name: Snapshot performance equity
         env:
           BASE: ${{ secrets.PROD_BASE_URL }}

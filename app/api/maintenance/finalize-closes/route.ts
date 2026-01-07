@@ -10,24 +10,76 @@ function isAuthed(req: Request) {
 }
 
 export async function POST(req: Request) {
-  if (!isAuthed(req)) return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+  const runSource = req.headers.get("x-run-source") || "unknown";
+  const runId = req.headers.get("x-run-id") || "";
+  const marketLoopOnly = process.env.FINALIZE_MARKET_LOOP_ONLY !== "0";
+  const allowedSources = (process.env.FINALIZE_ALLOWED_SOURCES || "github-actions,terminal")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (!isAuthed(req)) {
+    return NextResponse.json({ ok: false, error: "unauthorized", runSource, runId }, { status: 401 });
+  }
+
+  if (!allowedSources.includes(runSource)) {
+    return NextResponse.json(
+      { ok: false, error: "forbidden_run_source", runSource, allowed: allowedSources, runId },
+      { status: 403 }
+    );
+  }
+
+  if (marketLoopOnly && runSource !== "github-actions") {
+    return NextResponse.json({ ok: false, error: "market_loop_only", runSource, runId }, { status: 403 });
+  }
 
   const url = new URL(req.url);
   const tickers = (url.searchParams.get("tickers") || "")
     .split(",")
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean);
-  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || "50"), 1), 500);
+  const rawLimit = Number(url.searchParams.get("limit") || "25");
+  const effectiveLimit = Math.min(50, Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 25));
 
   const trades = await readTrades();
-  const candidates = trades
-    .filter((t: any) => String(t.status || "").toUpperCase() === "CLOSED" && (t.realizedPnL == null || t.realizedR == null))
-    .filter((t: any) => (tickers.length ? tickers.includes(String(t.ticker || "").toUpperCase()) : true))
-    .sort((a: any, b: any) => String(b.closedAt || "").localeCompare(String(a.closedAt || "")))
-    .slice(0, limit);
+  const closedFilter = (t: any) => String(t.status || "").toUpperCase() === "CLOSED";
+  const candidates = tickers.length
+    ? trades
+        .filter(
+          (t: any) =>
+            closedFilter(t) &&
+            (t.realizedPnL == null || t.realizedR == null) &&
+            tickers.includes(String(t.ticker || "").toUpperCase())
+        )
+        .sort((a: any, b: any) => String(b.closedAt || "").localeCompare(String(a.closedAt || "")))
+        .slice(0, effectiveLimit)
+    : trades
+        .filter(
+          (t: any) =>
+            closedFilter(t) &&
+            !t.finalizedAt &&
+            Boolean(t.closedAt)
+        )
+        .sort((a: any, b: any) => String(b.closedAt || "").localeCompare(String(a.closedAt || "")))
+        .slice(0, effectiveLimit);
 
   const updates: any[] = [];
   const results: any[] = [];
+  let skippedReason = "";
+
+  if (!candidates.length) {
+    skippedReason = tickers.length ? "no_candidates_for_tickers" : "no_recent_unfinalized_closes";
+    return NextResponse.json({
+      ok: true,
+      runSource,
+      runId,
+      skippedReason,
+      effectiveLimit,
+      checked: 0,
+      updated: 0,
+      results,
+    });
+  }
 
   for (const t of candidates) {
     const r = await finalizeTradeClose(t);
@@ -84,6 +136,10 @@ export async function POST(req: Request) {
 
   return NextResponse.json({
     ok: true,
+    runSource,
+    runId,
+    skippedReason,
+    effectiveLimit,
     checked: candidates.length,
     updated: updates.length,
     results,
