@@ -27,6 +27,7 @@ const PUBLIC_PATHS = [
   "/api/trades/apply-stop",
   "/api/signals",
   "/api/signals/all",
+  "/api/scorecard",
 ];
 
 
