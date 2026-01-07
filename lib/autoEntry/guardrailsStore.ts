@@ -72,6 +72,7 @@ export async function bumpEntry(etDate: string, ticker: string) {
 export async function resetFailures(etDate: string) {
   if (!redis) return;
   await redis.hset(guardKey(etDate), { consecutiveFailures: "0" });
+  await redis.hdel(guardKey(etDate), "autoDisabledReason");
 }
 
 export async function recordFailure(etDate: string, reason: string, opts?: { markLoss?: boolean }) {
