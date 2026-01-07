@@ -1,44 +1,53 @@
 import { NextResponse } from "next/server";
-import { requireAuth } from "@/lib/auth";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 
-export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+function isCronAuthorized(req: Request) {
+  const token = req.headers.get("x-cron-token") || "";
+  return Boolean(process.env.CRON_TOKEN) && token === process.env.CRON_TOKEN;
+}
+
 export async function POST(req: Request) {
-  const auth = await requireAuth(req);
-  if (!auth.ok) {
-    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
-  }
-
-  let body: { tradeId?: string; reason?: string } = {};
   try {
-    body = (await req.json()) as typeof body;
-  } catch {}
+    if (!isCronAuthorized(req)) {
+      return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+    }
 
-  const tradeId = String(body.tradeId || "").trim();
-  if (!tradeId) {
-    return NextResponse.json({ ok: false, error: "missing_tradeId" }, { status: 400 });
+    const body = await req.json().catch(() => ({}));
+    const tradeId = String(body.tradeId || "");
+    const ticker = String(body.ticker || "").toUpperCase();
+    const reason = String(body.reason || "disabled_by_maintenance");
+
+    if (!tradeId && !ticker) {
+      return NextResponse.json({ ok: false, error: "missing_tradeId_or_ticker" }, { status: 400 });
+    }
+
+    const trades = await readTrades();
+    const now = new Date().toISOString();
+    let updated = 0;
+
+    const next = trades.map((t: any) => {
+      const match = tradeId ? t.id === tradeId : (ticker && (t.ticker || "").toUpperCase() === ticker);
+      if (!match) return t;
+      updated += 1;
+      return {
+        ...t,
+        status: "ERROR",
+        autoEntryStatus: "DISABLED",
+        error: "disabled_by_maintenance",
+        reason,
+        updatedAt: now,
+      };
+    });
+
+    if (updated === 0) {
+      return NextResponse.json({ ok: false, error: "not_found", tradeId: tradeId || null, ticker: ticker || null }, { status: 404 });
+    }
+
+    await writeTrades(next);
+    return NextResponse.json({ ok: true, updated, tradeId: tradeId || null, ticker: ticker || null, reason });
+  } catch (e: any) {
+    return NextResponse.json({ ok: false, error: "exception", detail: String(e?.message || e) }, { status: 500 });
   }
-
-  const trades = await readTrades<any>();
-  const idx = trades.findIndex((t) => String(t?.id || "") === tradeId);
-  if (idx === -1) {
-    return NextResponse.json({ ok: false, error: "trade_not_found" }, { status: 404 });
-  }
-
-  const now = new Date().toISOString();
-  const reason = String(body.reason || "manual").trim() || "manual";
-
-  trades[idx] = {
-    ...trades[idx],
-    status: "DISABLED",
-    autoEntryStatus: "AUTO_DISABLED",
-    error: `disabled:${reason}`,
-    updatedAt: now,
-  };
-
-  await writeTrades(trades);
-
-  return NextResponse.json({ ok: true, tradeId }, { status: 200 });
 }
