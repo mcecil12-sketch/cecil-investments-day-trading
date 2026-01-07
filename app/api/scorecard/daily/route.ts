@@ -27,7 +27,6 @@ export async function GET(req: Request) {
     dateET,
     found: res.found,
     key: res.key,
-    scorecard: res.card,
+    scorecard: res.scorecard,
   });
 }
-
