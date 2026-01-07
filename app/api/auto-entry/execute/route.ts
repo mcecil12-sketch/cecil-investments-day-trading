@@ -37,6 +37,35 @@ function ensureBracketLegsValid(params: {
   return { takeProfitLimit: tp, stopLossStop: sl };
 }
 
+function isAlpacaInvalidStopVsBase(err: any) {
+  const s = String(err?.message || err || "").toLowerCase();
+  return (
+    s.includes("stop_loss.stop_price") &&
+    s.includes("base_price") &&
+    (s.includes("must be") || s.includes("must"))
+  );
+}
+
+async function disableTradeAsPoison(tradeId: string, reason: string) {
+  const trades = await readTrades();
+  const now = new Date().toISOString();
+  let updated = 0;
+  const next = trades.map((t: any) => {
+    if (t.id !== tradeId) return t;
+    updated += 1;
+    return {
+      ...t,
+      status: "ERROR",
+      autoEntryStatus: "DISABLED",
+      error: "invalid_trade_payload",
+      reason,
+      updatedAt: now,
+    };
+  });
+  if (updated) await writeTrades(next);
+  return updated;
+}
+
 
 function isAutoPendingTrade(t: any) {
   return (
@@ -597,7 +626,14 @@ export async function POST(req: Request) {
 
       if (wantTp) payload.take_profit = { limit_price: tp };
 
-      return await createOrder(payload);
+      try {
+        return await createOrder(payload);
+      } catch (e: any) {
+        if (isAlpacaInvalidStopVsBase(e)) {
+          return { __poison: true, message: String(e?.message || e || "") } as any;
+        }
+        throw e;
+      }
     },
   });
 
@@ -624,6 +660,14 @@ export async function POST(req: Request) {
 
   try {
     const order = lock.value;
+    if ((order as any)?.__poison) {
+      counts.invalidMarked += 1;
+      await disableTradeAsPoison(tradeId, "invalid_stop_vs_base_price");
+      return NextResponse.json(
+        { ok: true, skipped: true, reason: "invalid_stop_vs_base_price", tradeId, counts, guardrails: guardSummary },
+        { status: 200 }
+      );
+    }
 
     const legs = Array.isArray((order as any)?.legs) ? (order as any).legs : [];
     const stopChild = (order as any)?.stop_loss ?? legs.find((l: any) => String(l?.type || "").toLowerCase().includes("stop"));
