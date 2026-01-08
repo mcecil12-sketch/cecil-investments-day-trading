@@ -548,6 +548,7 @@ export async function GET(req: NextRequest) {
 
   const hdrs = headers();
   const authCookie = hdrs.get("cookie") || "";
+  const inboundScannerToken = req.headers.get("x-scanner-token") || "";
   const baseUrl = getBaseUrlFromEnv();
 
   const rawMode = (search.get("mode") || "").toLowerCase();
@@ -724,7 +725,6 @@ const logSummary = () => {
 
   let candidates: CandidateSignal[] = [];
   let postedCount = 0;
-  let postDebug: any = null;
 
   for (let i = 0; i < slicedUniverse.length; i += chunkSize) {
     const chunk = slicedUniverse.slice(i, i + chunkSize);
@@ -933,6 +933,8 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
   const posted: OutgoingSignal[] = [];
   let postedSignals = 0;
   let queuedSignals = 0;
+  const postDebug: any[] = [];
+
   for (const candidate of topCandidates) {
     if (aiSeedMode && (postedSignals >= AI_SEED_MAX_POST || queuedSignals >= AI_SEED_MAX_QUEUE)) {
       break;
@@ -942,37 +944,31 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
         totals.signalsCreated += 1;
       }
       const payload = toOutgoing(candidate);
-      const res = await fetch(`${baseUrl}/api/signals`, {
+      const postUrl = `${baseUrl}/api/signals`;
+      const res = await fetch(postUrl, {
         method: "POST",
         body: JSON.stringify(payload),
         cache: "no-store",
         headers: {
           "Content-Type": "application/json",
-          cookie: authCookie,
-          ...(scannerToken ? { "x-scanner-token": scannerToken } : {}),
+          ...(authCookie ? { cookie: authCookie } : {}),
+          ...(inboundScannerToken ? { "x-scanner-token": inboundScannerToken } : {}),
+          ...(scanSource ? { "x-scan-source": scanSource } : {}),
+          ...(scanRunId ? { "x-scan-run-id": String(scanRunId) } : {}),
         },
       });
-
-      if (debugScan && postDebug == null) {
-        try {
-          const txt = await res.clone().text();
-          postDebug = {
-            url: `${baseUrl}/api/signals`,
-            status: res.status,
-            ok: res.ok,
-            hasScannerToken: Boolean(scannerToken),
-            bodyHead: (txt || "").slice(0, 600),
-          };
-        } catch (e) {
-          postDebug = {
-            url: `${baseUrl}/api/signals`,
-            status: res.status,
-            ok: res.ok,
-            hasScannerToken: Boolean(scannerToken),
-            bodyHead: "read_failed",
-          };
-        }
+      if (debugScan) {
+        const txt = await res.clone().text().catch(() => "");
+        postDebug.push({
+          ticker: candidate.ticker,
+          url: postUrl,
+          status: res.status,
+          ok: res.ok,
+          hasScannerToken: Boolean(inboundScannerToken),
+          bodyHead: txt.slice(0, 240),
+        });
       }
+
 
       if (!res.ok) {
         console.error(
@@ -1033,6 +1029,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     signalsPosted: posted.length,
     gptQueued: posted.length,
     aiSeedDebug,
+    ...(debugScan ? { postDebug } : {}),
     ...(debugScan && summarySnapshot ? { debugSummary: summarySnapshot } : {}),
   });
 }
