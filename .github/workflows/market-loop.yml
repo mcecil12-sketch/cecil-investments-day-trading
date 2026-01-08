@@ -100,8 +100,7 @@ jobs:
             -d '{}' \
             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
-      - name: Snapshot performance equity
-        - name: Scorecard recompute
+      - name: Scorecard recompute
           env:
             BASE: ${{ secrets.PROD_BASE_URL }}
             CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
