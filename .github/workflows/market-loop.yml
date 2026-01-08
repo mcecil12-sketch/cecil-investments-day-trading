@@ -101,23 +101,23 @@ jobs:
             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
       - name: Scorecard recompute
-          env:
-            BASE: ${{ secrets.PROD_BASE_URL }}
-            CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
-          run: |
-            set -euo pipefail
-            DATE_ET="$(TZ=America/New_York date +%F)"
-            RUN_ID="gh-scorecard-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)"
-            CODE="$(curl -sS -o /tmp/scorecard.json -w "%{http_code}" -X POST "$BASE/api/scorecard/recompute" \
-              -H "Content-Type: application/json" \
-              -H "x-cron-token: $CRON_TOKEN" \
-              -H "x-run-source: github-actions" \
-              -H "x-run-id: $RUN_ID" \
-              -d "{\"dateET\":\"$DATE_ET\"}")"
-            cat /tmp/scorecard.json | head -c 4000 || true
-            echo
-            echo "HTTP $CODE"
-            if [ "$CODE" -ne 200 ]; then exit 1; fi
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          set -euo pipefail
+          DATE_ET="$(TZ=America/New_York date +%F)"
+          RUN_ID="gh-scorecard-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)"
+          CODE="$(curl -sS -o /tmp/scorecard.json -w "%{http_code}" -X POST "$BASE/api/scorecard/recompute" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: github-actions" \
+            -H "x-run-id: $RUN_ID" \
+            -d "{\"dateET\":\"$DATE_ET\"}")"
+          cat /tmp/scorecard.json | head -c 4000 || true
+          echo
+          echo "HTTP $CODE"
+          if [ "$CODE" -ne 200 ]; then exit 1; fi
 
         env:
           BASE: ${{ secrets.PROD_BASE_URL }}
