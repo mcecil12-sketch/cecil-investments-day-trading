@@ -544,6 +544,7 @@ export async function GET(req: NextRequest) {
   const search = url.searchParams;
   const scanSource = req.headers.get("x-scan-source") ?? "unknown";
   const scanRunId = req.headers.get("x-scan-run-id") ?? null;
+  const scannerToken = req.headers.get("x-scanner-token") ?? "";
 
   const hdrs = headers();
   const authCookie = hdrs.get("cookie") || "";
@@ -723,6 +724,7 @@ const logSummary = () => {
 
   let candidates: CandidateSignal[] = [];
   let postedCount = 0;
+  let postDebug: any = null;
 
   for (let i = 0; i < slicedUniverse.length; i += chunkSize) {
     const chunk = slicedUniverse.slice(i, i + chunkSize);
@@ -947,8 +949,30 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
         headers: {
           "Content-Type": "application/json",
           cookie: authCookie,
+          ...(scannerToken ? { "x-scanner-token": scannerToken } : {}),
         },
       });
+
+      if (debugScan && postDebug == null) {
+        try {
+          const txt = await res.clone().text();
+          postDebug = {
+            url: `${baseUrl}/api/signals`,
+            status: res.status,
+            ok: res.ok,
+            hasScannerToken: Boolean(scannerToken),
+            bodyHead: (txt || "").slice(0, 600),
+          };
+        } catch (e) {
+          postDebug = {
+            url: `${baseUrl}/api/signals`,
+            status: res.status,
+            ok: res.ok,
+            hasScannerToken: Boolean(scannerToken),
+            bodyHead: "read_failed",
+          };
+        }
+      }
 
       if (!res.ok) {
         console.error(
