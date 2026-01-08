@@ -62,7 +62,7 @@ jobs:
             -H "x-run-source: github-actions" \
             -H "x-run-id: $RUN_ID" \
             -d '{"limit":3,"minScore":7.5}' \
-            -w "\nHTTP %{http_code}\n"" | head -c 4000 || true
+            -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
 
           echo "=== auto-entry execute ==="
