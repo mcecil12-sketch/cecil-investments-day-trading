@@ -31,6 +31,7 @@ const PUBLIC_PATHS = [
   "/api/signals",
   "/api/signals/all",
   "/api/scorecard",
+  "/api/scan",
   "/api/scan/health",
   "/api/ai/health",
 ];
