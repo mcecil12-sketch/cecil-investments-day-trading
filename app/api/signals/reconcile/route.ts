@@ -5,6 +5,9 @@ import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
 const PLACEHOLDER_SUMMARIES = new Set([
   "AI scoring pending",
   "No summary provided by AI.",
+  "No detailed summary returned.",
+  "Scored F (0). No detailed summary returned.",
+  "Scored F (0.0). No detailed summary returned.",
 ]);
 
 function isPlaceholderSummary(value?: string) {

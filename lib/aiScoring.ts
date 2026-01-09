@@ -89,6 +89,14 @@ function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n))
 }
 
+function clampScore(x: any) {
+  const n = typeof x === "number" ? x : Number(x)
+  if (!Number.isFinite(n)) return 1.0
+  if (n <= 0) return 1.0
+  if (n > 10) return 10.0
+  return Math.round(n * 100) / 100
+}
+
 function scoreToGrade(score: number) {
   const s = clamp(score, 0, 10)
   if (s >= 9) return "A"
@@ -202,7 +210,7 @@ function normalizeAiScoreResult(raw: string): NormalizedAiScoreResult {
     const gradeRx = scoreToGrade(scoreRx)
     const t = stripCodeFences(raw)
     const summary = t.length > 0 ? t.slice(0, 1200) : `Scored ${gradeRx} (${scoreRx}).`
-    return { aiScore: scoreRx, aiGrade: gradeRx, aiSummary: summary, rawHead, parseMode: "regex" }
+    return { aiScore: clampScore(scoreRx), aiGrade: gradeRx, aiSummary: summary, rawHead, parseMode: "regex" }
   }
 
   return {
@@ -223,7 +231,7 @@ export function gradeFromScore(score: number): AiGrade {
 }
 
 export function formatAiSummary(grade: AiGrade, score: number) {
-  return `Scored ${grade} (${score}). AI response parse fallback. See rawHead for excerpt.
+  return `Scored ${grade} (${score}). AI response parse fallback. See rawHead for excerpt.`;
 }
 
 const MIN_BARS_FOR_AI = Number(process.env.MIN_BARS_FOR_AI ?? 20);
