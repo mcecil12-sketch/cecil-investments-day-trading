@@ -187,7 +187,29 @@ export async function POST(req: Request) {
   let finalSignal: StoredSignal = placeholder;
 
   try {
-    scored = await scoreSignalWithAI(rawSignal);
+    const scoredResult = await scoreSignalWithAI(rawSignal);
+    if (!scoredResult.ok) {
+      finalSignal = {
+        ...placeholder,
+        status: "ERROR",
+        error: scoredResult.error,
+        aiErrorReason: scoredResult.error,
+        aiRawHead: scoredResult.rawHead,
+        aiSummary: `AI parse failed (${scoredResult.reason})`,
+        aiScore: null,
+        aiGrade: null,
+        totalScore: null,
+        score: null,
+        grade: null,
+        qualified: false,
+        shownInApp: false,
+        reasoning: "AI parse failed",
+      };
+      await replaceSignal(finalSignal);
+      return NextResponse.json({ signal: finalSignal });
+    }
+
+    scored = scoredResult.scored;
     if (scored.status === "SKIPPED") {
       finalSignal = {
         ...placeholder,

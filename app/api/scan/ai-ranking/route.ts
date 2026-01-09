@@ -78,8 +78,24 @@ export async function GET(req: Request) {
 
       if (needsScore) {
         const raw = toRawSignal(s);
-        const scored = await scoreSignalWithAI(raw);
-        rescoredSignals.push(scored);
+        const scoredResult = await scoreSignalWithAI(raw);
+        if (!scoredResult.ok) {
+          rescoredSignals.push({
+            ...s,
+            status: "ERROR",
+            error: scoredResult.error,
+            aiErrorReason: scoredResult.error,
+            aiRawHead: scoredResult.rawHead,
+            aiSummary: `AI parse failed (${scoredResult.reason})`,
+            aiScore: null,
+            aiGrade: null,
+            totalScore: null,
+            qualified: false,
+            shownInApp: false,
+          } as ScoredSignal);
+        } else {
+          rescoredSignals.push(scoredResult.scored);
+        }
         rescoredCount += 1;
       } else {
         rescoredSignals.push(s);

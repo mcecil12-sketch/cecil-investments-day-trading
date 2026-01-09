@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import { recordSpend, recordAiCall, recordAiError, writeAiHeartbeat } from "./aiMetrics";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { buildSignalContext, SignalContext } from "@/lib/signalContext";
+import { parseAiScoreOutput } from "@/lib/ai/scoreParse";
 
 function dynamicMinScore(sessionMinutes: number) {
   const m = Number.isFinite(sessionMinutes) ? sessionMinutes : 60;
@@ -54,6 +55,8 @@ export type ScoredSignal = RawSignal & {
   tradePlan?: TradePlan | null;
   qualified?: boolean;
   shownInApp?: boolean;
+  aiRawHead?: string | null;
+  aiErrorReason?: string | null;
 };
 
 type ModelResponse = {
@@ -65,6 +68,10 @@ type ModelResponse = {
   aiSummary?: string;
   totalScore?: number;
 };
+
+export type AiScoreResult =
+  | { ok: true; scored: ScoredSignal }
+  | { ok: false; error: "ai_parse_failed"; reason: string; rawHead: string };
 
 function supportsCustomTemperature(model: string) {
   return !model.startsWith("gpt-5");
@@ -238,17 +245,20 @@ export function formatAiSummary(grade: AiGrade, score: number) {
 
 const MIN_BARS_FOR_AI = Number(process.env.MIN_BARS_FOR_AI ?? 20);
 
-export async function scoreSignalWithAI(rawSignal: RawSignal): Promise<ScoredSignal> {
+export async function scoreSignalWithAI(rawSignal: RawSignal): Promise<AiScoreResult> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     // Fail-safe: if key missing, treat as low-quality
     console.warn("[aiScoring] OPENAI_API_KEY not set; returning default low score.");
     return {
+      ok: true,
+      scored: {
       ...rawSignal,
       aiScore: 0,
       aiGrade: "F",
       aiSummary: "AI scoring disabled (no API key).",
       totalScore: 0,
+      },
     };
   }
 
@@ -313,6 +323,8 @@ Rules:
   if (context && context.barsUsed < MIN_BARS_FOR_AI) {
     const reason = `Insufficient recent bars (${context.barsUsed} < ${MIN_BARS_FOR_AI})`;
     return {
+      ok: true,
+      scored: {
       ...signal,
       aiScore: null,
       aiGrade: null,
@@ -322,6 +334,7 @@ Rules:
       skipReason: reason,
       qualified: false,
       shownInApp: false,
+      },
     };
   }
 
@@ -347,72 +360,58 @@ Return ONLY valid JSON with:
   const HEAVY_MODEL = process.env.OPENAI_MODEL_HEAVY || "gpt-5.1";
   const useHeavyModel = (signal.playbookScore ?? 0) >= 8;
   const model = useHeavyModel ? HEAVY_MODEL : BULK_MODEL;
+  const retryOnParseFail = process.env.AI_SCORE_RETRY_ON_PARSE_FAIL === "1";
 
   const openai = new OpenAI({ apiKey });
-  await recordAiCall(model);
+  const scoreOnce = async (promptText: string) => {
+    await recordAiCall(model);
+    let completion;
+    try {
+      completion = await openai.chat.completions.create({
+        model,
+        ...(supportsCustomTemperature(model) ? { temperature: 0.3 } : {}),
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: promptText },
+        ],
+      });
+    } catch (err: any) {
+      await recordAiError(model, err?.message ?? String(err));
+      throw err;
+    }
 
-  let completion;
-  try {
-    completion = await openai.chat.completions.create({
-      model,
-      ...(supportsCustomTemperature(model) ? { temperature: 0.3 } : {}),
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: prompt },
-      ],
-    });
-  } catch (err: any) {
-    await recordAiError(model, err?.message ?? String(err));
-    throw err;
+    try {
+      await recordSpend(model, estimateCost(model));
+    } catch (e: any) {
+      console.log("[aiScoring] recordSpend failed (non-fatal):", e?.message ?? String(e));
+    }
+    await bumpTodayFunnel({ gptScoredByModel: { [model]: 1 } });
+    return completion.choices[0]?.message?.content ?? "";
+  };
+
+  let content = await scoreOnce(prompt);
+  let parsed = parseAiScoreOutput(content);
+  if (!parsed.ok && retryOnParseFail) {
+    const retryPrompt =
+      prompt +
+      "\n\nIMPORTANT: Respond ONLY with a single JSON object: {\"score\":number,\"grade\":\"A|B|C|D|F\",\"summary\":string,\"reasoning\":string}";
+    content = await scoreOnce(retryPrompt);
+    parsed = parseAiScoreOutput(content);
   }
 
-  try {
-    await recordSpend(model, estimateCost(model));
-  } catch (e: any) {
-    console.log("[aiScoring] recordSpend failed (non-fatal):", e?.message ?? String(e));
-  }
-  await bumpTodayFunnel({ gptScoredByModel: { [model]: 1 } });
-
-  const content = completion.choices[0]?.message?.content ?? "{}";
-
-  let parsed: Partial<ModelResponse>;
-  try {
-    parsed = JSON.parse(content);
-  } catch (err) {
-    console.error("[aiScoring] Failed to parse JSON response:", err, content);
-    parsed = {};
+  if (!parsed.ok) {
+    return { ok: false, error: "ai_parse_failed", reason: parsed.reason, rawHead: parsed.rawHead };
   }
 
-  const normalizedScore =
-    typeof parsed.score === "number" && isFinite(parsed.score)
-      ? Math.min(10, Math.max(0, parsed.score))
-      : 0;
-
-  const rawGrade = typeof parsed.grade === "string" && parsed.grade.trim()
-    ? (parsed.grade.trim() as AiGrade)
-    : gradeFromScore(normalizedScore);
-  const rawSummary = typeof parsed.summary === "string" ? parsed.summary : "";
-
-  const _scoreNum = Number.isFinite(Number(normalizedScore)) ? Number(normalizedScore) : 0;
+  const parsedScore = parsed.parsed;
+  const _scoreNum = parsedScore.score;
+  const gradeCandidate = String(parsedScore.grade || "").trim().toUpperCase();
   const _grade: AiGrade =
-    rawGrade && rawGrade.trim()
-      ? (rawGrade as AiGrade)
-      : _scoreNum >= 9
-      ? "A+"
-      : _scoreNum >= 8
-      ? "A"
-      : _scoreNum >= 7
-      ? "B"
-      : _scoreNum >= 6
-      ? "C"
-      : _scoreNum >= 5
-      ? "D"
-      : "F";
-  const _summary =
-    typeof rawSummary === "string" && rawSummary.trim().length
-      ? rawSummary.trim()
-      : formatAiSummary(_grade, _scoreNum);
+    ["A+", "A", "B", "C", "D", "F"].includes(gradeCandidate)
+      ? (gradeCandidate as AiGrade)
+      : gradeFromScore(_scoreNum);
+  const _summary = parsedScore.summary.trim();
 
   const result: ScoredSignal = {
     ...signal,
@@ -434,5 +433,5 @@ Return ONLY valid JSON with:
     console.warn("[aiScoring] heartbeat update failed", err);
   }
 
-  return result;
+  return { ok: true, scored: result };
 }

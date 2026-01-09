@@ -34,6 +34,8 @@ export type StoredSignal = {
   aiGrade?: string | null;
   aiSummary?: string | null;
   totalScore?: number | null;
+  aiRawHead?: string | null;
+  aiErrorReason?: string | null;
   priority?: number;
   grade?: string | null;
   score?: number | null;
