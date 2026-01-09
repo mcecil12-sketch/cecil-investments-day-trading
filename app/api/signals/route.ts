@@ -188,6 +188,23 @@ export async function POST(req: Request) {
 
   try {
     scored = await scoreSignalWithAI(rawSignal);
+    if (scored.status === "SKIPPED") {
+      finalSignal = {
+        ...placeholder,
+        ...scored,
+        aiScore: null,
+        aiGrade: null,
+        totalScore: null,
+        score: null,
+        grade: null,
+        status: "SKIPPED",
+        qualified: false,
+        shownInApp: false,
+        reasoning: scored.aiSummary ?? placeholder.reasoning ?? "AI scoring skipped",
+      };
+      await replaceSignal(finalSignal);
+      return NextResponse.json({ signal: finalSignal });
+    }
     const safeScore = Number.isFinite(scored.aiScore ?? NaN)
       ? scored.aiScore!
       : null;
@@ -314,7 +331,7 @@ export async function POST(req: Request) {
     console.log("[funnel] bump failed (non-fatal)", err);
   }
 
-  if (scored.aiGrade === "A" || scored.aiScore >= 9) {
+  if (scored.aiGrade === "A" || (scored.aiScore ?? 0) >= 9) {
     try {
       await sendPullbackAlert(scored);
     } catch (err) {
@@ -343,4 +360,3 @@ export async function POST(req: Request) {
     );
   }
 }
-

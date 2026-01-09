@@ -45,13 +45,15 @@ export type RawSignal = {
 export type AiGrade = "A+" | "A" | "B" | "C" | "D" | "F";
 
 export type ScoredSignal = RawSignal & {
-  aiScore: number; // 0–10, numeric
-  aiGrade: AiGrade;
+  aiScore: number | null; // 0–10, numeric
+  aiGrade: AiGrade | null;
   aiSummary: string; // short explanation
-  totalScore: number;
+  totalScore: number | null;
   status?: string;
   skipReason?: string;
   tradePlan?: TradePlan | null;
+  qualified?: boolean;
+  shownInApp?: boolean;
 };
 
 type ModelResponse = {
@@ -312,12 +314,14 @@ Rules:
     const reason = `Insufficient recent bars (${context.barsUsed} < ${MIN_BARS_FOR_AI})`;
     return {
       ...signal,
-      aiScore: 0,
-      aiGrade: "F",
+      aiScore: null,
+      aiGrade: null,
       aiSummary: reason,
-      totalScore: 0,
+      totalScore: null,
       status: "SKIPPED",
       skipReason: reason,
+      qualified: false,
+      shownInApp: false,
     };
   }
 

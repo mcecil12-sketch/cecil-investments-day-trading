@@ -10,7 +10,8 @@ export type SignalContext = {
   trendSlopePct: number;
   avgVolume: number | null;
   lastVolume: number | null;
-  relVolume: number | null;
+  relVolume: number;
+  relVolumeNote?: string;
   rangePctAvg: number | null;
   liquidityNote: string;
 };
@@ -54,12 +55,17 @@ function computeTrend(bars: AlpacaBar[]) {
 
 function computeVolumes(bars: AlpacaBar[]) {
   const vols = bars.map((b) => safeNum((b as any).v)).filter((v): v is number => v !== null);
-  if (vols.length < 6) return { avg: null, last: null, rel: null };
+  if (vols.length < 6) {
+    return { avg: null, last: null, rel: 1.0, relNote: "relVol defaulted (insufficient volume bars)" };
+  }
   const last = vols[vols.length - 1];
   const sample = vols.slice(-Math.min(30, vols.length));
   const avg = sample.reduce((a, b) => a + b, 0) / sample.length;
-  const rel = avg > 0 ? last / avg : null;
-  return { avg, last, rel };
+  if (!(avg > 0)) {
+    return { avg, last, rel: 1.0, relNote: "relVol defaulted (avg volume <= 0)" };
+  }
+  const rel = last / avg;
+  return { avg, last, rel, relNote: null };
 }
 
 function computeAvgRangePct(bars: AlpacaBar[]) {
@@ -193,7 +199,7 @@ export async function buildSignalContext(params: {
 
   const vwap = computeVWAP(finalBars);
   const { trend, slopePct } = computeTrend(finalBars);
-  const { avg, last, rel } = computeVolumes(finalBars);
+  const { avg, last, rel, relNote } = computeVolumes(finalBars);
   const rangePctAvg = computeAvgRangePct(finalBars);
   const lastClose = finalBars.length ? finalBars[finalBars.length - 1].c : null;
   const liquidityNote = liquidityNoteFromContext(avg, lastClose ?? null);
@@ -206,7 +212,8 @@ export async function buildSignalContext(params: {
     trendSlopePct: slopePct,
     avgVolume: avg ?? null,
     lastVolume: last ?? null,
-    relVolume: rel ?? null,
+    relVolume: Number.isFinite(rel) ? rel : 1.0,
+    relVolumeNote: relNote ?? undefined,
     rangePctAvg,
     liquidityNote,
   };

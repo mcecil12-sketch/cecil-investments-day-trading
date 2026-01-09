@@ -10,6 +10,7 @@ export type StoredSignalStatus =
   | "APPROVED"
   | "DISMISSED"
   | "SCORED"
+  | "SKIPPED"
   | "ERROR"
   | "ARCHIVED";
 
@@ -29,10 +30,10 @@ export type StoredSignal = {
   archivedAt?: string;
 
   // AI fields
-  aiScore?: number;
-  aiGrade?: string;
-  aiSummary?: string;
-  totalScore?: number;
+  aiScore?: number | null;
+  aiGrade?: string | null;
+  aiSummary?: string | null;
+  totalScore?: number | null;
   priority?: number;
   grade?: string | null;
   score?: number | null;
