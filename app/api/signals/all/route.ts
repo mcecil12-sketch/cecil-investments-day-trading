@@ -14,8 +14,13 @@ function normalizeSignal(s: any) {
 export async function GET() {
   const signals = await readSignals();
   const normalized = signals.map(normalizeSignal);
+  const sortedSignals = [...normalized].sort((a: any, b: any) => {
+    const ta = Date.parse(a?.createdAt ?? 0) || 0;
+    const tb = Date.parse(b?.createdAt ?? 0) || 0;
+    return tb - ta;
+  });
   return NextResponse.json(
-    { signals: normalized },
+    { ok: true, signals: sortedSignals },
     {
       headers: {
         "Cache-Control": "no-store",
