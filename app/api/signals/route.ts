@@ -88,7 +88,28 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-  const body = await req.json();
+  const _t0 = Date.now();
+  const _runId = req.headers.get("x-scan-run-id") || req.headers.get("x-run-id") || null;
+  const _source = req.headers.get("x-scan-source") || req.headers.get("x-run-source") || null;
+  let _where = "start";
+  let _raw = "";
+  let body: any = null;
+  try {
+    _where = "read_body";
+    _raw = await req.text();
+    _where = "parse_json";
+    body = _raw ? JSON.parse(_raw) : null;
+  } catch (err: any) {
+    const msg = err?.message ?? "invalid_json";
+    console.error("[signals] bad_json", { runId: _runId, source: _source, msg, head: (_raw || "").slice(0,240) });
+    return NextResponse.json(
+      { ok:false, error:"signals_bad_json", runId:_runId, source:_source, message: msg, bodyHead: (_raw||"").slice(0,240) },
+      { status: 400, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+
+  try {
+    _where = "handler";
 
   const {
     ticker,
@@ -302,4 +323,24 @@ export async function POST(req: Request) {
   }
 
   return NextResponse.json({ signal: finalSignal });
+  } catch (err: any) {
+    const msg = err?.message ?? "signals_fatal";
+    const stack = (err?.stack ? String(err.stack) : "");
+    console.error("[signals] fatal", { where: _where, runId: _runId, source: _source, msg, stackHead: stack.slice(0,800) });
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "signals_fatal",
+        where: _where,
+        runId: _runId,
+        source: _source,
+        message: msg,
+        stackHead: stack.slice(0,800),
+        bodyHead: (_raw || "").slice(0,240),
+        ms: Date.now() - _t0,
+      },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
+    );
+  }
 }
+
