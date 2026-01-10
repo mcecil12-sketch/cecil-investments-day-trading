@@ -62,11 +62,11 @@ export async function GET(req: Request) {
   const statusesRaw = url.searchParams.get("statuses");
 
   const hasSince = Boolean(sinceRaw);
-  const hasStatuses =
+  const providedStatuses =
     statusList.length > 0 || (typeof statusesRaw === "string" && statusesRaw.trim().length > 0);
   const hasOnlyActive = onlyActiveRaw != null;
 
-  const useDefaults = !hasSince && !hasStatuses && !hasOnlyActive;
+  const useDefaults = !hasSince && !providedStatuses && !hasOnlyActive;
 
   const sinceDate = useDefaults ? parseSince("48h") : parseSince(sinceRaw);
   const order = orderRaw === "asc" ? "asc" : "desc";
@@ -76,6 +76,8 @@ export async function GET(req: Request) {
   const onlyActive = useDefaults ? true : (parseBool(onlyActiveRaw) ?? false);
 
   const statusesApplied = useDefaults
+    ? normalizeStatuses(["SCORED", "PENDING"])
+    : onlyActive && !providedStatuses
     ? normalizeStatuses(["SCORED", "PENDING"])
     : normalizeStatuses([
         ...statusList,
@@ -128,6 +130,7 @@ export async function GET(req: Request) {
         limit,
         onlyActive,
         statusesApplied,
+        statusesProvided: providedStatuses,
       },
       signals: sliced,
     },
