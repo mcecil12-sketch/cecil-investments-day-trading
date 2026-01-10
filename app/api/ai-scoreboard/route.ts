@@ -28,7 +28,7 @@ export async function GET(req: Request) {
 
   const url = new URL(req.url);
   const base = `${url.protocol}//${url.host}`;
-  const resp = await fetch(`${base}/api/signals/all`, {
+  const resp = await fetch(`${base}/api/signals/all?since=48h&onlyActive=1&order=desc&limit=500`, {
     headers: {
       cookie: req.headers.get("cookie") || "",
     },
@@ -84,8 +84,7 @@ export async function GET(req: Request) {
 
   const recent = scored
     .filter((s) => (s.status ?? "").toUpperCase() !== "ARCHIVED")
-    .slice(-20)
-    .reverse();
+    .slice(0, 20);
 
   return NextResponse.json({
     ok: true,

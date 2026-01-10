@@ -36,7 +36,7 @@ export default function SignalsPage() {
       setLoading(true);
       setErrorMsg(null);
       try {
-        const res = await fetch("/api/signals/all");
+        const res = await fetch("/api/signals/all?since=48h&onlyActive=1&order=desc&limit=200");
         if (!res.ok) {
           throw new Error(`HTTP ${res.status}`);
         }

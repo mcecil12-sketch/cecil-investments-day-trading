@@ -74,7 +74,7 @@ export async function GET(req: Request) {
     const [aiHealthResp, funnelResp, signalsResp] = await Promise.all([
       fetch(`${base}/api/ai-health`, { headers: { cookie }, cache: "no-store" }),
       fetch(`${base}/api/funnel-stats`, { headers: { cookie }, cache: "no-store" }),
-      fetch(`${base}/api/signals/all`, { headers: { cookie }, cache: "no-store" }),
+      fetch(`${base}/api/signals/all?since=48h&onlyActive=1&order=desc&limit=500`, { headers: { cookie }, cache: "no-store" }),
     ]);
 
     if (!aiHealthResp.ok) {
