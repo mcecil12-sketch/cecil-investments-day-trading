@@ -67,8 +67,13 @@ function etDate(d = new Date()): string {
 }
 
 export async function POST(req: Request) {
-  const token = req.headers.get("x-cron-token") || "";
-  if (!process.env.CRON_TOKEN || token !== process.env.CRON_TOKEN) {
+  const cronToken = req.headers.get("x-cron-token") || "";
+  const autoToken = req.headers.get("x-auto-entry-token") || "";
+
+  const okCron = !!process.env.CRON_TOKEN && cronToken === process.env.CRON_TOKEN;
+  const okAuto = !!process.env.AUTO_ENTRY_TOKEN && autoToken === process.env.AUTO_ENTRY_TOKEN;
+
+  if (!okCron && !okAuto) {
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
 
