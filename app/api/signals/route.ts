@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const MAX_SIGNALS = Number(process.env.MAX_SIGNALS ?? "4000");
 import {
   scoreSignalWithAI,
   RawSignal,
@@ -22,6 +24,13 @@ const PLACEHOLDER_SUMMARIES = new Set([
   "No summary provided by AI.",
 ]);
 
+function trimSignals(signals: any[]) {
+  if (!Array.isArray(signals)) return signals;
+  // retain only most recent N to avoid Upstash 10MB max request size
+  if (signals.length <= MAX_SIGNALS) return signals;
+  return signals.slice(Math.max(0, signals.length - MAX_SIGNALS));
+}
+
 function isPlaceholderSummary(value?: string) {
   if (!value) return true;
   const trimmed = value.trim();
@@ -31,7 +40,7 @@ function isPlaceholderSummary(value?: string) {
 async function appendSignal(signal: StoredSignal) {
   const signals = await readSignals();
   signals.push(signal);
-  await writeSignals(signals);
+  await writeSignals(trimSignals(signals));
 }
 
 async function replaceSignal(scored: StoredSignal) {
@@ -42,7 +51,7 @@ async function replaceSignal(scored: StoredSignal) {
   } else {
     signals.push(scored);
   }
-  await writeSignals(signals);
+  await writeSignals(trimSignals(signals));
 }
 
 export async function GET(req: Request) {
