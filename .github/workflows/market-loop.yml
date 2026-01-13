@@ -53,19 +53,8 @@ jobs:
             -H "x-scan-run-id: $RUN_ID" \
             -d '{}' \
             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
-          echo "=== signals score-pending ==="
-          curl -sS -X POST "$BASE/api/signals/score-pending?limit=25&sinceHours=6" \
-            -H "Content-Type: application/json" \
-            -H "x-cron-token: $CRON_TOKEN" \
-            -H "x-run-source: github-actions" \
-            -H "x-run-id: $RUN_ID" \
-            -d '{}' \
-            -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
 
-          echo
-
-          
           echo "=== score pending signals ==="
           curl -sS -X POST "$BASE/api/signals/score-pending?limit=25&sinceHours=6" \
             -H "Content-Type: application/json" \
@@ -76,7 +65,7 @@ jobs:
             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
 
-echo "=== auto-entry seed-from-signals ==="
+          echo "=== auto-entry seed-from-signals ==="
           curl -sS -X POST "$BASE/api/auto-entry/seed-from-signals" \
             -H "Content-Type: application/json" \
             -H "x-cron-token: $CRON_TOKEN" \
@@ -105,6 +94,7 @@ echo "=== auto-entry seed-from-signals ==="
             -d '{}' \
             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
+
       - name: Finalize closes
         env:
           BASE: ${{ secrets.PROD_BASE_URL }}
@@ -121,6 +111,7 @@ echo "=== auto-entry seed-from-signals ==="
             -d '{}' \
             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
+
       - name: Scorecard recompute
         env:
           BASE: ${{ secrets.PROD_BASE_URL }}
@@ -146,4 +137,10 @@ echo "=== auto-entry seed-from-signals ==="
           CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
         run: |
           set -euo pipefail
-          curl -sS -X POST "$BASE/api/performance/snapshot" -H "x-cron-token: $CRON_TOKEN" -H "x-run-source: github-actions" -H "x-run-id: gha-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}" -H "Content-Type: application/json" -d '{}' -w "\nHTTP %{http_code}\n" | head -c 4000
+          curl -sS -X POST "$BASE/api/performance/snapshot" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: github-actions" \
+            -H "x-run-id: gha-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            -w "\nHTTP %{http_code}\n" | head -c 4000
