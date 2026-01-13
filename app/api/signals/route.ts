@@ -120,6 +120,8 @@ export async function POST(req: Request) {
   try {
     _where = "handler";
 
+  const deferAI = req.headers.get("x-defer-ai") === "1";
+
   const {
     ticker,
     side,
@@ -179,6 +181,13 @@ export async function POST(req: Request) {
   };
 
   await appendSignal(placeholder);
+
+  if (deferAI) {
+    return NextResponse.json(
+      { ok: true, deferred: true, signal: placeholder },
+      { status: 200, headers: { "Cache-Control": "no-store" } }
+    );
+  }
 
   const placeholderScored: ScoredSignal = {
     ...placeholder,

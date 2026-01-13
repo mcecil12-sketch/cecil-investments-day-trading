@@ -951,6 +951,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
         cache: "no-store",
         headers: {
           "Content-Type": "application/json",
+            "x-defer-ai": "1",
           ...(authCookie ? { cookie: authCookie } : {}),
           ...(inboundScannerToken ? { "x-scanner-token": inboundScannerToken } : {}),
           ...(scanSource ? { "x-scan-source": scanSource } : {}),
