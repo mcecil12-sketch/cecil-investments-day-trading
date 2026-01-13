@@ -53,6 +53,16 @@ jobs:
             -H "x-scan-run-id: $RUN_ID" \
             -d '{}' \
             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
+          echo "=== signals score-pending ==="
+          curl -sS -X POST "$BASE/api/signals/score-pending?limit=25&sinceHours=6" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: github-actions" \
+            -H "x-run-id: $RUN_ID" \
+            -d '{}' \
+            -w "\nHTTP %{http_code}\n" | head -c 4000 || true
+          echo
+
           echo
 
           echo "=== auto-entry seed-from-signals ==="
