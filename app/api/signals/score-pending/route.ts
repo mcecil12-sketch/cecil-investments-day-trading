@@ -115,15 +115,24 @@ export async function POST(req: Request) {
         grade: (scored.aiGrade as any) ?? null,
       });
 
+      const _scoreRaw = scored.totalScore ?? scored.aiScore ?? null;
+      const _hasNumericScore =
+        typeof _scoreRaw === "number" && Number.isFinite(_scoreRaw);
+      const _aiSummary = String((scored as any)?.aiSummary ?? "");
+      const _insufficientBars =
+        _aiSummary.toLowerCase().includes("insufficient recent bars");
+      const _nullScorePolicy = true; // NULL_SCORE_POLICY_v1
+      const _shouldDefer = _insufficientBars || !_hasNumericScore;
+
       const final: StoredSignal = {
         ...(s as any),
         ...scored,
         tradePlan,
-        qualified,
-        shownInApp: true,
-        status: "SCORED",
-        score: scored.totalScore ?? scored.aiScore ?? null,
-        grade: (scored.aiGrade as any) ?? null,
+        qualified: _shouldDefer ? false : qualified,
+        shownInApp: _shouldDefer ? false : true,
+        status: _shouldDefer ? "PENDING" : "SCORED",
+        score: _shouldDefer ? null : (_scoreRaw as any),
+        grade: _shouldDefer ? null : ((scored.aiGrade as any) ?? null),
         updatedAt: new Date().toISOString(),
       };
 
