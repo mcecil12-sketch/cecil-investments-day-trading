@@ -29,8 +29,10 @@ export async function POST(req: Request) {
   const auth = await ensureToken(req);
   if (!auth.ok) return NextResponse.json(auth, { status: auth.status });
 
+  const url = new URL(req.url);
+  const qsSymbol = url.searchParams.get("symbol") || url.searchParams.get("ticker") || "";
   const body = await req.json().catch(() => ({}));
-  const symbol = String(body?.symbol || "").toUpperCase();
+  const symbol = String(qsSymbol || body?.symbol || body?.ticker || "").toUpperCase();
   const qs = symbol
     ? `status=open&symbols=${encodeURIComponent(symbol)}&limit=50`
     : "status=open&limit=50";
