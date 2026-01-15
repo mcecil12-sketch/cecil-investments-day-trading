@@ -4,6 +4,8 @@ import { readTrades, writeTrades } from "@/lib/tradesStore";
 
 export const dynamic = "force-dynamic";
 
+const POSITION_OPEN_OVERRIDES_CANCELED_v1 = true;
+
 const up = (v: any) => String(v || "").toUpperCase();
 
 async function safeJsonArray(text: string | undefined): Promise<any[]> {
@@ -102,6 +104,14 @@ export async function POST(req: Request) {
           const obj = await safeJsonObject(r.text);
           const s = obj?.status ? String(obj.status) : null;
           if (s) orderStatus = s;
+
+            if (existsPos && orderStatus) {
+              const os = String(orderStatus).toLowerCase();
+              if (os === "canceled" || os === "expired" || os === "rejected") {
+                orderStatus = "position_open";
+              }
+            }
+
           if (!dryRun && obj && (typeof obj.filled_qty === "string" || typeof obj.filled_qty === "number")) {
             const fq = Number(obj.filled_qty);
             if (Number.isFinite(fq) && fq > 0) t.filledQty = fq;

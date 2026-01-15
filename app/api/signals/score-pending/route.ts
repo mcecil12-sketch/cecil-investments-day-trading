@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const FUNNEL_QUALIFIED_SHOWN_BUMP_v1 = true;
+
 import { scoreSignalWithAI, RawSignal, ScoredSignal } from "@/lib/aiScoring";
 import { parseAiTradePlan } from "@/lib/tradePlan";
 import { shouldQualify } from "@/lib/aiQualify";
@@ -139,6 +141,9 @@ export async function POST(req: Request) {
       updated.push(final);
 
       await bumpTodayFunnel({ gptScored: 1 });
+      if (final.qualified === true) await bumpTodayFunnel({ qualified: 1 });
+      if (final.shownInApp === true) await bumpTodayFunnel({ shownInApp: 1 });
+
       await touchHeartbeat();
     } catch (err: any) {
       errors.push({ id: s?.id, ticker: s?.ticker, message: err?.message || String(err) });
