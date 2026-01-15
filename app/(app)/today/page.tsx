@@ -428,7 +428,10 @@ export default function TodayPage() {
     setLoadingApprovalTrades(true);
     setApprovalTradesError(null);
     try {
-      const res = await fetch("/api/trades", { cache: "no-store" });
+      const res = await fetch(`/api/trades?_=${Date.now()}`, {
+        cache: "no-store",
+        next: { revalidate: 0 },
+      });
       if (!res.ok) {
         const text = await res.text().catch(() => "");
         throw new Error(`Failed to load trades (${res.status}): ${text}`);
@@ -476,7 +479,10 @@ export default function TodayPage() {
 
   const loadStats = useCallback(async () => {
     try {
-      const res = await fetch("/api/trades/summary");
+      const res = await fetch(`/api/trades/summary?_=${Date.now()}`, {
+        cache: "no-store",
+        next: { revalidate: 0 },
+      });
       if (!res.ok) throw new Error(`Stats failed (${res.status})`);
       const data = await res.json();
       setDailyStats(data?.stats ?? null);
@@ -506,7 +512,10 @@ export default function TodayPage() {
     let cancelled = false;
     const sync = async () => {
       try {
-        const res = await fetch("/api/trades/manage");
+        const res = await fetch(`/api/trades/manage?_=${Date.now()}`, {
+          cache: "no-store",
+          next: { revalidate: 0 },
+        });
         if (!res.ok) throw new Error(`manage failed (${res.status})`);
         setManageSyncError(null);
         await loadStats();
@@ -547,7 +556,10 @@ export default function TodayPage() {
     try {
       setLoadingAuto(true);
       setAutoError(null);
-      const res = await fetch("/api/auto-manage");
+      const res = await fetch(`/api/auto-manage?_=${Date.now()}`, {
+        cache: "no-store",
+        next: { revalidate: 0 },
+      });
       if (!res.ok)
         throw new Error(
           `Failed to fetch auto-managed trades: ${res.statusText}`

@@ -100,7 +100,10 @@ export const TradingProvider: React.FC<TradingProviderProps> = ({
   useEffect(() => {
     async function loadTrades() {
       try {
-        const res = await fetch("/api/trades");
+        const res = await fetch(`/api/trades?_=${Date.now()}`, {
+          cache: "no-store",
+          next: { revalidate: 0 },
+        });
         if (!res.ok) {
           console.error("Failed to load trades from DB");
           return;

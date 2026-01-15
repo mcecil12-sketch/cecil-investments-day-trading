@@ -263,7 +263,7 @@ export default function TradesPage() {
         setLoading(true);
         setError(null);
 
-        const res = await fetch("/api/trades", {
+        const res = await fetch(`/api/trades?_=${Date.now()}`, {
           method: "GET",
           headers: {
             "Content-Type": "application/json",
