@@ -20,6 +20,13 @@ function isPending(s: any) {
   return st === "PENDING" || st === "";
 }
 
+function shouldSkipBackoff(signal: any, nowMs: number): boolean {
+  const nextScoreAt = signal?.nextScoreAt;
+  if (!nextScoreAt) return false;
+  const nextMs = new Date(nextScoreAt).getTime();
+  return Number.isFinite(nextMs) && nowMs < nextMs;
+}
+
 export async function POST(req: Request) {
   const cronToken = req.headers.get("x-cron-token") || "";
   const autoToken = req.headers.get("x-auto-entry-token") || "";
@@ -50,14 +57,20 @@ export async function POST(req: Request) {
       return Number.isFinite(t) && t >= sinceMs;
     });
 
-  const pending = recent.filter(isPending);
-  const picked = pending.slice(0, limit);
+  const pendingAll = recent.filter(isPending);
+    const pending = pendingAll.filter((x: any) => !shouldSkipBackoff(x, now.getTime()));
+    const picked = pending.slice(0, limit);
 
   const updated: StoredSignal[] = [];
   const errors: any[] = [];
 
+  const _nowIso = new Date().toISOString();
+
   for (const s of picked) {
     try {
+      const _attempts = ((s as any)?.scoreAttempts ?? 0) + 1;
+      const _nextScoreAt = new Date(now.getTime() + Math.pow(2, Math.min(_attempts, 6)) * 60000).toISOString();
+
       const raw: RawSignal = {
         id: String(s.id),
         ticker: String(s.ticker),
@@ -95,7 +108,10 @@ export async function POST(req: Request) {
           qualified: false,
           shownInApp: false,
           reasoning: "AI parse failed",
-          updatedAt: new Date().toISOString(),
+          updatedAt: _nowIso,
+          lastScoreAttemptAt: _nowIso,
+          scoreAttempts: _attempts,
+          nextScoreAt: _nextScoreAt,
         };
         updated.push(fail);
         continue;
