@@ -66,8 +66,15 @@ export async function POST(req: Request) {
 
   const _nowIso = new Date().toISOString();
 
+    const TIME_BUDGET_MS = Number(process.env.SCORE_PENDING_TIME_BUDGET_MS ?? 25000);
+    const startedMs = Date.now();
+
   for (const s of picked) {
     try {
+        if (Date.now() - startedMs > TIME_BUDGET_MS) {
+          errors.push({ id: null, ticker: null, message: `time_budget_exhausted_${TIME_BUDGET_MS}ms` });
+          break;
+        }
       const _attempts = ((s as any)?.scoreAttempts ?? 0) + 1;
       const _nextScoreAt = new Date(now.getTime() + Math.pow(2, Math.min(_attempts, 6)) * 60000).toISOString();
 
