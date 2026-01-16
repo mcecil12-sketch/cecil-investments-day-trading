@@ -151,7 +151,10 @@ export async function POST(req: Request) {
         status: _shouldDefer ? "PENDING" : "SCORED",
         score: _shouldDefer ? null : (_scoreRaw as any),
         grade: _shouldDefer ? null : ((scored.aiGrade as any) ?? null),
-        updatedAt: new Date().toISOString(),          lastScoreAttemptAt: _nowIso,          scoreAttempts: _attempts,          nextScoreAt: (_shouldDefer ? _nextScoreAt : null),
+        updatedAt: _nowIso,
+        lastScoreAttemptAt: _nowIso,
+        scoreAttempts: _attempts,
+        nextScoreAt: (_shouldDefer ? _nextScoreAt : null),
 };
 
       updated.push(final);
