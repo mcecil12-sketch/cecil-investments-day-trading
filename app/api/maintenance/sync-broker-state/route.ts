@@ -49,7 +49,7 @@ export async function POST(req: NextRequest) {
   }
 
   const url = new URL(req.url);
-  const sinceHours = asNum(url.searchParams.get("sinceHours")) ?? 72;
+  const sinceHours = asNum(url.searchParams.get("sinceHours")) ?? 336;
   const clampedHours = Math.max(1, Math.min(336, sinceHours));
   const sinceIso = isoHoursAgo(clampedHours);
 
@@ -58,16 +58,15 @@ export async function POST(req: NextRequest) {
   const trades = await readTrades();
 
   const candidates = trades.filter((t: any) => {
-    const createdAt = t?.createdAt ?? "";
     const status = t?.status;
-    const aes = t?.autoEntryStatus;
-    const alive =
-      status === "OPEN" ||
-      status === "AUTO_PENDING" ||
-      aes === "OPEN" ||
-      aes === "AUTO_PENDING";
-    const recentEnough = createdAt && createdAt >= sinceIso;
-    return alive && recentEnough;
+    // Include all non-terminal trades (not CLOSED and not ERROR)
+    const isTerminal = status === "CLOSED" || status === "ERROR";
+    if (isTerminal) return false;
+    
+    // Time filtering: use updatedAt ?? createdAt, tolerate missing timestamps
+    const timestamp = t?.updatedAt ?? t?.createdAt;
+    if (!timestamp) return true; // Include trades with no timestamp
+    return timestamp >= sinceIso;
   });
 
   const positions = (await alpacaRequest({ method: "GET", path: "/v2/positions" }))
@@ -87,6 +86,7 @@ export async function POST(req: NextRequest) {
   let filledToOpen = 0;
   let canceledOrRejected = 0;
   let missingAtBroker = 0;
+  let closedGhosts = 0;
 
   const nowIso = new Date().toISOString();
 
@@ -143,6 +143,22 @@ export async function POST(req: NextRequest) {
       canceledOrRejected++;
       changed = true;
     } else if (!orderId && !brokerHasPosition) {
+      // Ghost detection: trade is alive but has no broker position and no order
+      // Apply safety delay: only if trade is older than 15 minutes
+      const timestamp = t?.updatedAt ?? t?.createdAt;
+      if (timestamp) {
+        const ageMs = Date.now() - new Date(timestamp).getTime();
+        const fifteenMinutesMs = 15 * 60 * 1000;
+        if (ageMs > fifteenMinutesMs) {
+          t.status = "ERROR";
+          t.autoEntryStatus = "AUTO_ERROR";
+          t.error = "broker_missing";
+          t.closeReason = "stale_no_broker_position_or_order";
+          t.updatedAt = nowIso;
+          closedGhosts++;
+          changed = true;
+        }
+      }
       missingAtBroker++;
     } else {
       if (brokerStatus && t.alpacaStatus !== brokerStatus) {
@@ -172,6 +188,7 @@ export async function POST(req: NextRequest) {
     filledToOpen,
     canceledOrRejected,
     missingAtBroker,
+    closedGhosts,
   };
 
   await writeSyncMetrics(summary);
