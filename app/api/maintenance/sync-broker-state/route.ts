@@ -1,9 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { requireCronToken } from "@/lib/auth";
-import { alpacaGet } from "@/lib/alpaca";
-import { getTrades, saveTrades } from "@/lib/trades";
-import { getRedis } from "@/lib/redis";
-import { etDateFromNow } from "@/lib/time";
+import { alpacaRequest } from "@/lib/alpaca";
+import { readTrades, writeTrades } from "@/lib/tradesStore";
+import { redis } from "@/lib/redis";
+import { nowETDate } from "@/lib/performance/time";
 
 type AlpacaPosition = { symbol: string };
 type AlpacaOrder = {
@@ -25,12 +24,16 @@ function asNum(v: any): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+function isAuthed(req: NextRequest) {
+  const tok = req.headers.get("x-cron-token") || "";
+  return Boolean(process.env.CRON_TOKEN && tok && tok === process.env.CRON_TOKEN);
+}
+
 async function writeSyncMetrics(summary: any) {
   try {
-    const redis = getRedis();
     if (!redis) return;
 
-    const dateET = etDateFromNow();
+    const dateET = nowETDate();
     const key = `brokerSync:summary:v1:${dateET}`;
 
     await redis.set(key, JSON.stringify(summary));
@@ -41,7 +44,9 @@ async function writeSyncMetrics(summary: any) {
 }
 
 export async function POST(req: NextRequest) {
-  requireCronToken(req);
+  if (!isAuthed(req)) {
+    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+  }
 
   const url = new URL(req.url);
   const sinceHours = asNum(url.searchParams.get("sinceHours")) ?? 72;
@@ -50,8 +55,7 @@ export async function POST(req: NextRequest) {
 
   const startedAt = new Date().toISOString();
 
-  const tradesData = await getTrades();
-  const trades = (tradesData as any)?.trades ?? [];
+  const trades = await readTrades();
 
   const candidates = trades.filter((t: any) => {
     const createdAt = t?.createdAt ?? "";
@@ -66,12 +70,18 @@ export async function POST(req: NextRequest) {
     return alive && recentEnough;
   });
 
-  const positions = (await alpacaGet("/v2/positions")) as AlpacaPosition[];
-  const openOrders = (await alpacaGet("/v2/orders?status=open&limit=500")) as AlpacaOrder[];
+  const positions = (await alpacaRequest({ method: "GET", path: "/v2/positions" }))
+    .text
+    ? JSON.parse((await alpacaRequest({ method: "GET", path: "/v2/positions" })).text || "[]")
+    : [];
+  const openOrders = (await alpacaRequest({ method: "GET", path: "/v2/orders?status=open&limit=500" }))
+    .text
+    ? JSON.parse((await alpacaRequest({ method: "GET", path: "/v2/orders?status=open&limit=500" })).text || "[]")
+    : [];
 
-  const posSet = new Set((positions ?? []).map((p) => p.symbol));
+  const posSet = new Set((positions ?? []).map((p: AlpacaPosition) => p.symbol));
   const openOrderById = new Map<string, AlpacaOrder>();
-  for (const o of openOrders ?? []) openOrderById.set(o.id, o);
+  for (const o of openOrders ?? []) openOrderById.set((o as AlpacaOrder).id, o as AlpacaOrder);
 
   let updated = 0;
   let filledToOpen = 0;
@@ -94,7 +104,8 @@ export async function POST(req: NextRequest) {
         filledAvg = asNum(open.filled_avg_price);
       } else {
         try {
-          const ord = (await alpacaGet(`/v2/orders/${orderId}`)) as AlpacaOrder;
+          const resp = await alpacaRequest({ method: "GET", path: `/v2/orders/${orderId}` });
+          const ord = resp.ok ? JSON.parse(resp.text) : null;
           brokerStatus = ord?.status ?? null;
           filledAvg = asNum(ord?.filled_avg_price);
         } catch {
@@ -144,7 +155,7 @@ export async function POST(req: NextRequest) {
     if (changed) updated++;
   }
 
-  await saveTrades({ trades });
+  await writeTrades(trades);
 
   const summary = {
     ok: true,
