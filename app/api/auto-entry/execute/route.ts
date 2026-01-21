@@ -97,6 +97,110 @@ function safeNum(v: any, fb = 0) {
   return Number.isFinite(n) ? n : fb;
 }
 
+/**
+ * Check if a trade is stale (created more than 6 hours ago or not from today ET).
+ * Returns true if stale, false if recent.
+ */
+function isStaleAutoPending(createdAt: string | undefined, etDate: string): boolean {
+  if (!createdAt) return false; // Assume recent if no timestamp
+  try {
+    const createdDate = new Date(createdAt);
+    const nowMs = Date.now();
+    const ageMs = nowMs - createdDate.getTime();
+    const ageHours = ageMs / (1000 * 60 * 60);
+    if (ageHours > 6) return true; // Older than 6 hours
+    
+    // Also check if createdAt is not from today ET
+    const createdETDate = etDateString(createdDate);
+    if (createdETDate !== etDate) return true; // Not from today
+  } catch {
+    return false; // If parsing fails, assume valid
+  }
+  return false;
+}
+
+/**
+ * Check if entry price has drifted too much from decision price.
+ * Returns rejection reason if drifted, null if acceptable.
+ */
+function checkPriceDrift(
+  decisionPrice: number,
+  entryPrice: number,
+  stopPrice: number
+): string | null {
+  if (decisionPrice <= 0 || entryPrice <= 0) return null;
+  
+  const priceDriftPct = Math.abs(decisionPrice - entryPrice) / entryPrice;
+  
+  // Allow 1-2% drift
+  if (priceDriftPct > 0.02) {
+    return "entry_price_drifted_too_much";
+  }
+  
+  // Also check if drift exceeds 0.5R risk distance
+  const riskPerShare = Math.abs(entryPrice - stopPrice);
+  if (riskPerShare > 0 && Math.abs(decisionPrice - entryPrice) > 0.5 * riskPerShare) {
+    return "entry_price_drifted_risk_multiple";
+  }
+  
+  return null;
+}
+
+/**
+ * Validate and repair bracket prices before submission.
+ * Returns { valid: boolean, tp: number, stop: number, reason?: string }
+ */
+function validateAndRepairBracket(params: {
+  side: "LONG" | "SHORT";
+  basePrice: number;
+  takeProfitPrice: number;
+  stopPrice: number;
+}): { valid: boolean; tp: number; stop: number; reason?: string } {
+  const { side, basePrice, takeProfitPrice, stopPrice } = params;
+  const isLong = side === "LONG";
+  const tick = 0.01;
+  
+  const roundUp = (x: number) => Number((Math.ceil(x / tick) * tick).toFixed(2));
+  const roundDown = (x: number) => Number((Math.floor(x / tick) * tick).toFixed(2));
+  
+  // Validate stop price direction
+  if (isLong && stopPrice >= basePrice) {
+    return { valid: false, tp: takeProfitPrice, stop: stopPrice, reason: "stop_price_invalid_for_side" };
+  }
+  if (!isLong && stopPrice <= basePrice) {
+    return { valid: false, tp: takeProfitPrice, stop: stopPrice, reason: "stop_price_invalid_for_side" };
+  }
+  
+  // Validate TP meets minimum requirements
+  const minTpLong = basePrice + tick;
+  const maxTpShort = basePrice - tick;
+  
+  let tp = takeProfitPrice;
+  const tpIsValid = isLong ? (tp >= minTpLong) : (tp <= maxTpShort);
+  
+  if (!tpIsValid) {
+    // Try to repair TP using risk multiple
+    const stopDist = Math.abs(basePrice - stopPrice);
+    if (stopDist < tick) {
+      return { valid: false, tp, stop: stopPrice, reason: "stop_distance_too_small" };
+    }
+    
+    const repairedTp = isLong 
+      ? roundUp(basePrice + 2 * stopDist) 
+      : roundDown(basePrice - 2 * stopDist);
+    
+    // Check if repaired TP is now valid
+    const repairedTpValid = isLong ? (repairedTp >= minTpLong) : (repairedTp <= maxTpShort);
+    if (!repairedTpValid) {
+      return { valid: false, tp: repairedTp, stop: stopPrice, reason: "invalid_bracket_prices_unrepairable" };
+    }
+    
+    return { valid: true, tp: repairedTp, stop: stopPrice, reason: "bracket_repaired_with_risk_multiple" };
+  }
+  
+  return { valid: true, tp, stop: stopPrice };
+}
+
 function headerToken(req: Request) {
   const h = req.headers.get("x-auto-entry-token") || "";
   if (h) return h;
@@ -433,7 +537,21 @@ export async function POST(req: Request) {
     const isLong = sideStr === "LONG";
     let invalidError: string | null = null;
 
-    if (entryPrice <= 0 || stopPrice <= 0 || takeProfitPrice <= 0) {
+    // Check if trade is stale (created >6h ago or not from today ET)
+    if (isStaleAutoPending(candidate.createdAt, etDate)) {
+      invalidError = "stale_auto_pending";
+    }
+    // Check for price drift between decision price and entry price
+    else if (!invalidError && candidate.decisionPrice) {
+      const driftReason = checkPriceDrift(
+        safeNum(candidate.decisionPrice, 0),
+        entryPrice,
+        stopPrice
+      );
+      if (driftReason) invalidError = driftReason;
+    }
+    // Original basic validations
+    else if (entryPrice <= 0 || stopPrice <= 0 || takeProfitPrice <= 0) {
       invalidError = "auto_entry_invalid_missing_prices_any";
     } else if (isLong && stopPrice >= entryPrice) {
       invalidError = "auto_entry_invalid_bad_stop";
@@ -612,13 +730,30 @@ export async function POST(req: Request) {
       const roundUp = (x: number) => Number((Math.ceil(x / tick) * tick).toFixed(2));
       const roundDown = (x: number) => Number((Math.floor(x / tick) * tick).toFixed(2));
 
+      // Validate and repair bracket BEFORE submitting order
+      const bracketCheck = validateAndRepairBracket({
+        side: sideDirection === "buy" ? "LONG" : "SHORT",
+        basePrice: entryPrice,
+        takeProfitPrice: tp,
+        stopPrice: bracketStop,
+      });
+      
+      if (!bracketCheck.valid) {
+        // Return poison flag to trigger disabling
+        return { __poison: true, message: `bracket_validation_failed: ${bracketCheck.reason || "unknown"}` } as any;
+      }
+      
+      // Use repaired bracket if it was corrected
+      let finalTp = bracketCheck.tp;
+      let finalStop = bracketCheck.stop;
+
       const minTpLong = roundUp(entryPrice + tick);
       const maxTpShort = roundDown(entryPrice - tick);
 
       const wantTp =
         sideDirection === "buy"
-          ? tp >= minTpLong
-          : tp <= maxTpShort;
+          ? finalTp >= minTpLong
+          : finalTp <= maxTpShort;
 
       const payload: any = {
         symbol: ticker,
@@ -627,10 +762,10 @@ export async function POST(req: Request) {
         type: "market",
         time_in_force: "day",
         order_class: wantTp ? "bracket" : "oto",
-        stop_loss: { stop_price: bracketStop },
+        stop_loss: { stop_price: finalStop },
       };
 
-      if (wantTp) payload.take_profit = { limit_price: tp };
+      if (wantTp) payload.take_profit = { limit_price: finalTp };
 
       try {
         return await createOrder(payload);
