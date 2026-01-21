@@ -49,9 +49,9 @@ export async function POST(req: NextRequest) {
   }
 
   const url = new URL(req.url);
-  const sinceHours = asNum(url.searchParams.get("sinceHours")) ?? 336;
-  const clampedHours = Math.max(1, Math.min(336, sinceHours));
-  const sinceIso = isoHoursAgo(clampedHours);
+  const sinceHoursParam = asNum(url.searchParams.get("sinceHours"));
+  const sinceHours = sinceHoursParam !== null ? Math.max(1, Math.min(336, sinceHoursParam)) : null;
+  const sinceIso = sinceHours !== null ? isoHoursAgo(sinceHours) : null;
 
   const startedAt = new Date().toISOString();
 
@@ -63,7 +63,10 @@ export async function POST(req: NextRequest) {
     const isTerminal = status === "CLOSED" || status === "ERROR";
     if (isTerminal) return false;
     
-    // Time filtering: use updatedAt ?? createdAt, tolerate missing timestamps
+    // Time filtering: only apply if sinceHours was explicitly provided
+    if (sinceIso === null) return true; // No time filter when sinceHours not provided
+    
+    // Use updatedAt ?? createdAt, tolerate missing timestamps
     const timestamp = t?.updatedAt ?? t?.createdAt;
     if (!timestamp) return true; // Include trades with no timestamp
     return timestamp >= sinceIso;
@@ -173,12 +176,10 @@ export async function POST(req: NextRequest) {
 
   await writeTrades(trades);
 
-  const summary = {
+  const summary: any = {
     ok: true,
     startedAt,
     finishedAt: new Date().toISOString(),
-    sinceHours: clampedHours,
-    sinceIso,
     broker: {
       positions: positions?.length ?? 0,
       openOrders: openOrders?.length ?? 0,
@@ -190,6 +191,12 @@ export async function POST(req: NextRequest) {
     missingAtBroker,
     closedGhosts,
   };
+
+  // Only include sinceHours and sinceIso when explicitly provided
+  if (sinceHours !== null) {
+    summary.sinceHours = sinceHours;
+    summary.sinceIso = sinceIso;
+  }
 
   await writeSyncMetrics(summary);
 
