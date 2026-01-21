@@ -385,6 +385,7 @@ export async function POST(req: Request) {
 
   if (openPositions >= guardConfig.maxOpenPositions) {
     counts.skipped += 1;
+    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "max_open_positions", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
       { ok: true, skipped: true, reason: "max_open_positions", counts, guardrails: guardSummary },
       { status: 200 }
@@ -393,6 +394,7 @@ export async function POST(req: Request) {
 
   if (guardState.entriesToday >= guardConfig.maxEntriesPerDay) {
     counts.skipped += 1;
+    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "max_entries_per_day", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
       { ok: true, skipped: true, reason: "max_entries_per_day", counts, guardrails: guardSummary },
       { status: 200 }
@@ -404,6 +406,7 @@ export async function POST(req: Request) {
     const minsRemaining = Math.ceil(guardConfig.cooldownAfterLossMin - sinceLoss);
     guardSummary.cooldownRemainingMin = minsRemaining;
     counts.skipped += 1;
+    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "cooldown_after_loss", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
       {
         ok: true,
@@ -457,6 +460,7 @@ export async function POST(req: Request) {
 
   if (idx === -1) {
     counts.skipped += 1;
+    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "no_AUTO_PENDING", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
       { ok: true, skipped: true, reason: "no_AUTO_PENDING_trades", counts, guardrails: guardSummary },
       { status: 200 }
@@ -472,6 +476,7 @@ export async function POST(req: Request) {
   if (sinceTicker != null && sinceTicker < guardConfig.tickerCooldownMin) {
     const minsRemaining = Math.ceil(guardConfig.tickerCooldownMin - sinceTicker);
     counts.skipped += 1;
+    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "ticker_cooldown", ticker, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
       {
         ok: true,
@@ -521,6 +526,7 @@ export async function POST(req: Request) {
   }
   if (open.orders.length > 0) {
     counts.skipped += 1;
+    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "open_order_exists", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
       { ok: true, skipped: true, reason: "open_order_exists", tradeId, openOrders: open.orders.map((o: any) => ({ id: o.id, symbol: o.symbol, side: o.side, type: o.type, status: o.status })), counts, guardrails: guardSummary },
       { status: 200 }
@@ -663,6 +669,7 @@ export async function POST(req: Request) {
     if ((order as any)?.__poison) {
       counts.invalidMarked += 1;
       await disableTradeAsPoison(tradeId, "invalid_stop_vs_base_price");
+      await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "invalid_stop_vs_base_price", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
       return NextResponse.json(
         { ok: true, skipped: true, reason: "invalid_stop_vs_base_price", tradeId, counts, guardrails: guardSummary },
         { status: 200 }
