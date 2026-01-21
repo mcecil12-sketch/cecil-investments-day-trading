@@ -9,6 +9,24 @@ jobs:
   loop:
     runs-on: ubuntu-latest
     steps:
+      - name: Sync broker state
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID="gha-market-loop-sync-$(date +%s)"
+          CODE="$(curl -sS -o /tmp/sync_broker_state.json -w "%{http_code}" -X POST "$BASE/api/maintenance/sync-broker-state" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: gha-market-loop" \
+            -H "x-run-id: $RUN_ID" \
+            -d '{}')"
+          cat /tmp/sync_broker_state.json | head -c 4000 || true
+          echo
+          echo "HTTP $CODE"
+          if [ "$CODE" -ne 200 ]; then exit 1; fi
+
       - name: run loop
         env:
           BASE: ${{ secrets.PROD_BASE_URL }}
