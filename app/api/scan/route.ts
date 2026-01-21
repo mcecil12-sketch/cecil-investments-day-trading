@@ -624,14 +624,62 @@ function clamp(n: number, lo: number, hi: number) {
     return Math.round(score);
   }
 
-  function minutesSinceOpenFromBars(bars: any[]) {
-    if (!bars || !bars.length) return 999;
-    const first = bars[0];
-    const last = bars[bars.length - 1];
-    const t0 = new Date(first.t).getTime();
-    const t1 = new Date(last.t).getTime();
-        if (!isFinite(t0) || !isFinite(t1) || t1 <= t0) return 999;
-    return Math.floor((t1 - t0) / 60000);
+  /**
+   * Compute minutes since market open (9:30 AM ET).
+   * Prefers using actual bar data if available and recent.
+   * Falls back to Alpaca clock timestamp if bars are sparse/thin.
+   * When market is open but cannot compute, defaults to 0 (safe).
+   * Only returns 999 (sentinel) if market is definitely closed.
+   * 
+   * @param bars - Candidate bars (for bar-based computation)
+   * @param clock - Alpaca clock object with timestamp and is_open
+   * @param marketOpen - true if open, false if closed, null if unknown (clock fetch failed)
+   *                     CRITICAL: only return 999 if marketOpen === false
+   *                     Return 0 for null (unknown) to avoid false SKIPs on clock fetch failures
+   */
+  function minutesSinceOpenFromBars(bars: any[], clock: any, marketOpen: boolean | null): number {
+    // Market is definitely closed: return sentinel 999
+    if (marketOpen === false) return 999;
+
+    // Prefer bar-based computation if we have recent bars
+    if (bars && bars.length >= 2) {
+      const first = bars[0];
+      const last = bars[bars.length - 1];
+      const t0 = new Date(first.t).getTime();
+      const t1 = new Date(last.t).getTime();
+      if (isFinite(t0) && isFinite(t1) && t1 > t0) {
+        const minutesDiff = Math.floor((t1 - t0) / 60000);
+        // If bars span a reasonable time range, use it
+        if (minutesDiff >= 0 && minutesDiff <= 390) { // 390 min = 6.5 hours (market open + buffer)
+          return minutesDiff;
+        }
+      }
+    }
+
+    // Fall back to clock-based computation (market open is 9:30 AM ET)
+    // Only attempt if clock is available and market status is not definitively closed
+    if ((marketOpen === true || marketOpen === null) && clock && clock.timestamp) {
+      try {
+        const nowMs = new Date(clock.timestamp).getTime();
+        if (!isFinite(nowMs)) return 0; // Safe default
+
+        // Compute today's market open time (9:30 AM ET)
+        const now = new Date(clock.timestamp);
+        const marketOpenET = new Date(now);
+        marketOpenET.setUTCHours(13, 30, 0, 0); // 9:30 AM ET = 13:30 UTC
+        const openMs = marketOpenET.getTime();
+
+        if (isFinite(openMs) && nowMs >= openMs) {
+          const minutes = Math.floor((nowMs - openMs) / 60000);
+          return Math.max(0, minutes); // Never negative
+        }
+      } catch (e) {
+        // Ignore computation errors
+      }
+    }
+
+    // Market status unknown or open but cannot compute: safe default (not 999)
+    return 0;
   }
 
 const reject = (
@@ -667,10 +715,11 @@ const logSummary = () => {
   return summary;
 };
 
-  if (aiSeedMode) {
-    // Market-aware: don’t run ai-seed off-hours when minute bars go thin
+  // Fetch Alpaca market clock for all modes (needed for minutesSinceOpen computation)
+  let clock: any = null;
+  try {
     const clockUrl = `${ALPACA_BASE_URL.replace(/\/+$/, "")}/v2/clock`;
-    const clock = await fetch(clockUrl, {
+    clock = await fetch(clockUrl, {
       headers: {
         "APCA-API-KEY-ID": ALPACA_API_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
@@ -679,7 +728,13 @@ const logSummary = () => {
     })
       .then((r) => (r.ok ? r.json() : null))
       .catch(() => null);
+  } catch (e) {
+    // Ignore clock fetch errors, proceed with null clock
+  }
 
+  if (aiSeedMode) {
+    // Market-aware: don’t run ai-seed off-hours when minute bars go thin
+    
     if ((clock && clock.is_open === false) && !(debugScan && (search.get("force") === "1"))) {
       try {
         await bumpScanSkip(mode, {
@@ -903,7 +958,10 @@ const logSummary = () => {
   }
 
   // Sort by pattern strength and take top N, dropping zero/negative scores
-  const minutesSinceOpen = minutesSinceOpenFromBars(candidates as any);
+  // Three-state market status: true (open), false (closed), null (unknown/clock failed)
+  // Only return 999 sentinel if definitively closed; treat unknown as open to avoid false SKIPs
+  const marketOpen = clock?.is_open === true ? true : (clock ? false : null);
+  const minutesSinceOpen = minutesSinceOpenFromBars(candidates as any, clock, marketOpen);
   const openingMode = minutesSinceOpen <= AI_SEED_OPENING_MINUTES;
 
   const enriched = candidates.map((c: any) => {
