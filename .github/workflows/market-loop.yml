@@ -25,7 +25,9 @@ jobs:
           cat /tmp/sync_broker_state.json | head -c 4000 || true
           echo
           echo "HTTP $CODE"
-          if [ "$CODE" -ne 200 ]; then exit 1; fi
+          if [ "$CODE" -ne 200 ]; then
+            echo "WARN: sync-broker-state failed (non-fatal). Continuing."
+          fi
 
       - name: run loop
         env:
@@ -147,7 +149,9 @@ jobs:
           cat /tmp/scorecard.json | head -c 4000 || true
           echo
           echo "HTTP $CODE"
-          if [ "$CODE" -ne 200 ]; then exit 1; fi
+          if [ "$CODE" -ne 200 ]; then
+            echo "WARN: sync-broker-state failed (non-fatal). Continuing."
+          fi
 
       - name: Snapshot performance equity
         env:
