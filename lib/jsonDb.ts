@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { redis } from "@/lib/redis";
 import { TradePlan } from "@/lib/tradePlan";
+import { setWithTtl, getTtlSeconds } from "@/lib/redis/ttl";
 
 export type SignalSide = "LONG" | "SHORT";
 
@@ -74,7 +75,8 @@ export async function readSignals(): Promise<StoredSignal[]> {
 
 export async function writeSignals(signals: StoredSignal[]): Promise<void> {
   if (redis) {
-    await redis.set(SIGNALS_KEY, signals);
+    const ttl = getTtlSeconds("SIGNALS_DAYS");
+    await setWithTtl(redis, SIGNALS_KEY, signals, ttl);
     return;
   }
 

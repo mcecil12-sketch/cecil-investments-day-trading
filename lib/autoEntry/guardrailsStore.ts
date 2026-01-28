@@ -1,5 +1,6 @@
 import { redis } from "@/lib/redis";
 import { GuardrailConfig } from "./guardrails";
+import { getTtlSeconds, ensureExpire } from "@/lib/redis/ttl";
 
 const PREFIX = "ae:guardrails:v1";
 const ENABLE_KEY = "ae:auto-entry:enabled";
@@ -67,12 +68,17 @@ export async function bumpEntry(etDate: string, ticker: string) {
   await redis.hincrby(key, "entriesToday", 1);
   await redis.hset(key, { lastEntryAt: now });
   await redis.hset(key, { [tickerField(ticker)]: now });
+  const ttl = getTtlSeconds("GUARDRAILS_DAYS");
+  await ensureExpire(redis, key, ttl);
 }
 
 export async function resetFailures(etDate: string) {
   if (!redis) return;
-  await redis.hset(guardKey(etDate), { consecutiveFailures: "0" });
-  await redis.hdel(guardKey(etDate), "autoDisabledReason");
+  const key = guardKey(etDate);
+  await redis.hset(key, { consecutiveFailures: "0" });
+  await redis.hdel(key, "autoDisabledReason");
+  const ttl = getTtlSeconds("GUARDRAILS_DAYS");
+  await ensureExpire(redis, key, ttl);
 }
 
 export async function recordFailure(etDate: string, reason: string, opts?: { markLoss?: boolean }) {
@@ -83,12 +89,17 @@ export async function recordFailure(etDate: string, reason: string, opts?: { mar
     await redis.hset(key, { lastLossAt: now });
   }
   const count = await redis.hincrby(key, "consecutiveFailures", 1);
+  const ttl = getTtlSeconds("GUARDRAILS_DAYS");
+  await ensureExpire(redis, key, ttl);
   return count;
 }
 
 export async function setAutoDisabled(etDate: string, reason: string) {
   if (!redis) return;
-  await redis.hset(guardKey(etDate), { autoDisabledReason: reason });
+  const key = guardKey(etDate);
+  await redis.hset(key, { autoDisabledReason: reason });
+  const ttl = getTtlSeconds("GUARDRAILS_DAYS");
+  await ensureExpire(redis, key, ttl);
 }
 
 export async function clearAutoDisabled(etDate: string) {
@@ -115,7 +126,10 @@ export async function resetGuardrails(etDate: string, opts?: { resetEntries?: bo
 
 export async function recordLoss(etDate: string, atIso: string) {
   if (!redis) return;
-  await redis.hset(guardKey(etDate), { lastLossAt: atIso });
+  const key = guardKey(etDate);
+  await redis.hset(key, { lastLossAt: atIso });
+  const ttl = getTtlSeconds("GUARDRAILS_DAYS");
+  await ensureExpire(redis, key, ttl);
 }
 
 function parseBooleanFlag(value: string | null | undefined): boolean | null {

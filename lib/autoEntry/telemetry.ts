@@ -1,4 +1,5 @@
 import { redis } from "@/lib/redis";
+import { getTtlSeconds, ensureExpire, trimList } from "@/lib/redis/ttl";
 
 export type AutoEntryOutcome = "SUCCESS" | "SKIP" | "FAIL";
 
@@ -102,7 +103,7 @@ export async function recordAutoEntryTelemetry(e: AutoEntryTelemetryEvent) {
     });
 
     await safeLpush(rk, JSON.stringify(e));
-    await safeLtrim(rk, 0, 199);
+    await trimList(redis, rk, 200);
 
     try {
       await redis.hset(dk, {
@@ -112,8 +113,9 @@ export async function recordAutoEntryTelemetry(e: AutoEntryTelemetryEvent) {
       });
     } catch {}
 
-    await redis.expire(dk, 60 * 60 * 24 * 35);
-    await redis.expire(rk, 60 * 60 * 24 * 35);
+    const ttl = getTtlSeconds("TELEMETRY_DAYS");
+    await ensureExpire(redis, dk, ttl);
+    await ensureExpire(redis, rk, ttl);
   } catch {
     // never break auto-entry for telemetry
   }

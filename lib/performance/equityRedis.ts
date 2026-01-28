@@ -1,6 +1,7 @@
 import { redis } from "@/lib/redis";
 import { nowETDate, etParts } from "@/lib/performance/time";
 import { num } from "@/lib/performance/math";
+import { getTtlSeconds, ensureExpire, trimList } from "@/lib/redis/ttl";
 
 export type EquityPoint = {
   ts: string;
@@ -54,7 +55,11 @@ export async function recordEquityPoint(p: Partial<EquityPoint>) {
   };
 
   try {
+    const ttl = getTtlSeconds("PERFORMANCE_EQUITY_DAYS");
+    
     await redis!.sadd(KEY_DATES, dateET);
+    await ensureExpire(redis, KEY_DATES, ttl);
+    
     await redis!.hset(keyLatest(dateET), {
       ts: point.ts,
       hhmm: String(point.hhmm),
@@ -67,8 +72,11 @@ export async function recordEquityPoint(p: Partial<EquityPoint>) {
       source: point.source || "",
       runId: point.runId || "",
     });
+    await ensureExpire(redis, keyLatest(dateET), ttl);
+    
     await redis!.lpush(keyPoints(dateET), JSON.stringify(point));
-    await redis!.ltrim(keyPoints(dateET), 0, 999);
+    await trimList(redis, keyPoints(dateET), 1000);
+    await ensureExpire(redis, keyPoints(dateET), ttl);
 
     return { ok: true, stored: true, redis: true, point };
   } catch (e: any) {

@@ -1,7 +1,8 @@
 import { redis } from "@/lib/redis";
+import { getTtlSeconds, setWithTtl } from "@/lib/redis/ttl";
 
 const KEY_PREFIX = "funnel:v2:";
-const TTL_SECONDS = 60 * 60 * 48;
+const TTL_SECONDS = getTtlSeconds("FUNNEL_DAYS");
 
 const NUMERIC_COUNTERS = [
   "scansRun",
@@ -80,7 +81,8 @@ function targetKey(date: string) {
 
 async function persistToday(today: FunnelToday) {
   if (!redis) return;
-  await redis.set(targetKey(today.date), today, { ex: TTL_SECONDS });
+  const ttl = getTtlSeconds("FUNNEL_DAYS");
+  await setWithTtl(redis, targetKey(today.date), today, ttl);
 }
 
 export async function readTodayFunnel(): Promise<FunnelToday> {

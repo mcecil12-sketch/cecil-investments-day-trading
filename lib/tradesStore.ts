@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import { redis } from "@/lib/redis";
+import { setWithTtl, getTtlSeconds } from "@/lib/redis/ttl";
 
 const DATA_PATH = path.join(process.cwd(), "data");
 const TRADES_FILE = path.join(DATA_PATH, "trades.json");
@@ -52,7 +53,8 @@ async function readFromRedis<T = any>(): Promise<T[]> {
 
 async function writeToRedis<T = any>(trades: T[]): Promise<void> {
   if (!redis) return;
-  await redis.set(REDIS_KEY, JSON.stringify(trades));
+  const ttl = getTtlSeconds("TRADES_DAYS");
+  await setWithTtl(redis, REDIS_KEY, JSON.stringify(trades), ttl);
 }
 
 export async function readTrades<T = any>(): Promise<T[]> {
