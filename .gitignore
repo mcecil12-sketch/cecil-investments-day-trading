@@ -49,3 +49,9 @@ cookies*.txt
 cookies-prod.txt
 cookies.txt
 .env*.local
+
+# local debug output
+0*-*.txt
+
+# local experiments
+lib/redis/
