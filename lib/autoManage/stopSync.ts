@@ -1,4 +1,5 @@
 import { alpacaRequest, createOrder, getOrder, getPositions } from "@/lib/alpaca";
+import { normalizeStopPrice, tickForEquityPrice } from "@/lib/tickSize";
 
 type Side = "LONG" | "SHORT";
 
@@ -108,13 +109,31 @@ export async function syncStopForTrade(trade: TradeLike, nextStopPrice: number):
 
     const stopSide = side === "SHORT" ? "buy" : "sell";
 
+    // Normalize stop price to ensure tick compliance
+    const entryPrice = num(trade.stopPrice) ?? 0; // Use current stop as fallback for directional check
+    const tick = tickForEquityPrice(entryPrice);
+    const normResult = normalizeStopPrice({
+      side,
+      entryPrice,
+      stopPrice: nextStopPrice,
+      tick,
+    });
+
+    if (!normResult.ok) {
+      return {
+        ok: false,
+        error: "stop_normalization_failed",
+        detail: `reason=${normResult.reason} original=${nextStopPrice} normalized=${normResult.stop || "N/A"}`,
+      };
+    }
+
     const stopOrder = await createOrder({
       symbol: ticker,
       qty,
       side: stopSide,
       type: "stop",
       time_in_force: "day",
-      stop_price: nextStopPrice,
+      stop_price: normResult.stop,
       extended_hours: false,
     });
 

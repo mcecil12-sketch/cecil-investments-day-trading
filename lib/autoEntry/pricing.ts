@@ -1,3 +1,5 @@
+import { normalizeStopPrice, normalizeLimitPrice, tickForEquityPrice } from "@/lib/tickSize";
+
 function round2(n: number) {
   return Math.round(n * 100) / 100;
 }
@@ -133,6 +135,24 @@ export function computeBracket({
   });
   takeProfitPrice = clamped.takeProfitPrice;
   stopPrice = clamped.stopPrice;
+
+  // FINAL normalization pass using tickSize utilities
+  const tick = tickForEquityPrice(entryPrice);
+  const stopNorm = normalizeStopPrice({
+    side,
+    entryPrice,
+    stopPrice,
+    tick,
+  });
+  if (stopNorm.ok) {
+    stopPrice = stopNorm.stop;
+  }
+
+  const tpNorm = normalizeLimitPrice({
+    price: takeProfitPrice,
+    tick,
+  });
+  takeProfitPrice = tpNorm;
 
   return { entryPrice, stopPrice, takeProfitPrice };
 }

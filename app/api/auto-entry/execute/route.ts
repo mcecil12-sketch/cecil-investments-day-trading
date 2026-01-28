@@ -12,6 +12,7 @@ import { fetchAlpacaClock } from "@/lib/alpacaClock";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { sendNotification } from "@/lib/notifications/notify";
 import { NotificationEvent } from "@/lib/notifications/types";
+import { normalizeStopPrice, normalizeLimitPrice, tickForEquityPrice } from "@/lib/tickSize";
 
 function ensureBracketLegsValid(params: {
   side: "LONG" | "SHORT";
@@ -726,10 +727,6 @@ export async function POST(req: Request) {
     ttlSeconds: 90,
     owner: `execute:${tradeId}`,
     fn: async () => {
-      const tick = 0.01;
-      const roundUp = (x: number) => Number((Math.ceil(x / tick) * tick).toFixed(2));
-      const roundDown = (x: number) => Number((Math.floor(x / tick) * tick).toFixed(2));
-
       // Validate and repair bracket BEFORE submitting order
       const bracketCheck = validateAndRepairBracket({
         side: sideDirection === "buy" ? "LONG" : "SHORT",
@@ -747,8 +744,23 @@ export async function POST(req: Request) {
       let finalTp = bracketCheck.tp;
       let finalStop = bracketCheck.stop;
 
-      const minTpLong = roundUp(entryPrice + tick);
-      const maxTpShort = roundDown(entryPrice - tick);
+      // Apply FINAL tick normalization
+      const tick = tickForEquityPrice(entryPrice);
+      const stopNorm = normalizeStopPrice({
+        side: sideDirection === "buy" ? "LONG" : "SHORT",
+        entryPrice,
+        stopPrice: finalStop,
+        tick,
+      });
+      if (!stopNorm.ok) {
+        return { __poison: true, message: `stop_normalization_failed: ${stopNorm.reason}` } as any;
+      }
+      finalStop = stopNorm.stop;
+
+      finalTp = normalizeLimitPrice({ price: finalTp, tick });
+
+      const minTpLong = Number((entryPrice + tick).toFixed(2));
+      const maxTpShort = Number((entryPrice - tick).toFixed(2));
 
       const wantTp =
         sideDirection === "buy"

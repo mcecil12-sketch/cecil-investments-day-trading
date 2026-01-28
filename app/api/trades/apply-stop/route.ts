@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { alpacaRequest, createOrder, getOrder, getPositions } from "@/lib/alpaca";
+import { normalizeStopPrice, tickForEquityPrice } from "@/lib/tickSize";
 
 type ApplyStopBody = {
   tradeId: string;
@@ -105,20 +106,44 @@ export async function POST(req: Request) {
     }
 
     const stopSide = trade.side?.toUpperCase() === "SHORT" ? "buy" : "sell";
+    
+    // Normalize stop price to ensure tick compliance
+    const entryPrice = Number(trade.entryPrice ?? 0);
+    const tick = tickForEquityPrice(entryPrice);
+    const normResult = normalizeStopPrice({
+      side: side as "LONG" | "SHORT",
+      entryPrice,
+      stopPrice,
+      tick,
+    });
+
+    if (!normResult.ok) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "stop_price_normalization_failed",
+          reason: normResult.reason,
+          original: stopPrice,
+          normalized: normResult.stop,
+        },
+        { status: 400 }
+      );
+    }
+
     const stopOrder = await createOrder({
       symbol: ticker,
       qty,
       side: stopSide,
       type: "stop",
       time_in_force: "day",
-      stop_price: stopPrice,
+      stop_price: normResult.stop,
       extended_hours: false,
     });
 
     const updatedTrade = {
       ...trade,
       quantity: qty,
-      stopPrice,
+      stopPrice: normResult.stop,
       stopOrderId: stopOrder.id,
       lastStopAppliedAt: nowIso,
       updatedAt: nowIso,

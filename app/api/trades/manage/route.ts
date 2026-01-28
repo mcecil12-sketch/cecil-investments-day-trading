@@ -9,6 +9,7 @@ import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { NotificationEvent } from "@/lib/notifications/types";
 import { sendNotification } from "@/lib/notifications/notify";
 import { getAllSignals } from "@/lib/signalsStore";
+import { normalizeStopPrice, tickForEquityPrice } from "@/lib/tickSize";
 
 async function fireNotification(event: NotificationEvent) {
   try {
@@ -122,7 +123,25 @@ async function autoApplyStop(trade: Trade, nowIso: string) {
     throw new Error("Stop leg not found");
   }
   const oldStop = stopLeg.stop_price;
-  const newStop = trade.suggestedStopPrice;
+  let newStop = trade.suggestedStopPrice;
+
+  // Normalize stop price before submission
+  const entryPrice = Number(trade.entryPrice ?? 0);
+  const tick = tickForEquityPrice(entryPrice);
+  const normResult = normalizeStopPrice({
+    side: (trade.side?.toUpperCase() as "LONG" | "SHORT") || "LONG",
+    entryPrice,
+    stopPrice: newStop,
+    tick,
+  });
+
+  if (!normResult.ok) {
+    throw new Error(
+      `Cannot apply stop: normalization failed (${normResult.reason}) for ${newStop}`
+    );
+  }
+
+  newStop = normResult.stop;
   await replaceOrder(stopLeg.id, { stop_price: newStop });
   console.log("[manage] auto-applied stop", {
     id: trade.id,
@@ -239,6 +258,15 @@ export async function GET() {
           ) {
             suggestedStopPrice = entry;
             stopSuggestionReason = "Move stop to breakeven at 1R";
+            // Normalize the suggested stop
+            const tick = tickForEquityPrice(entry);
+            const normBE = normalizeStopPrice({
+              side: (t.side?.toUpperCase() as "LONG" | "SHORT") || "LONG",
+              entryPrice: entry,
+              stopPrice: suggestedStopPrice,
+              tick,
+            });
+            if (normBE.ok) suggestedStopPrice = normBE.stop;
             console.log("[manage] stop suggestion BE", {
               id: t.id,
               ticker: t.ticker,
@@ -246,10 +274,18 @@ export async function GET() {
             });
           }
           if (unrealizedR != null && unrealizedR >= 2 && oneRVal > 0) {
-            const lockIn = t.side.toUpperCase() === "LONG"
+            const lockInRaw = t.side.toUpperCase() === "LONG"
               ? entry + oneRVal / t.size
               : entry - oneRVal / t.size;
-            suggestedStopPrice = lockIn;
+            // Normalize the computed stop
+            const tick = tickForEquityPrice(entry);
+            const normLock = normalizeStopPrice({
+              side: (t.side?.toUpperCase() as "LONG" | "SHORT") || "LONG",
+              entryPrice: entry,
+              stopPrice: lockInRaw,
+              tick,
+            });
+            suggestedStopPrice = normLock.ok ? normLock.stop : lockInRaw;
             stopSuggestionReason = "Lock at +1R (advisory)";
             console.log("[manage] stop suggestion lock", {
               id: t.id,

@@ -1,3 +1,5 @@
+import { normalizeStopPrice, normalizeLimitPrice, tickForEquityPrice } from "@/lib/tickSize";
+
 function stripV2(base: string) {
   return base.replace(/\/+$/, "").replace(/\/v2$/, "");
 }
@@ -92,20 +94,40 @@ function enforceBracketBasePriceConstraint(order: any) {
 
     if (!(base > 0)) return order;
 
-    const min = 0.01;
+    const tick = tickForEquityPrice(base);
+    const min = tick;
+
     if (side === "buy") {
       if (Number.isFinite(tp) && tp < base + min) {
-        order.take_profit = { ...(order.take_profit || {}), limit_price: Number((base + min).toFixed(2)) };
+        const normalized = normalizeLimitPrice({ price: base + min, tick });
+        order.take_profit = { ...(order.take_profit || {}), limit_price: normalized };
       }
       if (Number.isFinite(sl) && sl > base - min) {
-        order.stop_loss = { ...(order.stop_loss || {}), stop_price: Number((base - min).toFixed(2)) };
+        const normResult = normalizeStopPrice({
+          side: "LONG",
+          entryPrice: base,
+          stopPrice: base - min,
+          tick,
+        });
+        if (normResult.ok) {
+          order.stop_loss = { ...(order.stop_loss || {}), stop_price: normResult.stop };
+        }
       }
     } else if (side === "sell") {
       if (Number.isFinite(tp) && tp > base - min) {
-        order.take_profit = { ...(order.take_profit || {}), limit_price: Number((base - min).toFixed(2)) };
+        const normalized = normalizeLimitPrice({ price: base - min, tick });
+        order.take_profit = { ...(order.take_profit || {}), limit_price: normalized };
       }
       if (Number.isFinite(sl) && sl < base + min) {
-        order.stop_loss = { ...(order.stop_loss || {}), stop_price: Number((base + min).toFixed(2)) };
+        const normResult = normalizeStopPrice({
+          side: "SHORT",
+          entryPrice: base,
+          stopPrice: base + min,
+          tick,
+        });
+        if (normResult.ok) {
+          order.stop_loss = { ...(order.stop_loss || {}), stop_price: normResult.stop };
+        }
       }
     }
   } catch {
