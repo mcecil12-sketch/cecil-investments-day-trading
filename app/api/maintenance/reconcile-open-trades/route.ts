@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
 import { alpacaRequest } from "@/lib/alpaca";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 
@@ -29,15 +28,12 @@ async function safeJsonObject(text: string | undefined): Promise<any | null> {
 
 export async function POST(req: Request) {
   const token = req.headers.get("x-cron-token") || "";
-  const cookieStore = await cookies();
-  const sessionAuth = cookieStore.get("session")?.value;
 
-  if (sessionAuth) {
-    return NextResponse.json({ ok: true, authMode: 'session' }, { status: 200 });
-  }
+  const hasSession = req.headers.get("cookie")?.includes("session=") ?? false;
+  const hasToken = !!process.env.CRON_TOKEN && token === process.env.CRON_TOKEN;
 
-  if (!process.env.CRON_TOKEN || token !== process.env.CRON_TOKEN) {
-    return NextResponse.json({ ok: false, error: "unauthorized", authMode: null }, { status: 401 });
+  if (!hasSession && !hasToken) {
+    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
 
   const body = await req.json().catch(() => ({}));
