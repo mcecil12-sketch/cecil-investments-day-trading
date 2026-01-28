@@ -20,8 +20,8 @@ type TradeLike = {
 };
 
 export type StopSyncResult =
-  | { ok: true; qty: number; stopOrderId: string; cancelled: string[] }
-  | { ok: false; error: string; detail?: string };
+  | { ok: true; qty: number; stopOrderId: string; cancelled: string[]; quantizationNote?: string }
+  | { ok: false; error: string; detail?: string; quantizationNote?: string };
 
 const num = (v: any) => {
   const n = Number(v);
@@ -127,6 +127,13 @@ export async function syncStopForTrade(trade: TradeLike, nextStopPrice: number):
       };
     }
 
+    // Check if quantization changed the price significantly
+    const quantizationDiff = Math.abs(normResult.stop - nextStopPrice);
+    let quantizationNote: string | undefined;
+    if (quantizationDiff > 0.0001) {
+      quantizationNote = `price_adjusted_for_tick_compliance: ${nextStopPrice} -> ${normResult.stop} (diff: ${quantizationDiff.toFixed(6)})`;
+    }
+
     const stopOrder = await createOrder({
       symbol: ticker,
       qty,
@@ -137,7 +144,13 @@ export async function syncStopForTrade(trade: TradeLike, nextStopPrice: number):
       extended_hours: false,
     });
 
-    return { ok: true, qty, stopOrderId: String((stopOrder as any)?.id || ""), cancelled };
+    return { 
+      ok: true, 
+      qty, 
+      stopOrderId: String((stopOrder as any)?.id || ""), 
+      cancelled,
+      quantizationNote,
+    };
   } catch (err: any) {
     return { ok: false, error: "stop_sync_error", detail: err?.message ?? String(err) };
   }

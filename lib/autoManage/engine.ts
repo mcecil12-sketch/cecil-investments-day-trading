@@ -15,6 +15,7 @@ export type AutoManageResult = {
   now: string;
   market?: any;
   notes?: string[];
+  forced?: boolean;
   cfg: ReturnType<typeof getAutoManageConfig>;
 };
 
@@ -182,9 +183,15 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
             updatedAt: now,
             error: undefined,
           };
+          if (res.quantizationNote) {
+            notes.push(`quantize:${ticker}:${res.quantizationNote}`);
+          }
         } else {
           stopSyncOk = false;
           stopSyncNote = `${res.error}${res.detail ? ":" + res.detail : ""}`;
+          if (res.quantizationNote) {
+            stopSyncNote += ` [${res.quantizationNote}]`;
+          }
           next[idx] = {
             ...next[idx],
             autoManage: {
@@ -248,5 +255,5 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   });
 
   const notesCapped = notes.slice(0, 50);
-  return { ok: true, checked, updated, flattened, enabled: true, now, market: clock, notes: notesCapped, cfg };
+  return { ok: true, checked, updated, flattened, enabled: true, now, market: clock, notes: notesCapped, forced: force ? true : undefined, cfg };
 }
