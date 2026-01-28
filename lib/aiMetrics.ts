@@ -1,6 +1,7 @@
 import { redis } from "@/lib/redis";
 import { getBudgetState, addSpend } from "@/lib/aiBudget";
 import { getTradingDayKey } from "@/lib/tradingDay";
+import { setWithTtl, getTtlSeconds, ensureExpire } from "@/lib/redis/ttl";
 
 export type AiMetrics = {
   date: string; // YYYY-MM-DD (ET)
@@ -27,7 +28,8 @@ export function aiMetricsKeyToday() {
 
 export async function saveAiMetrics(metrics: AiMetrics): Promise<void> {
   if (!redis) return;
-  await redis.set(aiMetricsKey(metrics.date), metrics);
+  const ttl = getTtlSeconds("AI_METRICS_DAYS");
+  await setWithTtl(redis, aiMetricsKey(metrics.date), metrics, ttl);
 }
 
 /**
@@ -66,7 +68,11 @@ export async function touchHeartbeat(nowIso: string) {
     errors: (current.errors ?? {}) as Record<string, number>,
   };
 
-  await Promise.all([redis.set(HEARTBEAT_KEY, nowIso), redis.set(key, next)]);
+  const ttl = getTtlSeconds("AI_METRICS_DAYS");
+  await Promise.all([
+    setWithTtl(redis, HEARTBEAT_KEY, nowIso, ttl),
+    setWithTtl(redis, key, next, ttl),
+  ]);
   return next;
 }
 
@@ -103,7 +109,8 @@ export async function getAiMetrics(date = etDateKey()): Promise<AiMetrics> {
 
 export async function recordHeartbeat(): Promise<void> {
   if (!redis) return;
-  await redis.set(HEARTBEAT_KEY, isoNow());
+  const ttl = getTtlSeconds("AI_METRICS_DAYS");
+  await setWithTtl(redis, HEARTBEAT_KEY, isoNow(), ttl);
 }
 
 export async function writeAiHeartbeat(): Promise<void> {
@@ -119,7 +126,8 @@ export async function writeAiHeartbeat(): Promise<void> {
       errors: {},
     };
   current.lastHeartbeat = isoNow();
-  await redis.set(key, current);
+  const ttl = getTtlSeconds("AI_METRICS_DAYS");
+  await setWithTtl(redis, key, current, ttl);
 }
 
 export async function recordAiCall(model: string): Promise<void> {
@@ -142,7 +150,8 @@ export async function recordAiCall(model: string): Promise<void> {
   counts[model] = (counts[model] ?? 0) + 1;
   current.byModel = counts;
 
-  await redis.set(key, current);
+  const ttl = getTtlSeconds("AI_METRICS_DAYS");
+  await setWithTtl(redis, key, current, ttl);
 }
 
 export async function recordAiError(model: string, message: string): Promise<void> {
@@ -164,7 +173,8 @@ export async function recordAiError(model: string, message: string): Promise<voi
   errCounts[model] = (errCounts[model] ?? 0) + 1;
   current.errors = errCounts;
 
-  await redis.set(key, current);
+  const ttl = getTtlSeconds("AI_METRICS_DAYS");
+  await setWithTtl(redis, key, current, ttl);
 }
 
 export async function recordSpend(model: string, amountUsd: number): Promise<void> {
