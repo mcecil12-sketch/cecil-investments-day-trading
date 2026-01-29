@@ -3,6 +3,7 @@ import { recordAutoManage } from "@/lib/autoManage/telemetry";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { getLatestQuote, alpacaRequest } from "@/lib/alpaca";
 import { syncStopForTrade } from "@/lib/autoManage/stopSync";
+import { reconcileOpenTrades } from "@/lib/maintenance/reconcileOpenTrades";
 
 export type AutoManageResult = {
   ok: true;
@@ -17,6 +18,13 @@ export type AutoManageResult = {
   notes?: string[];
   forced?: boolean;
   cfg: ReturnType<typeof getAutoManageConfig>;
+  reconcile?: {
+    ok: boolean;
+    checked: number;
+    closed: number;
+    synced: number;
+    note: string;
+  };
 };
 
 const num = (v: any) => {
@@ -68,9 +76,33 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   const notes: string[] = [];
   const force = !!opts.force;
 
+  // === RECONCILE at START ===
+  let reconcileNote = "";
+  let reconcileResult: any = { ok: false, checked: 0, closed: 0, synced: 0 };
+  try {
+    const reconcileRunId = `${opts.runId || "auto-manage"}-reconcile`;
+    const r = await reconcileOpenTrades({
+      dryRun: false,
+      runSource: "auto-manage",
+      runId: reconcileRunId,
+      deadlineMs: 3000,
+    });
+    reconcileResult = r;
+    if (r.ok) {
+      reconcileNote = `reconcile_ok closed=${r.closed ?? 0} checked=${r.checked ?? 0}`;
+    } else {
+      reconcileNote = `reconcile_failed ${r.error || "unknown"}`;
+    }
+  } catch (e: any) {
+    reconcileNote = `reconcile_error ${String(e?.message || e)}`;
+  }
+  // Non-fatal: we continue even if reconcile failed
+  console.log(`[autoManage] ${reconcileNote}`);
+  if (reconcileNote) notes.push(`${reconcileNote}`);
+
   if (!cfg.enabled) {
     await recordAutoManage({ ts: now, outcome: "SKIP", reason: "disabled", source: opts.source, runId: opts.runId });
-    return { ok: true, skipped: true, reason: "disabled", checked: 0, updated: 0, flattened: 0, enabled: false, now, cfg };
+    return { ok: true, skipped: true, reason: "disabled", checked: 0, updated: 0, flattened: 0, enabled: false, now, cfg, reconcile: reconcileResult };
   }
 
   const clock = await getClockSafe();
@@ -81,12 +113,12 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
 
   if (!open.length) {
     await recordAutoManage({ ts: now, outcome: "SKIP", reason: "no_open_trades", source: opts.source, runId: opts.runId });
-    return { ok: true, skipped: true, reason: "no_open_trades", checked: 0, updated: 0, flattened: 0, enabled: true, now, market: clock, cfg };
+    return { ok: true, skipped: true, reason: "no_open_trades", checked: 0, updated: 0, flattened: 0, enabled: true, now, market: clock, cfg, reconcile: reconcileResult };
   }
 
   if (marketClosed && !cfg.eodFlatten && !force) {
     await recordAutoManage({ ts: now, outcome: "SKIP", reason: "market_closed", source: opts.source, runId: opts.runId });
-    return { ok: true, skipped: true, reason: "market_closed", checked: 0, updated: 0, flattened: 0, enabled: true, now, market: clock, cfg };
+    return { ok: true, skipped: true, reason: "market_closed", checked: 0, updated: 0, flattened: 0, enabled: true, now, market: clock, cfg, reconcile: reconcileResult };
   }
 
   let checked = 0;
@@ -255,5 +287,5 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   });
 
   const notesCapped = notes.slice(0, 50);
-  return { ok: true, checked, updated, flattened, enabled: true, now, market: clock, notes: notesCapped, forced: force ? true : undefined, cfg };
+  return { ok: true, checked, updated, flattened, enabled: true, now, market: clock, notes: notesCapped, forced: force ? true : undefined, cfg, reconcile: reconcileResult };
 }
