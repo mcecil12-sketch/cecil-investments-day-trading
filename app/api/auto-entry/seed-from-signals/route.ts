@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { readSignals } from "@/lib/jsonDb";
 import { readTrades, upsertTrade } from "@/lib/tradesStore";
 import { alpacaRequest } from "@/lib/alpaca";
@@ -66,7 +66,7 @@ function etDate(d = new Date()): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(d);
 }
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   const cronToken = req.headers.get("x-cron-token") || "";
   const autoToken = req.headers.get("x-auto-entry-token") || "";
 
@@ -82,13 +82,23 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, skipped: true, reason: "AUTO_TRADING_ENABLED=false" }, { status: 200 });
   }
 
-  let body: Partial<{ limit: number; minScore: number }> = {};
-  try {
-    body = (await req.json()) as typeof body;
-  } catch {}
+  // Parse query params from URL (not from JSON body)
+  const url = new URL(req.url);
+  const limitRaw = url.searchParams.get("limit");
+  const minScoreRaw = url.searchParams.get("minScore");
 
-  const limit = Math.max(0, Math.min(10, Number(body.limit ?? process.env.AUTO_SEED_LIMIT ?? "3")));
-  const minScore = Number(body.minScore ?? process.env.AUTO_SEED_MIN_SCORE ?? "7.5");
+  const limitParsed = Number(limitRaw);
+  const minScoreParsed = Number(minScoreRaw);
+
+  // Apply defaults and bounds
+  const limit = Number.isFinite(limitParsed)
+    ? Math.max(1, Math.min(50, limitParsed))
+    : Math.max(1, Math.min(10, Number(process.env.AUTO_SEED_LIMIT ?? "3")));
+
+  const minScore = Number.isFinite(minScoreParsed)
+    ? minScoreParsed
+    : Number(process.env.AUTO_SEED_MIN_SCORE ?? "7.5");
+
   const today = etDate();
 
   const [signals, trades] = await Promise.all([readSignals(), readTrades<any>()]);
@@ -187,6 +197,11 @@ export async function POST(req: Request) {
       today,
       limit,
       minScore,
+      // Echo raw query params for prod visibility
+      receivedQuery: {
+        limitRaw,
+        minScoreRaw,
+      },
       totalSignals: (signals || []).length,
       totalCandidates: candidates.length,
       createdCount: created.length,
