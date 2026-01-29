@@ -1,0 +1,55 @@
+name: score-drain
+
+on:
+  schedule:
+    # Run every 5 minutes during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)
+    - cron: "*/5 13-20 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  drain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Drain pending signals
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID="gha-score-drain-$(date +%s)"
+          
+          if [ -z "${BASE:-}" ]; then
+            echo "FATAL: PROD_BASE_URL missing"
+            exit 1
+          fi
+          
+          if [ -z "${CRON_TOKEN:-}" ]; then
+            echo "FATAL: CRON_TOKEN missing"
+            exit 1
+          fi
+
+          echo "Starting drain (RUN_ID=$RUN_ID, LIMIT=25)"
+          
+          HTTP_CODE=$(curl -sS -o /tmp/drain_response.json -w "%{http_code}" -X POST "$BASE/api/ai/score/drain?limit=25" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-token: $CRON_TOKEN")
+          
+          echo "HTTP $HTTP_CODE"
+          cat /tmp/drain_response.json | jq '.' || cat /tmp/drain_response.json || true
+          echo
+          
+          # Check response and warn if not 200
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "WARN: drain returned HTTP $HTTP_CODE (may be in progress or failed)"
+            # Don't fail - drain is best-effort and might be running
+            exit 0
+          fi
+          
+          # Check if drain was successful
+          if grep -q '"ok":true' /tmp/drain_response.json 2>/dev/null; then
+            echo "SUCCESS: drain completed"
+            exit 0
+          else
+            echo "WARN: drain response indicated failure"
+            exit 0
+          fi

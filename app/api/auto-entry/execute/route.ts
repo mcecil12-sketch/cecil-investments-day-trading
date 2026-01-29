@@ -13,6 +13,7 @@ import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { sendNotification } from "@/lib/notifications/notify";
 import { NotificationEvent } from "@/lib/notifications/types";
 import { normalizeStopPrice, normalizeLimitPrice, tickForEquityPrice } from "@/lib/tickSize";
+import { fetchBrokerTruth, type BrokerTruth } from "@/lib/broker/truth";
 
 function ensureBracketLegsValid(params: {
   side: "LONG" | "SHORT";
@@ -342,6 +343,9 @@ type GuardSummary = {
   autoDisabledReason: string | null;
   maxOpenPositions: number;
   openPositions: number;
+  brokerPositionsCount?: number;
+  brokerOpenOrdersCount?: number;
+  brokerTruthError?: string;
   lastLossAt: string | null;
   cooldownAfterLossMin: number;
   cooldownRemainingMin: number | null;
@@ -355,6 +359,7 @@ function buildGuardSummary(params: {
   guardConfig: import("@/lib/autoEntry/guardrails").GuardrailConfig;
   toggleState: { enabled: boolean; reason: string | null };
   openPositions: number;
+  brokerTruth?: BrokerTruth;
 }): GuardSummary {
   return {
     enabled: params.toggleState.enabled,
@@ -366,6 +371,9 @@ function buildGuardSummary(params: {
     autoDisabledReason: params.guardState.autoDisabledReason,
     maxOpenPositions: params.guardConfig.maxOpenPositions,
     openPositions: params.openPositions,
+    brokerPositionsCount: params.brokerTruth?.positionsCount,
+    brokerOpenOrdersCount: params.brokerTruth?.openOrdersCount,
+    brokerTruthError: params.brokerTruth?.error,
     lastLossAt: params.guardState.lastLossAt,
     cooldownAfterLossMin: params.guardConfig.cooldownAfterLossMin,
     cooldownRemainingMin: null,
@@ -407,9 +415,10 @@ export async function POST(req: Request) {
   };
   const guardConfig = getGuardrailConfig();
   const etDate = etDateString(new Date());
-  const [guardState, toggleState] = await Promise.all([
+  const [guardState, toggleState, brokerTruth] = await Promise.all([
     guardrailsStore.getGuardrailsState(etDate),
     guardrailsStore.getAutoEntryEnabledState(guardConfig),
+    fetchBrokerTruth(),
   ]);
 
   const trades = await readTrades<any>();
@@ -424,6 +433,7 @@ export async function POST(req: Request) {
     guardConfig,
     toggleState,
     openPositions,
+    brokerTruth,
   });
 
   if (!cfg.enabled) {
@@ -488,11 +498,50 @@ export async function POST(req: Request) {
     );
   }
 
-  if (openPositions >= guardConfig.maxOpenPositions) {
+  if (brokerTruth.error) {
     counts.skipped += 1;
-    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "max_open_positions", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
+    await recordAutoEntryTelemetry({
+      etDate,
+      at: new Date().toISOString(),
+      outcome: "SKIP",
+      reason: "broker_truth_unavailable",
+      source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"),
+      runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || ""),
+      detail: brokerTruth.error,
+    });
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "max_open_positions", counts, guardrails: guardSummary },
+      {
+        ok: true,
+        skipped: true,
+        reason: "broker_truth_unavailable",
+        detail: brokerTruth.error,
+        counts,
+        guardrails: guardSummary,
+      },
+      { status: 200 }
+    );
+  }
+
+  if (brokerTruth.positionsCount >= guardConfig.maxOpenPositions) {
+    counts.skipped += 1;
+    await recordAutoEntryTelemetry({
+      etDate,
+      at: new Date().toISOString(),
+      outcome: "SKIP",
+      reason: "max_open_positions",
+      source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"),
+      runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || ""),
+      detail: `brokerPositionsCount=${brokerTruth.positionsCount}, maxOpenPositions=${guardConfig.maxOpenPositions}`,
+    });
+    return NextResponse.json(
+      {
+        ok: true,
+        skipped: true,
+        reason: "max_open_positions",
+        detail: `brokerPositionsCount=${brokerTruth.positionsCount}, maxOpenPositions=${guardConfig.maxOpenPositions}`,
+        counts,
+        guardrails: guardSummary,
+      },
       { status: 200 }
     );
   }

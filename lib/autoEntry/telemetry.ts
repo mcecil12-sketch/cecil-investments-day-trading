@@ -12,6 +12,7 @@ export type AutoEntryTelemetryEvent = {
   tradeId?: string;
   source?: string;
   runId?: string;
+  detail?: string;  // Additional detail like broker position counts
 };
 
 const PREFIX = "autoentry:telemetry:v1";
@@ -100,6 +101,7 @@ export async function recordAutoEntryTelemetry(e: AutoEntryTelemetryEvent) {
       lastTradeId: e.tradeId ?? "",
       lastSource: e.source ?? "",
       lastRunId: e.runId ?? "",
+      lastDetail: e.detail ?? "",
     });
 
     await safeLpush(rk, JSON.stringify(e));
