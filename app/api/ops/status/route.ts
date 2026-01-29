@@ -80,11 +80,36 @@ export async function GET() {
       ? null
       : brokerTruth.positionsCount >= guardConfig.maxOpenPositions;
 
-    // Get trades counts
-    const openTrades = trades.filter((t: any) => t.status === "OPEN").length;
-    const autoOpenTrades = trades.filter(
+    // --- Broker truth openTrades (positions are the only "open positions" that matter for max-open gating) ---
+    const brokerPositionsCount =
+      typeof brokerTruth.positionsCount === "number"
+        ? brokerTruth.positionsCount
+        : Array.isArray(brokerTruth.positions)
+          ? brokerTruth.positions.length
+          : 0;
+
+    const brokerOpenOrdersCount =
+      typeof brokerTruth.openOrdersCount === "number"
+        ? brokerTruth.openOrdersCount
+        : Array.isArray(brokerTruth.openOrders)
+          ? brokerTruth.openOrders.length
+          : 0;
+
+    // Whatever we currently compute from DB/app state (for diagnostics only):
+    const dbOpenTradesCount = trades.filter((t: any) => t.status === "OPEN").length;
+    const dbAutoOpenTradesCount = trades.filter(
       (t: any) => t.status === "OPEN" && (t.source === "auto-entry" || t.source === "AUTO")
     ).length;
+
+    // IMPORTANT: entryState.openTrades is now broker-truth based.
+    // This prevents "ghost open trades" from ever showing up in ops/status.
+    const brokerTruthOpenTrades = brokerPositionsCount;
+
+    // If you need "fromAutoEntry", we use brokerPositionsCount as a safe proxy
+    // (assume all open positions count against the gate).
+    const brokerTruthFromAutoEntry = brokerPositionsCount;
+
+    const openTradesMismatch = dbOpenTradesCount !== brokerTruthOpenTrades;
 
     // Legacy flags for backward compatibility
     const pause = process.env.PAUSE_AUTOTRADING === "1";
@@ -153,9 +178,22 @@ export async function GET() {
           lastLossAt: guardState.lastLossAt,
           autoDisabledReason: guardState.autoDisabledReason,
         },
+        // BROKER-TRUTH based openTrades (not DB, to eliminate ghost trade reporting)
         openTrades: {
-          total: openTrades,
-          fromAutoEntry: autoOpenTrades,
+          total: brokerTruthOpenTrades,
+          fromAutoEntry: brokerTruthFromAutoEntry,
+          // Include broker truth details for clarity
+          brokerPositionsCount,
+          brokerOpenOrdersCount,
+        },
+        // Diagnostics: DB state for mismatch detection without blocking automation
+        diagnostics: {
+          dbOpenTradesCount,
+          dbAutoOpenTradesCount,
+          openTradesMismatch,
+          mismatchNote: openTradesMismatch
+            ? `DB has ${dbOpenTradesCount} open trades but broker has ${brokerTruthOpenTrades} positions. Run reconcile-open-trades to cleanup.`
+            : null,
         },
       },
 

@@ -4,6 +4,7 @@ import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
 import { getGuardrailConfig, etDateString, minutesSince } from "@/lib/autoEntry/guardrails";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
+import { fetchBrokerTruth } from "@/lib/broker/truth";
 
 type Check = {
   name: string;
@@ -108,9 +109,10 @@ export async function GET(req: Request) {
 
   const todayEt = etDateString(new Date());
   const guardConfig = getGuardrailConfig();
-  const [guardState, toggleState] = await Promise.all([
+  const [guardState, toggleState, brokerTruth] = await Promise.all([
     guardrailsStore.getGuardrailsState(todayEt),
     guardrailsStore.getAutoEntryEnabledState(guardConfig),
+    fetchBrokerTruth(),
   ]);
 
   const signals: any[] = Array.isArray(signalsPayload)
@@ -173,6 +175,18 @@ export async function GET(req: Request) {
     (scoredToday.length > 0 &&
       (minsSinceLastScore == null || minsSinceLastScore <= SIGNALS_STALE_MINUTES));
 
+  // --- Broker truth for max open positions check ---
+  const brokerPositionsCount =
+    typeof brokerTruth.positionsCount === "number"
+      ? brokerTruth.positionsCount
+      : Array.isArray(brokerTruth.positions)
+        ? brokerTruth.positions.length
+        : 0;
+
+  const wouldSkipMaxOpenPositions = brokerTruth.error
+    ? null
+    : brokerPositionsCount >= guardConfig.maxOpenPositions;
+
   const checks: Check[] = [
     {
       name: "market_open",
@@ -204,6 +218,13 @@ export async function GET(req: Request) {
       detail: !marketOpen
         ? "market closed; scoring freshness not required"
         : `scoredToday=${scoredToday.length} lastScore=${lastScoredAt || "none"} (${minsSinceLastScore?.toFixed(1) ?? "?"}m)`,
+    },
+    {
+      name: "max_open_positions",
+      ok: publicMode ? true : wouldSkipMaxOpenPositions === null ? true : !wouldSkipMaxOpenPositions,
+      detail: brokerTruth.error
+        ? `broker_error: ${brokerTruth.error}`
+        : `broker positions: ${brokerPositionsCount} / max: ${guardConfig.maxOpenPositions}`,
     },
   ];
 
@@ -259,6 +280,16 @@ export async function GET(req: Request) {
       autoDisabledReason: guardState.autoDisabledReason,
       maxOpenPositions: guardConfig.maxOpenPositions,
       lastLossAt: guardState.lastLossAt,
+      // Broker truth for open positions (not DB)
+      brokerPositionsCount,
+      brokerOpenOrdersCount:
+        typeof brokerTruth.openOrdersCount === "number"
+          ? brokerTruth.openOrdersCount
+          : Array.isArray(brokerTruth.openOrders)
+            ? brokerTruth.openOrders.length
+            : 0,
+      wouldSkipMaxOpenPositions,
+      brokerError: brokerTruth.error || null,
     },
     checks,
     reasons,
