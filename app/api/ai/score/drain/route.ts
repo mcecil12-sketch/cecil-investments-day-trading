@@ -155,23 +155,38 @@ export async function POST(req: Request) {
   }
 
   // Initialize result object (guaranteed to be returned as JSON)
-  const result = {
-    ok: true,
-    processed: 0,
-    scored: 0,
-    errored: 0,
-    skipped: false,
-    reason: undefined as string | undefined,
-    expired: false,
-    durationMs: 0,
-    details: [] as Array<{
+  const result: {
+    ok: boolean;
+    processed: number;
+    scored: number;
+    errored: number;
+    skipped: boolean;
+    reason?: string;
+    expired: boolean;
+    durationMs: number;
+    details: Array<{
       id: string;
       ticker: string;
       status: "SCORED" | "ERROR";
       aiScore?: number | null;
       error?: string;
-    }>,
+    }>;
+    pickedStrategy?: "recent_first" | "backlog_fallback";
+    recentWindowHours?: number;
+    newestPickedCreatedAt?: string | null;
+    oldestPickedCreatedAt?: string | null;
+  } = {
+    ok: true,
+    processed: 0,
+    scored: 0,
+    errored: 0,
+    skipped: false,
+    reason: undefined,
+    expired: false,
+    durationMs: 0,
+    details: [],
   };
+
 
   let lockAcquired = false;
 
@@ -186,36 +201,69 @@ export async function POST(req: Request) {
     }
 
     // If authorization passed and lock acquired, proceed
-    // Read signals (do NOT scan full backlog)
+    // --- AI scoring drain: always prioritize newest PENDING signals for real-time funnel health ---
+    // Why newest-first? Ensures the most recent signals are scored promptly, keeping the funnel responsive and preventing backlog starvation.
     const signals = await readSignals();
     const now = new Date();
-    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const RECENT_WINDOW_HOURS = Number(process.env.AI_SCORE_DRAIN_RECENT_HOURS ?? 6);
+    const recentWindowStart = new Date(now.getTime() - RECENT_WINDOW_HOURS * 60 * 60 * 1000);
 
-    // Find PENDING signals from last 24h, oldest-first (to avoid re-scoring recent ones)
-    // Limit to MAX_PER_RUN before processing
-    const pendingSignals = signals
-      .filter((s) => {
-        if (s.status !== "PENDING") return false;
-        const createdAt = new Date(s.createdAt);
-        return createdAt >= oneDayAgo && createdAt <= now;
-      })
-      .sort(
-        (a, b) =>
-          new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
-      )
+    // 1. Try to pick newest PENDING signals within the recent window
+    let pickedStrategy: "recent_first" | "backlog_fallback" = "recent_first";
+    let pickedSignals = signals
+      .filter((s) => s.status === "PENDING" && new Date(s.createdAt) >= recentWindowStart)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
       .slice(0, MAX_PER_RUN);
 
+    // 2. Fallback: if none in recent window, pick newest PENDING from full backlog
+    if (pickedSignals.length === 0) {
+      pickedStrategy = "backlog_fallback";
+      pickedSignals = signals
+        .filter((s) => s.status === "PENDING")
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+        .slice(0, MAX_PER_RUN);
+    }
+
+    // Claim/lock: mark as SCORING with a short TTL (2 min), revert to PENDING if not processed
+    const claimUntil = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+    for (const s of pickedSignals) {
+      s.status = "SCORING";
+      s.scoringLockUntil = claimUntil;
+      s.updatedAt = new Date().toISOString();
+    }
+    await writeSignals(signals);
+
+    // For response visibility
+    const recentWindowHours = RECENT_WINDOW_HOURS;
+    const newestPickedCreatedAt = pickedSignals[0]?.createdAt || null;
+    const oldestPickedCreatedAt = pickedSignals.length > 0 ? pickedSignals[pickedSignals.length - 1].createdAt : null;
+
     console.log("[score/drain] start", {
-      pendingCount: pendingSignals.length,
+      pickedStrategy,
+      pickedCount: pickedSignals.length,
       maxPerRun: MAX_PER_RUN,
       deadlineMs: DEADLINE_MS,
+      recentWindowHours,
+      newestPickedCreatedAt,
+      oldestPickedCreatedAt,
     });
 
     // Process signals sequentially (NOT Promise.all)
-    for (const signal of pendingSignals) {
+    let actuallyProcessed = 0;
+    for (const signal of pickedSignals) {
       // Check deadline BEFORE processing each signal
       if (isExpired()) {
         result.expired = true;
+        // Revert any remaining SCORING signals to PENDING (not processed)
+        for (let i = actuallyProcessed; i < pickedSignals.length; ++i) {
+          const s = pickedSignals[i];
+          if (s.status === "SCORING") {
+            s.status = "PENDING";
+            s.scoringLockUntil = undefined;
+            s.updatedAt = new Date().toISOString();
+          }
+        }
+        await writeSignals(signals);
         console.log("[score/drain] deadline expired", {
           processed: result.processed,
           scored: result.scored,
@@ -226,15 +274,22 @@ export async function POST(req: Request) {
       }
 
       result.processed += 1;
+      actuallyProcessed += 1;
 
       try {
         // Wrap AI call in timeout to avoid hanging
         const scoreResult = await scoreWithTimeout(signal, deadlineAtMs);
 
         if (!scoreResult.ok) {
-          // Mark as ERROR (never PENDING)
+          // If the error is a deadline_exceeded, do NOT mark as ERROR, just break (leave as SCORING, will revert if expired)
+          if (scoreResult.reason === "deadline_exceeded") {
+            result.expired = true;
+            break;
+          }
+          // If the error is a model timeout, mark as ERROR: model_timeout
+          const isTimeout = scoreResult.error === "timeout";
           signal.status = "ERROR";
-          signal.error = scoreResult.error;
+          signal.error = isTimeout ? "model_timeout" : scoreResult.error;
           signal.aiErrorReason = scoreResult.reason;
           signal.updatedAt = new Date().toISOString();
           result.errored += 1;
@@ -242,7 +297,7 @@ export async function POST(req: Request) {
             id: signal.id,
             ticker: signal.ticker,
             status: "ERROR",
-            error: scoreResult.reason,
+            error: isTimeout ? "model_timeout" : scoreResult.reason,
           });
           console.warn("[score/drain] score error", {
             id: signal.id,
@@ -324,6 +379,11 @@ export async function POST(req: Request) {
       durationMs: Date.now() - startedAtMs,
     });
 
+    // Add selection strategy and window info to response
+    result.pickedStrategy = pickedStrategy;
+    result.recentWindowHours = recentWindowHours;
+    result.newestPickedCreatedAt = newestPickedCreatedAt;
+    result.oldestPickedCreatedAt = oldestPickedCreatedAt;
     return buildResponse(result, startedAtMs, 200);
   } catch (err) {
     // Unexpected error: still return JSON
