@@ -3,6 +3,20 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
+/**
+ * MACHINE API ALLOWLIST
+ * These automation endpoints bypass cookie auth and rely on header-based auth only.
+ * Each endpoint must validate its own tokens (x-cron-token, x-scanner-token, etc).
+ */
+const MACHINE_API_PREFIXES = [
+  "/api/scan",
+  "/api/maintenance",
+  "/api/auto-entry",
+  "/api/auto-manage",
+  "/api/ai",
+  "/api/ops",
+];
+
 const PUBLIC_PATHS = [
   '/api/readiness',
   "/api/auto-entry",
@@ -39,6 +53,9 @@ const PUBLIC_PATHS = [
   "/api/ai/health",
 ];
 
+function isMachineApi(pathname: string): boolean {
+  return MACHINE_API_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+}
 
 function isCronAuthed(req: NextRequest) {
   const token = process.env.CRON_TOKEN;
@@ -56,6 +73,13 @@ function isScannerAuthed(req: NextRequest) {
 
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
+
+  // CRITICAL: Machine APIs bypass auth entirely and rely on header-based auth
+  // This must be checked BEFORE any cookie or redirect logic
+  if (isMachineApi(pathname)) {
+    return NextResponse.next();
+  }
+
   const scannerToken = req.headers.get("x-scanner-token") || "";
   const expectedScannerToken = process.env.SCANNER_TOKEN || "";
   if (
@@ -79,12 +103,11 @@ export function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  
   if (pathname.startsWith("/api/maintenance/") && isCronAuthed(req)) {
     return NextResponse.next();
   }
 
-if (pathname === "/api/auto-manage/run" && isCronAuthed(req)) {
+  if (pathname === "/api/auto-manage/run" && isCronAuthed(req)) {
     return NextResponse.next();
   }
 
@@ -97,3 +120,15 @@ if (pathname === "/api/auto-manage/run" && isCronAuthed(req)) {
 
   return NextResponse.next();
 }
+
+export const config = {
+  matcher: [
+    /*
+     * Match all request paths except for the ones starting with:
+     * - _next/static (static files)
+     * - _next/image (image optimization files)
+     * - favicon.ico (favicon file)
+     */
+    "/((?!_next/static|_next/image|favicon.ico).*)",
+  ],
+};
