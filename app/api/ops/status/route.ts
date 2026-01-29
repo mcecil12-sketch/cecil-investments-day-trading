@@ -11,6 +11,7 @@ import { readSignals } from "@/lib/jsonDb";
 import { readTrades } from "@/lib/tradesStore";
 import { etDateString } from "@/lib/autoEntry/guardrails";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
+import { readReconcileTelemetry } from "@/lib/maintenance/reconcileTelemetry";
 
 export const dynamic = "force-dynamic";
 
@@ -39,6 +40,7 @@ export async function GET() {
       clock,
       autoEntry,
       autoManage,
+      reconcileTel,
     ] = await Promise.all([
       fetchBrokerTruth(),
       fetchAlpacaClock().catch(() => ({ is_open: null, next_open: null, next_close: null })),
@@ -49,6 +51,7 @@ export async function GET() {
       getClockSafe(),
       Promise.resolve(getAutoConfig()),
       Promise.resolve(getAutoManageConfig()),
+      readReconcileTelemetry(5),
     ]);
 
     // Get guard state for additional info
@@ -114,6 +117,7 @@ export async function GET() {
       },
       reasons,
       autoManageTelemetry: amTel,
+      reconcileTelemetry: reconcileTel,
 
       // New comprehensive diagnostics
       broker: {
