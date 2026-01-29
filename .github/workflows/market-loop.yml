@@ -31,6 +31,22 @@ jobs:
             echo "WARN: sync-broker-state failed (non-fatal). Continuing."
           fi
 
+      - name: Reconcile ghost open trades
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID="gh-reconcile-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)"
+          echo "RUN_ID=$RUN_ID"
+          curl -sS --max-time 60 -X POST "$BASE/api/maintenance/reconcile-open-trades?_=$(date +%s)" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: github-actions" \
+            -H "x-run-id: $RUN_ID" \
+            -H "Content-Type: application/json" \
+            -d '{"dryRun":false}' | head -c 2000 || true
+          echo ""
+
       - name: run loop
         env:
           BASE: ${{ secrets.PROD_BASE_URL }}
