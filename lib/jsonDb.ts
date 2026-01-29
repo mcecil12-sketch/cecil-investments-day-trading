@@ -8,6 +8,7 @@ export type SignalSide = "LONG" | "SHORT";
 
 export type StoredSignalStatus =
   | "PENDING"
+  | "SCORING" // For drain claim/lock
   | "APPROVED"
   | "DISMISSED"
   | "SCORED"
@@ -29,6 +30,8 @@ export type StoredSignal = {
   updatedAt?: string;
   archived?: boolean;
   archivedAt?: string;
+  scoringLockUntil?: string;
+
 
   // AI fields
   aiScore?: number | null;
