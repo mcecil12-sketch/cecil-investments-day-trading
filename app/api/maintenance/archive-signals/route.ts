@@ -10,6 +10,9 @@ const DEADLINE_MS = Number(
   process.env.MAINT_ARCHIVE_SIGNALS_DEADLINE_MS ?? 8000
 );
 
+// Redis SCAN batch size (keys to scan per iteration)
+const SCAN_BATCH_SIZE = 500;
+
 /**
  * Check cron token authorization
  */
