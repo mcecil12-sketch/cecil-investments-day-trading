@@ -164,6 +164,8 @@ export async function POST(req: Request) {
     reason?: string;
     expired: boolean;
     durationMs: number;
+    releasedCount: number;
+    reclaimedCount: number;
     details: Array<{
       id: string;
       ticker: string;
@@ -184,6 +186,8 @@ export async function POST(req: Request) {
     reason: undefined,
     expired: false,
     durationMs: 0,
+    releasedCount: 0,
+    reclaimedCount: 0,
     details: [],
   };
 
@@ -208,6 +212,34 @@ export async function POST(req: Request) {
     const RECENT_WINDOW_HOURS = Number(process.env.AI_SCORE_DRAIN_RECENT_HOURS ?? 6);
     const recentWindowStart = new Date(now.getTime() - RECENT_WINDOW_HOURS * 60 * 60 * 1000);
 
+    // === RECLAIM STALE SCORING SIGNALS ===
+    // Before picking new signals, find any stuck SCORING signals older than 10 minutes and revert them to PENDING
+    const SCORING_STALE_MINUTES = 10;
+    const scoringStaleThreshold = new Date(now.getTime() - SCORING_STALE_MINUTES * 60 * 1000);
+    const staleScoring = signals.filter(
+      (s) => s.status === "SCORING" && new Date(s.scoringStartedAt || s.createdAt) < scoringStaleThreshold
+    );
+
+    for (const s of staleScoring.slice(0, 200)) {
+      // Limit reclaim batch to 200 per run
+      s.status = "PENDING";
+      s.scoringLockUntil = undefined;
+      s.scoringStartedAt = undefined;
+      s.updatedAt = new Date().toISOString();
+      result.reclaimedCount += 1;
+    }
+
+    if (result.reclaimedCount > 0) {
+      await writeSignals(signals);
+      console.log("[score/drain] reclaimed stale SCORING signals", {
+        reclaimedCount: result.reclaimedCount,
+      });
+    }
+
+    // === TRACK CLAIMED AND FINALIZED SIGNAL IDs ===
+    const claimedIds: string[] = [];
+    const finalizedIds: string[] = [];
+
     // 1. Try to pick newest PENDING signals within the recent window
     let pickedStrategy: "recent_first" | "backlog_fallback" = "recent_first";
     let pickedSignals = signals
@@ -229,7 +261,9 @@ export async function POST(req: Request) {
     for (const s of pickedSignals) {
       s.status = "SCORING";
       s.scoringLockUntil = claimUntil;
+      s.scoringStartedAt = new Date().toISOString();
       s.updatedAt = new Date().toISOString();
+      claimedIds.push(s.id);
     }
     await writeSignals(signals);
 
@@ -292,6 +326,9 @@ export async function POST(req: Request) {
           signal.error = isTimeout ? "model_timeout" : scoreResult.error;
           signal.aiErrorReason = scoreResult.reason;
           signal.updatedAt = new Date().toISOString();
+          signal.scoringLockUntil = undefined;
+          signal.scoringStartedAt = undefined;
+          finalizedIds.push(signal.id);
           result.errored += 1;
           result.details.push({
             id: signal.id,
@@ -322,6 +359,9 @@ export async function POST(req: Request) {
         });
         signal.shownInApp = signal.qualified;
         signal.updatedAt = new Date().toISOString();
+        signal.scoringLockUntil = undefined;
+        signal.scoringStartedAt = undefined;
+        finalizedIds.push(signal.id);
 
         result.scored += 1;
         result.details.push({
@@ -336,6 +376,9 @@ export async function POST(req: Request) {
         signal.error = "unexpected_error";
         signal.aiErrorReason = String(err);
         signal.updatedAt = new Date().toISOString();
+        signal.scoringLockUntil = undefined;
+        signal.scoringStartedAt = undefined;
+        finalizedIds.push(signal.id);
         result.errored += 1;
         result.details.push({
           id: signal.id,
@@ -348,6 +391,23 @@ export async function POST(req: Request) {
           ticker: signal.ticker,
           error: err,
         });
+      }
+    }
+
+    // CLEANUP: Release any unfinalized claims (signals stuck in SCORING)
+    const toRelease = claimedIds.filter(id => !finalizedIds.includes(id));
+    if (toRelease.length > 0) {
+      console.log("[score/drain] releasing unfinalized claims", {
+        count: toRelease.length,
+        ids: toRelease,
+      });
+      for (const signal of signals) {
+        if (toRelease.includes(signal.id) && signal.status === "SCORING") {
+          signal.status = "PENDING";
+          signal.scoringLockUntil = undefined;
+          signal.scoringStartedAt = undefined;
+          result.releasedCount += 1;
+        }
       }
     }
 
