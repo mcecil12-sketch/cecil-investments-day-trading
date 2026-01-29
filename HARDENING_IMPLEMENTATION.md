@@ -298,6 +298,7 @@ Optional Monitoring:
 **Created:**
 - `lib/broker/truth.ts` - Broker truth module
 - `app/api/ai/score/drain/route.ts` - Drain endpoint
+- `app/api/maintenance/archive-signals/route.ts` - Archive endpoint
 - `.github/workflows/score-drain.yml` - Drain automation
 
 **Updated:**
@@ -316,5 +317,7 @@ Optional Monitoring:
 - **24-hour window:** Drain only processes signals from last 24 hours (prevents reprocessing old signals)
 - **Signal status → ERROR:** Failed scores now marked ERROR with reason, freeing pipeline
 - **Reconcile timing:** Safe to run frequently; only modifies stale trades
+- **Archive cursor:** Safe to run repeatedly; cursor pagination ensures full coverage over time
+- **Archive metadata:** Signals marked `archived=true` + `archivedAt` for audit trail
 
-This implementation ensures **entry gating is always correct** and **PENDING signals never accumulate permanently**.
+This implementation ensures **entry gating is always correct**, **PENDING signals never accumulate permanently**, and **signal store stays lean with audit trail**.
