@@ -31,7 +31,6 @@ export type StoredSignal = {
   archived?: boolean;
   archivedAt?: string;
   scoringLockUntil?: string;
-    scoringStartedAt?: string;
   scoringStartedAt?: string;
 
   // AI fields
