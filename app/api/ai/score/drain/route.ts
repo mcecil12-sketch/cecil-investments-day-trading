@@ -173,7 +173,7 @@ export async function POST(req: Request) {
       aiScore?: number | null;
       error?: string;
     }>;
-    pickedStrategy?: "recent_first" | "backlog_fallback";
+    pickedStrategy?: "recent_first" | "backlog_fallback" | "backlog_oldest_first";
     recentWindowHours?: number;
     newestPickedCreatedAt?: string | null;
     oldestPickedCreatedAt?: string | null;
@@ -240,20 +240,46 @@ export async function POST(req: Request) {
     const claimedIds: string[] = [];
     const finalizedIds: string[] = [];
 
-    // 1. Try to pick newest PENDING signals within the recent window
-    let pickedStrategy: "recent_first" | "backlog_fallback" = "recent_first";
-    let pickedSignals = signals
-      .filter((s) => s.status === "PENDING" && new Date(s.createdAt) >= recentWindowStart)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-      .slice(0, MAX_PER_RUN);
+    // Parse backlog flag + strategy from query params
+    const url = new URL(req.url);
+    const qp = url.searchParams;
+    const backlog = ["1", "true", "yes", "y", "on"].includes(
+      (qp.get("backlog") || "").toLowerCase()
+    );
+    const strategyParam = (qp.get("strategy") || "").toLowerCase();
+    const wantBacklogStrategy =
+      backlog ||
+      strategyParam === "backlog" ||
+      strategyParam === "backlog_oldest_first";
 
-    // 2. Fallback: if none in recent window, pick newest PENDING from full backlog
-    if (pickedSignals.length === 0) {
-      pickedStrategy = "backlog_fallback";
+    type PickStrategy = "recent_first" | "backlog_fallback" | "backlog_oldest_first";
+
+    // Decide strategy (default stays recent_first)
+    const pickedStrategy: PickStrategy = wantBacklogStrategy
+      ? "backlog_oldest_first"
+      : "recent_first";
+    let pickedSignals: any[] = [];
+
+    if (pickedStrategy === "backlog_oldest_first") {
+      // Backlog mode: pick oldest-first (no recent window filter)
       pickedSignals = signals
         .filter((s) => s.status === "PENDING")
+        .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+        .slice(0, MAX_PER_RUN);
+    } else {
+      // Recent-first: pick newest within recent window
+      pickedSignals = signals
+        .filter((s) => s.status === "PENDING" && new Date(s.createdAt) >= recentWindowStart)
         .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
         .slice(0, MAX_PER_RUN);
+
+      // Fallback: if none in recent window, pick newest PENDING from full backlog
+      if (pickedSignals.length === 0) {
+        pickedSignals = signals
+          .filter((s) => s.status === "PENDING")
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+          .slice(0, MAX_PER_RUN);
+      }
     }
 
     // Claim/lock: mark as SCORING with a short TTL (2 min), revert to PENDING if not processed
@@ -267,10 +293,14 @@ export async function POST(req: Request) {
     }
     await writeSignals(signals);
 
-    // For response visibility
+    // For response visibility: compute createdAt range based on picked signals
     const recentWindowHours = RECENT_WINDOW_HOURS;
-    const newestPickedCreatedAt = pickedSignals[0]?.createdAt || null;
-    const oldestPickedCreatedAt = pickedSignals.length > 0 ? pickedSignals[pickedSignals.length - 1].createdAt : null;
+    const newestPickedCreatedAt = pickedSignals.length > 0
+      ? pickedSignals.reduce((max, s) => (new Date(s.createdAt) > new Date(max) ? s.createdAt : max), pickedSignals[0].createdAt)
+      : null;
+    const oldestPickedCreatedAt = pickedSignals.length > 0
+      ? pickedSignals.reduce((min, s) => (new Date(s.createdAt) < new Date(min) ? s.createdAt : min), pickedSignals[0].createdAt)
+      : null;
 
     console.log("[score/drain] start", {
       pickedStrategy,
