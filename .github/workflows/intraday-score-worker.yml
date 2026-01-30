@@ -1,0 +1,43 @@
+name: intraday-score-worker
+
+on:
+  schedule:
+    # wide UTC window on weekdays; we hard-guard with /api/ops/status market.is_open
+    - cron: "*/5 13-21 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [1, 2, 3]
+    steps:
+      - name: Intraday scoring worker
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOW="$(date +%s)"
+          RUN_ID="gha-intraday-score-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-w${{ matrix.worker }}-${NOW}"
+
+          OPS="$(curl -sS "$BASE/api/ops/status?_=$NOW")"
+          IS_OPEN="$(echo "$OPS" | jq -r '.market.is_open // false')"
+          if [ "$IS_OPEN" != "true" ]; then
+            echo "market_closed; exiting"
+            exit 0
+          fi
+
+          echo "RUN_ID=$RUN_ID"
+          echo "drain recent-first (intraday), worker=${{ matrix.worker }}"
+
+          curl -sS --max-time 90 -X POST \
+            "$BASE/api/ai/score/drain?limit=15&releaseLimit=0&_=$NOW" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: github-actions" \
+            -H "x-run-id: $RUN_ID" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            | jq '{ok,processed,scored,errored,expired,pickedStrategy,durationMs,newestPickedCreatedAt,oldestPickedCreatedAt}'
