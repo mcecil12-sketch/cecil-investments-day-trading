@@ -412,6 +412,9 @@ export async function POST(req: Request) {
       strategyParam === "backlog" ||
       strategyParam === "backlog_oldest_first";
     const releaseLimit = Number(qp.get("releaseLimit") ?? "-1"); // -1 = release all
+    const limitParamRaw = Number(qp.get("limit") ?? "NaN");
+    const limitParam = Number.isFinite(limitParamRaw) && limitParamRaw > 0 ? limitParamRaw : MAX_PER_RUN;
+    const maxPerRun = Math.min(MAX_PER_RUN, limitParam);
 
     type PickStrategy = "recent_first" | "backlog_fallback" | "backlog_oldest_first";
 
@@ -421,25 +424,38 @@ export async function POST(req: Request) {
       : "recent_first";
     let pickedSignals: any[] = [];
 
+    // Soft-stop guard: if low on time, don't attempt new work
+    const remainingBeforePickMs = deadlineAtMs - Date.now();
+    if (remainingBeforePickMs < SOFT_STOP_MARGIN_MS) {
+      result.expired = true;
+      result.reason = "deadline_soft_stop";
+      result.remainingTimeMs = Math.max(0, remainingBeforePickMs);
+      console.log("[score/drain] soft stop before picking", {
+        remainingBeforePickMs,
+        margin: SOFT_STOP_MARGIN_MS,
+      });
+      return buildResponse(result, startedAtMs, 200);
+    }
+
     if (pickedStrategy === "backlog_oldest_first") {
       // Backlog mode: pick oldest-first (no recent window filter)
       pickedSignals = signals
         .filter((s) => s.status === "PENDING")
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
-        .slice(0, MAX_PER_RUN);
+        .slice(0, maxPerRun);
     } else {
       // Recent-first: pick newest within recent window
       pickedSignals = signals
         .filter((s) => s.status === "PENDING" && new Date(s.createdAt) >= recentWindowStart)
         .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-        .slice(0, MAX_PER_RUN);
+        .slice(0, maxPerRun);
 
       // Fallback: if none in recent window, pick newest PENDING from full backlog
       if (pickedSignals.length === 0) {
         pickedSignals = signals
           .filter((s) => s.status === "PENDING")
           .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-          .slice(0, MAX_PER_RUN);
+          .slice(0, maxPerRun);
       }
     }
 
@@ -466,7 +482,7 @@ export async function POST(req: Request) {
     console.log("[score/drain] start", {
       pickedStrategy,
       pickedCount: pickedSignals.length,
-      maxPerRun: MAX_PER_RUN,
+      maxPerRun,
       deadlineMs: DEADLINE_MS,
       softStopMarginMs: SOFT_STOP_MARGIN_MS,
       concurrency: SCORING_CONCURRENCY,

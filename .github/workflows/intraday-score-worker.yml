@@ -2,8 +2,10 @@ name: intraday-score-worker
 
 on:
   schedule:
-    # wide UTC window on weekdays; we hard-guard with /api/ops/status market.is_open
-    - cron: "*/5 13-21 * * 1-5"
+    # Market hours ET (09:30-16:00), converted to UTC (14:30-21:00)
+    - cron: "30-59/5 14 * * 1-5"
+    - cron: "*/5 15-20 * * 1-5"
+    - cron: "0 21 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -34,10 +36,10 @@ jobs:
           echo "drain recent-first (intraday), worker=${{ matrix.worker }}"
 
           curl -sS --max-time 90 -X POST \
-            "$BASE/api/ai/score/drain?limit=15&releaseLimit=0&_=$NOW" \
+            "$BASE/api/ai/score/drain?limit=2&releaseLimit=0&_=$NOW" \
             -H "x-cron-token: $CRON_TOKEN" \
             -H "x-run-source: github-actions" \
             -H "x-run-id: $RUN_ID" \
             -H "Content-Type: application/json" \
             -d '{}' \
-            | jq '{ok,processed,scored,errored,expired,pickedStrategy,durationMs,newestPickedCreatedAt,oldestPickedCreatedAt}'
+            | jq '{attemptedCount,completedCount,timeoutCount,scoredCount,durationMs,remainingTimeMs,pickedStrategy}'
