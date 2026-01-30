@@ -8,10 +8,14 @@ import { touchHeartbeat } from "@/lib/aiHeartbeat";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+export const maxDuration = 120; // Allow up to 120s runtime on Vercel/Next.js
 
 // Execution guards: wall-clock timeout and max signals per run
-const DEADLINE_MS = Number(process.env.AI_SCORE_DRAIN_DEADLINE_MS ?? 8000);
+// DEADLINE_MS is the internal time budget; we soft-stop at ~8s before this to avoid hard timeout
+const DEADLINE_MS = Number(process.env.AI_SCORE_DRAIN_DEADLINE_MS ?? 110000); // 110s internal budget
+const SOFT_STOP_MARGIN_MS = 8000; // Stop starting new work when <8s remaining
 const MAX_PER_RUN = Number(process.env.AI_SCORE_DRAIN_MAX ?? 25);
+const SCORING_CONCURRENCY = Number(process.env.AI_SCORE_DRAIN_CONCURRENCY ?? 5); // Parallel scoring workers
 
 const DRAIN_LOCK_KEY = "ai:score:drain:lock";
 const DRAIN_LOCK_TTL = 30; // seconds
@@ -111,6 +115,150 @@ async function scoreWithTimeout(
 }
 
 /**
+ * Process signals with concurrent scoring pool
+ * Returns: { scoredCount, errorCount, timeoutCount, details }
+ */
+async function scoreSignalsConcurrent(
+  signals: any[],
+  deadlineAtMs: number,
+  concurrency: number
+): Promise<{
+  scoredCount: number;
+  errorCount: number;
+  timeoutCount: number;
+  details: Array<{
+    id: string;
+    ticker: string;
+    status: "SCORED" | "ERROR";
+    aiScore?: number | null;
+    error?: string;
+  }>;
+  results: Array<{
+    signal: any;
+    status: "SCORED" | "ERROR" | "TIMEOUT";
+    scoreResult?: any;
+    errorReason?: string;
+  }>;
+}> {
+  const results: Array<{
+    signal: any;
+    status: "SCORED" | "ERROR" | "TIMEOUT";
+    scoreResult?: any;
+    errorReason?: string;
+  }> = [];
+  const details: Array<{
+    id: string;
+    ticker: string;
+    status: "SCORED" | "ERROR";
+    aiScore?: number | null;
+    error?: string;
+  }> = [];
+
+  let scoredCount = 0;
+  let errorCount = 0;
+  let timeoutCount = 0;
+
+  // Process with concurrency limit
+  let i = 0;
+  while (i < signals.length) {
+    // Check soft stop margin: if <8s remaining, stop starting new work
+    const remainingMs = deadlineAtMs - Date.now();
+    if (remainingMs < SOFT_STOP_MARGIN_MS) {
+      console.log("[score/drain] soft stop margin reached", {
+        remainingMs,
+        margin: SOFT_STOP_MARGIN_MS,
+        processed: i,
+        total: signals.length,
+      });
+      break;
+    }
+
+    // Launch up to `concurrency` tasks
+    const batch = signals.slice(i, i + concurrency);
+    const promises = batch.map((signal) => scoreWithTimeout(signal, deadlineAtMs));
+
+    const batchResults = await Promise.allSettled(promises);
+
+    for (let j = 0; j < batch.length; ++j) {
+      const signal = batch[j];
+      const settledResult = batchResults[j];
+
+      if (settledResult.status === "rejected") {
+        // Promise.allSettled rejected (shouldn't happen, but handle it)
+        results.push({
+          signal,
+          status: "ERROR",
+          errorReason: String(settledResult.reason),
+        });
+        errorCount += 1;
+        details.push({
+          id: signal.id,
+          ticker: signal.ticker,
+          status: "ERROR",
+          error: "promise_rejected",
+        });
+        continue;
+      }
+
+      const scoreResult = settledResult.value;
+
+      if (!scoreResult.ok) {
+        if (scoreResult.reason === "deadline_exceeded") {
+          results.push({
+            signal,
+            status: "TIMEOUT",
+            errorReason: scoreResult.reason,
+          });
+          timeoutCount += 1;
+        } else {
+          results.push({
+            signal,
+            status: "ERROR",
+            scoreResult,
+            errorReason: scoreResult.reason,
+          });
+          errorCount += 1;
+          details.push({
+            id: signal.id,
+            ticker: signal.ticker,
+            status: "ERROR",
+            error: scoreResult.reason,
+          });
+        }
+        continue;
+      }
+
+      // Success
+      results.push({
+        signal,
+        status: "SCORED",
+        scoreResult: scoreResult.scored,
+      });
+      scoredCount += 1;
+      details.push({
+        id: signal.id,
+        ticker: signal.ticker,
+        status: "SCORED",
+        aiScore: scoreResult.scored.aiScore,
+      });
+    }
+
+    i += batch.length;
+  }
+
+  // Cap details to 20 entries for response size
+  const cappedDetails = details.slice(0, 20);
+
+  return {
+    scoredCount,
+    errorCount,
+    timeoutCount,
+    details: cappedDetails,
+    results,
+  };
+}
+
+/**
  * Build response JSON (always JSON, never throw)
  */
 function buildResponse(
@@ -164,8 +312,14 @@ export async function POST(req: Request) {
     reason?: string;
     expired: boolean;
     durationMs: number;
+    remainingTimeMs?: number;
     releasedCount: number;
     reclaimedCount: number;
+    attemptedCount: number;
+    completedCount: number;
+    scoredCount: number;
+    errorCount: number;
+    timeoutCount: number;
     details: Array<{
       id: string;
       ticker: string;
@@ -186,8 +340,14 @@ export async function POST(req: Request) {
     reason: undefined,
     expired: false,
     durationMs: 0,
+    remainingTimeMs: 0,
     releasedCount: 0,
     reclaimedCount: 0,
+    attemptedCount: 0,
+    completedCount: 0,
+    scoredCount: 0,
+    errorCount: 0,
+    timeoutCount: 0,
     details: [],
   };
 
@@ -308,122 +468,87 @@ export async function POST(req: Request) {
       pickedCount: pickedSignals.length,
       maxPerRun: MAX_PER_RUN,
       deadlineMs: DEADLINE_MS,
+      softStopMarginMs: SOFT_STOP_MARGIN_MS,
+      concurrency: SCORING_CONCURRENCY,
       recentWindowHours,
       newestPickedCreatedAt,
       oldestPickedCreatedAt,
     });
 
-    // Process signals sequentially (NOT Promise.all)
-    let actuallyProcessed = 0;
-    for (const signal of pickedSignals) {
-      // Check deadline BEFORE processing each signal
-      if (isExpired()) {
-        result.expired = true;
-        // Revert any remaining SCORING signals to PENDING (not processed)
-        for (let i = actuallyProcessed; i < pickedSignals.length; ++i) {
-          const s = pickedSignals[i];
-          if (s.status === "SCORING") {
-            s.status = "PENDING";
-            s.scoringLockUntil = undefined;
-            s.updatedAt = new Date().toISOString();
-          }
-        }
-        await writeSignals(signals);
-        console.log("[score/drain] deadline expired", {
-          processed: result.processed,
-          scored: result.scored,
-          errored: result.errored,
-          durationMs: Date.now() - startedAtMs,
-        });
-        break;
-      }
+    // Process signals with concurrency
+    const concurrentResult = await scoreSignalsConcurrent(
+      pickedSignals,
+      deadlineAtMs,
+      SCORING_CONCURRENCY
+    );
 
-      result.processed += 1;
-      actuallyProcessed += 1;
+    // Check if we hit soft stop
+    if (concurrentResult.timeoutCount > 0 || (deadlineAtMs - Date.now() < SOFT_STOP_MARGIN_MS)) {
+      result.expired = true;
+    }
 
-      try {
-        // Wrap AI call in timeout to avoid hanging
-        const scoreResult = await scoreWithTimeout(signal, deadlineAtMs);
+    // Apply scoring results to signals and track finalized IDs
+    for (const procResult of concurrentResult.results) {
+      const signal = procResult.signal;
+      result.attemptedCount += 1;
 
-        if (!scoreResult.ok) {
-          // If the error is a deadline_exceeded, do NOT mark as ERROR, just break (leave as SCORING, will revert if expired)
-          if (scoreResult.reason === "deadline_exceeded") {
-            result.expired = true;
-            break;
-          }
-          // If the error is a model timeout, mark as ERROR: model_timeout
-          const isTimeout = scoreResult.error === "timeout";
-          signal.status = "ERROR";
-          signal.error = isTimeout ? "model_timeout" : scoreResult.error;
-          signal.aiErrorReason = scoreResult.reason;
-          signal.updatedAt = new Date().toISOString();
-          signal.scoringLockUntil = undefined;
-          signal.scoringStartedAt = undefined;
-          finalizedIds.push(signal.id);
-          result.errored += 1;
-          result.details.push({
-            id: signal.id,
-            ticker: signal.ticker,
-            status: "ERROR",
-            error: isTimeout ? "model_timeout" : scoreResult.reason,
-          });
-          console.warn("[score/drain] score error", {
-            id: signal.id,
-            ticker: signal.ticker,
-            reason: scoreResult.reason,
-          });
-          continue;
-        }
-
-        const scored = scoreResult.scored;
-
-        // Mark as SCORED
-        signal.status = "SCORED";
-        signal.aiScore = scored.aiScore ?? null;
-        signal.aiGrade = scored.aiGrade ?? null;
-        signal.aiSummary = scored.aiSummary ?? null;
-        signal.totalScore = scored.totalScore ?? null;
-        signal.tradePlan = scored.tradePlan ?? null;
-        signal.qualified = shouldQualify({
-          score: scored.aiScore,
-          grade: scored.aiGrade,
-        });
-        signal.shownInApp = signal.qualified;
-        signal.updatedAt = new Date().toISOString();
-        signal.scoringLockUntil = undefined;
-        signal.scoringStartedAt = undefined;
-        finalizedIds.push(signal.id);
-
-        result.scored += 1;
-        result.details.push({
+      if (procResult.status === "TIMEOUT") {
+        // Leave as SCORING; will be reclaimed on next run if not finished
+        console.log("[score/drain] timeout", {
           id: signal.id,
           ticker: signal.ticker,
-          status: "SCORED",
-          aiScore: signal.aiScore,
         });
-      } catch (err) {
-        // Unexpected error: mark as ERROR (never PENDING)
+        continue;
+      }
+
+      result.completedCount += 1;
+
+      if (procResult.status === "ERROR") {
+        // Mark as ERROR: model_timeout or other reason
         signal.status = "ERROR";
-        signal.error = "unexpected_error";
-        signal.aiErrorReason = String(err);
+        signal.error = procResult.errorReason?.includes("timeout")
+          ? "model_timeout"
+          : "scoring_failed";
+        signal.aiErrorReason = procResult.errorReason;
         signal.updatedAt = new Date().toISOString();
         signal.scoringLockUntil = undefined;
         signal.scoringStartedAt = undefined;
         finalizedIds.push(signal.id);
         result.errored += 1;
-        result.details.push({
+        result.errorCount += 1;
+        console.warn("[score/drain] score error", {
           id: signal.id,
           ticker: signal.ticker,
-          status: "ERROR",
-          error: String(err),
+          reason: procResult.errorReason,
         });
-        console.error("[score/drain] unexpected error", {
-          id: signal.id,
-          ticker: signal.ticker,
-          error: err,
-        });
+        continue;
       }
+
+      // Success: SCORED
+      const scored = procResult.scoreResult;
+      signal.status = "SCORED";
+      signal.aiScore = scored.aiScore ?? null;
+      signal.aiGrade = scored.aiGrade ?? null;
+      signal.aiSummary = scored.aiSummary ?? null;
+      signal.totalScore = scored.totalScore ?? null;
+      signal.tradePlan = scored.tradePlan ?? null;
+      signal.qualified = shouldQualify({
+        score: scored.aiScore,
+        grade: scored.aiGrade,
+      });
+      signal.shownInApp = signal.qualified;
+      signal.updatedAt = new Date().toISOString();
+      signal.scoringLockUntil = undefined;
+      signal.scoringStartedAt = undefined;
+      finalizedIds.push(signal.id);
+
+      result.scored += 1;
+      result.scoredCount += 1;
     }
+
+    result.processed = concurrentResult.scoredCount + concurrentResult.errorCount;
+    result.timeoutCount = concurrentResult.timeoutCount;
+    result.details = concurrentResult.details;
 
     // CLEANUP: Release any unfinalized claims (signals stuck in SCORING)
     // releaseLimit controls how many to release: 0 = none, -1 = all, N > 0 = up to N
@@ -471,8 +596,10 @@ export async function POST(req: Request) {
       processed: result.processed,
       scored: result.scored,
       errored: result.errored,
+      timeoutCount: result.timeoutCount,
       expired: result.expired,
       durationMs: Date.now() - startedAtMs,
+      remainingTimeMs: deadlineAtMs - Date.now(),
     });
 
     // Add selection strategy and window info to response
@@ -480,6 +607,7 @@ export async function POST(req: Request) {
     result.recentWindowHours = recentWindowHours;
     result.newestPickedCreatedAt = newestPickedCreatedAt;
     result.oldestPickedCreatedAt = oldestPickedCreatedAt;
+    result.remainingTimeMs = Math.max(0, deadlineAtMs - Date.now());
     return buildResponse(result, startedAtMs, 200);
   } catch (err) {
     // Unexpected error: still return JSON
