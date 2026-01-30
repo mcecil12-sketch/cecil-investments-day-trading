@@ -3,17 +3,40 @@ name: backlog-worker
 on:
   schedule:
     # Run every hour after market hours and on weekends
-    - cron: "0 * * * 0-5"
+    # 0-4 = Sun-Thu pre-open (before 9:30 AM ET = 13:30 UTC)
+    # 22-23 = after market close (after 4:00 PM ET = 20:00 UTC on same day + overnight)
+    - cron: "0 0-4 * * *"
+    - cron: "0 22-23 * * *"
   workflow_dispatch:
 
 jobs:
   backlog:
     runs-on: ubuntu-latest
     steps:
-      - name: Drain AI Score
+      - name: Backlog drain (oldest-first)
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
         run: |
-          curl -X POST https://cecil-investments-day-trading.vercel.app/api/ai/score/drain?mode=backlog
+          set -euo pipefail
+          NOW="$(date +%s)"
+          curl -4 -sS --max-time 120 -X POST \
+            "$BASE/api/ai/score/drain?limit=50&backlog=1&releaseLimit=10&_=$NOW" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            | head -c 4000; echo
 
-      - name: Archive Signals
+      - name: Archive old signals
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
         run: |
-          curl -X POST https://cecil-investments-day-trading.vercel.app/api/signals/archive?olderThanDays=2&status=PENDING&limit=2000
+          set -euo pipefail
+          NOW="$(date +%s)"
+          curl -4 -sS --max-time 120 -X POST \
+            "$BASE/api/signals/archive?olderThanDays=2&status=PENDING&limit=2000&_=$NOW" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            | head -c 4000; echo

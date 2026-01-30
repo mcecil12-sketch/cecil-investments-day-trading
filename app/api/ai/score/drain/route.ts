@@ -251,6 +251,7 @@ export async function POST(req: Request) {
       backlog ||
       strategyParam === "backlog" ||
       strategyParam === "backlog_oldest_first";
+    const releaseLimit = Number(qp.get("releaseLimit") ?? "-1"); // -1 = release all
 
     type PickStrategy = "recent_first" | "backlog_fallback" | "backlog_oldest_first";
 
@@ -425,14 +426,19 @@ export async function POST(req: Request) {
     }
 
     // CLEANUP: Release any unfinalized claims (signals stuck in SCORING)
+    // releaseLimit controls how many to release: 0 = none, -1 = all, N > 0 = up to N
     const toRelease = claimedIds.filter(id => !finalizedIds.includes(id));
-    if (toRelease.length > 0) {
+    const releaseCount = releaseLimit === 0 ? 0 : releaseLimit === -1 ? toRelease.length : Math.min(releaseLimit, toRelease.length);
+    const toReleaseSliced = toRelease.slice(0, releaseCount);
+    
+    if (toReleaseSliced.length > 0) {
       console.log("[score/drain] releasing unfinalized claims", {
-        count: toRelease.length,
-        ids: toRelease,
+        count: toReleaseSliced.length,
+        limit: releaseLimit,
+        ids: toReleaseSliced,
       });
       for (const signal of signals) {
-        if (toRelease.includes(signal.id) && signal.status === "SCORING") {
+        if (toReleaseSliced.includes(signal.id) && signal.status === "SCORING") {
           signal.status = "PENDING";
           signal.scoringLockUntil = undefined;
           signal.scoringStartedAt = undefined;
