@@ -86,3 +86,19 @@ export async function writeSignals(signals: StoredSignal[]): Promise<void> {
   ensureLocalDir();
   fs.writeFileSync(LOCAL_SIGNALS_FILE, JSON.stringify(signals, null, 2), "utf8");
 }
+
+export async function writeSignalsWithPipeline(signals: StoredSignal[]): Promise<void> {
+  if (redis) {
+    const ttl = getTtlSeconds("SIGNALS_DAYS");
+    const pipeline = redis.pipeline();
+    pipeline.set(SIGNALS_KEY, signals);
+    if (ttl > 0) {
+      pipeline.expire(SIGNALS_KEY, ttl);
+    }
+    await pipeline.exec();
+    return;
+  }
+
+  ensureLocalDir();
+  fs.writeFileSync(LOCAL_SIGNALS_FILE, JSON.stringify(signals, null, 2), "utf8");
+}

@@ -1,0 +1,19 @@
+name: backlog-worker
+
+on:
+  schedule:
+    # Run every hour after market hours and on weekends
+    - cron: "0 * * * 0-5"
+  workflow_dispatch:
+
+jobs:
+  backlog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Drain AI Score
+        run: |
+          curl -X POST https://cecil-investments-day-trading.vercel.app/api/ai/score/drain?mode=backlog
+
+      - name: Archive Signals
+        run: |
+          curl -X POST https://cecil-investments-day-trading.vercel.app/api/signals/archive?olderThanDays=2&status=PENDING&limit=2000
