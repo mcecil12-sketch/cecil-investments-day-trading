@@ -2,6 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { headers } from "next/headers";
 import { AlpacaBar, fetchRecentBars } from "@/lib/alpaca";
+import { fetchAlpacaClock } from "@/lib/alpacaClock";
 import { bumpScanRun, bumpScanSkip, bumpTodayFunnel } from "@/lib/funnelRedis";
 
 const DEFAULT_WATCHLIST = ["SPY", "QQQ", "TSLA", "NVDA", "META", "AMD"];
@@ -562,6 +563,36 @@ export async function GET(req: NextRequest) {
       : rawMode === "ai-seed"
       ? "ai-seed"
       : "vwap"; // default/alias for vwap
+  const force = search.get("force") === "1";
+
+  let marketClock: { is_open?: boolean; next_open?: string | null; next_close?: string | null } | null = null;
+  try {
+    marketClock = await fetchAlpacaClock();
+  } catch (err) {
+    console.warn("[scan] unable to fetch market clock", err);
+  }
+
+  if (marketClock?.is_open === false && !force) {
+    try {
+      await bumpScanSkip(mode, {
+        source: scanSource,
+        runId: scanRunId,
+        status: "SKIP",
+      });
+    } catch (err) {
+      console.log("[funnel] bump scansSkipped failed (non-fatal)", err);
+    }
+    return NextResponse.json(
+      {
+        ok: true,
+        skipped: true,
+        reason: "market_closed",
+        mode,
+        clock: marketClock,
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+  }
 const aiSeedMode = mode === "ai-seed";
 const debugScan = req.headers.get("x-debug-scan") === "1";
 const totals = {
@@ -1094,9 +1125,51 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
 }
 
 export async function POST(req: NextRequest) {
-  
   const url = new URL(req.url);
-  const force = url.searchParams.get("force") === "1";
-  const debug = req.headers.get("x-debug-scan") === "1";
-return GET(req);
+  const search = url.searchParams;
+  const force = search.get("force") === "1";
+  const scanSource = req.headers.get("x-scan-source") ?? "unknown";
+  const scanRunId = req.headers.get("x-scan-run-id") ?? null;
+
+  const rawMode = (search.get("mode") || "").toLowerCase();
+  const mode: ScanMode =
+    rawMode === "breakout"
+      ? "breakout"
+      : rawMode === "compression" || rawMode === "nr7"
+      ? "compression"
+      : rawMode === "premarket" || rawMode === "premarket-vwap"
+      ? "premarket-vwap"
+      : rawMode === "ai-seed"
+      ? "ai-seed"
+      : "vwap";
+
+  let marketClock: { is_open?: boolean; next_open?: string | null; next_close?: string | null } | null = null;
+  try {
+    marketClock = await fetchAlpacaClock();
+  } catch (err) {
+    console.warn("[scan] unable to fetch market clock", err);
+  }
+
+  if (marketClock?.is_open === false && !force) {
+    try {
+      await bumpScanSkip(mode, {
+        source: scanSource,
+        runId: scanRunId,
+        status: "SKIP",
+      });
+    } catch (err) {
+      console.log("[funnel] bump scansSkipped failed (non-fatal)", err);
+    }
+    return NextResponse.json(
+      {
+        ok: true,
+        skipped: true,
+        reason: "market_closed",
+        mode,
+        clock: marketClock,
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+  }
+  return GET(req);
 }
