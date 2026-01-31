@@ -2,15 +2,18 @@ name: backlog-worker
 
 on:
   schedule:
-    # Run every hour after market hours and on weekends
-    # 0-4 = Sun-Thu pre-open (before 9:30 AM ET = 13:30 UTC)
-    # 22-23 = after market close (after 4:00 PM ET = 20:00 UTC on same day + overnight)
-    - cron: "0 0-4 * * *"
-    - cron: "0 22-23 * * *"
+    # Run every 15 minutes after market close through overnight (UTC) on weekdays
+    # 21-23 and 0-12 UTC, Mon-Fri
+    - cron: "*/15 21-23 * * 1-5"
+    - cron: "*/15 0-12 * * 1-5"
+    # Run every 15 minutes all day on weekends
+    - cron: "*/15 * * * 6,0"
+    # Archive old signals daily at 02:10 UTC
+    - cron: "10 2 * * *"
   workflow_dispatch:
 
 jobs:
-  backlog:
+  drain:
     runs-on: ubuntu-latest
     steps:
       - name: Backlog drain (oldest-first)
@@ -21,12 +24,15 @@ jobs:
           set -euo pipefail
           NOW="$(date +%s)"
           curl -4 -sS --max-time 120 -X POST \
-            "$BASE/api/ai/score/drain?limit=50&backlog=1&releaseLimit=10&_=$NOW" \
+            "$BASE/api/ai/score/drain?limit=5&backlog=1&releaseLimit=3&_=$NOW" \
             -H "x-cron-token: $CRON_TOKEN" \
             -H "Content-Type: application/json" \
             -d '{}' \
             | head -c 4000; echo
 
+  archive:
+    runs-on: ubuntu-latest
+    steps:
       - name: Archive old signals
         env:
           BASE: ${{ secrets.PROD_BASE_URL }}
