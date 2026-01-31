@@ -24,11 +24,11 @@ jobs:
           set -euo pipefail
           NOW="$(date +%s)"
           curl -4 -sS --max-time 120 -X POST \
-            "$BASE/api/ai/score/drain?limit=5&backlog=1&releaseLimit=3&_=$NOW" \
+            "$BASE/api/ai/score/drain?limit=2&backlog=1&releaseLimit=2&_=$NOW" \
             -H "x-cron-token: $CRON_TOKEN" \
             -H "Content-Type: application/json" \
             -d '{}' \
-            | head -c 4000; echo
+            | jq '{ok,processed,scored,errored,timeoutCount,expired,pickedStrategy,releasedCount,oldestPickedCreatedAt,newestPickedCreatedAt}'
 
   archive:
     runs-on: ubuntu-latest
