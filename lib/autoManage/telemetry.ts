@@ -9,12 +9,16 @@ export type AutoManageRun = {
   checked?: number;
   updated?: number;
   flattened?: number;
+  rescueAttempted?: number;
+  rescueOk?: number;
+  rescueFailed?: number;
   source?: string;
   runId?: string;
 };
 
 const KEY_SUMMARY = "telemetry:auto-manage:summary";
 const KEY_RUNS = "telemetry:auto-manage:runs";
+const KEY_STOP_RESCUE = "telemetry:auto-manage:stop-rescue";
 
 const hasRedis = () => !!redis;
 
@@ -28,6 +32,9 @@ export async function recordAutoManage(run: AutoManageRun) {
   if (outcome === "SUCCESS") incr.success = 1;
   if (outcome === "FAIL") incr.fail = 1;
   if (outcome === "SKIP") incr.skipped = 1;
+  if (run.rescueAttempted) incr.rescueAttempted = run.rescueAttempted;
+  if (run.rescueOk) incr.rescueOk = run.rescueOk;
+  if (run.rescueFailed) incr.rescueFailed = run.rescueFailed;
 
   const reasonKey = run.reason ? `reason:${run.reason}` : undefined;
 
@@ -42,6 +49,9 @@ export async function recordAutoManage(run: AutoManageRun) {
       lastReason: run.reason || "",
       lastSource: run.source || "",
       lastRunId: run.runId || "",
+      lastRescueAttempted: run.rescueAttempted || 0,
+      lastRescueOk: run.rescueOk || 0,
+      lastRescueFailed: run.rescueFailed || 0,
     });
 
     pipe.lpush(KEY_RUNS, JSON.stringify({ ...run, ts }));

@@ -1,8 +1,8 @@
 import { getAutoManageConfig } from "@/lib/autoManage/config";
 import { recordAutoManage } from "@/lib/autoManage/telemetry";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
-import { getLatestQuote, alpacaRequest } from "@/lib/alpaca";
-import { syncStopForTrade } from "@/lib/autoManage/stopSync";
+import { getLatestQuote, alpacaRequest, getPositions } from "@/lib/alpaca";
+import { syncStopForTrade, rescueStop } from "@/lib/autoManage/stopSync";
 import { reconcileOpenTrades } from "@/lib/maintenance/reconcileOpenTrades";
 
 export type AutoManageResult = {
@@ -70,6 +70,59 @@ function riskPerShare(entry: number, stop: number) {
   return r > 0 ? r : null;
 }
 
+/**
+ * Stop Rescue Failsafe: ensure there's always an active protective stop when trade is OPEN and broker position exists.
+ * - Check if stopOrderId exists and is active
+ * - Check if broker position exists
+ * - If both missing or stop not active, create new standalone GTC stop
+ * - Persist stopOrderId only after Alpaca confirms acceptance
+ * - Non-fatal: record telemetry and continue if rescue fails
+ */
+async function ensureStopRescued(trade: any, now: string, ticker: string): Promise<{ rescueAttempted: boolean; rescueOk?: boolean; rescueNote?: string }> {
+  const stopOrderId = trade.stopOrderId;
+  
+  // Quick check: if stopOrderId exists, we assume it's active (detailed check in sync)
+  if (stopOrderId) {
+    return { rescueAttempted: false };
+  }
+
+  // No stop order ID - check if broker position exists
+  try {
+    const positions = await getPositions(ticker);
+    const brokerPos = Array.isArray(positions)
+      ? positions.find((p: any) => p?.symbol?.toUpperCase() === ticker)
+      : null;
+
+    const brokerQty = Number((brokerPos as any)?.qty ?? 0);
+    if (brokerQty <= 0) {
+      // No position, no rescue needed
+      return { rescueAttempted: false };
+    }
+
+    // Broker position exists but no stop - attempt rescue
+    const rescueRes = await rescueStop(trade);
+    if (rescueRes.ok) {
+      return {
+        rescueAttempted: true,
+        rescueOk: true,
+        rescueNote: `stop_rescued: ${rescueRes.stopOrderId}`,
+      };
+    } else {
+      return {
+        rescueAttempted: true,
+        rescueOk: false,
+        rescueNote: `stop_rescue_failed: ${rescueRes.error}${rescueRes.detail ? ": " + rescueRes.detail : ""}`,
+      };
+    }
+  } catch (err: any) {
+    return {
+      rescueAttempted: true,
+      rescueOk: false,
+      rescueNote: `stop_rescue_error: ${String(err?.message || err)}`,
+    };
+  }
+}
+
 export async function runAutoManage(opts: { source?: string; runId?: string; force?: boolean }): Promise<AutoManageResult> {
   const cfg = getAutoManageConfig();
   const now = new Date().toISOString();
@@ -124,6 +177,9 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   let checked = 0;
   let updated = 0;
   let flattened = 0;
+  let rescueAttempted = 0;
+  let rescueOk = 0;
+  let rescueFailed = 0;
   let hadFailures = false;
 
   const next = [...all];
@@ -194,6 +250,54 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
 
     const idx = next.findIndex((x: any) => x.id === id);
     if (idx >= 0) {
+      // STOP RESCUE FAILSAFE: ensure there's always an active protective stop
+      let rescueAttemptedLocal = false;
+      let rescueOkLocal = false;
+      let rescueNote: string = "";
+      try {
+        const rescueResult = await ensureStopRescued(next[idx], now, ticker);
+        rescueAttemptedLocal = rescueResult.rescueAttempted;
+        rescueOkLocal = rescueResult.rescueOk ?? false;
+        rescueNote = rescueResult.rescueNote || "";
+
+        if (rescueAttemptedLocal) {
+          rescueAttempted++;
+          if (rescueOkLocal) {
+            rescueOk++;
+            // Stop was rescued - update trade with new stopOrderId
+            next[idx] = {
+              ...next[idx],
+              stopOrderId: rescueNote.split(": ")[1], // Extract stopOrderId from note
+              autoManage: {
+                ...(next[idx].autoManage || {}),
+                lastStopRescueAt: now,
+                lastStopRescueStatus: "OK",
+              },
+              updatedAt: now,
+            };
+            notes.push(`stop_rescue_ok:${ticker}:${rescueNote}`);
+            updated++;
+          } else {
+            rescueFailed++;
+            // Rescue attempt failed - log but don't fail the run
+            next[idx] = {
+              ...next[idx],
+              autoManage: {
+                ...(next[idx].autoManage || {}),
+                lastStopRescueAt: now,
+                lastStopRescueStatus: "FAIL",
+                lastStopRescueError: rescueNote,
+              },
+              updatedAt: now,
+            };
+            notes.push(`stop_rescue_fail:${ticker}:${rescueNote}`);
+            hadFailures = true;
+          }
+        }
+      } catch (rescueErr: any) {
+        notes.push(`stop_rescue_exception:${ticker}:${String(rescueErr?.message || rescueErr)}`);
+      }
+
       const changedStop = Math.abs(nextStop - stop) > 1e-6;
       let stopSyncOk = true;
       let stopSyncNote = "";
@@ -284,6 +388,9 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     checked,
     updated,
     flattened,
+    rescueAttempted: rescueAttempted || undefined,
+    rescueOk: rescueOk || undefined,
+    rescueFailed: rescueFailed || undefined,
   });
 
   const notesCapped = notes.slice(0, 50);

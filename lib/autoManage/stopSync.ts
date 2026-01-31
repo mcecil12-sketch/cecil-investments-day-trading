@@ -48,6 +48,110 @@ async function cancelOrderId(orderId: string) {
   return resp.ok || resp.status === 404;
 }
 
+/**
+ * Check if a stop order is active in Alpaca.
+ * Returns true if order exists and status is "pending" or "accepted".
+ * Returns false if not found, canceled, expired, filled, or in error state.
+ */
+async function isStopOrderActive(orderId: string): Promise<boolean> {
+  if (!orderId) return false;
+  try {
+    const order = await getOrder(orderId);
+    const status = String((order as any)?.status || "").toLowerCase();
+    // Active states: pending, accepted, held
+    return status === "pending" || status === "accepted" || status === "held";
+  } catch (err) {
+    // Order not found or error fetching
+    return false;
+  }
+}
+
+export type StopRescueResult =
+  | { ok: true; stopOrderId: string; reason: string }
+  | { ok: false; error: string; detail?: string };
+
+/**
+ * Rescue stop: create a standalone GTC stop order when trade is OPEN and broker position exists
+ * but there's no active protective stop (missing, canceled, expired, or filled).
+ *
+ * Requirements:
+ * - Do NOT cancel or replace anything
+ * - Only persist stopOrderId after Alpaca confirms acceptance
+ * - Minimally invasive: add as a guard, not a refactor
+ */
+export async function rescueStop(trade: TradeLike): Promise<StopRescueResult> {
+  const ticker = normalizeTicker(trade.ticker);
+  const side = normalizeSide(trade.side);
+  const stopPrice = num(trade.stopPrice);
+
+  if (!ticker || !side) return { ok: false, error: "invalid_trade_ticker_or_side" };
+  if (stopPrice == null) return { ok: false, error: "missing_stopPrice" };
+
+  let qty = Number(trade.quantity ?? trade.qty ?? trade.size ?? trade.positionSize ?? trade.shares) || 0;
+
+  if (!qty || qty <= 0) {
+    try {
+      const positions = await getPositions(ticker);
+      const normalized = Array.isArray(positions)
+        ? positions.find((p) => p?.symbol?.toUpperCase() === ticker)
+        : positions;
+      qty = Number((normalized as any)?.qty ?? 0);
+    } catch (err) {
+      return { ok: false, error: "unable_to_determine_qty", detail: String(err) };
+    }
+  }
+
+  if (!qty || qty <= 0) {
+    return { ok: false, error: "no_open_position" };
+  }
+
+  const stopSide = side === "SHORT" ? "buy" : "sell";
+
+  try {
+    // Normalize stop price to ensure tick compliance
+    const entryPrice = stopPrice; // Use stop price as reference for tick sizing
+    const tick = tickForEquityPrice(entryPrice);
+    const normResult = normalizeStopPrice({
+      side,
+      entryPrice,
+      stopPrice,
+      tick,
+    });
+
+    if (!normResult.ok) {
+      return {
+        ok: false,
+        error: "stop_normalization_failed",
+        detail: `reason=${normResult.reason} original=${stopPrice} normalized=${normResult.stop || "N/A"}`,
+      };
+    }
+
+    // Create standalone GTC stop order
+    const stopOrder = await createOrder({
+      symbol: ticker,
+      qty,
+      side: stopSide,
+      type: "stop",
+      time_in_force: "gtc", // GTC: good-til-canceled
+      stop_price: normResult.stop,
+      extended_hours: false,
+    });
+
+    const stopOrderId = String((stopOrder as any)?.id || "");
+    if (!stopOrderId) {
+      return { ok: false, error: "stop_order_missing_id" };
+    }
+
+    return {
+      ok: true,
+      stopOrderId,
+      reason: "standalone_gtc_stop_created",
+    };
+  } catch (err: any) {
+    return { ok: false, error: "stop_rescue_error", detail: err?.message ?? String(err) };
+  }
+}
+
 export async function syncStopForTrade(trade: TradeLike, nextStopPrice: number): Promise<StopSyncResult> {
   const ticker = normalizeTicker(trade.ticker);
   const side = normalizeSide(trade.side);
