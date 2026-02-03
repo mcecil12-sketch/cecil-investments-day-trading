@@ -116,16 +116,67 @@ function mapAvgFillPrice(trade: TradeRecord) {
   return null;
 }
 
-export async function GET() {
+export async function GET(req: Request) {
   try {
-    const trades = await readTrades<TradeRecord>();
+    const url = new URL(req.url);
+    const statusParam = url.searchParams.get("status") ?? undefined;
+    const limitParam = url.searchParams.get("limit");
+    const orderParam = url.searchParams.get("order") ?? "desc";
+
+    // Parse limit with validation
+    let limit = 1000;
+    if (limitParam) {
+      const parsed = parseInt(limitParam, 10);
+      if (!isNaN(parsed) && parsed > 0) {
+        limit = Math.min(parsed, 5000);
+      }
+    }
+
+    // Normalize order
+    const order = orderParam === "asc" ? "asc" : "desc";
+
+    // Read all trades
+    let trades = await readTrades<TradeRecord>();
+
+    // Apply filtering by status
+    if (statusParam && statusParam !== "ALL") {
+      trades = trades.filter((trade) => trade.status === statusParam);
+    }
+
+    // Apply sorting by createdAt
+    trades.sort((a, b) => {
+      const dateA = new Date(a.createdAt).getTime();
+      const dateB = new Date(b.createdAt).getTime();
+      return order === "desc" ? dateB - dateA : dateA - dateB;
+    });
+
+    // Capture counts before limiting
+    const total = await readTrades<TradeRecord>();
+    const totalCount = total.length;
+    const filteredCount = trades.length;
+
+    // Apply limit
+    trades = trades.slice(0, limit);
+
+    // Map quantity fields
     const serialized = trades.map((trade) => ({
       ...trade,
       qty: mapQty(trade),
       filledQty: mapFilledQty(trade),
       avgFillPrice: mapAvgFillPrice(trade),
     }));
-    return NextResponse.json({ trades: serialized });
+
+    return NextResponse.json({
+      ok: true,
+      trades: serialized,
+      meta: {
+        total: totalCount,
+        filtered: filteredCount,
+        limit,
+        order,
+        status: statusParam ?? null,
+      },
+    });
   } catch (err: any) {
     console.error("[trades] GET error", err);
     return NextResponse.json(
