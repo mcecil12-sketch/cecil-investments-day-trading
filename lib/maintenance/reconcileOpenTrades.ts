@@ -205,11 +205,22 @@ export async function reconcileOpenTrades(
         }
 
         if (!dryRun) {
+          // Broker truth wins: enforce OPEN status when position exists
+          t.status = "OPEN";
           t.autoEntryStatus = "OPEN";
           t.alpacaStatus = orderStatus || "position_open";
           t.brokerStatus = orderStatus || "position_open";
           t.updatedAt = nowIso;
 
+          // Clear closure/error fields that may have been artifact of previous status
+          delete t.closedAt;
+          delete t.finalizedAt;
+          delete t.closeReason;
+          delete t.error;
+          delete t.realizedPnL;
+          delete t?.realizedR;
+
+          // Ensure filledQty/avgFillPrice are set from broker or estimate
           if (
             (t.filledQty == null || !Number.isFinite(Number(t.filledQty))) &&
             Number.isFinite(Number(t.qty))
