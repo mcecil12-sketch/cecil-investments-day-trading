@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { submitOrder } from "@/lib/alpaca";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
+import { fetchBrokerTruth } from "@/lib/broker/truth";
 
 export const runtime = "nodejs";
 
@@ -13,7 +14,8 @@ export type TradeStatus =
   | "BROKER_FILLED"
   | "BROKER_REJECTED"
   | "BROKER_ERROR"
-  | "ERROR";
+  | "ERROR"
+  | "DISABLED";
 
 export type ManagementStatus =
   | "UNMANAGED"
@@ -61,12 +63,25 @@ export interface TradeRecord extends IncomingTrade {
   alpacaOrderId?: string;
   alpacaStatus?: string;
   stopOrderId?: string;
+  takeProfitOrderId?: string;
   error?: string;
 
+  // Closure fields (should only be set when status is CLOSED/ERROR, not when position exists)
+  closedAt?: string;
+  finalizedAt?: string;
+  closeReason?: string;
+  realizedPnL?: number;
+  realizedR?: number;
+
   // Auto-management info
+  autoEntryStatus?: "OPEN" | "CLOSED"; // Track auto-entry status separately
   managementStatus?: ManagementStatus;
   lastAutoPrice?: number;
   lastAutoCheckAt?: string;
+
+  // Disabled metadata
+  disabledAt?: string;
+  disableReason?: string;
 
   // legacy/extended management config (kept for compatibility)
   management?: {
@@ -138,6 +153,9 @@ export async function GET(req: Request) {
     // Read all trades
     let trades = await readTrades<TradeRecord>();
 
+    // Always exclude DISABLED trades (they are archived/cleaned up)
+    trades = trades.filter((trade) => trade.status !== "DISABLED");
+
     // Apply filtering by status
     if (statusParam && statusParam !== "ALL") {
       trades = trades.filter((trade) => trade.status === statusParam);
@@ -157,6 +175,47 @@ export async function GET(req: Request) {
 
     // Apply limit
     trades = trades.slice(0, limit);
+
+    // Broker truth validation: repair OPEN trades that have closure fields set
+    // (This can happen if reconciliation was interrupted or data was corrupted)
+    let brokerTruth;
+    try {
+      brokerTruth = await fetchBrokerTruth();
+    } catch (err) {
+      console.warn("[trades] Could not fetch broker truth for validation", err);
+      brokerTruth = null;
+    }
+
+    if (brokerTruth && !brokerTruth.error) {
+      const posBySym = new Map<string, any>();
+      for (const p of brokerTruth.positions) {
+        const sym = String(p.symbol || "").toUpperCase();
+        if (sym) posBySym.set(sym, p);
+      }
+
+      // Repair any OPEN trades that have closure artifacts when broker position exists
+      for (const trade of trades) {
+        if (trade.status === "OPEN") {
+          const ticker = String(trade.ticker || "").toUpperCase();
+          const hasBrokerPos = ticker && posBySym.has(ticker);
+          const hasClosureFields = trade.closedAt || trade.error || trade.closeReason;
+
+          if (hasBrokerPos && hasClosureFields) {
+            // Broker truth wins: clear closure fields
+            trade.closedAt = undefined;
+            trade.finalizedAt = undefined;
+            trade.closeReason = undefined;
+            trade.error = undefined;
+            (trade as any).realizedPnL = undefined;
+            (trade as any).realizedR = undefined;
+            console.log(
+              "[trades] Repaired trade with broker position but closure artifacts",
+              { id: trade.id, ticker }
+            );
+          }
+        }
+      }
+    }
 
     // Map quantity fields
     const serialized = trades.map((trade) => ({
