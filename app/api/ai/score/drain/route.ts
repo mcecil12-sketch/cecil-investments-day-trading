@@ -5,6 +5,7 @@ import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { scoreSignalWithAI } from "@/lib/aiScoring";
 import { touchHeartbeat } from "@/lib/aiHeartbeat";
 import {
+  applyInsufficientBars,
   applyParseFailed,
   applyScoreError,
   applyScoreSuccess,
@@ -577,7 +578,9 @@ export async function POST(req: Request) {
 
       if (procResult.status === "ERROR") {
         const nowIso = new Date().toISOString();
-        if (procResult.errorCode === "parse_failed") {
+        if (procResult.errorCode === "insufficient_bars") {
+          applyInsufficientBars(signal, procResult.errorReason || "Insufficient recent bars", nowIso);
+        } else if (procResult.errorCode === "parse_failed") {
           applyParseFailed(
             signal,
             procResult.errorReason || "unparseable",

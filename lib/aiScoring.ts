@@ -78,9 +78,9 @@ export type AiScoreResult =
     }
   | {
       ok: false;
-      error: "ai_parse_failed" | "invalid_model_output";
+      error: "ai_parse_failed" | "invalid_model_output" | "insufficient_bars";
       reason: string;
-      rawHead: string;
+      rawHead?: string;
       aiModel: string;
       aiRequestId?: string | null;
       aiParseError?: string | null;
@@ -357,20 +357,11 @@ Rules:
   if (context && context.barsUsed < MIN_BARS_FOR_AI) {
     const reason = `Insufficient recent bars (${context.barsUsed} < ${MIN_BARS_FOR_AI})`;
     return {
-      ok: true,
+      ok: false,
+      error: "insufficient_bars",
+      reason: reason,
       aiModel: "skipped",
       aiRequestId: null,
-      scored: {
-      ...signal,
-      aiScore: 0,
-      aiGrade: "F",
-      aiSummary: reason,
-      totalScore: 0,
-      status: "SCORED",
-      skipReason: reason,
-      qualified: false,
-      shownInApp: false,
-      },
     };
   }
 

@@ -7,6 +7,26 @@ type ParseFailedMeta = {
   aiRequestId?: string | null;
 };
 
+export function applyInsufficientBars(signal: any, reason: string, nowIso: string) {
+  signal.status = "ERROR";
+  signal.error = "insufficient_bars";
+  signal.aiSummary = reason || "Insufficient recent bars";
+  signal.aiScore = 0;
+  signal.aiGrade = "F";
+  signal.scoredAt = nowIso;
+  signal.updatedAt = nowIso;
+  signal.scoringLockUntil = undefined;
+  signal.scoringStartedAt = undefined;
+  // Clear other score fields for consistency
+  delete signal.score;
+  delete signal.grade;
+  delete signal.totalScore;
+  delete signal.tradePlan;
+  delete signal.qualified;
+  delete signal.shownInApp;
+  return signal;
+}
+
 export function applyParseFailed(
   signal: any,
   reason: string,
