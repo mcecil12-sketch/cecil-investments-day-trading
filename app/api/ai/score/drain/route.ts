@@ -665,6 +665,61 @@ export async function POST(req: Request) {
       }
     }
 
+    // === WRITE GUARD: Enforce invariant SCORED → aiScore is finite ===
+    // Before persisting, verify that no SCORED signal has null/undefined/NaN aiScore.
+    // If a violation is detected, convert to ERROR to maintain data integrity.
+    const guardsApplied = [];
+    for (const sig of signals.filter((s) => finalizedIds.includes(s.id))) {
+      const signal = sig as any; // Allow dynamic properties like scoredAt
+      if (signal.status === "SCORED" && !Number.isFinite(signal.aiScore)) {
+        console.warn("[score/drain] write guard: SCORED signal has non-finite aiScore, converting to ERROR", {
+          id: signal.id,
+          ticker: signal.ticker,
+          aiScore: signal.aiScore,
+        });
+
+        // Determine which error code to use based on aiSummary or default to parse_failed
+        const isInsufficientBarsError = 
+          signal.aiSummary?.includes("Insufficient") || 
+          signal.error === "insufficient_bars";
+        
+        signal.status = "ERROR";
+        signal.error = isInsufficientBarsError ? "insufficient_bars" : "parse_failed";
+        signal.aiScore = 0;
+        signal.aiGrade = "F";
+        signal.aiSummary = `guard: non-finite aiScore (was ${signal.aiScore})`;
+        signal.scoredAt = new Date().toISOString();
+        signal.updatedAt = new Date().toISOString();
+
+        // Clear score-related fields for consistency
+        delete signal.score;
+        delete signal.grade;
+        delete signal.totalScore;
+        delete signal.tradePlan;
+        delete signal.qualified;
+        delete signal.shownInApp;
+
+        guardsApplied.push({
+          id: signal.id,
+          ticker: signal.ticker,
+          error: signal.error,
+        });
+
+        // Update result counters to reflect the correction
+        result.scored -= 1;
+        result.scoredCount -= 1;
+        result.errored += 1;
+        result.errorCount += 1;
+      }
+    }
+
+    if (guardsApplied.length > 0) {
+      console.warn("[score/drain] write guard applied corrections", {
+        count: guardsApplied.length,
+        corrections: guardsApplied,
+      });
+    }
+
     // Write updates (atomic for all signals processed so far)
     await writeSignals(signals);
 
