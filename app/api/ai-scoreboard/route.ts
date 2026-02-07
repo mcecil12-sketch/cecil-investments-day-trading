@@ -46,14 +46,15 @@ export async function GET(req: Request) {
   const list: Signal[] = Array.isArray(raw) ? raw : raw?.signals ?? [];
 
   const scored = list
-    .filter((s) => s && (s.aiScore != null || s.grade != null || s.score != null))
+    .filter((s) => s && (s.status || "").toUpperCase() === "SCORED")
     .map((s) => ({
       ticker: s.ticker,
       createdAt: s.createdAt,
       status: s.status,
       score: toNum(s.aiScore ?? s.score),
       grade: (s.grade ?? null) as string | null,
-    }));
+    }))
+    .filter((s) => typeof s.score === "number" && Number.isFinite(s.score));
 
   const gradeCounts: Record<string, number> = {};
   let sum = 0;
@@ -61,10 +62,8 @@ export async function GET(req: Request) {
 
   for (const s of scored) {
     if (s.grade) gradeCounts[s.grade] = (gradeCounts[s.grade] || 0) + 1;
-    if (typeof s.score === "number") {
-      sum += s.score;
-      n++;
-    }
+    sum += s.score as number;
+    n++;
   }
 
   const min = minScoreToQualify();

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { readSignals } from "@/lib/jsonDb";
+import { getSignalTimestampMs, parseSince, resolveSinceField } from "@/lib/signals/since";
 
 function normalizeSignal(s: any) {
   return {
@@ -23,29 +24,6 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
 
-function parseDurationToMs(s: string): number | null {
-  const m = s.trim().match(/^(\d+)(m|h|d)$/i);
-  if (!m) return null;
-  const value = Number(m[1]);
-  if (!Number.isFinite(value) || value <= 0) return null;
-  const unit = m[2].toLowerCase();
-  if (unit === "m") return value * 60_000;
-  if (unit === "h") return value * 60 * 60_000;
-  if (unit === "d") return value * 24 * 60 * 60_000;
-  return null;
-}
-
-function parseSince(raw: string | null): Date | null {
-  if (!raw) return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  const ms = parseDurationToMs(trimmed);
-  if (ms != null) return new Date(Date.now() - ms);
-  const t = Date.parse(trimmed);
-  if (Number.isFinite(t)) return new Date(t);
-  return null;
-}
-
 function normalizeStatuses(list: string[]) {
   return list
     .map((s) => s.trim().toUpperCase())
@@ -55,6 +33,7 @@ function normalizeStatuses(list: string[]) {
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const sinceRaw = url.searchParams.get("since");
+  const sinceFieldRaw = url.searchParams.get("sinceField");
   const onlyActiveRaw = url.searchParams.get("onlyActive");
   const orderRaw = (url.searchParams.get("order") || "").toLowerCase();
   const limitRaw = url.searchParams.get("limit");
@@ -68,6 +47,7 @@ export async function GET(req: Request) {
 
   const useDefaults = !hasSince && !providedStatuses && !hasOnlyActive;
 
+  const sinceField = resolveSinceField(sinceFieldRaw);
   const sinceDate = useDefaults ? parseSince("48h") : parseSince(sinceRaw);
   const order = orderRaw === "asc" ? "asc" : "desc";
   const limitParsed = Number(limitRaw ?? 200);
@@ -91,8 +71,8 @@ export async function GET(req: Request) {
   if (sinceDate) {
     const sinceMs = sinceDate.getTime();
     filtered = filtered.filter((s: any) => {
-      const t = Date.parse(s?.createdAt ?? "");
-      return Number.isFinite(t) && t >= sinceMs;
+      const t = getSignalTimestampMs(s, sinceField);
+      return t != null && Number.isFinite(t) && t >= sinceMs;
     });
   }
 
@@ -126,6 +106,8 @@ export async function GET(req: Request) {
         totalBefore,
         totalAfter,
         since: sinceDate ? sinceDate.toISOString() : null,
+        sinceISO: sinceDate ? sinceDate.toISOString() : null,
+        sinceField,
         order,
         limit,
         onlyActive,

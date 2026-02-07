@@ -3,8 +3,12 @@ import { readSignals, writeSignals } from "@/lib/jsonDb";
 import { redis } from "@/lib/redis";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { scoreSignalWithAI } from "@/lib/aiScoring";
-import { shouldQualify } from "@/lib/aiQualify";
 import { touchHeartbeat } from "@/lib/aiHeartbeat";
+import {
+  applyParseFailed,
+  applyScoreError,
+  applyScoreSuccess,
+} from "@/lib/ai/scoreDrainApply";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -69,8 +73,18 @@ async function scoreWithTimeout(
   signal: any,
   deadlineAtMs: number
 ): Promise<
-  | { ok: true; scored: any }
-  | { ok: false; error: string; reason: string }
+  | { ok: true; scored: any; meta?: { aiModel?: string | null; aiRequestId?: string | null } }
+  | {
+      ok: false;
+      error: string;
+      reason: string;
+      meta?: {
+        aiModel?: string | null;
+        aiRawHead?: string | null;
+        aiParseError?: string | null;
+        aiRequestId?: string | null;
+      };
+    }
 > {
   const remainingMs = deadlineAtMs - Date.now();
   if (remainingMs <= 0) {
@@ -100,7 +114,32 @@ async function scoreWithTimeout(
       ),
     ]);
 
-    return result;
+    if (result.ok) {
+      return {
+        ok: true,
+        scored: result.scored,
+        meta: { aiModel: result.aiModel, aiRequestId: result.aiRequestId },
+      };
+    }
+
+    const isParseFailed =
+      result.error === "ai_parse_failed" || result.error === "invalid_model_output";
+    const hasAiMeta = typeof result === "object" && result != null && "aiModel" in result;
+    const aiModel = hasAiMeta ? (result as any).aiModel : null;
+    const aiRawHead = hasAiMeta ? (result as any).rawHead : null;
+    const aiParseError = hasAiMeta ? (result as any).aiParseError : null;
+    const aiRequestId = hasAiMeta ? (result as any).aiRequestId : null;
+    return {
+      ok: false,
+      error: isParseFailed ? "parse_failed" : result.error,
+      reason: result.reason,
+      meta: {
+        aiModel,
+        aiRawHead,
+        aiParseError: aiParseError ?? result.reason,
+        aiRequestId,
+      },
+    };
   } catch (err) {
     const errStr = String(err);
     if (errStr.includes("timeout")) {
@@ -138,6 +177,13 @@ async function scoreSignalsConcurrent(
     status: "SCORED" | "ERROR" | "TIMEOUT";
     scoreResult?: any;
     errorReason?: string;
+    errorCode?: string;
+    errorMeta?: {
+      aiModel?: string | null;
+      aiRawHead?: string | null;
+      aiParseError?: string | null;
+      aiRequestId?: string | null;
+    };
   }>;
 }> {
   const results: Array<{
@@ -145,6 +191,13 @@ async function scoreSignalsConcurrent(
     status: "SCORED" | "ERROR" | "TIMEOUT";
     scoreResult?: any;
     errorReason?: string;
+    errorCode?: string;
+    errorMeta?: {
+      aiModel?: string | null;
+      aiRawHead?: string | null;
+      aiParseError?: string | null;
+      aiRequestId?: string | null;
+    };
   }> = [];
   const details: Array<{
     id: string;
@@ -189,6 +242,7 @@ async function scoreSignalsConcurrent(
           signal,
           status: "ERROR",
           errorReason: String(settledResult.reason),
+          errorCode: "promise_rejected",
         });
         errorCount += 1;
         details.push({
@@ -216,13 +270,15 @@ async function scoreSignalsConcurrent(
             status: "ERROR",
             scoreResult,
             errorReason: scoreResult.reason,
+            errorCode: scoreResult.error,
+            errorMeta: scoreResult.meta,
           });
           errorCount += 1;
           details.push({
             id: signal.id,
             ticker: signal.ticker,
             status: "ERROR",
-            error: scoreResult.reason,
+            error: scoreResult.error,
           });
         }
         continue;
@@ -520,15 +576,18 @@ export async function POST(req: Request) {
       result.completedCount += 1;
 
       if (procResult.status === "ERROR") {
-        // Mark as ERROR: model_timeout or other reason
-        signal.status = "ERROR";
-        signal.error = procResult.errorReason?.includes("timeout")
-          ? "model_timeout"
-          : "scoring_failed";
-        signal.aiErrorReason = procResult.errorReason;
-        signal.updatedAt = new Date().toISOString();
-        signal.scoringLockUntil = undefined;
-        signal.scoringStartedAt = undefined;
+        const nowIso = new Date().toISOString();
+        if (procResult.errorCode === "parse_failed") {
+          applyParseFailed(
+            signal,
+            procResult.errorReason || "unparseable",
+            procResult.errorMeta,
+            nowIso
+          );
+        } else {
+          applyScoreError(signal, procResult.errorReason, nowIso);
+        }
+
         finalizedIds.push(signal.id);
         result.errored += 1;
         result.errorCount += 1;
@@ -536,26 +595,32 @@ export async function POST(req: Request) {
           id: signal.id,
           ticker: signal.ticker,
           reason: procResult.errorReason,
+          code: procResult.errorCode,
         });
         continue;
       }
 
       // Success: SCORED
       const scored = procResult.scoreResult;
-      signal.status = "SCORED";
-      signal.aiScore = scored.aiScore ?? null;
-      signal.aiGrade = scored.aiGrade ?? null;
-      signal.aiSummary = scored.aiSummary ?? null;
-      signal.totalScore = scored.totalScore ?? null;
-      signal.tradePlan = scored.tradePlan ?? null;
-      signal.qualified = shouldQualify({
-        score: scored.aiScore,
-        grade: scored.aiGrade,
-      });
-      signal.shownInApp = signal.qualified;
-      signal.updatedAt = new Date().toISOString();
-      signal.scoringLockUntil = undefined;
-      signal.scoringStartedAt = undefined;
+      // HARDENING: Never write SCORED with null score - treat as parse_failed
+      if (!Number.isFinite(scored.aiScore)) {
+        const nowIso = new Date().toISOString();
+        applyParseFailed(
+          signal,
+          "null_score_from_model",
+          undefined,
+          nowIso
+        );
+        finalizedIds.push(signal.id);
+        result.errored += 1;
+        result.errorCount += 1;
+        console.warn("[score/drain] score error: null score", {
+          id: signal.id,
+          ticker: signal.ticker,
+        });
+        continue;
+      }
+      applyScoreSuccess(signal, scored, new Date().toISOString());
       finalizedIds.push(signal.id);
 
       result.scored += 1;

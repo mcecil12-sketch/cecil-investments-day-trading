@@ -2,6 +2,8 @@ export type ParsedScore = {
   score: number;
   grade: string;
   summary: string;
+  qualified?: boolean;
+  reasons?: string[];
   reasoning?: string;
   rawJson?: any;
 };
@@ -77,10 +79,17 @@ export function parseAiScoreOutput(
       const score = clampScore(Number(obj.score ?? obj.aiScore));
       const grade = normalizeGrade(obj.grade ?? obj.aiGrade);
       const summary = String(obj.summary ?? obj.aiSummary ?? "").trim();
+      const qualified = typeof obj.qualified === "boolean" ? obj.qualified : undefined;
+      const reasons = Array.isArray(obj.reasons)
+        ? obj.reasons.map((r: any) => String(r)).filter((r: string) => r.trim().length > 0)
+        : undefined;
       const reasoning = obj.reasoning ? String(obj.reasoning) : undefined;
 
       if (Number.isFinite(score) && summary) {
-        return { ok: true, parsed: { score, grade, summary, reasoning, rawJson: obj } };
+        return {
+          ok: true,
+          parsed: { score, grade, summary, qualified, reasons, reasoning, rawJson: obj },
+        };
       }
     } catch {
       // fall through to heuristic

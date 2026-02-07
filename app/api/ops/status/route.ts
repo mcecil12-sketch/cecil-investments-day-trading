@@ -12,6 +12,7 @@ import { readTrades } from "@/lib/tradesStore";
 import { etDateString } from "@/lib/autoEntry/guardrails";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { readReconcileTelemetry } from "@/lib/maintenance/reconcileTelemetry";
+import { computeScoringWindows } from "@/lib/ops/scoringWindows";
 
 export const dynamic = "force-dynamic";
 
@@ -57,16 +58,7 @@ export async function GET() {
     // Get guard state for additional info
     const guardState = await guardrailsStore.getGuardrailsState(etDate);
 
-    // Compute scoring backlog
-    const now = new Date();
-    const sixHoursAgo = new Date(now.getTime() - 6 * 60 * 60 * 1000);
-    const signalsLast6h = signals.filter(
-      (s) => new Date(s.createdAt) >= sixHoursAgo && new Date(s.createdAt) <= now
-    );
-
-    const pending = signalsLast6h.filter((s) => s.status === "PENDING").length;
-    const scored = signalsLast6h.filter((s) => s.status === "SCORED").length;
-    const error = signalsLast6h.filter((s) => s.status === "ERROR").length;
+    const { createdLast6Hours, scoredLast6Hours } = computeScoringWindows(signals);
 
     // Get last auto-entry telemetry
     const telemetry = await readAutoEntryTelemetry(etDate, 1);
@@ -199,12 +191,17 @@ export async function GET() {
 
       // Scoring backlog
       scoring: {
-        last6Hours: {
-          total: signalsLast6h.length,
-          pending,
-          scored,
-          error,
-          backlog: pending, // How many are stuck pending
+        createdLast6Hours: {
+          total: createdLast6Hours.total,
+          pending: createdLast6Hours.pending,
+          scored: createdLast6Hours.scored,
+          error: createdLast6Hours.error,
+        },
+        scoredLast6Hours: {
+          total: scoredLast6Hours.total,
+          scored: scoredLast6Hours.scored,
+          error: scoredLast6Hours.error,
+          lastScoredAt: scoredLast6Hours.lastScoredAt,
         },
         allTime: {
           total: signals.length,
@@ -232,7 +229,7 @@ export async function GET() {
       // Health check
       health: {
         brokerConnected: !brokerTruth.error,
-        scoringHealthy: pending + error < 50, // Alert if >50 pending+error
+        scoringHealthy: createdLast6Hours.pending + createdLast6Hours.error < 50, // Alert if >50 pending+error
         entryReadiness:
           !brokerTruth.error &&
           !wouldSkipMaxOpenPositions &&

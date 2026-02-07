@@ -70,8 +70,21 @@ type ModelResponse = {
 };
 
 export type AiScoreResult =
-  | { ok: true; scored: ScoredSignal }
-  | { ok: false; error: "ai_parse_failed"; reason: string; rawHead: string };
+  | {
+      ok: true;
+      scored: ScoredSignal;
+      aiModel: string;
+      aiRequestId?: string | null;
+    }
+  | {
+      ok: false;
+      error: "ai_parse_failed" | "invalid_model_output";
+      reason: string;
+      rawHead: string;
+      aiModel: string;
+      aiRequestId?: string | null;
+      aiParseError?: string | null;
+    };
 
 function supportsCustomTemperature(model: string) {
   return !model.startsWith("gpt-5");
@@ -113,6 +126,25 @@ function scoreToGrade(score: number) {
   if (s >= 6) return "C"
   if (s >= 4) return "D"
   return "F"
+}
+
+function validateStructuredOutput(parsed: { score: number; grade: string; summary: string; qualified?: boolean; reasons?: string[] }) {
+  if (!Number.isFinite(parsed.score) || parsed.score < 0 || parsed.score > 10) {
+    return "invalid_score";
+  }
+  if (!["A", "B", "C", "D", "F"].includes(parsed.grade)) {
+    return "invalid_grade";
+  }
+  if (!parsed.summary || !parsed.summary.trim()) {
+    return "missing_summary";
+  }
+  if (typeof parsed.qualified !== "boolean") {
+    return "missing_qualified";
+  }
+  if (!Array.isArray(parsed.reasons) || parsed.reasons.length === 0) {
+    return "missing_reasons";
+  }
+  return null;
 }
 
 function stripCodeFences(s: string) {
@@ -252,6 +284,8 @@ export async function scoreSignalWithAI(rawSignal: RawSignal): Promise<AiScoreRe
     console.warn("[aiScoring] OPENAI_API_KEY not set; returning default low score.");
     return {
       ok: true,
+      aiModel: "disabled",
+      aiRequestId: null,
       scored: {
       ...rawSignal,
       aiScore: 0,
@@ -277,8 +311,8 @@ Rules:
   - Pullback quality relative to VWAP and recent range.
   - Liquidity and volume.
   - How clean/low-noise the setup seems.
-- Respond ONLY as a compact JSON object: 
-  {"score": number, "grade": "A"|"B"|"C"|"D"|"F", "summary": "short explanation"}.
+- Respond ONLY as a compact JSON object with fields:
+  {"aiScore": number, "aiGrade": "A"|"B"|"C"|"D"|"F", "qualified": boolean, "aiSummary": "short explanation", "reasons": string[]}.
   No extra text.
 `.trim();
 
@@ -324,6 +358,8 @@ Rules:
     const reason = `Insufficient recent bars (${context.barsUsed} < ${MIN_BARS_FOR_AI})`;
     return {
       ok: true,
+      aiModel: "skipped",
+      aiRequestId: null,
       scored: {
       ...signal,
       aiScore: null,
@@ -352,8 +388,8 @@ ${JSON.stringify(signal, null, 2)}
 ComputedContext JSON (from Alpaca bars):
 ${contextBlock}
 
-Return ONLY valid JSON with:
-{ "aiScore": number, "aiSummary": string, "aiGrade": string, "totalScore": number }
+Return ONLY valid JSON with fields:
+{ "aiScore": number, "aiSummary": string, "aiGrade": "A|B|C|D|F", "qualified": boolean, "reasons": string[] }
 `.trim();
 
   const BULK_MODEL = process.env.OPENAI_MODEL_BULK || "gpt-5-mini";
@@ -370,7 +406,25 @@ Return ONLY valid JSON with:
       completion = await openai.chat.completions.create({
         model,
         ...(supportsCustomTemperature(model) ? { temperature: 0.3 } : {}),
-        response_format: { type: "json_object" },
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "ai_score",
+            strict: true,
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                aiScore: { type: "number" },
+                aiGrade: { type: "string", enum: ["A", "B", "C", "D", "F"] },
+                qualified: { type: "boolean" },
+                aiSummary: { type: "string" },
+                reasons: { type: "array", items: { type: "string" } },
+              },
+              required: ["aiScore", "aiGrade", "qualified", "aiSummary", "reasons"],
+            },
+          },
+        },
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: promptText },
@@ -387,24 +441,55 @@ Return ONLY valid JSON with:
       console.log("[aiScoring] recordSpend failed (non-fatal):", e?.message ?? String(e));
     }
     await bumpTodayFunnel({ gptScoredByModel: { [model]: 1 } });
-    return completion.choices[0]?.message?.content ?? "";
+    const requestId =
+      (completion as any)?.request_id ??
+      (completion as any)?.id ??
+      (completion as any)?.response?.headers?.get?.("x-request-id") ??
+      null;
+    return { content: completion.choices[0]?.message?.content ?? "", requestId };
   };
 
-  let content = await scoreOnce(prompt);
-  let parsed = parseAiScoreOutput(content);
+  let scoreResponse = await scoreOnce(prompt);
+  let parsed = parseAiScoreOutput(scoreResponse.content);
   if (!parsed.ok && retryOnParseFail) {
     const retryPrompt =
       prompt +
-      "\n\nIMPORTANT: Respond ONLY with a single JSON object: {\"score\":number,\"grade\":\"A|B|C|D|F\",\"summary\":string,\"reasoning\":string}";
-    content = await scoreOnce(retryPrompt);
-    parsed = parseAiScoreOutput(content);
+      "\n\nIMPORTANT: Respond ONLY with a single JSON object: {\"aiScore\":number,\"aiGrade\":\"A|B|C|D|F\",\"qualified\":boolean,\"aiSummary\":string,\"reasons\":string[]}";
+    scoreResponse = await scoreOnce(retryPrompt);
+    parsed = parseAiScoreOutput(scoreResponse.content);
   }
 
   if (!parsed.ok) {
-    return { ok: false, error: "ai_parse_failed", reason: parsed.reason, rawHead: parsed.rawHead };
+    return {
+      ok: false,
+      error: "ai_parse_failed",
+      reason: parsed.reason,
+      rawHead: parsed.rawHead,
+      aiModel: model,
+      aiRequestId: scoreResponse.requestId,
+      aiParseError: parsed.reason,
+    };
   }
 
   const parsedScore = parsed.parsed;
+  const validationError = validateStructuredOutput({
+    score: parsedScore.score,
+    grade: parsedScore.grade,
+    summary: parsedScore.summary,
+    qualified: parsedScore.qualified,
+    reasons: parsedScore.reasons,
+  });
+  if (validationError) {
+    return {
+      ok: false,
+      error: "invalid_model_output",
+      reason: validationError,
+      rawHead: (scoreResponse.content || "").slice(0, 800),
+      aiModel: model,
+      aiRequestId: scoreResponse.requestId,
+      aiParseError: validationError,
+    };
+  }
   const _scoreNum = parsedScore.score;
   const gradeCandidate = String(parsedScore.grade || "").trim().toUpperCase();
   const _grade: AiGrade =
@@ -433,5 +518,5 @@ Return ONLY valid JSON with:
     console.warn("[aiScoring] heartbeat update failed", err);
   }
 
-  return { ok: true, scored: result };
+  return { ok: true, scored: result, aiModel: model, aiRequestId: scoreResponse.requestId };
 }
