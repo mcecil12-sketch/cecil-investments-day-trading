@@ -24,10 +24,15 @@ export function applyParseFailed(
   signal.updatedAt = nowIso;
   signal.scoringLockUntil = undefined;
   signal.scoringStartedAt = undefined;
+  // Clear all score fields for ERROR
   delete signal.aiScore;
+  delete signal.score;
   delete signal.aiGrade;
+  delete signal.grade;
   delete signal.totalScore;
   delete signal.tradePlan;
+  delete signal.qualified;
+  delete signal.shownInApp;
   return signal;
 }
 
@@ -39,24 +44,43 @@ export function applyScoreError(signal: any, reason: string | undefined, nowIso:
   signal.updatedAt = nowIso;
   signal.scoringLockUntil = undefined;
   signal.scoringStartedAt = undefined;
+  // Clear all score fields for ERROR
+  delete signal.aiScore;
+  delete signal.score;
+  delete signal.aiGrade;
+  delete signal.grade;
+  delete signal.totalScore;
+  delete signal.tradePlan;
+  delete signal.qualified;
+  delete signal.shownInApp;
   return signal;
 }
 
 export function applyScoreSuccess(signal: any, scored: any, nowIso: string) {
+  // HARD INVARIANT: aiScore must be finite for SCORED
+  if (!Number.isFinite(scored.aiScore)) {
+    throw new Error(
+      `applyScoreSuccess: aiScore must be finite for SCORED, got ${scored.aiScore}`
+    );
+  }
+
   signal.status = "SCORED";
-  signal.aiScore = scored.aiScore ?? null;
+  signal.aiScore = scored.aiScore;
+  signal.score = scored.aiScore; // Backwards compat alias
   signal.aiGrade = scored.aiGrade ?? null;
+  signal.grade = scored.aiGrade ?? null; // Backwards compat alias
   signal.aiSummary = scored.aiSummary ?? null;
-  signal.totalScore = scored.totalScore ?? null;
+  signal.totalScore = scored.totalScore ?? scored.aiScore;
   signal.tradePlan = scored.tradePlan ?? null;
   signal.scoredAt = nowIso;
+  signal.updatedAt = nowIso;
+  signal.scoringLockUntil = undefined;
+  signal.scoringStartedAt = undefined;
+
   signal.qualified = shouldQualify({
     score: scored.aiScore,
     grade: scored.aiGrade,
   });
   signal.shownInApp = signal.qualified;
-  signal.updatedAt = nowIso;
-  signal.scoringLockUntil = undefined;
-  signal.scoringStartedAt = undefined;
   return signal;
 }

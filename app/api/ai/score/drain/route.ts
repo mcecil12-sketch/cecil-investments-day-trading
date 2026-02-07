@@ -629,7 +629,16 @@ export async function POST(req: Request) {
 
     result.processed = concurrentResult.scoredCount + concurrentResult.errorCount;
     result.timeoutCount = concurrentResult.timeoutCount;
-    result.details = concurrentResult.details;
+
+    // Rebuild details from actual persisted signal state (post-apply)
+    const finalizedSignals = signals.filter((s) => finalizedIds.includes(s.id));
+    result.details = finalizedSignals.slice(0, 20).map((s) => ({
+      id: s.id,
+      ticker: s.ticker,
+      status: s.status as "SCORED" | "ERROR",
+      aiScore: s.status === "SCORED" ? s.aiScore : undefined,
+      error: s.status === "ERROR" ? (s.error ?? undefined) : undefined,
+    }));
 
     // CLEANUP: Release any unfinalized claims (signals stuck in SCORING)
     // releaseLimit controls how many to release: 0 = none, -1 = all, N > 0 = up to N
