@@ -26,6 +26,7 @@ export type RawSignal = {
   id: string;
   ticker: string;
   side: Side;
+  direction?: Side | null; // Heuristic direction based on VWAP/trend analysis
   entryPrice: number;
   stopPrice: number;
   targetPrice: number;
@@ -404,6 +405,7 @@ Rules:
   - Entry quality relative to VWAP and recent price action
   - Risk/reward setup
   - Liquidity and volume support
+- Direction alignment: if signal has a heuristic direction (LONG/SHORT based on VWAP/trend), strongly prefer setups aligned with it. Penalize significantly for wrong-way setups (e.g., SHORT with upward trend).
 - Choose bestDirection: "LONG", "SHORT", or "NONE" (if both weak)
 - Return finalScore = max(longScore, shortScore) when bestDirection chosen
 - Respond ONLY as a compact JSON object with fields:
@@ -496,12 +498,13 @@ Evaluate BOTH:
 2. SHORT hypothesis: Sell/short at entry, profit on downside to stop of LONG (inverted bracket)
 
 For each direction, score 0-10 based on:
-- Trend alignment
+- Trend alignment (strongly align the chosen direction with the dominant trend)
 - Entry quality (VWAP, pullback/rejection quality)
 - Risk/reward
 - Volume/liquidity support
+- Direction alignment: If the signal has a heuristic direction field, weight heavily toward it. Penalize setups opposite to the heuristic direction (e.g., if direction="LONG" but you score SHORT higher, apply -2 penalty to SHORT).
 
-Choose bestDirection as the higher-conviction setup. Set finalScore = max(longScore, shortScore).
+Choose bestDirection as the higher-conviction setup aligned with trend and heuristic direction. Set finalScore = max(longScore, shortScore).
 If both are weak (<5), set bestDirection="NONE" and finalScore=max(longScore,shortScore).
 
 Return ONLY valid JSON:

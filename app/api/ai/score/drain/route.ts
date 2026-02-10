@@ -21,6 +21,7 @@ const DEADLINE_MS = Number(process.env.AI_SCORE_DRAIN_DEADLINE_MS ?? 110000); //
 const SOFT_STOP_MARGIN_MS = 8000; // Stop starting new work when <8s remaining
 const MAX_PER_RUN = Number(process.env.AI_SCORE_DRAIN_MAX ?? 25);
 const SCORING_CONCURRENCY = Number(process.env.AI_SCORE_DRAIN_CONCURRENCY ?? 5); // Parallel scoring workers
+const MAX_PICK_POOL = 500; // Max signals to consider for sorting/picking (CPU optimization)
 
 const DRAIN_LOCK_KEY = "ai:score:drain:lock";
 const DRAIN_LOCK_TTL = 30; // seconds
@@ -460,7 +461,32 @@ export async function POST(req: Request) {
     // Why newest-first? Ensures the most recent signals are scored promptly, keeping the funnel responsive and preventing backlog starvation.
     const signals = await readSignals();
     const now = new Date();
-    const RECENT_WINDOW_HOURS = Number(process.env.AI_SCORE_DRAIN_RECENT_HOURS ?? 6);
+    
+    // Parse query params early
+    const url = new URL(req.url);
+    const qp = url.searchParams;
+    const backlog = ["1", "true", "yes", "y", "on"].includes(
+      (qp.get("backlog") || "").toLowerCase()
+    );
+    const strategyParam = (qp.get("strategy") || "").toLowerCase();
+    const wantBacklogStrategy =
+      backlog ||
+      strategyParam === "backlog" ||
+      strategyParam === "backlog_oldest_first";
+    const releaseLimit = Number(qp.get("releaseLimit") ?? "-1"); // -1 = release all
+    const limitParamRaw = Number(qp.get("limit") ?? "NaN");
+    const limitParam = Number.isFinite(limitParamRaw) && limitParamRaw > 0 ? limitParamRaw : MAX_PER_RUN;
+    const maxPerRun = Math.min(MAX_PER_RUN, limitParam);
+    
+    // Parse budgetMs parameter (default 12000ms = 12s)
+    const budgetMsParam = Number(qp.get("budgetMs") ?? "12000");
+    const budgetMs = Number.isFinite(budgetMsParam) && budgetMsParam > 0 ? budgetMsParam : 12000;
+    
+    // Parse recentWindowHours parameter (default from env or 6 hours)
+    const recentWindowHoursParam = Number(qp.get("recentWindowHours") ?? "NaN");
+    const RECENT_WINDOW_HOURS = Number.isFinite(recentWindowHoursParam) && recentWindowHoursParam > 0 
+      ? recentWindowHoursParam 
+      : Number(process.env.AI_SCORE_DRAIN_RECENT_HOURS ?? 6);
     const recentWindowStart = new Date(now.getTime() - RECENT_WINDOW_HOURS * 60 * 60 * 1000);
 
     // === RECLAIM STALE SCORING SIGNALS ===
@@ -491,35 +517,7 @@ export async function POST(req: Request) {
     const claimedIds: string[] = [];
     const finalizedIds: string[] = [];
 
-    // Parse backlog flag + strategy from query params
-    const url = new URL(req.url);
-    const qp = url.searchParams;
-    const backlog = ["1", "true", "yes", "y", "on"].includes(
-      (qp.get("backlog") || "").toLowerCase()
-    );
-    const strategyParam = (qp.get("strategy") || "").toLowerCase();
-    const wantBacklogStrategy =
-      backlog ||
-      strategyParam === "backlog" ||
-      strategyParam === "backlog_oldest_first";
-    const releaseLimit = Number(qp.get("releaseLimit") ?? "-1"); // -1 = release all
-    const limitParamRaw = Number(qp.get("limit") ?? "NaN");
-    const limitParam = Number.isFinite(limitParamRaw) && limitParamRaw > 0 ? limitParamRaw : MAX_PER_RUN;
-    const maxPerRun = Math.min(MAX_PER_RUN, limitParam);
-    
-    // Parse budgetMs parameter (default 12000ms = 12s)
-    const budgetMsParam = Number(qp.get("budgetMs") ?? "12000");
-    const budgetMs = Number.isFinite(budgetMsParam) && budgetMsParam > 0 ? budgetMsParam : 12000;
-
-    type PickStrategy = "recent_first" | "backlog_fallback" | "backlog_oldest_first";
-
-    // Decide strategy (default stays recent_first)
-    const pickedStrategy: PickStrategy = wantBacklogStrategy
-      ? "backlog_oldest_first"
-      : "recent_first";
-    let pickedSignals: any[] = [];
-
-    // Check budget exhaustion before picking signals
+    // Check budget exhaustion BEFORE picking/claiming signals
     const elapsedBeforePick = Date.now() - startedAtMs;
     if (elapsedBeforePick > budgetMs) {
       result.expired = true;
@@ -545,18 +543,52 @@ export async function POST(req: Request) {
       return buildResponse(result, startedAtMs, 200);
     }
 
+    type PickStrategy = "recent_first" | "backlog_fallback" | "backlog_oldest_first";
+
+    // Decide strategy (default stays recent_first)
+    let pickedStrategy: PickStrategy = wantBacklogStrategy
+      ? "backlog_oldest_first"
+      : "recent_first";
+    let pickedSignals: any[] = [];
+
     if (pickedStrategy === "backlog_oldest_first") {
       // Backlog mode: pick oldest-first (no recent window filter)
-      pickedSignals = signals
-        .filter((s) => s.status === "PENDING")
+      // Optimization: limit sorting pool to MAX_PICK_POOL
+      const pendingSignals = signals.filter((s) => s.status === "PENDING");
+      const poolSize = Math.min(pendingSignals.length, MAX_PICK_POOL * 2); // 2x for safety
+      const pool = pendingSignals.slice(0, poolSize);
+      pickedSignals = pool
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
         .slice(0, maxPerRun);
     } else {
-      // Recent-first: pick newest within recent window ONLY (no fallback to old PENDING)
-      pickedSignals = signals
-        .filter((s) => s.status === "PENDING" && new Date(s.createdAt) >= recentWindowStart)
-        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-        .slice(0, maxPerRun);
+      // Recent-first: pick newest within recent window with CPU optimization
+      // Filter PENDING signals within the recent window
+      const recentPending = signals.filter(
+        (s) => s.status === "PENDING" && new Date(s.createdAt) >= recentWindowStart
+      );
+      
+      if (recentPending.length > 0) {
+        // Optimization: if pool is large, only sort the newest MAX_PICK_POOL candidates
+        const poolSize = Math.min(recentPending.length, MAX_PICK_POOL);
+        // Take last N items (assuming signals array is roughly chronological)
+        const pool = recentPending.slice(-poolSize);
+        pickedSignals = pool
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+          .slice(0, maxPerRun);
+      } else {
+        // Fallback: if recent window yields nothing, pick oldest-first from ALL PENDING
+        console.log("[score/drain] recent window empty, falling back to backlog oldest-first", {
+          recentWindowHours: RECENT_WINDOW_HOURS,
+          recentWindowStart: recentWindowStart.toISOString(),
+        });
+        pickedStrategy = "backlog_fallback";
+        const pendingSignals = signals.filter((s) => s.status === "PENDING");
+        const poolSize = Math.min(pendingSignals.length, MAX_PICK_POOL * 2);
+        const pool = pendingSignals.slice(0, poolSize);
+        pickedSignals = pool
+          .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+          .slice(0, maxPerRun);
+      }
     }
 
     // Claim/lock: mark as SCORING with a short TTL (2 min), revert to PENDING if not processed
@@ -572,7 +604,6 @@ export async function POST(req: Request) {
     await writeSignals(signals);
 
     // For response visibility: compute createdAt range based on picked signals
-    const recentWindowHours = RECENT_WINDOW_HOURS;
     const newestPickedCreatedAt = pickedSignals.length > 0
       ? pickedSignals.reduce((max, s) => (new Date(s.createdAt) > new Date(max) ? s.createdAt : max), pickedSignals[0].createdAt)
       : null;
@@ -589,7 +620,7 @@ export async function POST(req: Request) {
       deadlineMs: DEADLINE_MS,
       softStopMarginMs: SOFT_STOP_MARGIN_MS,
       concurrency: SCORING_CONCURRENCY,
-      recentWindowHours,
+      recentWindowHours: RECENT_WINDOW_HOURS,
       newestPickedCreatedAt,
       oldestPickedCreatedAt,
     });
@@ -607,20 +638,25 @@ export async function POST(req: Request) {
     }
 
     // Apply scoring results to signals and track finalized IDs
+    // CRITICAL: Always persist completed results, even if budget is exceeded
+    // Only stop processing NEW results if budget exceeded
+    let budgetExceededDuringProcessing = false;
     for (const procResult of concurrentResult.results) {
       const signal = procResult.signal;
       
-      // Check budget before processing each signal
+      // Check budget but DON'T break - still process already-computed results
       const elapsed = Date.now() - startedAtMs;
-      if (elapsed > budgetMs) {
+      if (elapsed > budgetMs && !budgetExceededDuringProcessing) {
+        budgetExceededDuringProcessing = true;
         result.expired = true;
         result.reason = "budget_exhausted";
-        console.log("[score/drain] budget exhausted during processing", {
+        console.log("[score/drain] budget exhausted during result processing, persisting completed scores", {
           elapsed,
           budgetMs,
           processed: result.completedCount,
+          remaining: concurrentResult.results.length - result.completedCount,
         });
-        break;
+        // Continue processing - these results are already computed
       }
       
       result.attemptedCount += 1;
@@ -842,7 +878,7 @@ export async function POST(req: Request) {
 
     // Add selection strategy and window info to response
     result.pickedStrategy = pickedStrategy;
-    result.recentWindowHours = recentWindowHours;
+    result.recentWindowHours = RECENT_WINDOW_HOURS;
     result.newestPickedCreatedAt = newestPickedCreatedAt;
     result.oldestPickedCreatedAt = oldestPickedCreatedAt;
     result.remainingTimeMs = Math.max(0, deadlineAtMs - Date.now());

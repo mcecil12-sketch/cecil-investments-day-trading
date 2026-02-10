@@ -11,6 +11,7 @@ import {
   formatAiSummary,
   AiGrade,
 } from "@/lib/aiScoring";
+import { computeDirection } from "@/lib/scannerUtils";
 import { parseAiTradePlan } from "@/lib/tradePlan";
 import { sendPullbackAlert } from "@/lib/notify";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
@@ -144,11 +145,19 @@ export async function POST(req: Request) {
   await bumpTodayFunnel({ signalsReceived: 1 });
 
   const now = new Date().toISOString();
+  
+  // Compute direction heuristically based on VWAP and trend if available
+  const computedDirection = computeDirection({
+    price: Number(entryPrice),
+    vwap: rawMeta.vwap ? Number(rawMeta.vwap) : null,
+    trend: rawMeta.trend ?? "FLAT",
+  });
 
   const rawSignal: RawSignal = {
     id: rawMeta.id ?? `${ticker}-${now}`,
     ticker,
     side,
+    direction: computedDirection,
     entryPrice: Number(entryPrice),
     stopPrice: Number(stopPrice),
     targetPrice: Number(targetPrice),

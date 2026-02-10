@@ -67,6 +67,42 @@ export function isTopVolumeGainer(
   return avgPrior > 0 && lastVol >= avgPrior * multiplier;
 }
 
+/**
+ * Compute heuristic direction based on price relative to VWAP and trend.
+ * - If price is below VWAP and trend is up => LONG pullback
+ * - If price is above VWAP and trend is down => SHORT pullback
+ * Returns null if unclear or no strong signal.
+ */
+export function computeDirection(params: {
+  price: number;
+  vwap: number | null;
+  trend: "UP" | "DOWN" | "FLAT";
+}): "LONG" | "SHORT" | null {
+  const { price, vwap, trend } = params;
+  
+  if (!vwap || vwap <= 0 || !price || price <= 0) {
+    return null;
+  }
+  
+  const distancePct = ((price - vwap) / vwap) * 100;
+  
+  // LONG pullback: price below VWAP (pullback) in uptrend
+  if (distancePct < -0.2 && trend === "UP") {
+    return "LONG";
+  }
+  
+  // SHORT pullback: price above VWAP (rejection) in downtrend
+  if (distancePct > 0.2 && trend === "DOWN") {
+    return "SHORT";
+  }
+  
+  // Default: if clear uptrend => LONG bias, downtrend => SHORT bias
+  if (trend === "UP") return "LONG";
+  if (trend === "DOWN") return "SHORT";
+  
+  return null;
+}
+
 // Basic signal shape for scanners to reuse
 export type BasicSignalInput = {
   ticker: string;

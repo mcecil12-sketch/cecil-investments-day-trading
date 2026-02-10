@@ -20,6 +20,7 @@ export type StoredSignal = {
   id: string;
   ticker: string;
   side: SignalSide;
+  direction?: SignalSide | null; // Heuristic direction based on VWAP/trend (LONG pullback vs SHORT pullback)
   entryPrice: number;
   stopPrice?: number | null;
   targetPrice?: number | null;
