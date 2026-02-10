@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { finalizeTradeClose } from "@/lib/trades/finalizeClose";
+import { notify } from "@/lib/notifications/notify";
+import { buildTradeClosedPayload } from "@/lib/notifications/tradeClose";
 
 export const dynamic = "force-dynamic";
 
@@ -65,6 +67,7 @@ export async function POST(req: Request) {
 
   const updates: any[] = [];
   const results: any[] = [];
+  const finalizedTrades: any[] = [];
   let skippedReason = "";
 
   if (!candidates.length) {
@@ -88,7 +91,7 @@ export async function POST(req: Request) {
     if (!r.ok) continue;
 
     if (r.action === "FINALIZED") {
-      updates.push({
+      const finalizedTrade = {
         ...t,
         closePrice: (r as any).closePrice,
         realizedPnL: (r as any).realizedPnL,
@@ -96,7 +99,9 @@ export async function POST(req: Request) {
         closeReason: (r as any).closeReason,
         finalizedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      });
+      };
+      updates.push(finalizedTrade);
+      finalizedTrades.push(finalizedTrade);
       continue;
     }
 
@@ -134,6 +139,52 @@ export async function POST(req: Request) {
     await writeTrades(merged);
   }
 
+  // Send TRADE_CLOSED notifications for finalized trades
+  const notificationResults: any[] = [];
+  for (const trade of finalizedTrades) {
+    try {
+      const { title, message } = buildTradeClosedPayload(trade);
+      
+      const notifyResult = await notify({
+        type: "TRADE_CLOSED",
+        tradeId: trade.id,
+        ticker: trade.ticker,
+        paper: true, // Paper-first: these are paper trades
+        title,
+        message,
+        tier: "B",
+        dedupeKey: `notify:dedupe:v1:trade_closed:${trade.id}`,
+        dedupeTtlSec: 86400, // 24 hours
+      });
+      
+      notificationResults.push({
+        tradeId: trade.id,
+        ticker: trade.ticker,
+        sent: notifyResult.sent,
+        skippedReason: notifyResult.skippedReason,
+      });
+      
+      if (notifyResult.sent) {
+        console.log("[finalize-closes] TRADE_CLOSED notification sent", {
+          tradeId: trade.id,
+          ticker: trade.ticker,
+        });
+      }
+    } catch (err) {
+      console.error("[finalize-closes] notification error", {
+        tradeId: trade.id,
+        ticker: trade.ticker,
+        error: String(err),
+      });
+      notificationResults.push({
+        tradeId: trade.id,
+        ticker: trade.ticker,
+        sent: false,
+        skippedReason: "notification_exception",
+      });
+    }
+  }
+
   return NextResponse.json({
     ok: true,
     runSource,
@@ -142,6 +193,10 @@ export async function POST(req: Request) {
     effectiveLimit,
     checked: candidates.length,
     updated: updates.length,
+    finalized: finalizedTrades.length,
+    finalizedTrades: finalizedTrades.map((t) => ({ id: t.id, ticker: t.ticker })),
+    notificationsSent: notificationResults.filter((n) => n.sent).length,
+    notifications: notificationResults,
     results,
   });
 }

@@ -506,6 +506,10 @@ export async function POST(req: Request) {
     const limitParamRaw = Number(qp.get("limit") ?? "NaN");
     const limitParam = Number.isFinite(limitParamRaw) && limitParamRaw > 0 ? limitParamRaw : MAX_PER_RUN;
     const maxPerRun = Math.min(MAX_PER_RUN, limitParam);
+    
+    // Parse budgetMs parameter (default 12000ms = 12s)
+    const budgetMsParam = Number(qp.get("budgetMs") ?? "12000");
+    const budgetMs = Number.isFinite(budgetMsParam) && budgetMsParam > 0 ? budgetMsParam : 12000;
 
     type PickStrategy = "recent_first" | "backlog_fallback" | "backlog_oldest_first";
 
@@ -515,6 +519,19 @@ export async function POST(req: Request) {
       : "recent_first";
     let pickedSignals: any[] = [];
 
+    // Check budget exhaustion before picking signals
+    const elapsedBeforePick = Date.now() - startedAtMs;
+    if (elapsedBeforePick > budgetMs) {
+      result.expired = true;
+      result.reason = "budget_exhausted";
+      result.remainingTimeMs = Math.max(0, deadlineAtMs - Date.now());
+      console.log("[score/drain] budget exhausted before picking", {
+        elapsedBeforePick,
+        budgetMs,
+      });
+      return buildResponse(result, startedAtMs, 200);
+    }
+    
     // Soft-stop guard: if low on time, don't attempt new work
     const remainingBeforePickMs = deadlineAtMs - Date.now();
     if (remainingBeforePickMs < SOFT_STOP_MARGIN_MS) {
@@ -535,23 +552,16 @@ export async function POST(req: Request) {
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
         .slice(0, maxPerRun);
     } else {
-      // Recent-first: pick newest within recent window
+      // Recent-first: pick newest within recent window ONLY (no fallback to old PENDING)
       pickedSignals = signals
         .filter((s) => s.status === "PENDING" && new Date(s.createdAt) >= recentWindowStart)
         .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
         .slice(0, maxPerRun);
-
-      // Fallback: if none in recent window, pick newest PENDING from full backlog
-      if (pickedSignals.length === 0) {
-        pickedSignals = signals
-          .filter((s) => s.status === "PENDING")
-          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-          .slice(0, maxPerRun);
-      }
     }
 
     // Claim/lock: mark as SCORING with a short TTL (2 min), revert to PENDING if not processed
     const claimUntil = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+    const claimBatchSize = pickedSignals.length;
     for (const s of pickedSignals) {
       s.status = "SCORING";
       s.scoringLockUntil = claimUntil;
@@ -573,7 +583,9 @@ export async function POST(req: Request) {
     console.log("[score/drain] start", {
       pickedStrategy,
       pickedCount: pickedSignals.length,
+      claimBatchSize,
       maxPerRun,
+      budgetMs,
       deadlineMs: DEADLINE_MS,
       softStopMarginMs: SOFT_STOP_MARGIN_MS,
       concurrency: SCORING_CONCURRENCY,
@@ -597,6 +609,20 @@ export async function POST(req: Request) {
     // Apply scoring results to signals and track finalized IDs
     for (const procResult of concurrentResult.results) {
       const signal = procResult.signal;
+      
+      // Check budget before processing each signal
+      const elapsed = Date.now() - startedAtMs;
+      if (elapsed > budgetMs) {
+        result.expired = true;
+        result.reason = "budget_exhausted";
+        console.log("[score/drain] budget exhausted during processing", {
+          elapsed,
+          budgetMs,
+          processed: result.completedCount,
+        });
+        break;
+      }
+      
       result.attemptedCount += 1;
 
       // Try to acquire exclusive claim for this signal
@@ -694,14 +720,17 @@ export async function POST(req: Request) {
 
     // CLEANUP: Release any unfinalized claims (signals stuck in SCORING)
     // releaseLimit controls how many to release: 0 = none, -1 = all, N > 0 = up to N
+    // STRICT LIMIT: Never release more than the original claim batch size to honor limit
     const toRelease = claimedIds.filter(id => !finalizedIds.includes(id));
-    const releaseCount = releaseLimit === 0 ? 0 : releaseLimit === -1 ? toRelease.length : Math.min(releaseLimit, toRelease.length);
-    const toReleaseSliced = toRelease.slice(0, releaseCount);
+    const effectiveReleaseLimit = releaseLimit === 0 ? 0 : releaseLimit === -1 ? Math.min(toRelease.length, claimBatchSize) : Math.min(releaseLimit, claimBatchSize);
+    const toReleaseSliced = toRelease.slice(0, effectiveReleaseLimit);
     
     if (toReleaseSliced.length > 0) {
       console.log("[score/drain] releasing unfinalized claims", {
         count: toReleaseSliced.length,
         limit: releaseLimit,
+        claimBatchSize,
+        effectiveReleaseLimit,
         ids: toReleaseSliced,
       });
       for (const signal of signals) {
@@ -817,7 +846,18 @@ export async function POST(req: Request) {
     result.newestPickedCreatedAt = newestPickedCreatedAt;
     result.oldestPickedCreatedAt = oldestPickedCreatedAt;
     result.remainingTimeMs = Math.max(0, deadlineAtMs - Date.now());
-    return buildResponse(result, startedAtMs, 200);
+    
+    // Add drain-specific response fields
+    const response = {
+      ...result,
+      claimBatchSize,
+      budgetMs,
+    };
+    
+    return NextResponse.json(response, {
+      status: 200,
+      headers: { "Cache-Control": "no-store" },
+    });
   } catch (err) {
     // Unexpected error: still return JSON
     console.error("[score/drain] fatal error", err);
