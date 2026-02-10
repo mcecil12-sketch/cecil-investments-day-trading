@@ -13,6 +13,7 @@ import { etDateString } from "@/lib/autoEntry/guardrails";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { readReconcileTelemetry } from "@/lib/maintenance/reconcileTelemetry";
 import { computeScoringWindows } from "@/lib/ops/scoringWindows";
+import { readTodayFunnel } from "@/lib/funnelRedis";
 
 export const dynamic = "force-dynamic";
 
@@ -31,8 +32,7 @@ export async function GET() {
 
   try {
     // Fetch all data in parallel
-    const [
-      brokerTruth,
+    const [      brokerTruth,
       alpacaClock,
       guardConfig,
       etDate,
@@ -42,6 +42,7 @@ export async function GET() {
       autoEntry,
       autoManage,
       reconcileTel,
+      funnelToday,
     ] = await Promise.all([
       fetchBrokerTruth(),
       fetchAlpacaClock().catch(() => ({ is_open: null, next_open: null, next_close: null })),
@@ -53,6 +54,7 @@ export async function GET() {
       Promise.resolve(getAutoConfig()),
       Promise.resolve(getAutoManageConfig()),
       readReconcileTelemetry(5),
+      readTodayFunnel(),
     ]);
 
     // Get guard state for additional info
@@ -235,6 +237,87 @@ export async function GET() {
           !wouldSkipMaxOpenPositions &&
           !guardState.autoDisabledReason &&
           (alpacaClock?.is_open ?? true),
+      },
+
+      // Funnel visibility - comprehensive metrics for "why no trades happened"
+      funnel: {
+        date: funnelToday.date,
+        updatedAt: funnelToday.updatedAt,
+        
+        // Scan stage
+        scan: {
+          runsToday: funnelToday.scansRun ?? 0,
+          skippedToday: funnelToday.scansSkipped ?? 0,
+          candidatesFound: funnelToday.candidatesFound ?? 0,
+          signalsPosted: funnelToday.signalsPosted ?? 0,
+          lastScanAt: funnelToday.lastScanAt,
+          lastScanMode: funnelToday.lastScanMode,
+          runsByMode: funnelToday.scanRunsByMode ?? {},
+          skipsByMode: funnelToday.scanSkipsByMode ?? {},
+        },
+        
+        // Scoring stage
+        scoring: {
+          signalsReceivedToday: funnelToday.signalsReceived ?? 0,
+          pendingNow: signals.filter((s) => s.status === "PENDING").length,
+          scoredToday: funnelToday.gptScored ?? 0,
+          errorsToday: signals.filter((s) => s.status === "ERROR" && s.createdAt.startsWith(funnelToday.date)).length,
+          drainsRun: funnelToday.drainsRun ?? 0,
+          drainScored: funnelToday.drainScored ?? 0,
+          drainTimeout: funnelToday.drainTimeout ?? 0,
+          drainError: funnelToday.drainError ?? 0,
+          modelUsage: funnelToday.gptScoredByModel ?? {},
+        },
+        
+        // Error breakdown
+        errors: {
+          insufficientBars: funnelToday.errorInsufficientBars ?? 0,
+          liquidityDollarVol: funnelToday.errorLiquidityDollarVol ?? 0,
+          parseFailed: funnelToday.errorParseFailed ?? 0,
+          rateLimited: funnelToday.errorRateLimited ?? 0,
+          aiRateLimitErrors: funnelToday.aiRateLimitErrors ?? 0,
+          aiTimeoutErrors: funnelToday.aiTimeoutErrors ?? 0,
+          aiBreakerOpened: funnelToday.aiBreakerOpened ?? 0,
+        },
+        
+        // Auto-entry stage
+        autoEntry: {
+          executesToday: funnelToday.autoEntryExecutes ?? 0,
+          placedToday: funnelToday.autoEntryPlaced ?? 0,
+          skipReasons: {
+            maxOpenPositions: funnelToday.autoEntrySkipMaxOpen ?? 0,
+            noPending: funnelToday.autoEntrySkipNoPending ?? 0,
+            marketClosed: funnelToday.autoEntrySkipMarketClosed ?? 0,
+          },
+        },
+        
+        // Final stage
+        orders: {
+          placedToday: funnelToday.ordersPlaced ?? 0,
+          fillsToday: funnelToday.fills ?? 0,
+        },
+        
+        // Bottleneck diagnosis
+        diagnosis: {
+          bottleneck: 
+            (funnelToday.candidatesFound ?? 0) === 0 ? "scan" :
+            (funnelToday.signalsPosted ?? 0) === 0 ? "scan_persist" :
+            signals.filter((s) => s.status === "PENDING").length > 20 ? "scoring_backlog" :
+            (funnelToday.gptScored ?? 0) === 0 ? "scoring" :
+            (funnelToday.autoEntryPlaced ?? 0) === 0 && wouldSkipMaxOpenPositions ? "max_open_positions" :
+            (funnelToday.autoEntryPlaced ?? 0) === 0 ? "auto_entry" :
+            (funnelToday.ordersPlaced ?? 0) === 0 ? "order_placement" :
+            "none",
+          note: 
+            (funnelToday.candidatesFound ?? 0) === 0 ? "No candidates found by scanners today" :
+            (funnelToday.signalsPosted ?? 0) === 0 ? "Candidates found but not persisted (check caps/dedupe)" :
+            signals.filter((s) => s.status === "PENDING").length > 20 ? `${signals.filter((s) => s.status === "PENDING").length} signals pending scoring` :
+            (funnelToday.gptScored ?? 0) === 0 ? "Signals created but not scored yet" :
+            (funnelToday.autoEntryPlaced ?? 0) === 0 && wouldSkipMaxOpenPositions ? `Max open positions reached (${brokerTruth.positionsCount}/${guardConfig.maxOpenPositions})` :
+            (funnelToday.autoEntryPlaced ?? 0) === 0 ? "Scored signals but no auto-entry executions" :
+            (funnelToday.ordersPlaced ?? 0) === 0 ? "Auto-entry ran but no orders placed" :
+            "All stages operational",
+        },
       },
     };
 

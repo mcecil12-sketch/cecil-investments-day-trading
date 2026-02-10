@@ -4,6 +4,7 @@ import { recordSpend, recordAiCall, recordAiError, writeAiHeartbeat } from "./ai
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { buildSignalContext, SignalContext } from "@/lib/signalContext";
 import { parseAiScoreOutput } from "@/lib/ai/scoreParse";
+import { redis } from "@/lib/redis";
 
 function dynamicMinScore(sessionMinutes: number) {
   const m = Number.isFinite(sessionMinutes) ? sessionMinutes : 60;
@@ -46,7 +47,7 @@ export type RawSignal = {
 export type AiGrade = "A+" | "A" | "B" | "C" | "D" | "F";
 
 export type ScoredSignal = RawSignal & {
-  aiScore: number | null; // 0–10, numeric
+  aiScore: number | null; // 0–10, numeric (finalScore)
   aiGrade: AiGrade | null;
   aiSummary: string; // short explanation
   totalScore: number | null;
@@ -57,6 +58,11 @@ export type ScoredSignal = RawSignal & {
   shownInApp?: boolean;
   aiRawHead?: string | null;
   aiErrorReason?: string | null;
+  // Bidirectional scoring fields
+  aiDirection?: Side; // AI's chosen direction (LONG or SHORT)
+  longScore?: number | null; // 0-10 score for LONG hypothesis
+  shortScore?: number | null; // 0-10 score for SHORT hypothesis
+  bestDirection?: "LONG" | "SHORT" | "NONE";
 };
 
 type ModelResponse = {
@@ -276,8 +282,92 @@ export function formatAiSummary(grade: AiGrade, score: number) {
 }
 
 const MIN_BARS_FOR_AI = Number(process.env.MIN_BARS_FOR_AI ?? 20);
+const MIN_AVG_DOLLAR_VOL_HARD = Number(process.env.MIN_AVG_DOLLAR_VOL_HARD ?? 300000);
+const AI_SCORING_RETRY_MAX = Number(process.env.AI_SCORING_RETRY_MAX ?? 4);
+const AI_SCORING_BREAKER_ENABLED = String(process.env.AI_SCORING_BREAKER_ENABLED ?? "1") === "1";
+
+// Circuit breaker constants
+const BREAKER_KEY = "ai:breaker:v1";
+const BREAKER_ERROR_THRESHOLD = 10; // errors in window
+const BREAKER_WINDOW_SEC = 120; // 2 minutes
+const BREAKER_OPEN_TTL_SEC = 120; // 2 minutes
+
+/**
+ * Check if circuit breaker is open (too many recent errors)
+ */
+async function isCircuitBreakerOpen(): Promise<boolean> {
+  if (!AI_SCORING_BREAKER_ENABLED || !redis) return false;
+  try {
+    const breakerState = await redis.get(BREAKER_KEY);
+    return breakerState === "open";
+  } catch (err) {
+    console.warn("[aiScoring] breaker check failed", err);
+    return false;
+  }
+}
+
+/**
+ * Record an error and potentially open the circuit breaker
+ */
+async function recordBreakerError(errorType: "rate_limit" | "timeout" | "other"): Promise<void> {
+  if (!AI_SCORING_BREAKER_ENABLED || !redis) return;
+  try {
+    const errorKey = `ai:breaker:errors:v1`;
+    const now = Date.now();
+    const windowStart = now - BREAKER_WINDOW_SEC * 1000;
+    
+    // Add error with score = timestamp
+    await redis.zadd(errorKey, { score: now, member: `${errorType}:${now}` });
+    
+    // Remove old errors outside window
+    await redis.zremrangebyscore(errorKey, "-inf", windowStart);
+    
+    // Set TTL on error tracking key
+    await redis.expire(errorKey, BREAKER_WINDOW_SEC + 60);
+    
+    // Count errors in window
+    const errorCount = await redis.zcard(errorKey);
+    
+    // Open breaker if threshold exceeded
+    if (errorCount >= BREAKER_ERROR_THRESHOLD) {
+      await redis.set(BREAKER_KEY, "open", { ex: BREAKER_OPEN_TTL_SEC });
+      console.warn(`[aiScoring] Circuit breaker OPENED (${errorCount} errors in ${BREAKER_WINDOW_SEC}s)`);
+      await bumpTodayFunnel({ aiBreakerOpened: 1 }).catch(console.warn);
+    }
+  } catch (err) {
+    console.warn("[aiScoring] breaker error recording failed", err);
+  }
+}
+
+/**
+ * Sleep for exponential backoff with jitter
+ */
+function sleepWithJitter(baseMs: number): Promise<void> {
+  const jitter = Math.random() * 0.3; // 0-30% jitter
+  const actualMs = baseMs * (1 + jitter);
+  return new Promise(resolve => setTimeout(resolve, actualMs));
+}
 
 export async function scoreSignalWithAI(rawSignal: RawSignal): Promise<AiScoreResult> {
+  // Check circuit breaker first
+  if (await isCircuitBreakerOpen()) {
+    console.log("[aiScoring] Circuit breaker open, skipping scoring");
+    return {
+      ok: true,
+      aiModel: "breaker_open",
+      aiRequestId: null,
+      scored: {
+        ...rawSignal,
+        aiScore: 0,
+        aiGrade: "F",
+        aiSummary: "AI scoring skipped (circuit breaker open due to rate limits)",
+        totalScore: 0,
+        status: "SKIPPED",
+        skipReason: "breaker_open",
+      },
+    };
+  }
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     // Fail-safe: if key missing, treat as low-quality
@@ -298,7 +388,7 @@ export async function scoreSignalWithAI(rawSignal: RawSignal): Promise<AiScoreRe
 
   const systemPrompt = `
 You are a seasoned intraday equities trader.
-You are scoring VWAP pullback setups for quality.
+You evaluate trading setups from BOTH directions to find the highest-conviction trade.
 
 Rules:
 - Score from 0 to 10 (decimals allowed) where:
@@ -306,13 +396,18 @@ Rules:
   - 7-8.9 = good but not elite.
   - 5-6.9 = marginal/meh.
   - 0-4.9 = avoid.
-- Consider:
-  - Trend quality and direction.
-  - Pullback quality relative to VWAP and recent range.
-  - Liquidity and volume.
-  - How clean/low-noise the setup seems.
+- Evaluate BOTH:
+  1. LONG hypothesis (buy, profit on upside)
+  2. SHORT hypothesis (sell/short, profit on downside)
+- For each direction, assess:
+  - Trend quality and alignment
+  - Entry quality relative to VWAP and recent price action
+  - Risk/reward setup
+  - Liquidity and volume support
+- Choose bestDirection: "LONG", "SHORT", or "NONE" (if both weak)
+- Return finalScore = max(longScore, shortScore) when bestDirection chosen
 - Respond ONLY as a compact JSON object with fields:
-  {"aiScore": number, "aiGrade": "A"|"B"|"C"|"D"|"F", "qualified": boolean, "aiSummary": "short explanation", "reasons": string[]}.
+  {"longScore": number, "shortScore": number, "bestDirection": "LONG"|"SHORT"|"NONE", "finalScore": number, "aiGrade": "A"|"B"|"C"|"D"|"F", "qualified": boolean, "aiSummary": "short explanation", "reasons": string[]}.
   No extra text.
 `.trim();
 
@@ -356,6 +451,7 @@ Rules:
 
   if (context && context.barsUsed < MIN_BARS_FOR_AI) {
     const reason = `Insufficient recent bars (${context.barsUsed} < ${MIN_BARS_FOR_AI})`;
+    await bumpTodayFunnel({ errorInsufficientBars: 1 }).catch(console.warn);
     return {
       ok: false,
       error: "insufficient_bars",
@@ -365,22 +461,51 @@ Rules:
     };
   }
 
+  // Hard reject: liquidity (avg dollar volume)
+  if (context && context.avgVolume && rawSignal.entryPrice) {
+    const avgDollarVol = context.avgVolume * rawSignal.entryPrice;
+    if (avgDollarVol < MIN_AVG_DOLLAR_VOL_HARD) {
+      const reason = `Liquidity below threshold (avg dollar vol: $${Math.round(avgDollarVol).toLocaleString()} < $${MIN_AVG_DOLLAR_VOL_HARD.toLocaleString()})`;
+      await bumpTodayFunnel({ errorLiquidityDollarVol: 1 }).catch(console.warn);
+      return {
+        ok: false,
+        error: "insufficient_bars",
+        reason: reason,
+        aiModel: "skipped",
+        aiRequestId: null,
+      };
+    }
+  }
+
   const contextBlock =
     signal.signalContext
       ? JSON.stringify(signal.signalContext, null, 2)
       : "null";
 
   const prompt = `
-You are scoring an intraday trading signal.
+You are evaluating an intraday trading candidate from BOTH directions.
 
-Signal JSON:
+Candidate JSON:
 ${JSON.stringify(signal, null, 2)}
 
 ComputedContext JSON (from Alpaca bars):
 ${contextBlock}
 
-Return ONLY valid JSON with fields:
-{ "aiScore": number, "aiSummary": string, "aiGrade": "A|B|C|D|F", "qualified": boolean, "reasons": string[] }
+Evaluate BOTH:
+1. LONG hypothesis: Buy at entry, profit on upside to target
+2. SHORT hypothesis: Sell/short at entry, profit on downside to stop of LONG (inverted bracket)
+
+For each direction, score 0-10 based on:
+- Trend alignment
+- Entry quality (VWAP, pullback/rejection quality)
+- Risk/reward
+- Volume/liquidity support
+
+Choose bestDirection as the higher-conviction setup. Set finalScore = max(longScore, shortScore).
+If both are weak (<5), set bestDirection="NONE" and finalScore=max(longScore,shortScore).
+
+Return ONLY valid JSON:
+{ "longScore": number, "shortScore": number, "bestDirection": "LONG"|"SHORT"|"NONE", "finalScore": number, "aiGrade": "A"|"B"|"C"|"D"|"F", "qualified": boolean, "aiSummary": string, "reasons": string[] }
 `.trim();
 
   const BULK_MODEL = process.env.OPENAI_MODEL_BULK || "gpt-5-mini";
@@ -390,7 +515,7 @@ Return ONLY valid JSON with fields:
   const retryOnParseFail = process.env.AI_SCORE_RETRY_ON_PARSE_FAIL === "1";
 
   const openai = new OpenAI({ apiKey });
-  const scoreOnce = async (promptText: string) => {
+  const scoreOnce = async (promptText: string, retryAttempt: number = 0) => {
     await recordAiCall(model);
     let completion;
     try {
@@ -400,19 +525,22 @@ Return ONLY valid JSON with fields:
         response_format: {
           type: "json_schema",
           json_schema: {
-            name: "ai_score",
+            name: "ai_score_bidirectional",
             strict: true,
             schema: {
               type: "object",
               additionalProperties: false,
               properties: {
-                aiScore: { type: "number" },
+                longScore: { type: "number" },
+                shortScore: { type: "number" },
+                bestDirection: { type: "string", enum: ["LONG", "SHORT", "NONE"] },
+                finalScore: { type: "number" },
                 aiGrade: { type: "string", enum: ["A", "B", "C", "D", "F"] },
                 qualified: { type: "boolean" },
                 aiSummary: { type: "string" },
                 reasons: { type: "array", items: { type: "string" } },
               },
-              required: ["aiScore", "aiGrade", "qualified", "aiSummary", "reasons"],
+              required: ["longScore", "shortScore", "bestDirection", "finalScore", "aiGrade", "qualified", "aiSummary", "reasons"],
             },
           },
         },
@@ -422,7 +550,32 @@ Return ONLY valid JSON with fields:
         ],
       });
     } catch (err: any) {
-      await recordAiError(model, err?.message ?? String(err));
+      const errMsg = err?.message ?? String(err);
+      const errStatus = err?.status ?? err?.response?.status;
+      const isRateLimit = errStatus === 429 || errMsg.includes("429") || errMsg.includes("rate_limit");
+      const isTimeout = errMsg.includes("timeout") || errMsg.includes("ETIMEDOUT") || errStatus === 503;
+      
+      await recordAiError(model, errMsg);
+      
+      // Record error for circuit breaker
+      if (isRateLimit) {
+        await recordBreakerError("rate_limit");
+        await bumpTodayFunnel({ aiRateLimitErrors: 1 }).catch(console.warn);
+      } else if (isTimeout) {
+        await recordBreakerError("timeout");
+        await bumpTodayFunnel({ aiTimeoutErrors: 1 }).catch(console.warn);
+      } else {
+        await recordBreakerError("other");
+      }
+      
+      // Retry with exponential backoff for rate limits and timeouts
+      if ((isRateLimit || isTimeout) && retryAttempt < AI_SCORING_RETRY_MAX) {
+        const backoffMs = Math.pow(2, retryAttempt) * 1000; // 1s, 2s, 4s, 8s
+        console.log(`[aiScoring] Retry ${retryAttempt + 1}/${AI_SCORING_RETRY_MAX} after ${backoffMs}ms (${isRateLimit ? 'rate limit' : 'timeout'})`);
+        await sleepWithJitter(backoffMs);
+        return scoreOnce(promptText, retryAttempt + 1);
+      }
+      
       throw err;
     }
 
@@ -445,7 +598,7 @@ Return ONLY valid JSON with fields:
   if (!parsed.ok && retryOnParseFail) {
     const retryPrompt =
       prompt +
-      "\n\nIMPORTANT: Respond ONLY with a single JSON object: {\"aiScore\":number,\"aiGrade\":\"A|B|C|D|F\",\"qualified\":boolean,\"aiSummary\":string,\"reasons\":string[]}";
+      "\n\nIMPORTANT: Respond ONLY with a single JSON object: {\"longScore\":number,\"shortScore\":number,\"bestDirection\":\"LONG\"|\"SHORT\"|\"NONE\",\"finalScore\":number,\"aiGrade\":\"A|B|C|D|F\",\"qualified\":boolean,\"aiSummary\":string,\"reasons\":string[]}";
     scoreResponse = await scoreOnce(retryPrompt);
     parsed = parseAiScoreOutput(scoreResponse.content);
   }
@@ -463,8 +616,15 @@ Return ONLY valid JSON with fields:
   }
 
   const parsedScore = parsed.parsed;
+  // Extract bidirectional fields from parsed response
+  const rawObj = (parsedScore as any).rawJson || {};
+  const longScore = typeof rawObj.longScore === "number" ? rawObj.longScore : parsedScore.score;
+  const shortScore = typeof rawObj.shortScore === "number" ? rawObj.shortScore : parsedScore.score;
+  const bestDirection = rawObj.bestDirection || "LONG";
+  const finalScore = typeof rawObj.finalScore === "number" ? rawObj.finalScore : parsedScore.score;
+  
   const validationError = validateStructuredOutput({
-    score: parsedScore.score,
+    score: finalScore,
     grade: parsedScore.grade,
     summary: parsedScore.summary,
     qualified: parsedScore.qualified,
@@ -481,13 +641,16 @@ Return ONLY valid JSON with fields:
       aiParseError: validationError,
     };
   }
-  const _scoreNum = parsedScore.score;
+  const _scoreNum = finalScore;
   const gradeCandidate = String(parsedScore.grade || "").trim().toUpperCase();
   const _grade: AiGrade =
     ["A+", "A", "B", "C", "D", "F"].includes(gradeCandidate)
       ? (gradeCandidate as AiGrade)
       : gradeFromScore(_scoreNum);
   const _summary = parsedScore.summary.trim();
+  
+  // Determine final direction based on AI's evaluation
+  const _direction: Side = bestDirection === "SHORT" ? "SHORT" : "LONG";
 
   const result: ScoredSignal = {
     ...signal,
@@ -495,6 +658,11 @@ Return ONLY valid JSON with fields:
     aiGrade: _grade,
     aiSummary: _summary,
     totalScore: _scoreNum,
+    // Bidirectional scoring results
+    aiDirection: _direction,
+    longScore: clampScore(longScore),
+    shortScore: clampScore(shortScore),
+    bestDirection: bestDirection as "LONG" | "SHORT" | "NONE",
   };
 
   console.log("[aiScoring] Result:", {

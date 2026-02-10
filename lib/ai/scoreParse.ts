@@ -6,6 +6,11 @@ export type ParsedScore = {
   reasons?: string[];
   reasoning?: string;
   rawJson?: any;
+  // Bidirectional fields
+  longScore?: number;
+  shortScore?: number;
+  bestDirection?: "LONG" | "SHORT" | "NONE";
+  finalScore?: number;
 };
 
 function stripFences(s: string): string {
@@ -76,7 +81,12 @@ export function parseAiScoreOutput(
   if (jsonStr) {
     try {
       const obj = JSON.parse(jsonStr);
-      const score = clampScore(Number(obj.score ?? obj.aiScore));
+      // Try bidirectional fields first, fall back to legacy aiScore/score
+      const finalScore = obj.finalScore ?? obj.aiScore ?? obj.score;
+      const score = clampScore(Number(finalScore));
+      const longScore = typeof obj.longScore === "number" ? clampScore(obj.longScore) : undefined;
+      const shortScore = typeof obj.shortScore === "number" ? clampScore(obj.shortScore) : undefined;
+      const bestDirection = obj.bestDirection || undefined;
       const grade = normalizeGrade(obj.grade ?? obj.aiGrade);
       const summary = String(obj.summary ?? obj.aiSummary ?? "").trim();
       const qualified = typeof obj.qualified === "boolean" ? obj.qualified : undefined;
@@ -88,7 +98,7 @@ export function parseAiScoreOutput(
       if (Number.isFinite(score) && summary) {
         return {
           ok: true,
-          parsed: { score, grade, summary, qualified, reasons, reasoning, rawJson: obj },
+          parsed: { score, grade, summary, qualified, reasons, reasoning, rawJson: obj, longScore, shortScore, bestDirection, finalScore },
         };
       }
     } catch {

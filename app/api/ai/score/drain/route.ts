@@ -24,6 +24,38 @@ const SCORING_CONCURRENCY = Number(process.env.AI_SCORE_DRAIN_CONCURRENCY ?? 5);
 
 const DRAIN_LOCK_KEY = "ai:score:drain:lock";
 const DRAIN_LOCK_TTL = 30; // seconds
+const CLAIM_TTL_SEC = 300; // 5 minutes per signal claim
+
+/**
+ * Try to acquire exclusive claim for a specific signal
+ */
+async function acquireSignalClaim(signalId: string): Promise<boolean> {
+  if (!redis) return true; // Local mode: allow without lock
+  try {
+    const claimKey = `ai:score:claim:v1:${signalId}`;
+    const ok = await redis.set(claimKey, "1", {
+      nx: true,
+      ex: CLAIM_TTL_SEC,
+    });
+    return Boolean(ok);
+  } catch (err) {
+    console.error("[score/drain] signal claim acquire error", err);
+    return false;
+  }
+}
+
+/**
+ * Release exclusive claim for a specific signal
+ */
+async function releaseSignalClaim(signalId: string): Promise<void> {
+  if (!redis) return;
+  try {
+    const claimKey = `ai:score:claim:v1:${signalId}`;
+    await redis.del(claimKey);
+  } catch (err) {
+    console.warn("[score/drain] signal claim release error", err);
+  }
+}
 
 /**
  * Check cron token authorization (fast, synchronous)
@@ -377,6 +409,7 @@ export async function POST(req: Request) {
     scoredCount: number;
     errorCount: number;
     timeoutCount: number;
+    skippedAlreadyClaimed: number;
     details: Array<{
       id: string;
       ticker: string;
@@ -405,6 +438,7 @@ export async function POST(req: Request) {
     scoredCount: 0,
     errorCount: 0,
     timeoutCount: 0,
+    skippedAlreadyClaimed: 0,
     details: [],
   };
 
@@ -565,8 +599,20 @@ export async function POST(req: Request) {
       const signal = procResult.signal;
       result.attemptedCount += 1;
 
+      // Try to acquire exclusive claim for this signal
+      const claimed = await acquireSignalClaim(signal.id);
+      if (!claimed) {
+        result.skippedAlreadyClaimed += 1;
+        console.log("[score/drain] signal already claimed, skipping", {
+          id: signal.id,
+          ticker: signal.ticker,
+        });
+        continue;
+      }
+
       if (procResult.status === "TIMEOUT") {
         // Leave as SCORING; will be reclaimed on next run if not finished
+        await releaseSignalClaim(signal.id); // Release claim on timeout
         console.log("[score/drain] timeout", {
           id: signal.id,
           ticker: signal.ticker,
@@ -592,6 +638,7 @@ export async function POST(req: Request) {
         }
 
         finalizedIds.push(signal.id);
+        await releaseSignalClaim(signal.id); // Release claim after finalizing
         result.errored += 1;
         result.errorCount += 1;
         console.warn("[score/drain] score error", {
@@ -615,6 +662,7 @@ export async function POST(req: Request) {
           nowIso
         );
         finalizedIds.push(signal.id);
+        await releaseSignalClaim(signal.id); // Release claim after finalizing
         result.errored += 1;
         result.errorCount += 1;
         console.warn("[score/drain] score error: null score", {
@@ -625,6 +673,7 @@ export async function POST(req: Request) {
       }
       applyScoreSuccess(signal, scored, new Date().toISOString());
       finalizedIds.push(signal.id);
+      await releaseSignalClaim(signal.id); // Release claim after finalizing
 
       result.scored += 1;
       result.scoredCount += 1;
@@ -731,6 +780,18 @@ export async function POST(req: Request) {
         console.warn("[score/drain] funnel update error", err);
         // Non-fatal: don't fail the response
       }
+    }
+    
+    // Track drain metrics
+    try {
+      await bumpTodayFunnel({
+        drainsRun: 1,
+        drainScored: result.scoredCount,
+        drainTimeout: result.timeoutCount,
+        drainError: result.errorCount,
+      });
+    } catch (err) {
+      console.warn("[score/drain] drain metrics update error", err);
     }
 
     // Touch heartbeat (non-fatal if it fails)

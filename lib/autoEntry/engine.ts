@@ -128,9 +128,11 @@ async function writeTrade(trade: AnyTrade) {
 }
 
 function pickEntryFromSignal(s: AnySignal) {
+  // Use aiDirection if available (from bidirectional scoring), otherwise fall back to side
+  const direction = (s as any).aiDirection || s.side || "LONG";
   return {
     ticker: String(s.ticker || "").toUpperCase(),
-    side: String(s.side || "LONG").toUpperCase(),
+    side: String(direction).toUpperCase(),
     entryPrice: safeNum(s.entryPrice, 0),
     stopPrice: safeNum(s.stopPrice, 0),
     targetPrice: safeNum(s.targetPrice, 0),

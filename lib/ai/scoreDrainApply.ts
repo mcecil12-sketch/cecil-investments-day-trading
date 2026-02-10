@@ -1,4 +1,5 @@
 import { shouldQualify } from "@/lib/aiQualify";
+import { bumpTodayFunnel } from "@/lib/funnelRedis";
 
 type ParseFailedMeta = {
   aiModel?: string | null;
@@ -24,6 +25,10 @@ export function applyInsufficientBars(signal: any, reason: string, nowIso: strin
   delete signal.tradePlan;
   delete signal.qualified;
   delete signal.shownInApp;
+  
+  // Track error in funnel
+  bumpTodayFunnel({ errorInsufficientBars: 1 }).catch(console.warn);
+  
   return signal;
 }
 
@@ -48,6 +53,9 @@ export function applyParseFailed(
   delete signal.aiScore;
   delete signal.score;
   delete signal.aiGrade;
+  
+  // Track error in funnel
+  bumpTodayFunnel({ errorParseFailed: 1 }).catch(console.warn);
   delete signal.grade;
   delete signal.totalScore;
   delete signal.tradePlan;

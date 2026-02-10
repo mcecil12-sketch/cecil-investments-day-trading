@@ -4,6 +4,7 @@ import { headers } from "next/headers";
 import { AlpacaBar, fetchRecentBars } from "@/lib/alpaca";
 import { fetchAlpacaClock } from "@/lib/alpacaClock";
 import { bumpScanRun, bumpScanSkip, bumpTodayFunnel } from "@/lib/funnelRedis";
+import { redis } from "@/lib/redis";
 
 const DEFAULT_WATCHLIST = ["SPY", "QQQ", "TSLA", "NVDA", "META", "AMD"];
 
@@ -93,6 +94,13 @@ const DEFAULT_MIN_AVG_VOLUME = 300_000;
 const DEFAULT_LIMIT = 600;
 const MAX_SIGNALS_PER_SCAN = 50;
 const AI_SEED_MIN_BARS = 20;
+
+// Per-mode caps for persisted candidates
+const SCAN_PERSIST_CAP_AI_SEED = Number(process.env.SCAN_PERSIST_CAP_AI_SEED ?? 50);
+const SCAN_PERSIST_CAP_VWAP = Number(process.env.SCAN_PERSIST_CAP_VWAP ?? 30);
+const SCAN_PERSIST_CAP_BREAKOUT = Number(process.env.SCAN_PERSIST_CAP_BREAKOUT ?? 30);
+const SCAN_PERSIST_CAP_COMPRESSION = Number(process.env.SCAN_PERSIST_CAP_COMPRESSION ?? 20);
+const SCAN_PERSIST_DEDUPE_TTL_SEC = Number(process.env.SCAN_PERSIST_DEDUPE_TTL_SEC ?? 3600);
 
   const AI_SEED_OPENING_MINUTES = Number(process.env.AI_SEED_OPENING_MINUTES ?? 12);
   const AI_SEED_OPENING_PER_MIN_FLOOR_SHARES = Number(process.env.AI_SEED_OPENING_PER_MIN_FLOOR_SHARES ?? 25000);
@@ -1016,12 +1024,37 @@ const logSummary = () => {
 
 candidates.sort((a, b) => b.patternScore - a.patternScore);
   const filtered = candidates.filter((c) => c.patternScore > 0);
-  const topCandidates = filtered.slice(0, 
-    MAX_SIGNALS_PER_SCAN);
+  
+  // Apply per-mode caps
+  let capValue: number | null = null;
+  let capApplied = false;
+  if (mode === "ai-seed" && SCAN_PERSIST_CAP_AI_SEED > 0) {
+    capValue = SCAN_PERSIST_CAP_AI_SEED;
+    capApplied = true;
+  } else if (mode === "vwap" && SCAN_PERSIST_CAP_VWAP > 0) {
+    capValue = SCAN_PERSIST_CAP_VWAP;
+    capApplied = true;
+  } else if (mode === "breakout" && SCAN_PERSIST_CAP_BREAKOUT > 0) {
+    capValue = SCAN_PERSIST_CAP_BREAKOUT;
+    capApplied = true;
+  } else if (mode === "compression" && SCAN_PERSIST_CAP_COMPRESSION > 0) {
+    capValue = SCAN_PERSIST_CAP_COMPRESSION;
+    capApplied = true;
+  } else if (mode === "premarket-vwap" && SCAN_PERSIST_CAP_VWAP > 0) {
+    capValue = SCAN_PERSIST_CAP_VWAP;
+    capApplied = true;
+  }
+  
+  const effectiveCap = capApplied && capValue ? capValue : MAX_SIGNALS_PER_SCAN;
+  const topCandidates = filtered.slice(0, effectiveCap);
+  
+  const topPreScore = topCandidates.length > 0 ? topCandidates[0].patternScore : null;
+  const bottomPreScore = topCandidates.length > 0 ? topCandidates[topCandidates.length - 1].patternScore : null;
 
   const posted: OutgoingSignal[] = [];
   let postedSignals = 0;
   let queuedSignals = 0;
+  let candidatesSkippedDeduped = 0;
   const postDebug: any[] = [];
 
   for (const candidate of topCandidates) {
@@ -1029,6 +1062,25 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
       break;
     }
     try {
+      // Dedupe check: skip if this (mode + timeframe + ticker) was recently posted
+      const timeframe = "1Min"; // default timeframe
+      const dedupeKey = `scan:dedupe:v1:${mode}:${timeframe}:${candidate.ticker}`;
+      
+      if (redis && SCAN_PERSIST_DEDUPE_TTL_SEC > 0) {
+        try {
+          const existing = await redis.get(dedupeKey);
+          if (existing) {
+            candidatesSkippedDeduped += 1;
+            continue; // Skip this candidate
+          }
+          // Set dedupe key with TTL
+          await redis.set(dedupeKey, "1", { ex: SCAN_PERSIST_DEDUPE_TTL_SEC });
+        } catch (err) {
+          console.warn("[SCAN] dedupe check failed (non-fatal)", err);
+          // Continue without dedupe on Redis error
+        }
+      }
+      
       if (aiSeedMode) {
         totals.signalsCreated += 1;
       }
@@ -1116,6 +1168,12 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     ...result,
     scansRun: 1,
     candidatesFound: candidates.length,
+    candidatesPersisted: posted.length,
+    candidatesSkippedDeduped,
+    capApplied,
+    capValue,
+    topPreScore,
+    bottomPreScore,
     signalsPosted: posted.length,
     gptQueued: posted.length,
     aiSeedDebug,

@@ -16,6 +16,22 @@ const NUMERIC_COUNTERS = [
   "approvals",
   "ordersPlaced",
   "fills",
+  "drainsRun",
+  "drainScored",
+  "drainTimeout",
+  "drainError",
+  "errorInsufficientBars",
+  "errorLiquidityDollarVol",
+  "errorParseFailed",
+  "errorRateLimited",
+  "aiRateLimitErrors",
+  "aiTimeoutErrors",
+  "aiBreakerOpened",
+  "autoEntryExecutes",
+  "autoEntryPlaced",
+  "autoEntrySkipMaxOpen",
+  "autoEntrySkipNoPending",
+  "autoEntrySkipMarketClosed",
 ] as const;
 
 type NumericCounterKey = (typeof NUMERIC_COUNTERS)[number];

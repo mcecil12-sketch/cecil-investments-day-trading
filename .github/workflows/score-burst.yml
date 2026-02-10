@@ -1,0 +1,88 @@
+name: score-burst
+
+on:
+  schedule:
+    # Run every 2 minutes during market opening hour (9:35-10:35 AM ET = 14:35-15:35 UTC)
+    # Note: During DST, ET is UTC-4, so adjust to 13:35-14:35
+    - cron: "*/2 14-15 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: score-burst
+  cancel-in-progress: true
+
+jobs:
+  burst:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [1, 2, 3, 4]
+      fail-fast: false
+    steps:
+      - name: Check if within opening window
+        id: check_window
+        run: |
+          set -euo pipefail
+          # Get current ET time (GitHub Actions runs in UTC)
+          # Calculate ET time: UTC-5 (standard) or UTC-4 (DST) - simplified to UTC-5
+          ET_HOUR=$(TZ=America/New_York date +%H)
+          ET_MIN=$(TZ=America/New_York date +%M)
+          ET_HHMM="${ET_HOUR}${ET_MIN}"
+          
+          echo "Current ET time: ${ET_HOUR}:${ET_MIN} (${ET_HHMM})"
+          
+          # Check if between 9:35 and 10:35 (0935-1035)
+          if [ "$ET_HHMM" -ge "0935" ] && [ "$ET_HHMM" -le "1035" ]; then
+            echo "Within opening window"
+            echo "in_window=true" >> $GITHUB_OUTPUT
+          else
+            echo "Outside opening window, skipping"
+            echo "in_window=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Drain scoring backlog (shard ${{ matrix.shard }})
+        if: steps.check_window.outputs.in_window == 'true'
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          TIMESTAMP=$(date +%s)
+          RUN_ID="score-burst-${{ github.run_id }}-${{ github.run_attempt }}-shard${SHARD}-${TIMESTAMP}"
+          
+          if [ -z "${BASE:-}" ]; then
+            echo "FATAL: PROD_BASE_URL missing"
+            exit 1
+          fi
+          
+          if [ -z "${CRON_TOKEN:-}" ]; then
+            echo "FATAL: CRON_TOKEN missing"
+            exit 1
+          fi
+
+          echo "Starting burst drain (SHARD=$SHARD, RUN_ID=$RUN_ID, LIMIT=10)"
+          
+          HTTP_CODE=$(curl -sS -o /tmp/burst_response.json -w "%{http_code}" -X POST "$BASE/api/ai/score/drain?limit=10&_=$RUN_ID" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: github-actions" \
+            -H "x-run-id: $RUN_ID") || true
+          
+          echo "HTTP $HTTP_CODE"
+          
+          # Print first 2000 chars of response for debugging
+          if [ -f /tmp/burst_response.json ]; then
+            head -c 2000 /tmp/burst_response.json | jq '.' 2>/dev/null || head -c 2000 /tmp/burst_response.json || true
+          fi
+          echo
+          
+          # Best effort - don't fail the workflow on non-200
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "WARN: burst drain returned HTTP $HTTP_CODE (may be in progress, locked, or failed)"
+          else
+            echo "Burst drain completed successfully"
+          fi
+          
+          # Always exit 0 (best effort)
+          exit 0

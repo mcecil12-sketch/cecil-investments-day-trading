@@ -48,6 +48,12 @@ export type StoredSignal = {
   shownInApp?: boolean;
   error?: string | null;
   tradePlan?: TradePlan | null;
+  
+  // Bidirectional scoring fields
+  aiDirection?: SignalSide; // AI's chosen direction
+  longScore?: number | null; // Score for LONG hypothesis
+  shortScore?: number | null; // Score for SHORT hypothesis
+  bestDirection?: "LONG" | "SHORT" | "NONE"; // AI's evaluation of best direction
 };
 
 const LOCAL_DATA_DIR = path.join(process.cwd(), "data");
