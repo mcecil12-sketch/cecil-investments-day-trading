@@ -41,6 +41,9 @@ export type ReconcileOpenTradesResult = {
   checked: number;
   closed: number;
   synced: number;
+  backfilled: number;
+  backfilledTickers: string[];
+  repairedOpenedAt: number;
   broker: {
     positionsCount: number;
     openOrdersCount: number;
@@ -86,6 +89,9 @@ export async function reconcileOpenTrades(
         checked: 0,
         closed: 0,
         synced: 0,
+        backfilled: 0,
+        backfilledTickers: [],
+        repairedOpenedAt: 0,
         broker: {
           positionsCount: 0,
           openOrdersCount: 0,
@@ -116,6 +122,23 @@ export async function reconcileOpenTrades(
     const openTrades = trades
       .filter((t) => (t?.status || "").toUpperCase() === "OPEN")
       .slice(0, max);
+
+    // Repair: Ensure all OPEN trades have openedAt set
+    let repairedOpenedAt = 0;
+    for (const t of openTrades) {
+      if (!t.openedAt) {
+        const ticker = up(t?.ticker);
+        const brokerPos = ticker ? posBySym.get(ticker) : null;
+        t.openedAt = brokerPos?.created_at || t.createdAt || nowIso;
+        repairedOpenedAt += 1;
+      }
+    }
+
+    if (repairedOpenedAt > 0 && !dryRun) {
+      console.log(
+        `[reconcile] repaired openedAt for ${repairedOpenedAt} OPEN trades (source=${runSource}, id=${runId})`
+      );
+    }
 
     let closed = 0;
     let synced = 0;
@@ -212,6 +235,12 @@ export async function reconcileOpenTrades(
           t.brokerStatus = orderStatus || "position_open";
           t.updatedAt = nowIso;
 
+          // Ensure openedAt is set (use existing or broker position time or now)
+          if (!t.openedAt) {
+            const brokerPos = posBySym.get(up(t?.ticker));
+            t.openedAt = brokerPos?.created_at || nowIso;
+          }
+
           // Clear closure/error fields that may have been artifact of previous status
           delete t.closedAt;
           delete t.finalizedAt;
@@ -262,9 +291,72 @@ export async function reconcileOpenTrades(
 
     checkDeadline();
 
-    if (!dryRun && (closed > 0 || synced > 0)) {
+    // Backfill: Create DB trades for broker positions not represented in DB
+    let backfilled = 0;
+    const backfilledTickers: string[] = [];
+    const dbOpenTickerSet = new Set(openTrades.map((t) => up(t?.ticker)).filter(Boolean));
+
+    for (const pos of brokerTruth.positions) {
+      checkDeadline();
+
+      const posTicker = up(pos.symbol);
+      if (!posTicker || dbOpenTickerSet.has(posTicker)) {
+        continue; // Already exists in DB
+      }
+
+      // Broker position not in DB, backfill it
+      const newTrade: any = {
+        id: crypto.randomUUID(),
+        ticker: posTicker,
+        side: (Number(pos.qty) > 0 ? "LONG" : "SHORT") as "LONG" | "SHORT",
+        qty: Math.abs(Number(pos.qty || 0)),
+        status: "OPEN",
+        source: "broker_backfill",
+        paper: true,
+        note: "Backfilled from broker position during reconcile-open-trades",
+        createdAt: pos.created_at || nowIso,
+        openedAt: pos.created_at || nowIso,
+        updatedAt: nowIso,
+        entryPrice: Number(pos.avg_entry_price || 0),
+        filledQty: Math.abs(Number(pos.qty || 0)),
+        avgFillPrice: Number(pos.avg_entry_price || 0),
+        autoEntryStatus: "OPEN",
+        alpacaStatus: "position_open",
+        brokerStatus: "position_open",
+      };
+
+      if (!dryRun) {
+        trades.push(newTrade);
+      }
+
+      backfilled += 1;
+      if (backfilledTickers.length < 10) {
+        backfilledTickers.push(posTicker);
+      }
+
+      console.log(
+        `[reconcile] backfilling broker position to DB (source=${runSource}, id=${runId})`,
+        { ticker: posTicker, qty: newTrade.qty, side: newTrade.side, dryRun }
+      );
+    }
+
+    checkDeadline();
+
+    if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0)) {
       await writeTrades(trades);
     }
+
+    console.log(
+      `[reconcile] completed (source=${runSource}, id=${runId})`,
+      {
+        brokerPositions: brokerTruth.positionsCount,
+        dbOpenTrades: openTrades.length,
+        closed,
+        synced,
+        backfilled,
+        repairedOpenedAt,
+      }
+    );
 
     const result = {
       ok: true,
@@ -272,6 +364,9 @@ export async function reconcileOpenTrades(
       checked: openTrades.length,
       closed,
       synced,
+      backfilled,
+      backfilledTickers,
+      repairedOpenedAt,
       broker: {
         positionsCount: brokerTruth.positionsCount,
         openOrdersCount: brokerTruth.openOrdersCount,
@@ -320,6 +415,9 @@ export async function reconcileOpenTrades(
       checked: 0,
       closed: 0,
       synced: 0,
+      backfilled: 0,
+      backfilledTickers: [],
+      repairedOpenedAt: 0,
       broker: {
         positionsCount: 0,
         openOrdersCount: 0,

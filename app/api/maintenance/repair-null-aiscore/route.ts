@@ -14,7 +14,8 @@ interface RepairResult {
     id: string;
     ticker: string;
     status: string;
-    error: string;
+    error?: string;
+    skipReason?: string;
     aiSummary: string;
   }>;
   error?: string;
@@ -64,9 +65,11 @@ export async function POST(req: Request): Promise<NextResponse<RepairResult>> {
         const isInsufficientBars = aiSummary.toLowerCase().includes("insufficient recent bars");
 
         if (isInsufficientBars) {
-          // Convert to ERROR with insufficient_bars
-          signal.status = "ERROR";
-          signal.error = "insufficient_bars";
+          // Convert to ARCHIVED with skipReason
+          signal.status = "ARCHIVED";
+          signal.skipReason = "insufficient_bars";
+          signal.qualified = false;
+          signal.shownInApp = false;
           signal.scoredAt = nowIso;
           signal.updatedAt = nowIso;
           // Keep aiSummary as-is (already has the insufficient bars message)
@@ -78,8 +81,7 @@ export async function POST(req: Request): Promise<NextResponse<RepairResult>> {
           delete signal.grade;
           delete signal.totalScore;
           delete signal.tradePlan;
-          delete signal.qualified;
-          delete signal.shownInApp;
+          delete signal.error;
 
           fixedInsufficientBars++;
           fixed++;
@@ -89,7 +91,7 @@ export async function POST(req: Request): Promise<NextResponse<RepairResult>> {
               id: signal.id,
               ticker: signal.ticker,
               status: signal.status,
-              error: signal.error,
+              skipReason: signal.skipReason,
               aiSummary: signal.aiSummary,
             });
           }

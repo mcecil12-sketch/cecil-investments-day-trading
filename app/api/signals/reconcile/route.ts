@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { formatAiSummary, gradeFromScore, AiGrade } from "@/lib/aiScoring";
 
 const INSUFFICIENT_BARS_DEMOTE_v1 = true;
-import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
+import { readSignals, writeSignals, StoredSignal, StoredSignalStatus } from "@/lib/jsonDb";
 
 const PLACEHOLDER_SUMMARIES = new Set([
   "AI scoring pending",
@@ -38,7 +38,7 @@ export async function POST(req: Request) {
 
   const signals = await readSignals();
   let updated = 0;
-  const reconciled = signals.map((signal: StoredSignal) => {
+  const reconciled: StoredSignal[] = signals.map((signal: StoredSignal): StoredSignal => {
     const aiScoreNum = Number(signal.aiScore ?? 0);
     const hasScore = Number.isFinite(aiScoreNum) && aiScoreNum > 0;
     const summaryText =
@@ -75,18 +75,36 @@ export async function POST(req: Request) {
       ? summaryText
       : formatAiSummary(grade, aiScoreNum);
 
+    if (shouldDemoteInsufficient) {
+      // Archive as skip instead of demoting to PENDING
+      return {
+        ...signal,
+        status: "ARCHIVED" as const,
+        skipReason: insufficientBars ? "insufficient_bars" : "missing_score",
+        shownInApp: false,
+        qualified: false,
+        aiScore: 0,
+        aiGrade: "F" as AiGrade,
+        score: 0,
+        grade: "F" as AiGrade,
+        totalScore: 0,
+        aiSummary: summaryText || (insufficientBars ? "Insufficient recent bars" : "Missing score"),
+        updatedAt: new Date().toISOString(),
+      } as StoredSignal;
+    }
+
     return {
         ...signal,
-        status: shouldDemoteInsufficient ? "PENDING" : (shouldFlipStatus ? "SCORED" : signal.status),
-        shownInApp: shouldDemoteInsufficient ? false : (signal as any).shownInApp,
-        qualified: shouldDemoteInsufficient ? false : (signal as any).qualified,
-        aiScore: shouldDemoteInsufficient ? null : aiScoreNum,
-        aiGrade: shouldDemoteInsufficient ? null : grade,
-        score: shouldDemoteInsufficient ? null : (signal as any).score,
-        grade: shouldDemoteInsufficient ? null : (signal as any).grade,
-        totalScore: shouldDemoteInsufficient ? null : (signal as any).totalScore,
-        aiSummary: shouldDemoteInsufficient ? summaryText : summary,
-      };
+        status: (shouldFlipStatus ? "SCORED" : signal.status) as StoredSignalStatus,
+        shownInApp: (signal as any).shownInApp,
+        qualified: (signal as any).qualified,
+        aiScore: aiScoreNum,
+        aiGrade: grade,
+        score: (signal as any).score,
+        grade: (signal as any).grade,
+        totalScore: (signal as any).totalScore,
+        aiSummary: summary,
+      } as StoredSignal;
   });
 
   if (updated > 0) {

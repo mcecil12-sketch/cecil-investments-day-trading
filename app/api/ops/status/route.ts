@@ -280,6 +280,11 @@ export async function GET() {
           aiBreakerOpened: funnelToday.aiBreakerOpened ?? 0,
         },
         
+        // Skip breakdown (not errors)
+        skips: {
+          insufficientBars: funnelToday.skipInsufficientBars ?? 0,
+        },
+        
         // Auto-entry stage
         autoEntry: {
           executesToday: funnelToday.autoEntryExecutes ?? 0,

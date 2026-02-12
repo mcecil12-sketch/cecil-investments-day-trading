@@ -84,22 +84,24 @@ describe("score drain apply helpers", () => {
     expect(signal.status).toBe("SCORING"); // unchanged
   });
 
-  test("applyInsufficientBars sets ERROR status with aiScore=0", () => {
+  test("applyInsufficientBars sets ARCHIVED status with skipReason", () => {
     const signal: any = { status: "SCORING" };
     const reason = "Insufficient recent bars (5 < 20)";
     const nowIso = "2026-02-07T12:10:00Z";
     applyInsufficientBars(signal, reason, nowIso);
 
-    expect(signal.status).toBe("ERROR");
-    expect(signal.error).toBe("insufficient_bars");
+    expect(signal.status).toBe("ARCHIVED");
+    expect(signal.skipReason).toBe("insufficient_bars");
     expect(signal.aiScore).toBe(0);
     expect(signal.aiGrade).toBe("F");
+    expect(signal.qualified).toBe(false);
+    expect(signal.shownInApp).toBe(false);
     expect(signal.aiSummary).toBe(reason);
     expect(signal.scoredAt).toBe(nowIso);
     // Verify score fields are cleared
     expect(Object.prototype.hasOwnProperty.call(signal, "score")).toBe(false);
     expect(Object.prototype.hasOwnProperty.call(signal, "grade")).toBe(false);
-    expect(Object.prototype.hasOwnProperty.call(signal, "qualified")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(signal, "error")).toBe(false);
   });
 
   test("applyScoreSuccess with aiScore=0 is valid (for non-insufficient bars)", () => {
@@ -124,7 +126,7 @@ describe("score drain apply helpers", () => {
     // This test documents that the write guard in route.ts should catch and convert
     // any signal that somehow has SCORED status with non-finite aiScore.
     // The guard checks: if (signal.status === "SCORED" && !Number.isFinite(signal.aiScore))
-    // and converts to ERROR with error: "parse_failed" or "insufficient_bars"
+    // and converts to ARCHIVED (with skipReason="insufficient_bars") or ERROR (with error="parse_failed")
 
     const badSignals = [
       { id: "1", ticker: "AAPL", status: "SCORED", aiScore: null, aiGrade: "A", aiSummary: "test" },
@@ -140,20 +142,23 @@ describe("score drain apply helpers", () => {
     });
   });
 
-  test("insufficient bars path: error code is insufficient_bars with aiScore=0", () => {
+  test("insufficient bars path: archived as skip with aiScore=0", () => {
     // When a signal fails due to insufficient bars, applyInsufficientBars ensures:
-    // - status: "ERROR" (not SCORED)
-    // - error: "insufficient_bars"
+    // - status: "ARCHIVED" (not ERROR or SCORED)
+    // - skipReason: "insufficient_bars"
     // - aiScore: 0 (finite, never null)
     // - aiGrade: "F"
+    // - qualified: false, shownInApp: false
 
     const signal: any = { status: "SCORING", id: "test-1", ticker: "TEST" };
     applyInsufficientBars(signal, "Insufficient recent bars (0 < 20)", "2026-02-07T12:00:00Z");
 
-    expect(signal.status).toBe("ERROR");
-    expect(signal.error).toBe("insufficient_bars");
+    expect(signal.status).toBe("ARCHIVED");
+    expect(signal.skipReason).toBe("insufficient_bars");
     expect(Number.isFinite(signal.aiScore)).toBe(true);
     expect(signal.aiScore).toBe(0);
     expect(signal.aiGrade).toBe("F");
+    expect(signal.qualified).toBe(false);
+    expect(signal.shownInApp).toBe(false);
   });
 });

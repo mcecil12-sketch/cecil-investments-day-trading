@@ -453,7 +453,7 @@ Rules:
 
   if (context && context.barsUsed < MIN_BARS_FOR_AI) {
     const reason = `Insufficient recent bars (${context.barsUsed} < ${MIN_BARS_FOR_AI})`;
-    await bumpTodayFunnel({ errorInsufficientBars: 1 }).catch(console.warn);
+    await bumpTodayFunnel({ skipInsufficientBars: 1 }).catch(console.warn);
     return {
       ok: false,
       error: "insufficient_bars",

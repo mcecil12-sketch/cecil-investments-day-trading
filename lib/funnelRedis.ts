@@ -21,6 +21,7 @@ const NUMERIC_COUNTERS = [
   "drainTimeout",
   "drainError",
   "errorInsufficientBars",
+  "skipInsufficientBars",
   "errorLiquidityDollarVol",
   "errorParseFailed",
   "errorRateLimited",

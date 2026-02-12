@@ -105,6 +105,7 @@ export async function POST(req: Request) {
       brokerRaw: order,
       alpacaOrderId: order.id,
       alpacaStatus: order.status,
+      openedAt: nowIso,
       error: undefined,
     };
 

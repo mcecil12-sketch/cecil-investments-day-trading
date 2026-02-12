@@ -721,7 +721,30 @@ export async function POST(req: Request) {
       if (procResult.status === "ERROR") {
         const nowIso = new Date().toISOString();
         if (procResult.errorCode === "insufficient_bars") {
+          // Archive as skip (not error)
           applyInsufficientBars(signal, procResult.errorReason || "Insufficient recent bars", nowIso);
+          
+          // Log with bars diagnostics if available
+          const ctx = signal.signalContext;
+          const barsDiags = ctx ? {
+            barsUsed: ctx.barsUsed,
+            firstBar: ctx.firstBar || null,
+            lastBar: ctx.lastBar || null,
+            windowMinutes: ctx.windowMinutes || null,
+            feed: ctx.feed || null,
+          } : null;
+          
+          console.log("[score/drain] insufficient_bars skip", {
+            id: signal.id,
+            ticker: signal.ticker,
+            reason: procResult.errorReason,
+            barsDiags,
+          });
+          
+          finalizedIds.push(signal.id);
+          await releaseSignalClaim(signal.id);
+          // Don't increment error counters - this is a skip
+          continue;
         } else if (procResult.errorCode === "parse_failed") {
           applyParseFailed(
             signal,
@@ -831,8 +854,18 @@ export async function POST(req: Request) {
           signal.aiSummary?.includes("Insufficient") || 
           signal.error === "insufficient_bars";
         
-        signal.status = "ERROR";
-        signal.error = isInsufficientBarsError ? "insufficient_bars" : "parse_failed";
+        if (isInsufficientBarsError) {
+          // Archive as skip, not error
+          signal.status = "ARCHIVED";
+          signal.skipReason = "insufficient_bars";
+          signal.qualified = false;
+          signal.shownInApp = false;
+          delete signal.error;
+        } else {
+          signal.status = "ERROR";
+          signal.error = "parse_failed";
+        }
+        
         signal.aiScore = 0;
         signal.aiGrade = "F";
         signal.aiSummary = `guard: non-finite aiScore (was ${signal.aiScore})`;
@@ -844,13 +877,13 @@ export async function POST(req: Request) {
         delete signal.grade;
         delete signal.totalScore;
         delete signal.tradePlan;
-        delete signal.qualified;
-        delete signal.shownInApp;
 
         guardsApplied.push({
           id: signal.id,
           ticker: signal.ticker,
-          error: signal.error,
+          status: signal.status,
+          skipReason: signal.skipReason || null,
+          error: signal.error || null,
         });
 
         // Update result counters to reflect the correction

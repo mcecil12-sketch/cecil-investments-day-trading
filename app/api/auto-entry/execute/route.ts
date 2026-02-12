@@ -894,6 +894,7 @@ export async function POST(req: Request) {
       error: undefined,
       updatedAt: startedAt,
       executedAt: startedAt,
+      openedAt: startedAt,
       ai: {
         ...(trade.ai || {}),
         score,

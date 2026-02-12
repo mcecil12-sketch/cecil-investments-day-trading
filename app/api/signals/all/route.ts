@@ -9,6 +9,12 @@ function normalizeSignal(s: any) {
     priority: typeof s.priority === "number" ? s.priority : 4.8,
     grade: s.grade ?? s.aiGrade ?? null,
     score: s.score ?? s.totalScore ?? s.aiScore ?? null,
+    // Expose bidirectional scoring fields
+    direction: s.direction ?? null,
+    aiDirection: s.aiDirection ?? null,
+    bestDirection: s.bestDirection ?? null,
+    longScore: s.longScore ?? null,
+    shortScore: s.shortScore ?? null,
   };
 }
 
@@ -99,12 +105,19 @@ export async function GET(req: Request) {
   const totalBefore = normalized.length;
   const totalAfter = sortedSignals.length;
   const sliced = sortedSignals.slice(0, limit);
+  
+  // Count signals with non-null direction for smoke testing
+  const withDirection = sliced.filter(
+    (s: any) => s.direction === "LONG" || s.direction === "SHORT"
+  ).length;
+
   return NextResponse.json(
     {
       ok: true,
       meta: {
         totalBefore,
         totalAfter,
+        withDirection,
         since: sinceDate ? sinceDate.toISOString() : null,
         sinceISO: sinceDate ? sinceDate.toISOString() : null,
         sinceField,

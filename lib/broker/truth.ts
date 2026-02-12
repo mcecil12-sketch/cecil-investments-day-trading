@@ -12,7 +12,12 @@ export type BrokerTruth = {
   fetchedAt: string;
   positionsCount: number;
   openOrdersCount: number;
-  positions: Array<{ symbol: string; qty: number }>;
+  positions: Array<{ 
+    symbol: string; 
+    qty: number;
+    avg_entry_price?: string | number;
+    created_at?: string;
+  }>;
   openOrders: Array<{ id: string; symbol: string; side: string; status: string }>;
   error?: string;
 };
