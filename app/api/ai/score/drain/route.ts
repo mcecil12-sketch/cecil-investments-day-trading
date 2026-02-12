@@ -16,9 +16,9 @@ export const runtime = "nodejs";
 export const maxDuration = 120; // Allow up to 120s runtime on Vercel/Next.js
 
 // Execution guards: wall-clock timeout and max signals per run
-// DEADLINE_MS is the internal time budget; we soft-stop at ~8s before this to avoid hard timeout
-const DEADLINE_MS = Number(process.env.AI_SCORE_DRAIN_DEADLINE_MS ?? 110000); // 110s internal budget
-const SOFT_STOP_MARGIN_MS = 8000; // Stop starting new work when <8s remaining
+// budgetMs is passed as query param; we cap it at HARD_CAP_MS to respect maxDuration=120
+const HARD_CAP_MS = 110000; // ~110s internal budget (maxDuration=120s with safety margin)
+const SOFT_STOP_MARGIN_MS = 2000; // Stop starting new work when <2s remaining (reduced from 8s)
 const MAX_PER_RUN = Number(process.env.AI_SCORE_DRAIN_MAX ?? 25);
 const SCORING_CONCURRENCY = Number(process.env.AI_SCORE_DRAIN_CONCURRENCY ?? 5); // Parallel scoring workers
 const MAX_PICK_POOL = 500; // Max signals to consider for sorting/picking (CPU optimization)
@@ -376,7 +376,6 @@ function buildResponse(
  */
 export async function POST(req: Request) {
   const startedAtMs = Date.now();
-  const deadlineAtMs = startedAtMs + DEADLINE_MS;
 
   // Helper: check if deadline expired
   function isExpired(): boolean {
@@ -391,6 +390,42 @@ export async function POST(req: Request) {
       { status: 401, headers: { "Cache-Control": "no-store" } }
     );
   }
+
+  // Parse query params and body early to compute deadline
+  const url = new URL(req.url);
+  const qp = url.searchParams;
+  
+  // Parse budgetMs from query param; cap at HARD_CAP_MS, default to 60000ms
+  const budgetMsParam = Number(qp.get("budgetMs") ?? "60000");
+  const budgetMs = Math.min(
+    Number.isFinite(budgetMsParam) && budgetMsParam > 0 ? budgetMsParam : 60000,
+    HARD_CAP_MS
+  );
+  const deadlineAtMs = startedAtMs + budgetMs;
+  const deadlineMsConfigured = budgetMs;
+
+  // Parse limit from query param first, then try body
+  let bodyLimit: number | undefined;
+  try {
+    if (req.body) {
+      const bodyJson = await req.json();
+      if (typeof bodyJson === "object" && bodyJson !== null && "limit" in bodyJson) {
+        bodyLimit = Number(bodyJson.limit);
+      }
+    }
+  } catch {
+    // Ignore JSON parse errors
+  }
+
+  const limitParamRaw = Number(qp.get("limit") ?? "NaN");
+  const queryLimit =
+    Number.isFinite(limitParamRaw) && limitParamRaw > 0 ? limitParamRaw : undefined;
+  
+  // Prefer query param, fallback to body, then use MAX_PER_RUN
+  const effectiveLimit = queryLimit ?? (
+    bodyLimit !== undefined && Number.isFinite(bodyLimit) && bodyLimit > 0 ? bodyLimit : undefined
+  ) ?? MAX_PER_RUN;
+  const maxPerRunComputed = Math.min(MAX_PER_RUN, effectiveLimit);
 
   // Initialize result object (guaranteed to be returned as JSON)
   const result: {
@@ -422,6 +457,9 @@ export async function POST(req: Request) {
     recentWindowHours?: number;
     newestPickedCreatedAt?: string | null;
     oldestPickedCreatedAt?: string | null;
+    deadlineMsConfigured?: number;
+    softStopMarginMs?: number;
+    effectiveLimit?: number;
   } = {
     ok: true,
     processed: 0,
@@ -441,6 +479,9 @@ export async function POST(req: Request) {
     timeoutCount: 0,
     skippedAlreadyClaimed: 0,
     details: [],
+    deadlineMsConfigured,
+    softStopMarginMs: SOFT_STOP_MARGIN_MS,
+    effectiveLimit: maxPerRunComputed,
   };
 
 
@@ -462,9 +503,7 @@ export async function POST(req: Request) {
     const signals = await readSignals();
     const now = new Date();
     
-    // Parse query params early
-    const url = new URL(req.url);
-    const qp = url.searchParams;
+    // Parse query params (budgetMs and limit already parsed above)
     const backlog = ["1", "true", "yes", "y", "on"].includes(
       (qp.get("backlog") || "").toLowerCase()
     );
@@ -474,13 +513,6 @@ export async function POST(req: Request) {
       strategyParam === "backlog" ||
       strategyParam === "backlog_oldest_first";
     const releaseLimit = Number(qp.get("releaseLimit") ?? "-1"); // -1 = release all
-    const limitParamRaw = Number(qp.get("limit") ?? "NaN");
-    const limitParam = Number.isFinite(limitParamRaw) && limitParamRaw > 0 ? limitParamRaw : MAX_PER_RUN;
-    const maxPerRun = Math.min(MAX_PER_RUN, limitParam);
-    
-    // Parse budgetMs parameter (default 12000ms = 12s)
-    const budgetMsParam = Number(qp.get("budgetMs") ?? "12000");
-    const budgetMs = Number.isFinite(budgetMsParam) && budgetMsParam > 0 ? budgetMsParam : 12000;
     
     // Parse recentWindowHours parameter (default from env or 6 hours)
     const recentWindowHoursParam = Number(qp.get("recentWindowHours") ?? "NaN");
@@ -522,6 +554,7 @@ export async function POST(req: Request) {
     if (elapsedBeforePick > budgetMs) {
       result.expired = true;
       result.reason = "budget_exhausted";
+      result.durationMs = Date.now() - startedAtMs;
       result.remainingTimeMs = Math.max(0, deadlineAtMs - Date.now());
       console.log("[score/drain] budget exhausted before picking", {
         elapsedBeforePick,
@@ -535,6 +568,7 @@ export async function POST(req: Request) {
     if (remainingBeforePickMs < SOFT_STOP_MARGIN_MS) {
       result.expired = true;
       result.reason = "deadline_soft_stop";
+      result.durationMs = Date.now() - startedAtMs;
       result.remainingTimeMs = Math.max(0, remainingBeforePickMs);
       console.log("[score/drain] soft stop before picking", {
         remainingBeforePickMs,
@@ -559,7 +593,7 @@ export async function POST(req: Request) {
       const pool = pendingSignals.slice(0, poolSize);
       pickedSignals = pool
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
-        .slice(0, maxPerRun);
+        .slice(0, maxPerRunComputed);
     } else {
       // Recent-first: pick newest within recent window with CPU optimization
       // Filter PENDING signals within the recent window
@@ -574,7 +608,7 @@ export async function POST(req: Request) {
         const pool = recentPending.slice(-poolSize);
         pickedSignals = pool
           .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-          .slice(0, maxPerRun);
+          .slice(0, maxPerRunComputed);
       } else {
         // Fallback: if recent window yields nothing, pick oldest-first from ALL PENDING
         console.log("[score/drain] recent window empty, falling back to backlog oldest-first", {
@@ -587,7 +621,7 @@ export async function POST(req: Request) {
         const pool = pendingSignals.slice(0, poolSize);
         pickedSignals = pool
           .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
-          .slice(0, maxPerRun);
+          .slice(0, maxPerRunComputed);
       }
     }
 
@@ -615,9 +649,9 @@ export async function POST(req: Request) {
       pickedStrategy,
       pickedCount: pickedSignals.length,
       claimBatchSize,
-      maxPerRun,
+      maxPerRun: maxPerRunComputed,
       budgetMs,
-      deadlineMs: DEADLINE_MS,
+      hardCapMs: HARD_CAP_MS,
       softStopMarginMs: SOFT_STOP_MARGIN_MS,
       concurrency: SCORING_CONCURRENCY,
       recentWindowHours: RECENT_WINDOW_HOURS,
@@ -888,6 +922,7 @@ export async function POST(req: Request) {
       ...result,
       claimBatchSize,
       budgetMs,
+      effectiveLimit: maxPerRunComputed,
     };
     
     return NextResponse.json(response, {

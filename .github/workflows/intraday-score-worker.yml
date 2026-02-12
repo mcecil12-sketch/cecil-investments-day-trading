@@ -36,7 +36,7 @@ jobs:
           echo "drain recent-first (intraday), worker=${{ matrix.worker }}"
 
           curl -sS --max-time 90 -X POST \
-            "$BASE/api/ai/score/drain?limit=2&releaseLimit=0&_=$NOW" \
+            "$BASE/api/ai/score/drain?limit=2&releaseLimit=0&budgetMs=90000&recentWindowHours=48&_=$NOW" \
             -H "x-cron-token: $CRON_TOKEN" \
             -H "x-run-source: github-actions" \
             -H "x-run-id: $RUN_ID" \

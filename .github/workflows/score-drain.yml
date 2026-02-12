@@ -30,7 +30,7 @@ jobs:
 
           echo "Starting drain (RUN_ID=$RUN_ID, LIMIT=25)"
           
-          HTTP_CODE=$(curl -sS -o /tmp/drain_response.json -w "%{http_code}" -X POST "$BASE/api/ai/score/drain?limit=25&_=$RUN_ID" \
+          HTTP_CODE=$(curl -sS -o /tmp/drain_response.json -w "%{http_code}" -X POST "$BASE/api/ai/score/drain?limit=25&budgetMs=90000&recentWindowHours=48&_=$RUN_ID" \
             -H "Content-Type: application/json" \
             -H "x-cron-token: $CRON_TOKEN" \
             -H "x-run-source: github-actions" \
