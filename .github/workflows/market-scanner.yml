@@ -59,6 +59,17 @@ jobs:
             -w "HTTP_STATUS=%{http_code}\n" \
             "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=ai-seed" | tail -200
 
+      - name: Hit short scanner
+        run: |
+          RUN_ID="gh-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "Hitting: $SCANNER_BASE_URL/api/scan?mode=short"
+          curl -sS -L --retry 3 --retry-delay 3 --retry-all-errors \
+            -H "x-scanner-token: ${{ secrets.SCANNER_TOKEN }}" \
+            -H "x-scan-source: github-actions" \
+            -H "x-scan-run-id: ${RUN_ID}" \
+            -w "HTTP_STATUS=%{http_code}\n" \
+            "${{ secrets.SCANNER_BASE_URL }}/api/scan?mode=short" | tail -200 || true
+
       # Uncomment to backstop premarket via Actions as well
       # - name: Hit premarket VWAP scanner
       #   run: |
