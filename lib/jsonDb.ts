@@ -3,6 +3,7 @@ import path from "path";
 import { redis } from "@/lib/redis";
 import { TradePlan } from "@/lib/tradePlan";
 import { setWithTtl, getTtlSeconds } from "@/lib/redis/ttl";
+import { SignalContext } from "@/lib/signalContext";
 
 export type SignalSide = "LONG" | "SHORT";
 
@@ -55,6 +56,9 @@ export type StoredSignal = {
   longScore?: number | null; // Score for LONG hypothesis
   shortScore?: number | null; // Score for SHORT hypothesis
   bestDirection?: "LONG" | "SHORT" | "NONE"; // AI's evaluation of best direction
+  
+  // Context enrichment (from buildSignalContext)
+  signalContext?: SignalContext;
 };
 
 const LOCAL_DATA_DIR = path.join(process.cwd(), "data");

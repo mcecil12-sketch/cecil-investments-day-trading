@@ -1,37 +1,29 @@
 import { NextResponse } from "next/server";
 import { readSignals, writeSignals } from "@/lib/jsonDb";
+import { computeDirection } from "@/lib/scannerUtils";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 /**
- * Compute signal direction with fallback logic:
- * 1. Prefer aiDirection if present and valid
- * 2. Use existing direction if valid
- * 3. Infer from entry/stop prices
- * 4. Default to LONG
+ * Compute signal direction from signalContext (VWAP/trend) when available.
+ * 1. If signalContext exists with VWAP/trend, use computeDirection heuristic
+ * 2. Otherwise return null (do NOT guess from entry/stop)
  */
-function computeDirectionFallback(signal: any): "LONG" | "SHORT" {
-  // Prefer AI's chosen direction
-  if (signal.aiDirection === "LONG" || signal.aiDirection === "SHORT") {
-    return signal.aiDirection;
+function computeDirectionFromContext(signal: any): "LONG" | "SHORT" | null {
+  // Try to use signalContext if available
+  const ctx = signal.signalContext;
+  if (ctx?.vwap != null && ctx?.trend) {
+    const direction = computeDirection({
+      price: Number(signal.entryPrice),
+      vwap: ctx.vwap,
+      trend: ctx.trend as "UP" | "DOWN" | "FLAT",
+    });
+    if (direction) return direction;
   }
 
-  // Use existing heuristic direction if available
-  if (signal.direction === "LONG" || signal.direction === "SHORT") {
-    return signal.direction;
-  }
-
-  // Infer from entry/stop: stop < entry => LONG, stop > entry => SHORT
-  const entry = Number(signal.entryPrice);
-  const stop = Number(signal.stopPrice);
-  if (Number.isFinite(entry) && Number.isFinite(stop)) {
-    if (stop < entry) return "LONG";
-    if (stop > entry) return "SHORT";
-  }
-
-  // Default to LONG
-  return "LONG";
+  // No meaningful context → leave null
+  return null;
 }
 
 export async function POST(req: Request) {
@@ -49,33 +41,66 @@ export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
     const dryRun = body?.dryRun === true;
+    const sinceHours = typeof body?.sinceHours === "number" ? body.sinceHours : null;
+    const limit = typeof body?.limit === "number" ? body.limit : null;
 
-    const signals = await readSignals();
-    const nowIso = new Date().toISOString();
+    const allSignals = await readSignals();
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
 
-    let updated = 0;
-    const sample: any[] = [];
+    // Filter by time window if sinceHours provided
+    let candidateSignals = allSignals;
+    if (sinceHours != null && sinceHours > 0) {
+      const cutoffMs = nowMs - sinceHours * 3600 * 1000;
+      candidateSignals = allSignals.filter((s) => {
+        const createdMs = Date.parse(s.createdAt);
+        return Number.isFinite(createdMs) && createdMs >= cutoffMs;
+      });
+    }
+
+    // Sort newest-first for consistent ordering
+    candidateSignals.sort((a, b) => {
+      const ta = Date.parse(a.createdAt);
+      const tb = Date.parse(b.createdAt);
+      return tb - ta; // desc
+    });
+
+    // Apply limit after sorting
+    if (limit != null && limit > 0 && candidateSignals.length > limit) {
+      candidateSignals = candidateSignals.slice(0, limit);
+    }
 
     // Filter signals where direction is null/undefined
-    const needsBackfill = signals.filter(
+    const needsBackfill = candidateSignals.filter(
       (s) => !s.direction || (s.direction !== "LONG" && s.direction !== "SHORT")
     );
 
     console.log("[backfill-direction] found signals needing backfill", {
-      total: signals.length,
+      total: allSignals.length,
+      candidateSignals: candidateSignals.length,
       needsBackfill: needsBackfill.length,
+      sinceHours,
+      limit,
       dryRun,
     });
 
+    let updated = 0;
+    const sample: any[] = [];
+
     for (const signal of needsBackfill) {
-      const computedDirection = computeDirectionFallback(signal);
-      
-      if (!dryRun) {
+      const computedDirection = computeDirectionFromContext(signal);
+
+      // Track whether we computed a direction
+      const willUpdate = computedDirection !== null;
+
+      if (!dryRun && willUpdate) {
         signal.direction = computedDirection;
         signal.updatedAt = nowIso;
+        updated += 1;
+      } else if (willUpdate) {
+        // DryRun: just count
+        updated += 1;
       }
-
-      updated += 1;
 
       // Collect sample for response (max 10)
       if (sample.length < 10) {
@@ -85,14 +110,15 @@ export async function POST(req: Request) {
           oldDirection: signal.direction || null,
           newDirection: computedDirection,
           aiDirection: signal.aiDirection || null,
-          entryPrice: signal.entryPrice,
-          stopPrice: signal.stopPrice,
+          hasContext: !!signal.signalContext,
+          vwap: signal.signalContext?.vwap ?? null,
+          trend: signal.signalContext?.trend ?? null,
         });
       }
     }
 
     if (!dryRun && updated > 0) {
-      await writeSignals(signals);
+      await writeSignals(allSignals);
       console.log("[backfill-direction] updated signals", { updated });
     }
 
@@ -100,9 +126,9 @@ export async function POST(req: Request) {
       {
         ok: true,
         dryRun,
-        checked: signals.length,
-        updated,
+        checked: candidateSignals.length,
         needsBackfill: needsBackfill.length,
+        updated,
         sample,
       },
       { status: 200 }

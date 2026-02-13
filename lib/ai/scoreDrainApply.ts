@@ -1,5 +1,6 @@
 import { shouldQualify } from "@/lib/aiQualify";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
+import { computeDirection } from "@/lib/scannerUtils";
 
 type ParseFailedMeta = {
   aiModel?: string | null;
@@ -112,7 +113,7 @@ export function applyScoreSuccess(signal: any, scored: any, nowIso: string) {
   signal.longScore = scored.longScore ?? signal.longScore ?? null;
   signal.shortScore = scored.shortScore ?? signal.shortScore ?? null;
 
-  // Ensure direction is never null (use aiDirection with fallback)
+  // Compute direction from available context (may be null if unclear)
   signal.direction = computeSignalDirection(signal);
 
   signal.qualified = shouldQualify({
@@ -124,16 +125,27 @@ export function applyScoreSuccess(signal: any, scored: any, nowIso: string) {
 }
 
 /**
- * Compute signal direction with fallback logic:
- * 1. Prefer aiDirection if present
- * 2. Fallback to existing direction heuristic
- * 3. Infer from entry/stop prices
- * 4. Default to LONG
+ * Compute signal direction with improved heuristic:
+ * 1. Prefer aiDirection if present (from AI scoring)
+ * 2. Try to compute from signalContext (VWAP/trend) if available
+ * 3. Fallback to existing direction if valid
+ * 4. Leave null if no meaningful direction can be determined
  */
-function computeSignalDirection(signal: any): "LONG" | "SHORT" {
+function computeSignalDirection(signal: any): "LONG" | "SHORT" | null {
   // Prefer AI's chosen direction
   if (signal.aiDirection === "LONG" || signal.aiDirection === "SHORT") {
     return signal.aiDirection;
+  }
+
+  // Try to use signalContext if available
+  const ctx = signal.signalContext;
+  if (ctx?.vwap != null && ctx?.trend) {
+    const direction = computeDirection({
+      price: Number(signal.entryPrice),
+      vwap: ctx.vwap,
+      trend: ctx.trend as "UP" | "DOWN" | "FLAT",
+    });
+    if (direction) return direction;
   }
 
   // Use existing heuristic direction if available
@@ -141,14 +153,6 @@ function computeSignalDirection(signal: any): "LONG" | "SHORT" {
     return signal.direction;
   }
 
-  // Infer from entry/stop: stop < entry => LONG, stop > entry => SHORT
-  const entry = Number(signal.entryPrice);
-  const stop = Number(signal.stopPrice);
-  if (Number.isFinite(entry) && Number.isFinite(stop)) {
-    if (stop < entry) return "LONG";
-    if (stop > entry) return "SHORT";
-  }
-
-  // Default to LONG
-  return "LONG";
+  // No meaningful direction available
+  return null;
 }
