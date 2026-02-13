@@ -60,7 +60,7 @@ export type ScoredSignal = RawSignal & {
   aiRawHead?: string | null;
   aiErrorReason?: string | null;
   // Bidirectional scoring fields
-  aiDirection?: Side; // AI's chosen direction (LONG or SHORT)
+  aiDirection?: "LONG" | "SHORT" | "NONE"; // Final selected direction
   longScore?: number | null; // 0-10 score for LONG hypothesis
   shortScore?: number | null; // 0-10 score for SHORT hypothesis
   bestDirection?: "LONG" | "SHORT" | "NONE";
@@ -135,23 +135,39 @@ function scoreToGrade(score: number) {
   return "F"
 }
 
-function validateStructuredOutput(parsed: { score: number; grade: string; summary: string; qualified?: boolean; reasons?: string[] }) {
-  if (!Number.isFinite(parsed.score) || parsed.score < 0 || parsed.score > 10) {
-    return "invalid_score";
+function validateStructuredOutput(parsed: {
+  longScore: number;
+  shortScore: number;
+  longSummary: string;
+  shortSummary: string;
+  chosenDirection: string;
+  confidence: number;
+}) {
+  if (!Number.isFinite(parsed.longScore) || parsed.longScore < 0 || parsed.longScore > 10) {
+    return "invalid_long_score";
   }
-  if (!["A", "B", "C", "D", "F"].includes(parsed.grade)) {
-    return "invalid_grade";
+  if (!Number.isFinite(parsed.shortScore) || parsed.shortScore < 0 || parsed.shortScore > 10) {
+    return "invalid_short_score";
   }
-  if (!parsed.summary || !parsed.summary.trim()) {
-    return "missing_summary";
+  if (!parsed.longSummary || !parsed.longSummary.trim()) {
+    return "missing_long_summary";
   }
-  if (typeof parsed.qualified !== "boolean") {
-    return "missing_qualified";
+  if (!parsed.shortSummary || !parsed.shortSummary.trim()) {
+    return "missing_short_summary";
   }
-  if (!Array.isArray(parsed.reasons) || parsed.reasons.length === 0) {
-    return "missing_reasons";
+  if (!["LONG", "SHORT", "NONE"].includes(parsed.chosenDirection)) {
+    return "invalid_chosen_direction";
+  }
+  if (!Number.isFinite(parsed.confidence) || parsed.confidence < 0 || parsed.confidence > 1) {
+    return "invalid_confidence";
   }
   return null;
+}
+
+function normalizeDirectionalScore(x: any) {
+  const n = typeof x === "number" ? x : Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(clamp(n, 0, 10) * 100) / 100;
 }
 
 function stripCodeFences(s: string) {
@@ -284,6 +300,9 @@ export function formatAiSummary(grade: AiGrade, score: number) {
 
 const MIN_BARS_FOR_AI = Number(process.env.MIN_BARS_FOR_AI ?? 20);
 const MIN_AVG_DOLLAR_VOL_HARD = Number(process.env.MIN_AVG_DOLLAR_VOL_HARD ?? 300000);
+const MIN_LONG_SCORE = Number(process.env.MIN_LONG_SCORE ?? 7.5);
+const MIN_SHORT_SCORE = Number(process.env.MIN_SHORT_SCORE ?? 7.5);
+const MIN_EDGE = Number(process.env.MIN_EDGE ?? 0.7);
 const AI_SCORING_RETRY_MAX = Number(process.env.AI_SCORING_RETRY_MAX ?? 4);
 const AI_SCORING_BREAKER_ENABLED = String(process.env.AI_SCORING_BREAKER_ENABLED ?? "1") === "1";
 
@@ -389,7 +408,7 @@ export async function scoreSignalWithAI(rawSignal: RawSignal): Promise<AiScoreRe
 
   const systemPrompt = `
 You are a seasoned intraday equities trader.
-You evaluate trading setups from BOTH directions to find the highest-conviction trade.
+You evaluate each trading setup from BOTH directions independently.
 
 Rules:
 - Score from 0 to 10 (decimals allowed) where:
@@ -405,11 +424,8 @@ Rules:
   - Entry quality relative to VWAP and recent price action
   - Risk/reward setup
   - Liquidity and volume support
-- Direction alignment: if signal has a heuristic direction (LONG/SHORT based on VWAP/trend), strongly prefer setups aligned with it. Penalize significantly for wrong-way setups (e.g., SHORT with upward trend).
-- Choose bestDirection: "LONG", "SHORT", or "NONE" (if both weak)
-- Return finalScore = max(longScore, shortScore) when bestDirection chosen
-- Respond ONLY as a compact JSON object with fields:
-  {"longScore": number, "shortScore": number, "bestDirection": "LONG"|"SHORT"|"NONE", "finalScore": number, "aiGrade": "A"|"B"|"C"|"D"|"F", "qualified": boolean, "aiSummary": "short explanation", "reasons": string[]}.
+- Return ONLY a compact JSON object with fields:
+  {"longScore": number, "shortScore": number, "longSummary": string, "shortSummary": string, "chosenDirection": "LONG"|"SHORT"|"NONE", "confidence": number}.
   No extra text.
 `.trim();
 
@@ -498,17 +514,17 @@ Evaluate BOTH:
 2. SHORT hypothesis: Sell/short at entry, profit on downside to stop of LONG (inverted bracket)
 
 For each direction, score 0-10 based on:
-- Trend alignment (strongly align the chosen direction with the dominant trend)
+- Trend alignment
 - Entry quality (VWAP, pullback/rejection quality)
 - Risk/reward
 - Volume/liquidity support
-- Direction alignment: If the signal has a heuristic direction field, weight heavily toward it. Penalize setups opposite to the heuristic direction (e.g., if direction="LONG" but you score SHORT higher, apply -2 penalty to SHORT).
 
-Choose bestDirection as the higher-conviction setup aligned with trend and heuristic direction. Set finalScore = max(longScore, shortScore).
-If both are weak (<5), set bestDirection="NONE" and finalScore=max(longScore,shortScore).
+Evaluate LONG and SHORT independently. Do not prefer either direction by default.
+Set chosenDirection to the side you believe is stronger, or NONE if both are weak.
+Set confidence from 0 to 1.
 
 Return ONLY valid JSON:
-{ "longScore": number, "shortScore": number, "bestDirection": "LONG"|"SHORT"|"NONE", "finalScore": number, "aiGrade": "A"|"B"|"C"|"D"|"F", "qualified": boolean, "aiSummary": string, "reasons": string[] }
+{ "longScore": number, "shortScore": number, "longSummary": string, "shortSummary": string, "chosenDirection": "LONG"|"SHORT"|"NONE", "confidence": number }
 `.trim();
 
   const BULK_MODEL = process.env.OPENAI_MODEL_BULK || "gpt-5-mini";
@@ -536,14 +552,12 @@ Return ONLY valid JSON:
               properties: {
                 longScore: { type: "number" },
                 shortScore: { type: "number" },
-                bestDirection: { type: "string", enum: ["LONG", "SHORT", "NONE"] },
-                finalScore: { type: "number" },
-                aiGrade: { type: "string", enum: ["A", "B", "C", "D", "F"] },
-                qualified: { type: "boolean" },
-                aiSummary: { type: "string" },
-                reasons: { type: "array", items: { type: "string" } },
+                longSummary: { type: "string" },
+                shortSummary: { type: "string" },
+                chosenDirection: { type: "string", enum: ["LONG", "SHORT", "NONE"] },
+                confidence: { type: "number" },
               },
-              required: ["longScore", "shortScore", "bestDirection", "finalScore", "aiGrade", "qualified", "aiSummary", "reasons"],
+              required: ["longScore", "shortScore", "longSummary", "shortSummary", "chosenDirection", "confidence"],
             },
           },
         },
@@ -601,7 +615,7 @@ Return ONLY valid JSON:
   if (!parsed.ok && retryOnParseFail) {
     const retryPrompt =
       prompt +
-      "\n\nIMPORTANT: Respond ONLY with a single JSON object: {\"longScore\":number,\"shortScore\":number,\"bestDirection\":\"LONG\"|\"SHORT\"|\"NONE\",\"finalScore\":number,\"aiGrade\":\"A|B|C|D|F\",\"qualified\":boolean,\"aiSummary\":string,\"reasons\":string[]}";
+      "\n\nIMPORTANT: Respond ONLY with a single JSON object: {\"longScore\":number,\"shortScore\":number,\"longSummary\":string,\"shortSummary\":string,\"chosenDirection\":\"LONG\"|\"SHORT\"|\"NONE\",\"confidence\":number}";
     scoreResponse = await scoreOnce(retryPrompt);
     parsed = parseAiScoreOutput(scoreResponse.content);
   }
@@ -621,17 +635,24 @@ Return ONLY valid JSON:
   const parsedScore = parsed.parsed;
   // Extract bidirectional fields from parsed response
   const rawObj = (parsedScore as any).rawJson || {};
-  const longScore = typeof rawObj.longScore === "number" ? rawObj.longScore : parsedScore.score;
-  const shortScore = typeof rawObj.shortScore === "number" ? rawObj.shortScore : parsedScore.score;
-  const bestDirection = rawObj.bestDirection || "LONG";
-  const finalScore = typeof rawObj.finalScore === "number" ? rawObj.finalScore : parsedScore.score;
+  const longScore = normalizeDirectionalScore(rawObj.longScore ?? parsedScore.longScore ?? parsedScore.score);
+  const shortScore = normalizeDirectionalScore(rawObj.shortScore ?? parsedScore.shortScore ?? parsedScore.score);
+  const longSummary = String(rawObj.longSummary ?? "").trim();
+  const shortSummary = String(rawObj.shortSummary ?? "").trim();
+  const chosenDirectionRaw = String(rawObj.chosenDirection ?? "NONE").toUpperCase();
+  const chosenDirection =
+    chosenDirectionRaw === "LONG" || chosenDirectionRaw === "SHORT" || chosenDirectionRaw === "NONE"
+      ? chosenDirectionRaw
+      : "NONE";
+  const confidence = typeof rawObj.confidence === "number" ? rawObj.confidence : Number(rawObj.confidence);
   
   const validationError = validateStructuredOutput({
-    score: finalScore,
-    grade: parsedScore.grade,
-    summary: parsedScore.summary,
-    qualified: parsedScore.qualified,
-    reasons: parsedScore.reasons,
+    longScore,
+    shortScore,
+    longSummary,
+    shortSummary,
+    chosenDirection,
+    confidence,
   });
   if (validationError) {
     return {
@@ -644,34 +665,61 @@ Return ONLY valid JSON:
       aiParseError: validationError,
     };
   }
-  const _scoreNum = finalScore;
-  const gradeCandidate = String(parsedScore.grade || "").trim().toUpperCase();
-  const _grade: AiGrade =
-    ["A+", "A", "B", "C", "D", "F"].includes(gradeCandidate)
-      ? (gradeCandidate as AiGrade)
-      : gradeFromScore(_scoreNum);
-  const _summary = parsedScore.summary.trim();
-  
-  // Determine final direction based on AI's evaluation
-  const _direction: Side = bestDirection === "SHORT" ? "SHORT" : "LONG";
+
+  const edge = Math.abs(longScore - shortScore);
+  let bestDirection: "LONG" | "SHORT" | "NONE" = "NONE";
+  if (longScore >= MIN_LONG_SCORE && longScore > shortScore && edge >= MIN_EDGE) {
+    bestDirection = "LONG";
+  } else if (shortScore >= MIN_SHORT_SCORE && shortScore > longScore && edge >= MIN_EDGE) {
+    bestDirection = "SHORT";
+  }
+
+  const winnerScore =
+    bestDirection === "LONG" ? longScore :
+    bestDirection === "SHORT" ? shortScore :
+    0;
+  const _grade: AiGrade = gradeFromScore(winnerScore);
+  const _summary =
+    bestDirection === "LONG"
+      ? longSummary
+      : bestDirection === "SHORT"
+        ? shortSummary
+        : `No qualified directional edge. LONG ${longScore.toFixed(2)} vs SHORT ${shortScore.toFixed(2)} (edge ${edge.toFixed(2)} < min ${MIN_EDGE.toFixed(2)} or threshold miss).`;
+  const isQualified = bestDirection !== "NONE";
+  const _direction: "LONG" | "SHORT" | "NONE" = bestDirection;
 
   const result: ScoredSignal = {
     ...signal,
-    aiScore: _scoreNum,
+    aiScore: winnerScore,
     aiGrade: _grade,
     aiSummary: _summary,
-    totalScore: _scoreNum,
+    totalScore: winnerScore,
+    qualified: isQualified,
     // Bidirectional scoring results
     aiDirection: _direction,
-    longScore: clampScore(longScore),
-    shortScore: clampScore(shortScore),
-    bestDirection: bestDirection as "LONG" | "SHORT" | "NONE",
+    longScore,
+    shortScore,
+    bestDirection,
   };
+
+  if (bestDirection === "LONG") {
+    await bumpTodayFunnel({ aiDirectionLong: 1 }).catch(console.warn);
+  } else if (bestDirection === "SHORT") {
+    await bumpTodayFunnel({ aiDirectionShort: 1 }).catch(console.warn);
+  } else {
+    await bumpTodayFunnel({ aiDirectionNone: 1 }).catch(console.warn);
+  }
 
   console.log("[aiScoring] Result:", {
     ticker: result.ticker,
-    score: _scoreNum,
+    score: winnerScore,
     grade: _grade,
+    longScore,
+    shortScore,
+    chosenDirection,
+    confidence,
+    bestDirection,
+    edge,
   });
 
   try {

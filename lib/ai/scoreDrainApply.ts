@@ -116,10 +116,13 @@ export function applyScoreSuccess(signal: any, scored: any, nowIso: string) {
   // Compute direction from available context (may be null if unclear)
   signal.direction = computeSignalDirection(signal);
 
-  signal.qualified = shouldQualify({
-    score: scored.aiScore,
-    grade: scored.aiGrade,
-  });
+  signal.qualified =
+    typeof scored.qualified === "boolean"
+      ? scored.qualified
+      : shouldQualify({
+          score: scored.aiScore,
+          grade: scored.aiGrade,
+        });
   signal.shownInApp = signal.qualified;
   return signal;
 }
