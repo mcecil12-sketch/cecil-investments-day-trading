@@ -14,6 +14,7 @@ export type SignalContext = {
   relVolumeNote?: string;
   rangePctAvg: number | null;
   liquidityNote: string;
+  shortBias?: boolean;
 };
 
 function safeNum(n: any): number | null {
@@ -129,6 +130,84 @@ async function fetchLastTradingSessionClose() {
   }
 }
 
+/**
+ * detectShortBias - Evaluates bearish structure indicators
+ * Returns true when multiple SHORT setup signals align:
+ * - Price below VWAP (weakness)
+ * - Failed breakout / rejection from VWAP underside
+ * - Lower highs pattern (downtrend structure)
+ * - Negative trend slope
+ * - Recent bars showing distribution (volume on down bars)
+ */
+function detectShortBias(params: {
+  bars: AlpacaBar[];
+  vwap: number | null;
+  trend: SignalContext["trend"];
+  trendSlopePct: number;
+}): boolean {
+  const { bars, vwap, trend, trendSlopePct } = params;
+  
+  if (bars.length < 10) return false; // Need sufficient data
+  if (!vwap || vwap <= 0) return false; // Need valid VWAP
+  
+  const recentBars = bars.slice(-10); // Last 10 bars
+  const lastBar = recentBars[recentBars.length - 1];
+  if (!lastBar) return false;
+  
+  // Signal 1: Price below VWAP (weakness)
+  const belowVwap = lastBar.c < vwap;
+  
+  // Signal 2: Negative trend (DOWN) explicitly
+  const negTrend = trend === "DOWN";
+  
+  // Signal 3: Lower highs pattern - check if recent highs are declining
+  const recentHighs = recentBars.slice(-5).map((b) => b.h);
+  let lowerHighs = false;
+  if (recentHighs.length >= 3) {
+    const firstHigh = Math.max(...recentHighs.slice(0, 2));
+    const lastHigh = Math.max(...recentHighs.slice(-2));
+    lowerHighs = lastHigh < firstHigh * 0.998; // At least 0.2% decline in highs
+  }
+  
+  // Signal 4: Rejection from VWAP underside - price attempted to cross VWAP but failed
+  let vwapRejection = false;
+  for (let i = Math.max(0, recentBars.length - 5); i < recentBars.length; i++) {
+    const bar = recentBars[i];
+    // Bar touched or crossed above VWAP but closed below
+    if (bar.h >= vwap && bar.c < vwap * 0.999) {
+      vwapRejection = true;
+      break;
+    }
+  }
+  
+  // Signal 5: Distribution pattern - higher volume on down bars
+  let distributionScore = 0;
+  for (let i = Math.max(0, recentBars.length - 5); i < recentBars.length - 1; i++) {
+    const bar = recentBars[i];
+    const nextBar = recentBars[i + 1];
+    const vol = safeNum((bar as any).v) ?? 0;
+    const nextVol = safeNum((nextBar as any).v) ?? 0;
+    const avgVol = (vol + nextVol) / 2;
+    
+    // Down bar with above-average volume
+    if (bar.c < bar.o && vol > avgVol * 1.1) {
+      distributionScore++;
+    }
+  }
+  const hasDistribution = distributionScore >= 2;
+  
+  // Scoring: Need at least 3 signals to confirm SHORT bias
+  const signalCount = [
+    belowVwap,
+    negTrend,
+    lowerHighs,
+    vwapRejection,
+    hasDistribution,
+  ].filter(Boolean).length;
+  
+  return signalCount >= 3;
+}
+
 export async function buildSignalContext(params: {
   ticker: string;
   timeframe: string;
@@ -203,6 +282,14 @@ export async function buildSignalContext(params: {
   const rangePctAvg = computeAvgRangePct(finalBars);
   const lastClose = finalBars.length ? finalBars[finalBars.length - 1].c : null;
   const liquidityNote = liquidityNoteFromContext(avg, lastClose ?? null);
+  
+  // Detect SHORT bias when bearish structure indicators align
+  const shortBias = detectShortBias({
+    bars: finalBars,
+    vwap: vwap ?? null,
+    trend,
+    trendSlopePct: slopePct,
+  });
 
   return {
     timeframe: params.timeframe,
@@ -216,5 +303,6 @@ export async function buildSignalContext(params: {
     relVolumeNote: relNote ?? undefined,
     rangePctAvg,
     liquidityNote,
+    shortBias,
   };
 }

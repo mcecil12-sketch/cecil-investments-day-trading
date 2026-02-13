@@ -500,6 +500,12 @@ Rules:
       ? JSON.stringify(signal.signalContext, null, 2)
       : "null";
 
+  // Detect SHORT bias emphasis
+  const shortBiasDetected = signal.signalContext?.shortBias === true;
+  const directionGuidance = shortBiasDetected
+    ? "\n⚠️ SHORT BIAS DETECTED: Market context shows bearish structure (below VWAP, lower highs, distribution). Evaluate SHORT hypothesis with extra scrutiny."
+    : "";
+
   const prompt = `
 You are evaluating an intraday trading candidate from BOTH directions.
 
@@ -507,7 +513,7 @@ Candidate JSON:
 ${JSON.stringify(signal, null, 2)}
 
 ComputedContext JSON (from Alpaca bars):
-${contextBlock}
+${contextBlock}${directionGuidance}
 
 Evaluate BOTH:
 1. LONG hypothesis: Buy at entry, profit on upside to target
@@ -520,6 +526,7 @@ For each direction, score 0-10 based on:
 - Volume/liquidity support
 
 Evaluate LONG and SHORT independently. Do not prefer either direction by default.
+${shortBiasDetected ? "Given the SHORT bias context, ensure SHORT setup gets thorough analysis." : ""}
 Set chosenDirection to the side you believe is stronger, or NONE if both are weak.
 Set confidence from 0 to 1.
 

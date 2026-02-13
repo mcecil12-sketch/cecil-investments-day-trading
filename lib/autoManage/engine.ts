@@ -1,4 +1,5 @@
 import { getAutoManageConfig } from "@/lib/autoManage/config";
+import { getRuleForGrade, shouldMoveToBreakEven, shouldEnableTrailing } from "@/lib/autoManage/gradeRules";
 import { recordAutoManage } from "@/lib/autoManage/telemetry";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { getLatestQuote, alpacaRequest, getPositions } from "@/lib/alpaca";
@@ -234,16 +235,29 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     const unrealizedPnL = r2(pnlPerShare * qty);
     const unrealizedR = r3(pnlPerShare / rps);
 
+    // === GRADE-BASED STOP MANAGEMENT ===
     let nextStop = stop;
-
-    if (unrealizedR >= 1) {
-      nextStop = side === "SHORT" ? Math.min(nextStop, entry) : Math.max(nextStop, entry);
+    const tradeGrade = (t.grade ?? t.ai?.grade ?? t.signalGrade ?? "C") as string;
+    const gradeRule = getRuleForGrade(tradeGrade);
+    
+    // Check if already at break-even or better
+    const alreadyAtBreakEven = side === "SHORT" 
+      ? (stop <= entry + 0.001) // SHORT: stop at or below entry
+      : (stop >= entry - 0.001); // LONG: stop at or above entry
+    
+    // Move to break-even based on grade rule
+    if (shouldMoveToBreakEven(unrealizedR, tradeGrade, alreadyAtBreakEven)) {
+      nextStop = entry; // Move stop to entry (break-even)
     }
-    if (unrealizedR >= 2) {
-      const lock = side === "SHORT" ? (entry - rps) : (entry + rps);
-      nextStop = side === "SHORT" ? Math.min(nextStop, lock) : Math.max(nextStop, lock);
+    
+    // Lock in 1R profit at 2R (applicable to all grades)
+    if (unrealizedR >= 2.0 && !alreadyAtBreakEven) {
+      const lock1R = side === "SHORT" ? (entry - rps) : (entry + rps);
+      nextStop = side === "SHORT" ? Math.min(nextStop, lock1R) : Math.max(nextStop, lock1R);
     }
-    if (cfg.trailEnabled && unrealizedR >= cfg.trailStartR) {
+    
+    // Apply trailing stop if grade rule allows and currentR qualifies
+    if (shouldEnableTrailing(unrealizedR, tradeGrade) && cfg.trailEnabled) {
       const trailStop = side === "SHORT" ? px * (1 + cfg.trailPct) : px * (1 - cfg.trailPct);
       nextStop = side === "SHORT" ? Math.min(nextStop, trailStop) : Math.max(nextStop, trailStop);
     }
@@ -341,7 +355,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
         }
       }
 
-      const noteRule = unrealizedR >= 2 ? "LOCK_2R" : unrealizedR >= 1 ? "BE_1R" : "NONE";
+      const noteRule = unrealizedR >= 2 ? `LOCK_2R_${tradeGrade}` : unrealizedR >= gradeRule.breakEvenAtR ? `BE_${gradeRule.breakEvenAtR}R_${tradeGrade}` : `NONE_${tradeGrade}`;
       const stopFrom = r2(stop);
       const stopTo = r2(nextStop);
       const px2 = r2(px);

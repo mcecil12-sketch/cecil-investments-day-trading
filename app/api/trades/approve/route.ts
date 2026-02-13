@@ -60,6 +60,30 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: "Invalid trade side" }, { status: 400 });
   }
 
+  // === DIRECTION INTEGRITY GUARDS ===
+  // Validate stop price geometry is correct for direction
+  if (side === "SHORT") {
+    if (stopPrice <= entryPrice) {
+      return NextResponse.json(
+        { 
+          ok: false, 
+          error: `SHORT direction integrity violation: stopPrice (${stopPrice}) must be > entryPrice (${entryPrice})` 
+        },
+        { status: 400 }
+      );
+    }
+  } else if (side === "LONG") {
+    if (stopPrice >= entryPrice) {
+      return NextResponse.json(
+        { 
+          ok: false, 
+          error: `LONG direction integrity violation: stopPrice (${stopPrice}) must be < entryPrice (${entryPrice})` 
+        },
+        { status: 400 }
+      );
+    }
+  }
+
   let qty = parseNumber(
     trade?.quantity ?? trade?.size ?? trade?.qty ?? trade?.positionSize ?? trade?.shares
   );

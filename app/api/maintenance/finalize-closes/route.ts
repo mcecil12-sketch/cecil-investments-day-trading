@@ -3,6 +3,7 @@ import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { finalizeTradeClose } from "@/lib/trades/finalizeClose";
 import { notify } from "@/lib/notifications/notify";
 import { buildTradeClosedPayload } from "@/lib/notifications/tradeClose";
+import { recordTradeClose } from "@/lib/autoManage/gradeTelemetry";
 
 export const dynamic = "force-dynamic";
 
@@ -102,6 +103,32 @@ export async function POST(req: Request) {
       };
       updates.push(finalizedTrade);
       finalizedTrades.push(finalizedTrade);
+      
+      // Record grade telemetry for performance tracking
+      try {
+        const grade = (t.grade ?? t.ai?.grade ?? t.signalGrade ?? "C") as string;
+        const side = (t.side ?? "LONG").toString().toUpperCase() as "LONG" | "SHORT";
+        const entryAt = t.executedAt || t.openedAt || t.createdAt;
+        const closedAt = t.closedAt || finalizedTrade.updatedAt;
+        const holdDurationMs = entryAt && closedAt ? Date.parse(closedAt) - Date.parse(entryAt) : null;
+        
+        await recordTradeClose({
+          tradeId: t.id,
+          ticker: t.ticker,
+          grade: grade,
+          side: side,
+          realizedR: (r as any).realizedR,
+          realizedPnL: (r as any).realizedPnL,
+          closeReason: (r as any).closeReason,
+          closedAt: finalizedTrade.updatedAt,
+          entryPrice: t.entryPrice || 0,
+          exitPrice: (r as any).closePrice,
+          holdDurationMinutes: holdDurationMs ? Math.round(holdDurationMs / 60000) : undefined,
+        });
+      } catch (telemetryErr) {
+        console.warn("[finalize-closes] Grade telemetry failed (non-fatal):", telemetryErr);
+      }
+      
       continue;
     }
 
