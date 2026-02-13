@@ -11,6 +11,10 @@ export type ParsedScore = {
   shortScore?: number;
   bestDirection?: "LONG" | "SHORT" | "NONE";
   finalScore?: number;
+  longSummary?: string;
+  shortSummary?: string;
+  chosenDirection?: "LONG" | "SHORT" | "NONE";
+  confidence?: number;
 };
 
 function stripFences(s: string): string {
@@ -82,13 +86,30 @@ export function parseAiScoreOutput(
     try {
       const obj = JSON.parse(jsonStr);
       // Try bidirectional fields first, fall back to legacy aiScore/score
-      const finalScore = obj.finalScore ?? obj.aiScore ?? obj.score;
+      const longScoreRaw = Number(obj.longScore);
+      const shortScoreRaw = Number(obj.shortScore);
+      const derivedDirectionalScore =
+        Number.isFinite(longScoreRaw) && Number.isFinite(shortScoreRaw)
+          ? Math.max(longScoreRaw, shortScoreRaw)
+          : undefined;
+      const finalScore = obj.finalScore ?? obj.aiScore ?? obj.score ?? derivedDirectionalScore;
       const score = clampScore(Number(finalScore));
       const longScore = typeof obj.longScore === "number" ? clampScore(obj.longScore) : undefined;
       const shortScore = typeof obj.shortScore === "number" ? clampScore(obj.shortScore) : undefined;
-      const bestDirection = obj.bestDirection || undefined;
+      const bestDirection = obj.bestDirection || obj.chosenDirection || undefined;
+      const longSummary = typeof obj.longSummary === "string" ? obj.longSummary.trim() : undefined;
+      const shortSummary = typeof obj.shortSummary === "string" ? obj.shortSummary.trim() : undefined;
+      const chosenDirection =
+        obj.chosenDirection === "LONG" || obj.chosenDirection === "SHORT" || obj.chosenDirection === "NONE"
+          ? obj.chosenDirection
+          : undefined;
+      const confidence = Number.isFinite(Number(obj.confidence)) ? Number(obj.confidence) : undefined;
       const grade = normalizeGrade(obj.grade ?? obj.aiGrade);
-      const summary = String(obj.summary ?? obj.aiSummary ?? "").trim();
+      const summary = String(
+        obj.summary ??
+        obj.aiSummary ??
+        (longSummary || shortSummary ? `LONG: ${longSummary ?? "n/a"}; SHORT: ${shortSummary ?? "n/a"}` : "")
+      ).trim();
       const qualified = typeof obj.qualified === "boolean" ? obj.qualified : undefined;
       const reasons = Array.isArray(obj.reasons)
         ? obj.reasons.map((r: any) => String(r)).filter((r: string) => r.trim().length > 0)
@@ -98,7 +119,23 @@ export function parseAiScoreOutput(
       if (Number.isFinite(score) && summary) {
         return {
           ok: true,
-          parsed: { score, grade, summary, qualified, reasons, reasoning, rawJson: obj, longScore, shortScore, bestDirection, finalScore },
+          parsed: {
+            score,
+            grade,
+            summary,
+            qualified,
+            reasons,
+            reasoning,
+            rawJson: obj,
+            longScore,
+            shortScore,
+            bestDirection,
+            finalScore,
+            longSummary,
+            shortSummary,
+            chosenDirection,
+            confidence,
+          },
         };
       }
     } catch {

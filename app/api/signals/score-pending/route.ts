@@ -7,7 +7,7 @@ const FUNNEL_QUALIFIED_SHOWN_BUMP_v1 = true;
 import { scoreSignalWithAI, RawSignal, ScoredSignal } from "@/lib/aiScoring";
 import { parseAiTradePlan } from "@/lib/tradePlan";
 import { shouldQualify } from "@/lib/aiQualify";
-import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
+import { readSignals, writeSignals, StoredSignal, normalizeAiDirectionForStorage } from "@/lib/jsonDb";
 import { touchHeartbeat } from "@/lib/aiHeartbeat";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 
@@ -135,10 +135,13 @@ export async function POST(req: Request) {
         stopPrice: raw.stopPrice,
       });
 
-      const qualified = shouldQualify({
-        score: scored.totalScore ?? scored.aiScore ?? null,
-        grade: (scored.aiGrade as any) ?? null,
-      });
+      const qualified =
+        typeof scored.qualified === "boolean"
+          ? scored.qualified
+          : shouldQualify({
+              score: scored.totalScore ?? scored.aiScore ?? null,
+              grade: (scored.aiGrade as any) ?? null,
+            });
 
       const _scoreRaw = scored.totalScore ?? scored.aiScore ?? null;
       const _hasNumericScore =
@@ -162,6 +165,7 @@ export async function POST(req: Request) {
         lastScoreAttemptAt: _nowIso,
         scoreAttempts: _attempts,
         nextScoreAt: (_shouldDefer ? _nextScoreAt : null),
+        aiDirection: normalizeAiDirectionForStorage(scored.aiDirection),
 };
 
       updated.push(final);

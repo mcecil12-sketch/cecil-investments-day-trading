@@ -52,7 +52,7 @@ export type StoredSignal = {
   tradePlan?: TradePlan | null;
   
   // Bidirectional scoring fields
-  aiDirection?: SignalSide; // AI's chosen direction
+  aiDirection?: SignalSide; // AI's chosen direction (LONG or SHORT only, never NONE)
   longScore?: number | null; // Score for LONG hypothesis
   shortScore?: number | null; // Score for SHORT hypothesis
   bestDirection?: "LONG" | "SHORT" | "NONE"; // AI's evaluation of best direction
@@ -112,4 +112,18 @@ export async function writeSignalsWithPipeline(signals: StoredSignal[]): Promise
 
   ensureLocalDir();
   fs.writeFileSync(LOCAL_SIGNALS_FILE, JSON.stringify(signals, null, 2), "utf8");
+}
+
+/**
+ * Normalize aiDirection from scored result for StoredSignal persistence.
+ * StoredSignal.aiDirection must be LONG|SHORT only (never NONE).
+ * bestDirection can remain LONG|SHORT|NONE.
+ */
+export function normalizeAiDirectionForStorage(
+  aiDirection: "LONG" | "SHORT" | "NONE" | undefined | null
+): SignalSide | undefined {
+  if (aiDirection === "LONG" || aiDirection === "SHORT") {
+    return aiDirection;
+  }
+  return undefined;
 }

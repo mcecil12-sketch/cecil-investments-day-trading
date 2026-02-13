@@ -8,14 +8,15 @@ import { redis } from "@/lib/redis";
 
 const DEFAULT_WATCHLIST = ["SPY", "QQQ", "TSLA", "NVDA", "META", "AMD"];
 
-type ScanMode = "vwap" | "breakout" | "compression" | "premarket-vwap" | "ai-seed"; // keep in sync with existing union
+type ScanMode = "vwap" | "breakout" | "compression" | "premarket-vwap" | "ai-seed" | "short"; // keep in sync with existing union
 
 type PatternType =
   | "VWAP_PULLBACK"
   | "BREAKOUT"
   | "COMPRESSION"
   | "PREMARKET_VWAP"
-  | "AI_SEED";
+  | "AI_SEED"
+  | "SHORT_CANDIDATE";
 
 type Side = "LONG" | "SHORT";
 
@@ -40,6 +41,7 @@ interface CandidateSignal {
   patternScore: number;
   reasoning?: string;
   source?: string;
+  bias?: "SHORT_CANDIDATE"; // Tag for short scanning mode
 }
 
 /**
@@ -78,6 +80,12 @@ function scorePattern(pattern: PatternType, f: PatternFeatures): number {
       score += Math.max(0, vol);
       break;
     }
+    case "SHORT_CANDIDATE": {
+      // Use avgVol as lightweight proxy
+      const vol = f.avgVol ?? 0;
+      score += Math.max(0, vol);
+      break;
+    }
   }
 
   return score;
@@ -100,7 +108,10 @@ const SCAN_PERSIST_CAP_AI_SEED = Number(process.env.SCAN_PERSIST_CAP_AI_SEED ?? 
 const SCAN_PERSIST_CAP_VWAP = Number(process.env.SCAN_PERSIST_CAP_VWAP ?? 30);
 const SCAN_PERSIST_CAP_BREAKOUT = Number(process.env.SCAN_PERSIST_CAP_BREAKOUT ?? 30);
 const SCAN_PERSIST_CAP_COMPRESSION = Number(process.env.SCAN_PERSIST_CAP_COMPRESSION ?? 20);
+const SCAN_PERSIST_CAP_SHORT = Number(process.env.SCAN_PERSIST_CAP_SHORT ?? 30);
 const SCAN_PERSIST_DEDUPE_TTL_SEC = Number(process.env.SCAN_PERSIST_DEDUPE_TTL_SEC ?? 3600);
+
+const ENABLE_SHORT_SCAN = String(process.env.ENABLE_SHORT_SCAN ?? "0") === "1";
 
   const AI_SEED_OPENING_MINUTES = Number(process.env.AI_SEED_OPENING_MINUTES ?? 12);
   const AI_SEED_OPENING_PER_MIN_FLOOR_SHARES = Number(process.env.AI_SEED_OPENING_PER_MIN_FLOOR_SHARES ?? 25000);
@@ -330,7 +341,7 @@ async function fetchUniverseSymbols(): Promise<string[]> {
 // --- Mode-specific detectors -------------------------------------------------
 
 function toOutgoing(candidate: CandidateSignal): OutgoingSignal {
-  const { ticker, side, entryPrice, stopPrice, targetPrice, patternType, mode, reasoning, source } =
+  const { ticker, side, entryPrice, stopPrice, targetPrice, patternType, mode, reasoning, source, bias } =
     candidate;
   return {
     ticker,
@@ -347,6 +358,7 @@ function toOutgoing(candidate: CandidateSignal): OutgoingSignal {
       patternType,
       patternScore: candidate.patternScore,
       features: candidate.features,
+      ...(bias ? { bias } : {}),
     },
   };
 }
@@ -546,6 +558,90 @@ function detectAiSeedCandidate(
   };
 }
 
+/**
+ * Lightweight short candidate prefilter.
+ * AI is final decision maker — this just surfaces potential shorts.
+ */
+function detectShortCandidate(
+  symbol: string,
+  bars: AlpacaBar[],
+  reject: (ticker: string, reason: string, note?: string) => void
+): CandidateSignal | null {
+  if (bars.length < 20) {
+    reject(symbol, "missingBars", "bars < 20");
+    return null;
+  }
+
+  const last = bars[bars.length - 1];
+  const avgVol = avg(bars.map((b) => Number(b.v ?? 0)));
+  
+  // Basic liquidity filter
+  if (avgVol < MIN_AVG_VOL_SHARES) {
+    reject(symbol, "volumeTooLow", `avgVol=${Math.round(avgVol)}`);
+    return null;
+  }
+
+  const avgDollarVol = avgVol * last.c;
+  if (avgDollarVol < MIN_AVG_DOLLAR_VOL) {
+    reject(symbol, "dollarVolumeTooLow", `$${Math.round(avgDollarVol)}`);
+    return null;
+  }
+
+  // Compute VWAP and ATR
+  const vwap = computeVWAP(bars);
+  const ranges = bars.slice(-20).map(b => b.h - b.l);
+  const atr = avg(ranges);
+  
+  // Lightweight short heuristics (prefilter only)
+  const distanceFromVwap = last.c - vwap;
+  const distancePct = (distanceFromVwap / vwap) * 100;
+  const atrPct = (atr / last.c) * 100;
+  
+  // 1. Extended > 2 ATR above VWAP?
+  const extended = distanceFromVwap > 2 * atr && distancePct > 1.0;
+  
+  // 2. Lower high or recent rejection?
+  const recent5 = bars.slice(-5);
+  const lowerHigh = recent5.length >= 2 && 
+    recent5[recent5.length - 1].h < recent5[recent5.length - 2].h;
+  
+  // 3. 5-min trend negative?
+  const first5 = bars.slice(-5)[0];
+  const trendNegative = last.c < first5.c;
+  
+  // 4. Below VWAP (post-fade)?
+  const belowVwap = last.c < vwap;
+  
+  // Score: if any 2+ signals present, consider it
+  const signals = [extended, lowerHigh, trendNegative, belowVwap].filter(Boolean).length;
+  
+  if (signals < 2) {
+    reject(symbol, "other", `shortSignals=${signals}`);
+    return null;
+  }
+
+  // Build short candidate (AI will decide final direction)
+  const entryPrice = last.c;
+  const stopPrice = entryPrice * 1.015; // 1.5% upside stop
+  const targetPrice = entryPrice * 0.97; // 3% downside target
+  const features: PatternFeatures = { avgVol };
+  
+  return {
+    ticker: symbol,
+    side: "SHORT",
+    entryPrice,
+    stopPrice,
+    targetPrice,
+    patternType: "SHORT_CANDIDATE",
+    mode: "short",
+    features,
+    patternScore: scorePattern("SHORT_CANDIDATE", features),
+    reasoning: `Short candidate: ${signals} bearish signals (extended=${extended}, lowerHigh=${lowerHigh}, trendNeg=${trendNegative}, belowVwap=${belowVwap}).`,
+    source: "scan:short",
+    bias: "SHORT_CANDIDATE",
+  };
+}
+
 // --- Main handler ------------------------------------------------------------
 
 export async function GET(req: NextRequest) {
@@ -570,6 +666,8 @@ export async function GET(req: NextRequest) {
       ? "premarket-vwap"
       : rawMode === "ai-seed"
       ? "ai-seed"
+      : rawMode === "short"
+      ? "short"
       : "vwap"; // default/alias for vwap
   const force = search.get("force") === "1";
 
@@ -602,7 +700,30 @@ export async function GET(req: NextRequest) {
     );
   }
 const aiSeedMode = mode === "ai-seed";
+const shortMode = mode === "short";
 const debugScan = req.headers.get("x-debug-scan") === "1";
+
+  // Skip short mode if not enabled
+  if (shortMode && !ENABLE_SHORT_SCAN) {
+    try {
+      await bumpScanSkip(mode, {
+        source: scanSource,
+        runId: scanRunId,
+        status: "SKIP",
+      });
+    } catch (err) {
+      console.log("[funnel] bump scansSkipped failed (non-fatal)", err);
+    }
+    return NextResponse.json(
+      {
+        ok: true,
+        skipped: true,
+        reason: "short_scan_disabled",
+        mode,
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+  }
 const totals = {
   totalCandidates: 0,
   candidatesAfterBasicFilters: 0,
@@ -973,6 +1094,14 @@ const logSummary = () => {
           }
           // Without strict setup enforcement, let GPT judge these candidates.
           return null;
+        } else if (mode === "short") {
+          const candidate = detectShortCandidate(symbol, bars, reject);
+          if (candidate) {
+            totals.candidatesAfterBasicFilters += 1;
+            return candidate;
+          }
+          reject(symbol, "notCandidate", "notCandidate");
+          return null;
         }
         return null;
       } catch (err) {
@@ -1042,6 +1171,9 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     capApplied = true;
   } else if (mode === "premarket-vwap" && SCAN_PERSIST_CAP_VWAP > 0) {
     capValue = SCAN_PERSIST_CAP_VWAP;
+    capApplied = true;
+  } else if (mode === "short" && SCAN_PERSIST_CAP_SHORT > 0) {
+    capValue = SCAN_PERSIST_CAP_SHORT;
     capApplied = true;
   }
   
@@ -1199,6 +1331,8 @@ export async function POST(req: NextRequest) {
       ? "premarket-vwap"
       : rawMode === "ai-seed"
       ? "ai-seed"
+      : rawMode === "short"
+      ? "short"
       : "vwap";
 
   let marketClock: { is_open?: boolean; next_open?: string | null; next_close?: string | null } | null = null;

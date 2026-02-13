@@ -16,7 +16,7 @@ import { parseAiTradePlan } from "@/lib/tradePlan";
 import { sendPullbackAlert } from "@/lib/notify";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { shouldQualify } from "@/lib/aiQualify";
-import { readSignals, writeSignals, StoredSignal } from "@/lib/jsonDb";
+import { readSignals, writeSignals, StoredSignal, normalizeAiDirectionForStorage } from "@/lib/jsonDb";
 import { touchHeartbeat } from "@/lib/aiHeartbeat";
 import { notifyOnce } from "@/lib/notifyOnce";
 
@@ -250,6 +250,7 @@ export async function POST(req: Request) {
         qualified: false,
         shownInApp: false,
         reasoning: scored.aiSummary ?? placeholder.reasoning ?? "AI scoring skipped",
+        aiDirection: normalizeAiDirectionForStorage(scored.aiDirection),
       };
       await replaceSignal(finalSignal);
       return NextResponse.json({ signal: finalSignal });
@@ -300,16 +301,20 @@ export async function POST(req: Request) {
       reasoning: placeholder.reasoning ?? safeSummary,
       shownInApp: true,
       tradePlan,
+      aiDirection: normalizeAiDirectionForStorage(scored.aiDirection),
     };
     await replaceSignal(finalSignal);
     await touchHeartbeat();
 
     const minScore = Number(process.env.APPROVAL_MIN_AI_SCORE ?? "7.5");
     const aiScore = typeof finalSignal.aiScore === "number" ? finalSignal.aiScore : 0;
-    const qualified = shouldQualify({
-      score: finalSignal.aiScore ?? null,
-      grade: finalSignal.aiGrade ?? null,
-    });
+    const qualified =
+      typeof finalSignal.qualified === "boolean"
+        ? finalSignal.qualified
+        : shouldQualify({
+            score: finalSignal.aiScore ?? null,
+            grade: finalSignal.aiGrade ?? null,
+          });
     finalSignal = {
       ...finalSignal,
       qualified,

@@ -1,6 +1,7 @@
 import { shouldQualify } from "@/lib/aiQualify";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { computeDirection } from "@/lib/scannerUtils";
+import { normalizeAiDirectionForStorage } from "@/lib/jsonDb";
 
 type ParseFailedMeta = {
   aiModel?: string | null;
@@ -108,7 +109,8 @@ export function applyScoreSuccess(signal: any, scored: any, nowIso: string) {
   signal.scoringStartedAt = undefined;
 
   // Persist bidirectional scoring fields
-  signal.aiDirection = scored.aiDirection ?? signal.aiDirection ?? null;
+  // CRITICAL: aiDirection must never be "NONE" in StoredSignal
+  signal.aiDirection = normalizeAiDirectionForStorage(scored.aiDirection ?? signal.aiDirection);
   signal.bestDirection = scored.bestDirection ?? signal.bestDirection ?? null;
   signal.longScore = scored.longScore ?? signal.longScore ?? null;
   signal.shortScore = scored.shortScore ?? signal.shortScore ?? null;

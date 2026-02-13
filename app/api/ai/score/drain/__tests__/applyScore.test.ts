@@ -161,4 +161,67 @@ describe("score drain apply helpers", () => {
     expect(signal.qualified).toBe(false);
     expect(signal.shownInApp).toBe(false);
   });
+
+  test("aiDirection must never be NONE in StoredSignal (normalized to undefined)", () => {
+    // CRITICAL: StoredSignal.aiDirection is typed as SignalSide | undefined
+    // It must NEVER contain "NONE" - that belongs only in bestDirection
+    // When scored.aiDirection is "NONE", it should be normalized to undefined
+
+    const signal: any = { status: "SCORING", id: "test-1", ticker: "TEST" };
+    const scored = {
+      aiScore: 5.0,
+      aiGrade: "C",
+      aiSummary: "Weak setup, no clear direction",
+      totalScore: 5.0,
+      aiDirection: "NONE" as any, // This would fail TypeScript but simulate runtime
+      bestDirection: "NONE" as const,
+      longScore: 4.5,
+      shortScore: 4.8,
+    };
+    const nowIso = "2026-02-13T12:00:00Z";
+    applyScoreSuccess(signal, scored, nowIso);
+
+    expect(signal.status).toBe("SCORED");
+    expect(signal.bestDirection).toBe("NONE"); // bestDirection CAN be NONE
+    expect(signal.aiDirection).not.toBe("NONE"); // aiDirection must NEVER be NONE
+    expect(signal.aiDirection === undefined || signal.aiDirection === "LONG" || signal.aiDirection === "SHORT").toBe(true);
+    expect(signal.longScore).toBe(4.5);
+    expect(signal.shortScore).toBe(4.8);
+  });
+
+  test("aiDirection normalizes LONG and SHORT correctly", () => {
+    const signal: any = { status: "SCORING", id: "test-2", ticker: "TEST" };
+    const scored = {
+      aiScore: 8.5,
+      aiGrade: "A",
+      aiSummary: "Strong LONG setup",
+      totalScore: 8.5,
+      aiDirection: "LONG" as const,
+      bestDirection: "LONG" as const,
+      longScore: 8.5,
+      shortScore: 3.0,
+    };
+    const nowIso = "2026-02-13T12:00:00Z";
+    applyScoreSuccess(signal, scored, nowIso);
+
+    expect(signal.aiDirection).toBe("LONG"); // LONG is valid
+    expect(signal.bestDirection).toBe("LONG");
+
+    // Test SHORT as well
+    const signal2: any = { status: "SCORING", id: "test-3", ticker: "TEST" };
+    const scored2 = {
+      aiScore: 7.8,
+      aiGrade: "B",
+      aiSummary: "Good SHORT setup",
+      totalScore: 7.8,
+      aiDirection: "SHORT" as const,
+      bestDirection: "SHORT" as const,
+      longScore: 2.5,
+      shortScore: 7.8,
+    };
+    applyScoreSuccess(signal2, scored2, nowIso);
+
+    expect(signal2.aiDirection).toBe("SHORT"); // SHORT is valid
+    expect(signal2.bestDirection).toBe("SHORT");
+  });
 });
