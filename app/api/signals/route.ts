@@ -123,8 +123,9 @@ export async function POST(req: Request) {
 
   const deferAI = req.headers.get("x-defer-ai") === "1";
 
+  // Accept either 'ticker' or 'symbol' field (symbol as alias for ticker)
+  const ticker = body.ticker || body.symbol;
   const {
-    ticker,
     side,
     entryPrice,
     stopPrice,
@@ -137,7 +138,7 @@ export async function POST(req: Request) {
 
   if (!ticker || !side || !entryPrice || !stopPrice || !targetPrice) {
     return NextResponse.json(
-      { error: "Missing required fields for signal." },
+      { error: "Missing required fields for signal (ticker/symbol, side, entryPrice, stopPrice, targetPrice)." },
       { status: 400 }
     );
   }

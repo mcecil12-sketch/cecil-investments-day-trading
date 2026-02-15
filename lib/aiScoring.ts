@@ -5,6 +5,7 @@ import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { buildSignalContext, SignalContext } from "@/lib/signalContext";
 import { parseAiScoreOutput } from "@/lib/ai/scoreParse";
 import { redis } from "@/lib/redis";
+import { minScoreToQualify } from "@/lib/aiQualify";
 
 function dynamicMinScore(sessionMinutes: number) {
   const m = Number.isFinite(sessionMinutes) ? sessionMinutes : 60;
@@ -674,25 +675,68 @@ Return ONLY valid JSON:
   }
 
   const edge = Math.abs(longScore - shortScore);
+  const MIN_QUALIFY_SCORE = minScoreToQualify(); // Get the qualification threshold
+  
   let bestDirection: "LONG" | "SHORT" | "NONE" = "NONE";
-  if (longScore >= MIN_LONG_SCORE && longScore > shortScore && edge >= MIN_EDGE) {
-    bestDirection = "LONG";
-  } else if (shortScore >= MIN_SHORT_SCORE && shortScore > longScore && edge >= MIN_EDGE) {
-    bestDirection = "SHORT";
+  let winnerScore = 0;
+  let _summary = "";
+  let isQualified = false;
+  
+  // Check if signal has explicit side (LONG or SHORT)
+  const hasExplicitSide = signal.side === "LONG" || signal.side === "SHORT";
+  
+  if (hasExplicitSide) {
+    // Mode 1: Explicit directional signal - force direction to match side
+    bestDirection = signal.side as "LONG" | "SHORT";
+    winnerScore = bestDirection === "LONG" ? longScore : shortScore;
+    
+    // Qualify based on score threshold only (not edge gate)
+    isQualified = winnerScore >= MIN_QUALIFY_SCORE;
+    
+    // Build diagnostic summary showing both scores
+    const oppositeScore = bestDirection === "LONG" ? shortScore : longScore;
+    const oppositeDir = bestDirection === "LONG" ? "SHORT" : "LONG";
+    
+    if (isQualified) {
+      // Use the directional summary from AI
+      const baseSummary = bestDirection === "LONG" ? longSummary : shortSummary;
+      _summary = `${baseSummary} [Diagnostic: ${bestDirection} ${winnerScore.toFixed(2)} vs ${oppositeDir} ${oppositeScore.toFixed(2)}, edge ${edge.toFixed(2)}]`;
+    } else {
+      // Failed qualification
+      _summary = `${bestDirection} signal: score ${winnerScore.toFixed(2)} < min ${MIN_QUALIFY_SCORE.toFixed(2)}. [Diagnostic: ${oppositeDir} ${oppositeScore.toFixed(2)}, edge ${edge.toFixed(2)}]`;
+    }
+  } else {
+    // Mode 2: Neutral signal - use directional edge competition gate
+    if (longScore >= MIN_LONG_SCORE && longScore > shortScore && edge >= MIN_EDGE) {
+      bestDirection = "LONG";
+    } else if (shortScore >= MIN_SHORT_SCORE && shortScore > longScore && edge >= MIN_EDGE) {
+      bestDirection = "SHORT";
+    }
+    
+    winnerScore = bestDirection === "LONG" ? longScore :
+                  bestDirection === "SHORT" ? shortScore :
+                  0;
+    
+    isQualified = bestDirection !== "NONE";
+    
+    if (bestDirection === "LONG") {
+      _summary = longSummary;
+    } else if (bestDirection === "SHORT") {
+      _summary = shortSummary;
+    } else {
+      // Failed edge gate - show detailed diagnostic
+      const maxScore = Math.max(longScore, shortScore);
+      const failReasons = [];
+      if (longScore < MIN_LONG_SCORE && shortScore < MIN_SHORT_SCORE) {
+        failReasons.push(`both scores below threshold (LONG ${longScore.toFixed(2)} < ${MIN_LONG_SCORE.toFixed(2)}, SHORT ${shortScore.toFixed(2)} < ${MIN_SHORT_SCORE.toFixed(2)})`);
+      } else if (edge < MIN_EDGE) {
+        failReasons.push(`edge ${edge.toFixed(2)} < min ${MIN_EDGE.toFixed(2)}`);
+      }
+      _summary = `No qualified directional edge. LONG ${longScore.toFixed(2)} vs SHORT ${shortScore.toFixed(2)}, edge ${edge.toFixed(2)}. Failed: ${failReasons.join(", ")}.`;
+    }
   }
-
-  const winnerScore =
-    bestDirection === "LONG" ? longScore :
-    bestDirection === "SHORT" ? shortScore :
-    0;
+  
   const _grade: AiGrade = gradeFromScore(winnerScore);
-  const _summary =
-    bestDirection === "LONG"
-      ? longSummary
-      : bestDirection === "SHORT"
-        ? shortSummary
-        : `No qualified directional edge. LONG ${longScore.toFixed(2)} vs SHORT ${shortScore.toFixed(2)} (edge ${edge.toFixed(2)} < min ${MIN_EDGE.toFixed(2)} or threshold miss).`;
-  const isQualified = bestDirection !== "NONE";
   const _direction: "LONG" | "SHORT" | "NONE" = bestDirection;
 
   const result: ScoredSignal = {
