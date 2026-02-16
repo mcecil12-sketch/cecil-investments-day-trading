@@ -21,7 +21,16 @@ function isoDateOnly(date: Date): string | null {
   return iso ? iso.slice(0, 10) : null;
 }
 
-async function fetchLastTradingSessionClose(): Promise<{ date: string; open?: string; close: string; httpStatus?: number; url?: string; bodyHead?: string } | null> {
+async function fetchLastTradingSessionClose(): Promise<{ 
+  date?: string;
+  open?: string;
+  close?: string;
+  ok?: boolean;
+  httpStatus?: number;
+  calendarUrl?: string;
+  bodyHead?: string;
+  reason?: string;
+} | null> {
   try {
     const now = new Date();
     const start = new Date(now);
@@ -32,51 +41,96 @@ async function fetchLastTradingSessionClose(): Promise<{ date: string; open?: st
     
     if (!startStr || !endStr) {
       console.warn("[debug-context] calendar: could not format date range");
-      return null;
+      return { ok: false, reason: "date_format_failed" };
     }
     
-    const url = `${tradingUrl("/calendar")}?start=${encodeURIComponent(startStr)}&end=${encodeURIComponent(endStr)}`;
-    const res = await fetch(url, {
+    const calendarUrl = `${tradingUrl("/calendar")}?start=${encodeURIComponent(startStr)}&end=${encodeURIComponent(endStr)}`;
+    console.log("[debug-context] calendar URL:", calendarUrl.replace(/\?.*/,"?<params>"));
+    
+    const res = await fetch(calendarUrl, {
       headers: alpacaHeaders(),
       cache: "no-store",
     });
     
     const responseBody = await res.text();
+    const bodyHead = responseBody.slice(0, 300);
     
     if (!res.ok) {
       console.warn("[debug-context] calendar: non-200 response", res.status);
       return {
-        date: "",
-        close: "",
+        ok: false,
         httpStatus: res.status,
-        url,
-        bodyHead: responseBody.slice(0, 200),
+        calendarUrl,
+        bodyHead,
+        reason: "non_200",
       };
     }
     
-    const calendar = (await JSON.parse(responseBody)) as Array<{ date?: string; open?: string; close?: string }>;
+    let calendar: any;
+    try {
+      calendar = JSON.parse(responseBody);
+    } catch (parseErr) {
+      console.warn("[debug-context] calendar: JSON parse failed", parseErr);
+      return {
+        ok: false,
+        httpStatus: res.status,
+        calendarUrl,
+        bodyHead,
+        reason: "invalid_json",
+      };
+    }
+    
     if (!Array.isArray(calendar) || calendar.length === 0) {
       console.warn("[debug-context] calendar: empty response");
-      return null;
+      return {
+        ok: false,
+        httpStatus: res.status,
+        calendarUrl,
+        bodyHead,
+        reason: "empty_list",
+      };
     }
     
     const last = calendar[calendar.length - 1];
     if (!last?.date || !last?.close) {
       console.warn("[debug-context] calendar: missing date/close in last entry", last);
-      return null;
+      return {
+        ok: false,
+        httpStatus: res.status,
+        calendarUrl,
+        bodyHead,
+        reason: "missing_fields",
+      };
     }
     
     // Validate that close parses to a valid date
     const closeDate = new Date(last.close);
     if (!isValidDate(closeDate)) {
       console.warn("[debug-context] calendar: invalid close timestamp", last.close);
-      return null;
+      return {
+        ok: false,
+        httpStatus: res.status,
+        calendarUrl,
+        bodyHead,
+        reason: "invalid_date",
+      };
     }
     
-    return { date: last.date, close: last.close, url, ...(last.open ? { open: last.open } : {}) };
+    // Success
+    return {
+      ok: true,
+      date: last.date,
+      close: last.close,
+      open: last.open,
+      calendarUrl,
+      httpStatus: res.status,
+    };
   } catch (err) {
     console.warn("[debug-context] calendar lookup failed", err);
-    return null;
+    return {
+      ok: false,
+      reason: "fetch_error",
+    };
   }
 }
 
@@ -228,13 +282,19 @@ export async function GET(req: Request) {
       const calendarResult = await fetchLastTradingSessionClose();
       
       if (calendarResult) {
-        // Capture calendar error details if present
+        // Always capture URL and HTTP status from result if present
+        if (calendarResult.calendarUrl) {
+          calendarUrl = calendarResult.calendarUrl;
+        }
         if (calendarResult.httpStatus) {
           calendarHttpStatus = calendarResult.httpStatus;
-          calendarUrl = calendarResult.url || null;
-          calendarBodyHead = calendarResult.bodyHead || null;
-          calendarParseNote = `calendar API returned ${calendarResult.httpStatus}`;
-        } else if (calendarResult.close) {
+        }
+        if (calendarResult.bodyHead) {
+          calendarBodyHead = calendarResult.bodyHead;
+        }
+
+        // Check if calendar fetch was successful
+        if (calendarResult.ok === true && calendarResult.close && calendarResult.date) {
           // Success: calendar returned valid data
           try {
             const lastSessionClose = new Date(calendarResult.close);
@@ -267,15 +327,19 @@ export async function GET(req: Request) {
                     close: calendarResult.close,
                     ...(calendarResult.open ? { open: calendarResult.open } : {}),
                   };
+                  calendarParseNote = null; // Clear on success
                 }
               }
             }
           } catch (fallbackErr) {
             calendarParseNote = `last-session parsing error: ${String(fallbackErr).slice(0, 100)}`;
           }
+        } else {
+          // Calendar fetch failed or returned incomplete data
+          calendarParseNote = calendarResult.reason ? `calendar_${calendarResult.reason}` : "calendar_unknown_error";
         }
       } else {
-        calendarParseNote = "calendar fetch returned null";
+        calendarParseNote = "calendar_fetch_returned_null";
       }
     }
 
