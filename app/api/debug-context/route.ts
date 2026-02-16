@@ -74,29 +74,32 @@ export async function GET(req: Request) {
     const ageMinutes =
       lastBar && lastBar.t ? Math.max(0, (Date.now() - Date.parse(lastBar.t)) / 60000) : null;
 
-    return NextResponse.json({
-      ok: true,
-      ticker,
-      timeframe,
-      serverNow: new Date().toISOString(),
-      alpacaClock: clock,
-      barsUrlAttempted,
-      barsUsed: barsArray.length,
-      firstBar,
-      lastBar,
-      barsMeta: {
-        firstTimestamp: firstBar?.t ?? null,
-        lastTimestamp: lastBar?.t ?? null,
-        ageMinutes,
-        volumeSum,
-        avgVolume,
+    return NextResponse.json(
+      {
+        ok: true,
+        ticker,
+        timeframe,
+        serverNow: new Date().toISOString(),
+        alpacaClock: clock,
+        barsUrlAttempted,
+        barsUsed: barsArray.length,
+        firstBar,
+        lastBar,
+        barsMeta: {
+          firstTimestamp: firstBar?.t ?? null,
+          lastTimestamp: lastBar?.t ?? null,
+          ageMinutes,
+          volumeSum,
+          avgVolume,
+        },
+        env: {
+          hasAlpacaKey: hasAlpacaCreds(),
+          hasAlpacaSecret: hasAlpacaCreds(),
+          alpacaDataFeed: ALPACA_FEED,
+        },
       },
-      env: {
-        hasAlpacaKey: hasAlpacaCreds(),
-        hasAlpacaSecret: hasAlpacaCreds(),
-        alpacaDataFeed: ALPACA_FEED,
-      },
-    });
+      { headers: { "Cache-Control": "no-store" } }
+    );
   } catch (err: any) {
     return NextResponse.json(
       {
@@ -106,7 +109,7 @@ export async function GET(req: Request) {
         code: err?.code ?? null,
         stack: err?.stack ? String(err.stack).split("\n") : undefined,
       },
-      { status: 500 }
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }

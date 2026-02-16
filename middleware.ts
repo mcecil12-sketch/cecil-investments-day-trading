@@ -111,8 +111,19 @@ export function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
+  if (pathname.startsWith("/api/debug-context") && (isCronAuthed(req) || isScannerAuthed(req))) {
+    return NextResponse.next();
+  }
+
   const authPin = req.cookies.get("auth_pin")?.value;
   if (!authPin) {
+    // For API paths without auth, return 401 JSON instead of redirect
+    if (pathname.startsWith("/api/")) {
+      return NextResponse.json(
+        { ok: false, error: "unauthorized", message: "Missing authentication credentials" },
+        { status: 401, headers: { "Cache-Control": "no-store" } }
+      );
+    }
     const loginUrl = new URL("/login", req.url);
     loginUrl.searchParams.set("from", pathname);
     return NextResponse.redirect(loginUrl);
