@@ -21,7 +21,7 @@ function isoDateOnly(date: Date): string | null {
   return iso ? iso.slice(0, 10) : null;
 }
 
-async function fetchLastTradingSessionClose(): Promise<{ date: string; open?: string; close: string } | null> {
+async function fetchLastTradingSessionClose(): Promise<{ date: string; open?: string; close: string; httpStatus?: number; url?: string; bodyHead?: string } | null> {
   try {
     const now = new Date();
     const start = new Date(now);
@@ -40,12 +40,21 @@ async function fetchLastTradingSessionClose(): Promise<{ date: string; open?: st
       headers: alpacaHeaders(),
       cache: "no-store",
     });
+    
+    const responseBody = await res.text();
+    
     if (!res.ok) {
       console.warn("[debug-context] calendar: non-200 response", res.status);
-      return null;
+      return {
+        date: "",
+        close: "",
+        httpStatus: res.status,
+        url,
+        bodyHead: responseBody.slice(0, 200),
+      };
     }
     
-    const calendar = (await res.json()) as Array<{ date?: string; open?: string; close?: string }>;
+    const calendar = (await JSON.parse(responseBody)) as Array<{ date?: string; open?: string; close?: string }>;
     if (!Array.isArray(calendar) || calendar.length === 0) {
       console.warn("[debug-context] calendar: empty response");
       return null;
@@ -64,7 +73,7 @@ async function fetchLastTradingSessionClose(): Promise<{ date: string; open?: st
       return null;
     }
     
-    return { date: last.date, close: last.close, ...(last.open ? { open: last.open } : {}) };
+    return { date: last.date, close: last.close, url, ...(last.open ? { open: last.open } : {}) };
   } catch (err) {
     console.warn("[debug-context] calendar lookup failed", err);
     return null;
@@ -84,7 +93,11 @@ export async function GET(req: Request) {
     const startOverride = searchParams.get("start");
     const endOverride = searchParams.get("end");
     const entryPriceRaw = searchParams.get("entryPrice");
-    const fallbackRequested = searchParams.get("fallback") === "1" || searchParams.get("mode") === "last-session";
+    
+    // Parse fallback param robustly
+    const fallbackRaw = (searchParams.get("fallback") || "").toLowerCase();
+    const modeRaw = (searchParams.get("mode") || "").toLowerCase();
+    const wantFallback = ["1", "true", "yes", "on"].includes(fallbackRaw) || modeRaw === "last-session";
 
     const now = new Date();
     const clock = await fetchAlpacaClock().catch(() => null);
@@ -96,10 +109,15 @@ export async function GET(req: Request) {
     let startMs: number | null = null;
     let endMs: number | null = null;
     let calendarPick: { date: string; open?: string; close: string } | null = null;
+    let calendarHttpStatus: number | null = null;
+    let calendarUrl: string | null = null;
+    let calendarBodyHead: string | null = null;
     let barsUrlAttempted: string | null = null;
     let barsArray: any[] = [];
     let barsFetchReason: string | null = null;
     let calendarParseNote: string | null = null;
+    let shouldFallback: boolean = false;
+    let fallbackReason: string | null = null;
     const feed = process.env.ALPACA_DATA_FEED || "sip";
 
     // === BUILD ROLLING WINDOW ===
@@ -132,6 +150,9 @@ export async function GET(req: Request) {
           endMs: null,
           ticker,
           timeframe,
+          wantFallback,
+          shouldFallback: false,
+          fallbackReason: null,
         },
         { status: 400, headers: { "Cache-Control": "no-store" } }
       );
@@ -157,6 +178,9 @@ export async function GET(req: Request) {
           endMs: endDate.getTime(),
           ticker,
           timeframe,
+          wantFallback,
+          shouldFallback: false,
+          fallbackReason: null,
         },
         { status: 400, headers: { "Cache-Control": "no-store" } }
       );
@@ -185,49 +209,73 @@ export async function GET(req: Request) {
     barsArray = Array.isArray(bars) ? bars : [];
     barsFetchReason = "rolling window";
 
+    // === DETERMINE IF FALLBACK SHOULD TRIGGER ===
+    const barsUsed = barsArray.length;
+    if (wantFallback) {
+      shouldFallback = true;
+      fallbackReason = "wantFallback";
+    } else if (!marketOpen) {
+      shouldFallback = true;
+      fallbackReason = "market_closed";
+    } else if (barsUsed < 20) {
+      shouldFallback = true;
+      fallbackReason = "insufficient_bars";
+    }
+
     // === FALLBACK LOGIC ===
-    // If fallback requested, market closed, or insufficient bars, try last-session window
-    const shouldTryLastSession = fallbackRequested || !marketOpen || barsArray.length < 20;
-    if (shouldTryLastSession) {
-      const lastSession = await fetchLastTradingSessionClose();
-      if (lastSession?.close) {
-        try {
-          const lastSessionClose = new Date(lastSession.close);
-          if (!isValidDate(lastSessionClose)) {
-            calendarParseNote = "calendar close timestamp invalid";
-          } else {
-            const lastSessionStart = new Date(lastSessionClose.getTime() - windowMinutes * 60_000);
-            if (!isValidDate(lastSessionStart)) {
-              calendarParseNote = "calculated last-session start is invalid";
+    if (shouldFallback) {
+      barsFetchReason = `fallback: ${fallbackReason}`;
+      const calendarResult = await fetchLastTradingSessionClose();
+      
+      if (calendarResult) {
+        // Capture calendar error details if present
+        if (calendarResult.httpStatus) {
+          calendarHttpStatus = calendarResult.httpStatus;
+          calendarUrl = calendarResult.url || null;
+          calendarBodyHead = calendarResult.bodyHead || null;
+          calendarParseNote = `calendar API returned ${calendarResult.httpStatus}`;
+        } else if (calendarResult.close) {
+          // Success: calendar returned valid data
+          try {
+            const lastSessionClose = new Date(calendarResult.close);
+            if (!isValidDate(lastSessionClose)) {
+              calendarParseNote = "calendar close timestamp invalid";
             } else {
-              const lastSessionStartIso = lastSessionStart.toISOString();
-              const lastSessionEndIso = lastSessionClose.toISOString();
+              const lastSessionStart = new Date(lastSessionClose.getTime() - windowMinutes * 60_000);
+              if (!isValidDate(lastSessionStart)) {
+                calendarParseNote = "calculated last-session start is invalid";
+              } else {
+                const lastSessionStartIso = lastSessionStart.toISOString();
+                const lastSessionEndIso = lastSessionClose.toISOString();
 
-              const lastSessionResult = await fetchWindow(lastSessionStartIso, lastSessionEndIso);
-              const lastSessionBars = Array.isArray(lastSessionResult.bars) ? lastSessionResult.bars : [];
+                const lastSessionResult = await fetchWindow(lastSessionStartIso, lastSessionEndIso);
+                const lastSessionBars = Array.isArray(lastSessionResult.bars) ? lastSessionResult.bars : [];
 
-              // Prefer last-session if it has bars (especially if rolling had none or very few)
-              if (lastSessionBars.length > 0) {
-                bars = lastSessionBars;
-                barsArray = lastSessionBars;
-                barsUrlAttempted = lastSessionResult.url;
-                anchorMode = "last-session";
-                startIso = lastSessionStartIso;
-                endIso = lastSessionEndIso;
-                startMs = lastSessionStart.getTime();
-                endMs = lastSessionClose.getTime();
-                barsFetchReason = "last-session fallback";
-                calendarPick = {
-                  date: lastSession.date,
-                  close: lastSession.close,
-                  ...(lastSession.open ? { open: lastSession.open } : {}),
-                };
+                // Prefer last-session if it has bars
+                if (lastSessionBars.length > 0) {
+                  bars = lastSessionBars;
+                  barsArray = lastSessionBars;
+                  barsUrlAttempted = lastSessionResult.url;
+                  anchorMode = "last-session";
+                  startIso = lastSessionStartIso;
+                  endIso = lastSessionEndIso;
+                  startMs = lastSessionStart.getTime();
+                  endMs = lastSessionClose.getTime();
+                  barsFetchReason = `fallback: ${fallbackReason} -> last-session`;
+                  calendarPick = {
+                    date: calendarResult.date,
+                    close: calendarResult.close,
+                    ...(calendarResult.open ? { open: calendarResult.open } : {}),
+                  };
+                }
               }
             }
+          } catch (fallbackErr) {
+            calendarParseNote = `last-session parsing error: ${String(fallbackErr).slice(0, 100)}`;
           }
-        } catch (fallbackErr) {
-          calendarParseNote = `last-session parsing error: ${String(fallbackErr).slice(0, 100)}`;
         }
+      } else {
+        calendarParseNote = "calendar fetch returned null";
       }
     }
 
@@ -278,7 +326,14 @@ export async function GET(req: Request) {
         avgVolume,
       },
       contextWarning,
+      // Fallback diagnostics
+      wantFallback,
+      shouldFallback,
+      fallbackReason,
       calendarPick,
+      calendarHttpStatus,
+      calendarUrl,
+      calendarBodyHead,
       calendarParseNote,
       env: {
         hasAlpacaKey: hasAlpacaCreds(),
