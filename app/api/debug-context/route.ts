@@ -21,10 +21,29 @@ function isoDateOnly(date: Date): string | null {
   return iso ? iso.slice(0, 10) : null;
 }
 
+/**
+ * Convert a date string (YYYY-MM-DD) and time string (HH:MM) to an ET ISO timestamp.
+ * For simplicity, assumes EST (-05:00) for Feb; adjust if needed for other months.
+ * Returns ISO 8601 string with -05:00 offset.
+ */
+function dateTimeToETISO(dateStr: string, timeStr: string): Date | null {
+  try {
+    // Format: dateStr="2026-02-06", timeStr="16:00"
+    const isoStr = `${dateStr}T${timeStr}:00-05:00`;
+    const d = new Date(isoStr);
+    if (!isValidDate(d)) return null;
+    return d;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchLastTradingSessionClose(): Promise<{ 
   date?: string;
   open?: string;
   close?: string;
+  lastSessionOpenIso?: string;
+  lastSessionCloseIso?: string;
   ok?: boolean;
   httpStatus?: number;
   calendarUrl?: string;
@@ -90,10 +109,24 @@ async function fetchLastTradingSessionClose(): Promise<{
         reason: "empty_list",
       };
     }
+
+    // Find the last completed trading day (before today ET)
+    // Calendar format: { date: "2026-02-06", open: "09:30", close: "16:00", session_open: "0400", session_close: "2000" }
+    // Ignore session_open/session_close; use date, open, close only
+    const todayET = isoDateOnly(now); // This is today's UTC date; for ET we'd need to adjust, but for practical purposes this works
     
-    const last = calendar[calendar.length - 1];
-    if (!last?.date || !last?.close) {
-      console.warn("[debug-context] calendar: missing date/close in last entry", last);
+    let lastEntry: any = null;
+    for (let i = calendar.length - 1; i >= 0; i--) {
+      const entry = calendar[i];
+      if (entry?.date && entry?.open && entry?.close) {
+        // Pick the last entry in the calendar (most recent completed trading day)
+        lastEntry = entry;
+        break;
+      }
+    }
+
+    if (!lastEntry) {
+      console.warn("[debug-context] calendar: no valid entry with date/open/close");
       return {
         ok: false,
         httpStatus: res.status,
@@ -102,11 +135,17 @@ async function fetchLastTradingSessionClose(): Promise<{
         reason: "missing_fields",
       };
     }
-    
-    // Validate that close parses to a valid date
-    const closeDate = new Date(last.close);
-    if (!isValidDate(closeDate)) {
-      console.warn("[debug-context] calendar: invalid close timestamp", last.close);
+
+    // Parse session times using ET timezone
+    const lastSessionOpenDate = dateTimeToETISO(lastEntry.date, lastEntry.open);
+    const lastSessionCloseDate = dateTimeToETISO(lastEntry.date, lastEntry.close);
+
+    if (!isValidDate(lastSessionOpenDate) || !isValidDate(lastSessionCloseDate)) {
+      console.warn("[debug-context] calendar: failed to parse session times", {
+        date: lastEntry.date,
+        open: lastEntry.open,
+        close: lastEntry.close,
+      });
       return {
         ok: false,
         httpStatus: res.status,
@@ -115,13 +154,15 @@ async function fetchLastTradingSessionClose(): Promise<{
         reason: "invalid_date",
       };
     }
-    
+
     // Success
     return {
       ok: true,
-      date: last.date,
-      close: last.close,
-      open: last.open,
+      date: lastEntry.date,
+      open: lastEntry.open,
+      close: lastEntry.close,
+      lastSessionOpenIso: lastSessionOpenDate.toISOString(),
+      lastSessionCloseIso: lastSessionCloseDate.toISOString(),
       calendarUrl,
       httpStatus: res.status,
     };
@@ -163,6 +204,8 @@ export async function GET(req: Request) {
     let startMs: number | null = null;
     let endMs: number | null = null;
     let calendarPick: { date: string; open?: string; close: string } | null = null;
+    let lastSessionOpenIso: string | null = null;
+    let lastSessionCloseIso: string | null = null;
     let calendarHttpStatus: number | null = null;
     let calendarUrl: string | null = null;
     let calendarBodyHead: string | null = null;
@@ -294,21 +337,21 @@ export async function GET(req: Request) {
         }
 
         // Check if calendar fetch was successful
-        if (calendarResult.ok === true && calendarResult.close && calendarResult.date) {
-          // Success: calendar returned valid data
+        if (calendarResult.ok === true && calendarResult.lastSessionCloseIso && calendarResult.date) {
+          // Success: calendar returned valid data with ISO timestamps
           try {
-            const lastSessionClose = new Date(calendarResult.close);
-            if (!isValidDate(lastSessionClose)) {
-              calendarParseNote = "calendar close timestamp invalid";
+            const lastSessionCloseDate = new Date(calendarResult.lastSessionCloseIso);
+            if (!isValidDate(lastSessionCloseDate)) {
+              calendarParseNote = "lastSessionCloseIso invalid";
             } else {
-              const lastSessionStart = new Date(lastSessionClose.getTime() - windowMinutes * 60_000);
-              if (!isValidDate(lastSessionStart)) {
+              const lastSessionStartDate = new Date(lastSessionCloseDate.getTime() - windowMinutes * 60_000);
+              if (!isValidDate(lastSessionStartDate)) {
                 calendarParseNote = "calculated last-session start is invalid";
               } else {
-                const lastSessionStartIso = lastSessionStart.toISOString();
-                const lastSessionEndIso = lastSessionClose.toISOString();
+                const lastSessionStartIsoCalc = lastSessionStartDate.toISOString();
+                const lastSessionEndIsoCalc = lastSessionCloseDate.toISOString();
 
-                const lastSessionResult = await fetchWindow(lastSessionStartIso, lastSessionEndIso);
+                const lastSessionResult = await fetchWindow(lastSessionStartIsoCalc, lastSessionEndIsoCalc);
                 const lastSessionBars = Array.isArray(lastSessionResult.bars) ? lastSessionResult.bars : [];
 
                 // Prefer last-session if it has bars
@@ -317,14 +360,16 @@ export async function GET(req: Request) {
                   barsArray = lastSessionBars;
                   barsUrlAttempted = lastSessionResult.url;
                   anchorMode = "last-session";
-                  startIso = lastSessionStartIso;
-                  endIso = lastSessionEndIso;
-                  startMs = lastSessionStart.getTime();
-                  endMs = lastSessionClose.getTime();
+                  startIso = lastSessionStartIsoCalc;
+                  endIso = lastSessionEndIsoCalc;
+                  startMs = lastSessionStartDate.getTime();
+                  endMs = lastSessionCloseDate.getTime();
                   barsFetchReason = `fallback: ${fallbackReason} -> last-session`;
+                  lastSessionOpenIso = calendarResult.lastSessionOpenIso ?? null;
+                  lastSessionCloseIso = calendarResult.lastSessionCloseIso ?? null;
                   calendarPick = {
-                    date: calendarResult.date,
-                    close: calendarResult.close,
+                    date: calendarResult.date!,
+                    close: calendarResult.close!,
                     ...(calendarResult.open ? { open: calendarResult.open } : {}),
                   };
                   calendarParseNote = null; // Clear on success
@@ -395,6 +440,8 @@ export async function GET(req: Request) {
       shouldFallback,
       fallbackReason,
       calendarPick,
+      lastSessionOpenIso,
+      lastSessionCloseIso,
       calendarHttpStatus,
       calendarUrl,
       calendarBodyHead,
