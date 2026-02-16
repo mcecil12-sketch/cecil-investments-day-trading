@@ -5,6 +5,11 @@ import { getSignalTimestampMs, parseSince, resolveSinceField } from "@/lib/signa
 function normalizeSignal(s: any) {
   return {
     ...s,
+    symbol: (() => {
+      const sym = s.symbol ?? s.ticker;
+      return sym != null ? String(sym).toUpperCase() : null;
+    })(),
+    ticker: s.ticker != null ? String(s.ticker).toUpperCase() : null,
     reasoning: s.reasoning ?? "",
     priority: typeof s.priority === "number" ? s.priority : 4.8,
     grade: s.grade ?? s.aiGrade ?? null,

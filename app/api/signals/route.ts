@@ -154,11 +154,16 @@ export async function POST(req: Request) {
     trend: rawMeta.trend ?? "FLAT",
   });
 
+  // For directional signals (side=LONG/SHORT), set direction to match side
+  // This ensures direction is never null for side signals
+  const directionForSignal =
+    side === "LONG" || side === "SHORT" ? side : computedDirection;
+
   const rawSignal: RawSignal = {
     id: rawMeta.id ?? `${ticker}-${now}`,
     ticker,
     side,
-    direction: computedDirection,
+    direction: directionForSignal,
     entryPrice: Number(entryPrice),
     stopPrice: Number(stopPrice),
     targetPrice: Number(targetPrice),
@@ -302,6 +307,7 @@ export async function POST(req: Request) {
       reasoning: placeholder.reasoning ?? safeSummary,
       shownInApp: true,
       tradePlan,
+      direction: side === "LONG" || side === "SHORT" ? side : finalSignal.direction,
       aiDirection: normalizeAiDirectionForStorage(scored.aiDirection),
     };
     await replaceSignal(finalSignal);
