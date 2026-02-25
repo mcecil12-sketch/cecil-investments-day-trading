@@ -53,10 +53,9 @@ describe("runAutoEntryOnce diagnostics", () => {
     process.env.AUTO_ENTRY_TOKEN = "test-token";
     process.env.AUTO_ENTRY_MAX_OPEN = "10";
     process.env.AUTO_ENTRY_MAX_PER_DAY = "10";
-    process.env.AUTO_ENTRY_PENDING_MAX_AGE_MIN = "15";
-    process.env.AUTO_ENTRY_PENDING_RESCORE_MAX_AGE_MIN = "30";
-    process.env.AUTO_ENTRY_RESCORE_ENABLED = "1";
-    process.env.AUTO_ENTRY_RESCORE_ONCE = "1";
+    process.env.AUTO_ENTRY_MAX_AGE_MIN = "15";
+    process.env.AUTO_ENTRY_RESCORE_AFTER_MIN = "10";
+    process.env.AUTO_ENTRY_BLOCK_CARRYOVER = "1";
 
     const clockTs = new Date().toISOString();
     const session = deriveSessionFromIso(clockTs);
@@ -226,7 +225,7 @@ describe("runAutoEntryOnce diagnostics", () => {
     expect(blocked?.reason).toBe("max_open_positions");
   });
 
-  it("applies age windows: <=15 eligible, >15<=30 rescore, >30 stale", async () => {
+  it("applies age windows: <=10 eligible, >10<=15 rescore, >15 stale", async () => {
     vi.mocked(readTrades).mockResolvedValue([
       {
         id: "age-10",
@@ -243,8 +242,22 @@ describe("runAutoEntryOnce diagnostics", () => {
         sessionTag: CURRENT_SESSION_TAG,
       },
       {
-        id: "age-20",
+        id: "age-12",
         ticker: "MSFT",
+        side: "LONG",
+        status: "AUTO_PENDING",
+        source: "AUTO",
+        entryPrice: 100,
+        stopPrice: 98,
+        takeProfitPrice: 104,
+        createdAt: isoMinutesAgo(12),
+        scoredAt: isoMinutesAgo(12),
+        etDate: CURRENT_ET_DATE,
+        sessionTag: CURRENT_SESSION_TAG,
+      },
+      {
+        id: "age-20",
+        ticker: "NVDA",
         side: "LONG",
         status: "AUTO_PENDING",
         source: "AUTO",
@@ -253,20 +266,6 @@ describe("runAutoEntryOnce diagnostics", () => {
         takeProfitPrice: 104,
         createdAt: isoMinutesAgo(20),
         scoredAt: isoMinutesAgo(20),
-        etDate: CURRENT_ET_DATE,
-        sessionTag: CURRENT_SESSION_TAG,
-      },
-      {
-        id: "age-40",
-        ticker: "NVDA",
-        side: "LONG",
-        status: "AUTO_PENDING",
-        source: "AUTO",
-        entryPrice: 100,
-        stopPrice: 98,
-        takeProfitPrice: 104,
-        createdAt: isoMinutesAgo(40),
-        scoredAt: isoMinutesAgo(40),
         etDate: CURRENT_ET_DATE,
         sessionTag: CURRENT_SESSION_TAG,
       },
@@ -280,12 +279,12 @@ describe("runAutoEntryOnce diagnostics", () => {
     const result: any = await runAutoEntryOnce(req);
 
     expect(result.actions.find((a: any) => a.id === "age-10")?.decision).toBe("WOULD_EXECUTE");
-    expect(result.actions.find((a: any) => a.id === "age-20")?.decision).toBe("WOULD_EXECUTE");
-    expect(result.actions.find((a: any) => a.id === "age-40")?.reason).toBe("stale_trade");
+    expect(result.actions.find((a: any) => a.id === "age-12")?.decision).toBe("WOULD_EXECUTE");
+    expect(result.actions.find((a: any) => a.id === "age-20")?.reason).toBe("stale_trade");
     expect(vi.mocked(scoreSignalWithAI)).toHaveBeenCalledTimes(1);
   });
 
-  it("skips stale_session when etDate/sessionTag do not match", async () => {
+  it("skips carryover_session for prior market date", async () => {
     vi.mocked(readTrades).mockResolvedValue([
       {
         id: "stale-session",
@@ -312,7 +311,7 @@ describe("runAutoEntryOnce diagnostics", () => {
 
     const action = result.actions.find((a: any) => a.id === "stale-session");
     expect(action?.decision).toBe("SKIP");
-    expect(action?.reason).toBe("stale_session");
+    expect(action?.reason).toBe("carryover_session");
   });
 });
 

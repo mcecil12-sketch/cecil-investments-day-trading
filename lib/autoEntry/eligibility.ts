@@ -5,10 +5,10 @@ type AnyTrade = Record<string, any>;
 export type EligibilityConfig = {
   todayET: string;
   currentSessionTag: SessionTag;
+  marketIsOpen: boolean;
   maxAgeMin: number;
-  rescoreMaxAgeMin: number;
-  rescoreEnabled: boolean;
-  rescoreOnce: boolean;
+  rescoreAfterMin: number;
+  blockCarryover: boolean;
 };
 
 export type EligibilityResult = {
@@ -16,7 +16,7 @@ export type EligibilityResult = {
   reason:
     | "eligible"
     | "stale_trade"
-    | "stale_session"
+    | "carryover_session"
     | "invalid_trade"
     | "not_scored"
     | "rescore_required"
@@ -69,30 +69,25 @@ export function deriveSessionMeta(nowIso: string) {
   };
 }
 
-export function getTradeScoredAt(trade: AnyTrade): string {
-  return String(trade?.scoredAt || trade?.createdAt || "");
+export function getTradeTimestamp(trade: AnyTrade): string {
+  return String(trade?.createdAt || trade?.updatedAt || trade?.openedAt || "");
 }
 
 export function getTradeEtDate(trade: AnyTrade): string {
-  if (trade?.etDate) return String(trade.etDate);
-  const iso = String(trade?.createdAt || "");
+  const iso = getTradeTimestamp(trade);
   if (!iso) return "";
   return etParts(iso).etDate;
 }
 
 export function getTradeSessionTag(trade: AnyTrade): SessionTag {
-  const raw = String(trade?.sessionTag || "").toUpperCase();
-  if (raw === "PRE" || raw === "RTH" || raw === "POST" || raw === "CLOSED") {
-    return raw;
-  }
-  const iso = String(trade?.createdAt || "");
+  const iso = getTradeTimestamp(trade);
   if (!iso) return "CLOSED";
   const { hour, minute } = etParts(iso);
   return sessionTagFromEtTime(hour, minute);
 }
 
 export function getTradeAgeMin(trade: AnyTrade, nowIso: string) {
-  const baseTs = Date.parse(getTradeScoredAt(trade));
+  const baseTs = Date.parse(getTradeTimestamp(trade));
   const nowTs = Date.parse(nowIso);
   if (!Number.isFinite(baseTs) || !Number.isFinite(nowTs)) return Number.POSITIVE_INFINITY;
   return Math.max(0, (nowTs - baseTs) / 60000);
@@ -119,10 +114,8 @@ export function isScoredTrade(trade: AnyTrade) {
 }
 
 function canonicalSortTs(trade: AnyTrade) {
-  const scoredTs = Date.parse(String(trade?.scoredAt || ""));
-  if (Number.isFinite(scoredTs)) return scoredTs;
-  const createdTs = Date.parse(String(trade?.createdAt || ""));
-  return Number.isFinite(createdTs) ? createdTs : 0;
+  const ts = Date.parse(getTradeTimestamp(trade));
+  return Number.isFinite(ts) ? ts : 0;
 }
 
 export function pickCanonicalPendingByTicker<T extends AnyTrade>(trades: T[]) {
@@ -154,10 +147,24 @@ export function evaluatePendingEligibility(
   const sessionTag = getTradeSessionTag(trade);
   const ageMin = getTradeAgeMin(trade, nowIso);
 
-  if (!etDate || etDate !== cfg.todayET || sessionTag !== cfg.currentSessionTag) {
+  if (!Number.isFinite(ageMin)) {
     return {
       eligible: false,
-      reason: "stale_session",
+      reason: "stale_trade",
+      ageMin,
+      etDate,
+      sessionTag,
+      requiresRescore: false,
+    };
+  }
+
+  if (
+    cfg.blockCarryover &&
+    (!etDate || etDate !== cfg.todayET || (!cfg.marketIsOpen && sessionTag !== cfg.currentSessionTag))
+  ) {
+    return {
+      eligible: false,
+      reason: "carryover_session",
       ageMin,
       etDate,
       sessionTag,
@@ -187,7 +194,7 @@ export function evaluatePendingEligibility(
     };
   }
 
-  if (ageMin > cfg.rescoreMaxAgeMin) {
+  if (ageMin > cfg.maxAgeMin) {
     return {
       eligible: false,
       reason: "stale_trade",
@@ -198,29 +205,7 @@ export function evaluatePendingEligibility(
     };
   }
 
-  if (ageMin > cfg.maxAgeMin) {
-    if (!cfg.rescoreEnabled) {
-      return {
-        eligible: false,
-        reason: "stale_trade",
-        ageMin,
-        etDate,
-        sessionTag,
-        requiresRescore: false,
-      };
-    }
-
-    if (cfg.rescoreOnce && trade?.rescoreAttemptedAt) {
-      return {
-        eligible: false,
-        reason: "rescore_failed",
-        ageMin,
-        etDate,
-        sessionTag,
-        requiresRescore: false,
-      };
-    }
-
+  if (cfg.rescoreAfterMin > 0 && ageMin > cfg.rescoreAfterMin) {
     return {
       eligible: false,
       reason: "rescore_required",
@@ -239,4 +224,29 @@ export function evaluatePendingEligibility(
     sessionTag,
     requiresRescore: false,
   };
+}
+
+export function pickCanonicalEligibleByTicker<T extends AnyTrade>(
+  trades: T[],
+  nowIso: string,
+  cfg: EligibilityConfig
+) {
+  const byTicker = new Map<string, T[]>();
+  for (const t of trades) {
+    const ticker = String(t?.ticker || "").toUpperCase();
+    if (!ticker) continue;
+    const arr = byTicker.get(ticker) || [];
+    arr.push(t);
+    byTicker.set(ticker, arr);
+  }
+
+  const canonical = new Map<string, T>();
+
+  for (const [ticker, list] of byTicker.entries()) {
+    const sorted = [...list].sort((a, b) => canonicalSortTs(b) - canonicalSortTs(a));
+    const chosen = sorted.find((t) => evaluatePendingEligibility(t, nowIso, cfg).reason === "eligible");
+    if (chosen) canonical.set(ticker, chosen);
+  }
+
+  return canonical;
 }

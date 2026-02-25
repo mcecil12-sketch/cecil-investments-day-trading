@@ -5,7 +5,7 @@ import { alpacaRequest } from "@/lib/alpaca";
 import {
   deriveSessionMeta,
   evaluatePendingEligibility,
-  pickCanonicalPendingByTicker,
+  getTradeTimestamp,
   type EligibilityConfig,
 } from "@/lib/autoEntry/eligibility";
 import { scoreSignalWithAI } from "@/lib/aiScoring";
@@ -92,8 +92,8 @@ function hasInvalidPrices(trade: AnyTrade) {
 }
 
 function byNewestCreatedAtDesc(a: AnyTrade, b: AnyTrade) {
-  const aTs = Date.parse(String(a?.scoredAt || a?.createdAt || 0)) || 0;
-  const bTs = Date.parse(String(b?.scoredAt || b?.createdAt || 0)) || 0;
+  const aTs = Date.parse(getTradeTimestamp(a)) || 0;
+  const bTs = Date.parse(getTradeTimestamp(b)) || 0;
   return bTs - aTs;
 }
 
@@ -121,7 +121,7 @@ function toRawSignal(trade: AnyTrade) {
     id: trade?.signalId || trade?.id,
     ticker: String(trade?.ticker || "").toUpperCase(),
     timeframe: "1Min",
-    createdAt: String(trade?.scoredAt || trade?.createdAt || new Date().toISOString()),
+    createdAt: String(getTradeTimestamp(trade) || new Date().toISOString()),
     entryPrice: safeNum(trade?.entryPrice, 0),
     stopPrice: safeNum(trade?.stopPrice, 0),
     targetPrice: safeNum(trade?.takeProfitPrice ?? trade?.targetPrice, 0),
@@ -135,29 +135,35 @@ async function tryRescoreTrade(trade: AnyTrade) {
   const result = await scoreSignalWithAI(toRawSignal(trade));
   const scored = (result as any)?.scored || {};
   const score = Number(scored?.aiScore ?? scored?.score);
-  const qualified = scored?.qualified === true || Number.isFinite(score);
-  const sideRaw = String(scored?.bestDirection || scored?.direction || scored?.side || trade?.side || "").toUpperCase();
-  const side = sideRaw === "SHORT" ? "SHORT" : "LONG";
-  const entryPrice = Number(scored?.entryPrice ?? trade?.entryPrice);
-  const stopPrice = Number(scored?.stopPrice ?? trade?.stopPrice);
-  const tp = Number(scored?.targetPrice ?? scored?.takeProfitPrice ?? trade?.takeProfitPrice ?? trade?.targetPrice);
+  const grade = String(scored?.aiGrade || scored?.grade || "");
+  const qualified = scored?.qualified === true || Number.isFinite(score) || Boolean(grade);
+  const bestDirection = String(scored?.bestDirection || scored?.direction || scored?.side || trade?.side || "").toUpperCase();
+  const summary = String(scored?.aiSummary || scored?.summary || "");
 
-  if (!qualified || !Number.isFinite(entryPrice) || !Number.isFinite(stopPrice) || !Number.isFinite(tp)) {
+  if (!qualified) {
     return { ok: false as const };
   }
+
+  const now = new Date().toISOString();
 
   return {
     ok: true as const,
     patch: {
-      aiScore: Number.isFinite(score) ? score : trade?.aiScore,
-      side,
-      entryPrice,
-      stopPrice,
-      targetPrice: tp,
-      takeProfitPrice: tp,
-      scoredAt: new Date().toISOString(),
-      rescoreAttemptedAt: new Date().toISOString(),
-      qualified: true,
+      aiScore: Number.isFinite(score) ? score : trade?.aiScore ?? null,
+      aiGrade: grade || trade?.aiGrade || null,
+      qualified: scored?.qualified === true,
+      bestDirection,
+      aiSummary: summary || trade?.aiSummary || "",
+      rescoredAt: now,
+      updatedAt: now,
+      ai: {
+        ...(trade?.ai || {}),
+        score: Number.isFinite(score) ? score : trade?.ai?.score ?? null,
+        grade: grade || trade?.ai?.grade || null,
+        qualified: scored?.qualified === true,
+        bestDirection,
+        summary: summary || trade?.ai?.summary || "",
+      },
     },
   };
 }
@@ -196,27 +202,24 @@ export async function runAutoEntryOnce(req: Request) {
     marketIsOpen = false;
   }
 
-  const maxAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_PENDING_MAX_AGE_MIN))
-    ? Math.max(1, Number(process.env.AUTO_ENTRY_PENDING_MAX_AGE_MIN))
+  const maxAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
+    ? Math.max(1, Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
     : 15;
-  const rescoreMaxAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_PENDING_RESCORE_MAX_AGE_MIN))
-    ? Math.max(maxAgeMin + 1, Number(process.env.AUTO_ENTRY_PENDING_RESCORE_MAX_AGE_MIN))
-    : 30;
-  const rescoreEnabled = ["1", "true", "yes", "on"].includes(
-    String(process.env.AUTO_ENTRY_RESCORE_ENABLED || "1").toLowerCase()
-  );
-  const rescoreOnce = ["1", "true", "yes", "on"].includes(
-    String(process.env.AUTO_ENTRY_RESCORE_ONCE || "1").toLowerCase()
+  const rescoreAfterMin = Number.isFinite(Number(process.env.AUTO_ENTRY_RESCORE_AFTER_MIN))
+    ? Math.max(0, Number(process.env.AUTO_ENTRY_RESCORE_AFTER_MIN))
+    : 10;
+  const blockCarryover = ["1", "true", "yes", "on"].includes(
+    String(process.env.AUTO_ENTRY_BLOCK_CARRYOVER || "1").toLowerCase()
   );
 
   const sessionMeta = deriveSessionMeta(marketTimestamp || startedAt);
   const eligibilityCfg: EligibilityConfig = {
     todayET: sessionMeta.etDate,
     currentSessionTag: sessionMeta.sessionTag,
+    marketIsOpen: marketIsOpen,
     maxAgeMin,
-    rescoreMaxAgeMin,
-    rescoreEnabled,
-    rescoreOnce,
+    rescoreAfterMin,
+    blockCarryover,
   };
 
   const allTrades = await readTrades<AnyTrade>();
@@ -229,27 +232,25 @@ export async function runAutoEntryOnce(req: Request) {
     side: String(t?.side || "").toUpperCase(),
     etDate: t?.etDate ?? null,
     sessionTag: t?.sessionTag ?? null,
-    scoredAt: t?.scoredAt ?? null,
+    timestamp: getTradeTimestamp(t) || null,
     entryPrice: t?.entryPrice ?? null,
     stopPrice: t?.stopPrice ?? null,
     takeProfitPrice: t?.takeProfitPrice ?? t?.targetPrice ?? null,
     createdAt: t?.createdAt ?? null,
   }));
 
-  const { canonical: canonicalByTicker, duplicates } = pickCanonicalPendingByTicker(pendingSorted);
+  const byTicker = new Map<string, AnyTrade[]>();
+  for (const t of pendingSorted) {
+    const ticker = String(t?.ticker || "").toUpperCase();
+    if (!ticker) continue;
+    const arr = byTicker.get(ticker) || [];
+    arr.push(t);
+    byTicker.set(ticker, arr);
+  }
+
+  const canonicalByTicker: AnyTrade[] = [];
   const skipsByReason: Record<string, number> = {};
   const actions: RunAction[] = [];
-
-  for (const dup of duplicates) {
-    actions.push({
-      id: String(dup?.id || ""),
-      ticker: String(dup?.ticker || "").toUpperCase(),
-      side: String(dup?.side || "").toUpperCase(),
-      decision: "SKIP",
-      reason: "duplicate_ticker",
-    });
-    inc(skipsByReason, "duplicate_ticker");
-  }
 
   const openTrades = allTrades.filter(
     (t) => String(t?.status || "").toUpperCase() === "OPEN"
@@ -274,48 +275,91 @@ export async function runAutoEntryOnce(req: Request) {
 
   if (!marketIsOpen) inc(skipsByReason, "market_closed");
 
-  for (const trade of canonicalByTicker) {
-    const id = String(trade?.id || "");
-    const ticker = String(trade?.ticker || "").toUpperCase();
-    const side = String(trade?.side || "").toUpperCase();
+  for (const [ticker, group] of byTicker.entries()) {
+    const sorted = [...group].sort(byNewestCreatedAtDesc);
+    let selected: AnyTrade | null = null;
+    const processedIds = new Set<string>();
 
-    let workingTrade = trade;
-    const eligibility = evaluatePendingEligibility(workingTrade, startedAt, eligibilityCfg);
-    if (!eligibility.eligible) {
-      if (eligibility.requiresRescore) {
+    for (const trade of sorted) {
+      const id = String(trade?.id || "");
+      const side = String(trade?.side || "").toUpperCase();
+      let workingTrade = trade;
+      let eligibility = evaluatePendingEligibility(workingTrade, startedAt, eligibilityCfg);
+
+      if (!eligibility.eligible && eligibility.requiresRescore) {
         try {
           const rescored = await tryRescoreTrade(workingTrade);
           if (!rescored.ok) {
             actions.push({ id, ticker, side, decision: "SKIP", reason: "rescore_failed" });
             inc(skipsByReason, "rescore_failed");
+            processedIds.add(id);
             continue;
           }
           workingTrade = { ...workingTrade, ...rescored.patch };
-          const recheck = evaluatePendingEligibility(workingTrade, startedAt, eligibilityCfg);
-          if (!recheck.eligible) {
-            actions.push({ id, ticker, side, decision: "SKIP", reason: recheck.reason });
-            inc(skipsByReason, recheck.reason);
-            continue;
-          }
+          eligibility = evaluatePendingEligibility(workingTrade, startedAt, eligibilityCfg);
         } catch {
           actions.push({ id, ticker, side, decision: "SKIP", reason: "rescore_failed" });
           inc(skipsByReason, "rescore_failed");
+          processedIds.add(id);
           continue;
         }
-      } else {
+      }
+
+      if (!eligibility.eligible) {
         actions.push({ id, ticker, side, decision: "SKIP", reason: eligibility.reason });
         inc(skipsByReason, eligibility.reason);
+        processedIds.add(id);
         continue;
       }
+
+      if (hasMissingFields(workingTrade)) {
+        actions.push({ id, ticker, side, decision: "SKIP", reason: "missing_fields" });
+        inc(skipsByReason, "missing_fields");
+        processedIds.add(id);
+        continue;
+      }
+
+      if (hasInvalidPrices(workingTrade)) {
+        actions.push({ id, ticker, side, decision: "SKIP", reason: "invalid_prices" });
+        inc(skipsByReason, "invalid_prices");
+        processedIds.add(id);
+        continue;
+      }
+
+      selected = workingTrade;
+      canonicalByTicker.push(workingTrade);
+      processedIds.add(id);
+      break;
     }
 
-    if (hasMissingFields(workingTrade)) {
+    if (selected) {
+      for (const trade of sorted) {
+        const id = String(trade?.id || "");
+        if (processedIds.has(id)) continue;
+        actions.push({
+          id,
+          ticker,
+          side: String(trade?.side || "").toUpperCase(),
+          decision: "SKIP",
+          reason: "duplicate_ticker",
+        });
+        inc(skipsByReason, "duplicate_ticker");
+      }
+    }
+  }
+
+  for (const trade of canonicalByTicker) {
+    const id = String(trade?.id || "");
+    const ticker = String(trade?.ticker || "").toUpperCase();
+    const side = String(trade?.side || "").toUpperCase();
+
+    if (hasMissingFields(trade)) {
       actions.push({ id, ticker, side, decision: "SKIP", reason: "missing_fields" });
       inc(skipsByReason, "missing_fields");
       continue;
     }
 
-    if (hasInvalidPrices(workingTrade)) {
+    if (hasInvalidPrices(trade)) {
       actions.push({ id, ticker, side, decision: "SKIP", reason: "invalid_prices" });
       inc(skipsByReason, "invalid_prices");
       continue;
@@ -371,9 +415,8 @@ export async function runAutoEntryOnce(req: Request) {
       todayET: sessionMeta.etDate,
       sessionTag: sessionMeta.sessionTag,
       maxAgeMin,
-      rescoreMaxAgeMin,
-      rescoreEnabled,
-      rescoreOnce,
+      rescoreAfterMin,
+      blockCarryover,
     },
     pendingCount: pending.length,
     eligibleCount,

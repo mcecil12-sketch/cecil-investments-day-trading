@@ -17,7 +17,7 @@ import { fetchBrokerTruth, type BrokerTruth } from "@/lib/broker/truth";
 import {
   deriveSessionMeta,
   evaluatePendingEligibility,
-  pickCanonicalPendingByTicker,
+  getTradeTimestamp,
   type EligibilityConfig,
 } from "@/lib/autoEntry/eligibility";
 import { scoreSignalWithAI } from "@/lib/aiScoring";
@@ -130,8 +130,8 @@ function hasValidPendingRisk(trade: any) {
 }
 
 function byNewestCreatedAtDesc(a: any, b: any) {
-  const aTs = Date.parse(String(a?.scoredAt || a?.createdAt || 0)) || 0;
-  const bTs = Date.parse(String(b?.scoredAt || b?.createdAt || 0)) || 0;
+  const aTs = Date.parse(getTradeTimestamp(a)) || 0;
+  const bTs = Date.parse(getTradeTimestamp(b)) || 0;
   return bTs - aTs;
 }
 
@@ -142,7 +142,7 @@ function toRawSignal(trade: any) {
     id: trade?.signalId || trade?.id,
     ticker: String(trade?.ticker || "").toUpperCase(),
     timeframe: "1Min",
-    createdAt: String(trade?.scoredAt || trade?.createdAt || new Date().toISOString()),
+    createdAt: String(getTradeTimestamp(trade) || new Date().toISOString()),
     entryPrice: safeNum(trade?.entryPrice, 0),
     stopPrice: safeNum(trade?.stopPrice, 0),
     targetPrice: safeNum(trade?.takeProfitPrice ?? trade?.targetPrice, 0),
@@ -156,14 +156,12 @@ async function tryRescoreTrade(trade: any) {
   const result = await scoreSignalWithAI(toRawSignal(trade));
   const scored = (result as any)?.scored || {};
   const score = Number(scored?.aiScore ?? scored?.score);
-  const qualified = scored?.qualified === true || Number.isFinite(score);
-  const sideRaw = String(scored?.bestDirection || scored?.direction || scored?.side || trade?.side || "").toUpperCase();
-  const side = sideRaw === "SHORT" ? "SHORT" : "LONG";
-  const entryPrice = Number(scored?.entryPrice ?? trade?.entryPrice);
-  const stopPrice = Number(scored?.stopPrice ?? trade?.stopPrice);
-  const tp = Number(scored?.targetPrice ?? scored?.takeProfitPrice ?? trade?.takeProfitPrice ?? trade?.targetPrice);
+  const grade = String(scored?.aiGrade || scored?.grade || "");
+  const qualified = scored?.qualified === true || Number.isFinite(score) || Boolean(grade);
+  const bestDirection = String(scored?.bestDirection || scored?.direction || scored?.side || trade?.side || "").toUpperCase();
+  const summary = String(scored?.aiSummary || scored?.summary || "");
 
-  if (!qualified || !Number.isFinite(entryPrice) || !Number.isFinite(stopPrice) || !Number.isFinite(tp)) {
+  if (!qualified) {
     return { ok: false as const };
   }
 
@@ -171,16 +169,21 @@ async function tryRescoreTrade(trade: any) {
   return {
     ok: true as const,
     patch: {
-      aiScore: Number.isFinite(score) ? score : trade?.aiScore,
-      side,
-      entryPrice,
-      stopPrice,
-      targetPrice: tp,
-      takeProfitPrice: tp,
-      scoredAt: now,
-      rescoreAttemptedAt: now,
-      qualified: true,
+      aiScore: Number.isFinite(score) ? score : trade?.aiScore ?? null,
+      aiGrade: grade || trade?.aiGrade || null,
+      qualified: scored?.qualified === true,
+      bestDirection,
+      aiSummary: summary || trade?.aiSummary || "",
+      rescoredAt: now,
       updatedAt: now,
+      ai: {
+        ...(trade?.ai || {}),
+        score: Number.isFinite(score) ? score : trade?.ai?.score ?? null,
+        grade: grade || trade?.ai?.grade || null,
+        qualified: scored?.qualified === true,
+        bestDirection,
+        summary: summary || trade?.ai?.summary || "",
+      },
     },
   };
 }
@@ -490,6 +493,18 @@ export async function POST(req: Request) {
     fetchBrokerTruth(),
   ]);
 
+  let marketOpen = true;
+  let marketTimestamp = nowIso();
+  let marketReason: string | undefined;
+  try {
+    const clock = await fetchAlpacaClock();
+    marketOpen = Boolean(clock.is_open);
+    marketTimestamp = String((clock as any)?.timestamp || (clock as any)?.next_open || nowIso());
+  } catch {
+    marketOpen = false;
+    marketReason = "clock_unavailable";
+  }
+
   const trades = await readTrades<any>();
   const pendingIndexes = trades
     .map((t, i) => ({ t, i }))
@@ -498,62 +513,72 @@ export async function POST(req: Request) {
 
   const eligibleIndexes: number[] = [];
   const nowForPending = nowIso();
-  const maxAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_PENDING_MAX_AGE_MIN))
-    ? Math.max(1, Number(process.env.AUTO_ENTRY_PENDING_MAX_AGE_MIN))
+  const maxAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
+    ? Math.max(1, Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
     : 15;
-  const rescoreMaxAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_PENDING_RESCORE_MAX_AGE_MIN))
-    ? Math.max(maxAgeMin + 1, Number(process.env.AUTO_ENTRY_PENDING_RESCORE_MAX_AGE_MIN))
-    : 30;
-  const rescoreEnabled = ["1", "true", "yes", "on"].includes(
-    String(process.env.AUTO_ENTRY_RESCORE_ENABLED || "1").toLowerCase()
+  const rescoreAfterMin = Number.isFinite(Number(process.env.AUTO_ENTRY_RESCORE_AFTER_MIN))
+    ? Math.max(0, Number(process.env.AUTO_ENTRY_RESCORE_AFTER_MIN))
+    : 10;
+  const blockCarryover = ["1", "true", "yes", "on"].includes(
+    String(process.env.AUTO_ENTRY_BLOCK_CARRYOVER || "1").toLowerCase()
   );
-  const rescoreOnce = ["1", "true", "yes", "on"].includes(
-    String(process.env.AUTO_ENTRY_RESCORE_ONCE || "1").toLowerCase()
-  );
-  const sessionMeta = deriveSessionMeta(nowForPending);
+  const sessionMeta = deriveSessionMeta(marketTimestamp || nowForPending);
   const eligibilityCfg: EligibilityConfig = {
     todayET: sessionMeta.etDate,
     currentSessionTag: sessionMeta.sessionTag,
+    marketIsOpen: marketOpen,
     maxAgeMin,
-    rescoreMaxAgeMin,
-    rescoreEnabled,
-    rescoreOnce,
+    rescoreAfterMin,
+    blockCarryover,
   };
   let tradesChanged = false;
 
   const pendingSorted = [...pendingIndexes].sort((a, b) => byNewestCreatedAtDesc(a.t, b.t));
-  const canonicalResult = pickCanonicalPendingByTicker(pendingSorted.map((x) => x.t));
-  const canonicalIdSet = new Set(canonicalResult.canonical.map((t) => String(t?.id || "")));
-  const duplicateIdSet = new Set(canonicalResult.duplicates.map((t) => String(t?.id || "")));
-
+  const byTickerPending = new Map<string, Array<{ t: any; i: number }>>();
   for (const item of pendingSorted) {
-    counts.checked += 1;
-    const tradeId = String(item.t?.id || "");
     const ticker = String(item.t?.ticker || "").toUpperCase();
+    if (!ticker) continue;
+    const arr = byTickerPending.get(ticker) || [];
+    arr.push(item);
+    byTickerPending.set(ticker, arr);
+  }
 
-    if (duplicateIdSet.has(tradeId) && !canonicalIdSet.has(tradeId)) {
-      trades[item.i] = {
-        ...trades[item.i],
-        status: "ARCHIVED",
-        autoEntryStatus: "AUTO_ARCHIVED",
-        reason: "duplicate_auto_pending",
-        error: undefined,
-        closedAt: trades[item.i]?.closedAt || nowForPending,
-        updatedAt: nowForPending,
-      };
-      counts.duplicatesArchived += 1;
-      counts.skipped += 1;
-      tradesChanged = true;
-      continue;
-    }
+  for (const [ticker, group] of byTickerPending.entries()) {
+    const sorted = [...group].sort((a, b) => byNewestCreatedAtDesc(a.t, b.t));
+    const processed = new Set<number>();
+    let selectedIndex: number | null = null;
 
-    let workingTrade = item.t;
-    let eligibility = evaluatePendingEligibility(workingTrade, nowForPending, eligibilityCfg);
+    for (const item of sorted) {
+      counts.checked += 1;
+      const tradeId = String(item.t?.id || "");
+      let workingTrade = item.t;
+      let eligibility = evaluatePendingEligibility(workingTrade, nowForPending, eligibilityCfg);
 
-    if (!eligibility.eligible && eligibility.requiresRescore) {
-      try {
-        const rescored = await tryRescoreTrade(workingTrade);
-        if (!rescored.ok) {
+      if (!eligibility.eligible && eligibility.requiresRescore) {
+        try {
+          const rescored = await tryRescoreTrade(workingTrade);
+          if (!rescored.ok) {
+            trades[item.i] = {
+              ...trades[item.i],
+              status: "ERROR",
+              autoEntryStatus: "AUTO_ERROR",
+              reason: "rescore_failed",
+              error: "rescore_failed",
+              updatedAt: nowForPending,
+              rescoredAt: nowForPending,
+            };
+            counts.invalidMarked += 1;
+            counts.skipped += 1;
+            tradesChanged = true;
+            processed.add(item.i);
+            notes.push(`rescore_failed:${ticker}:${tradeId || "unknown"}`);
+            continue;
+          }
+          workingTrade = { ...workingTrade, ...rescored.patch };
+          trades[item.i] = { ...trades[item.i], ...rescored.patch };
+          tradesChanged = true;
+          eligibility = evaluatePendingEligibility(workingTrade, nowForPending, eligibilityCfg);
+        } catch {
           trades[item.i] = {
             ...trades[item.i],
             status: "ERROR",
@@ -561,91 +586,97 @@ export async function POST(req: Request) {
             reason: "rescore_failed",
             error: "rescore_failed",
             updatedAt: nowForPending,
-            rescoreAttemptedAt: nowForPending,
+            rescoredAt: nowForPending,
           };
           counts.invalidMarked += 1;
           counts.skipped += 1;
           tradesChanged = true;
+          processed.add(item.i);
           notes.push(`rescore_failed:${ticker}:${tradeId || "unknown"}`);
           continue;
         }
-        workingTrade = { ...workingTrade, ...rescored.patch };
-        trades[item.i] = { ...trades[item.i], ...rescored.patch };
-        tradesChanged = true;
-        eligibility = evaluatePendingEligibility(workingTrade, nowForPending, eligibilityCfg);
-      } catch {
+      }
+
+      if (!eligibility.eligible) {
+        if (eligibility.reason === "stale_trade" || eligibility.reason === "carryover_session") {
+          trades[item.i] = {
+            ...trades[item.i],
+            status: "ARCHIVED",
+            autoEntryStatus: "AUTO_ARCHIVED",
+            reason: eligibility.reason,
+            error: undefined,
+            closedAt: trades[item.i]?.closedAt || nowForPending,
+            updatedAt: nowForPending,
+          };
+          counts.staleArchived += 1;
+          counts.skipped += 1;
+          tradesChanged = true;
+          processed.add(item.i);
+          notes.push(`${eligibility.reason}:${ticker}:${tradeId || "unknown"}`);
+          continue;
+        }
+
         trades[item.i] = {
           ...trades[item.i],
           status: "ERROR",
           autoEntryStatus: "AUTO_ERROR",
-          reason: "rescore_failed",
-          error: "rescore_failed",
+          reason: eligibility.reason,
+          error: eligibility.reason,
           updatedAt: nowForPending,
-          rescoreAttemptedAt: nowForPending,
         };
         counts.invalidMarked += 1;
         counts.skipped += 1;
         tradesChanged = true;
-        notes.push(`rescore_failed:${ticker}:${tradeId || "unknown"}`);
-        continue;
-      }
-    }
-
-    if (!eligibility.eligible) {
-      if (eligibility.reason === "stale_trade" || eligibility.reason === "stale_session") {
-        trades[item.i] = {
-          ...trades[item.i],
-          status: "ARCHIVED",
-          autoEntryStatus: "AUTO_ARCHIVED",
-          reason: eligibility.reason,
-          error: undefined,
-          closedAt: trades[item.i]?.closedAt || nowForPending,
-          updatedAt: nowForPending,
-        };
-        counts.staleArchived += 1;
-        counts.skipped += 1;
-        tradesChanged = true;
+        processed.add(item.i);
         notes.push(`${eligibility.reason}:${ticker}:${tradeId || "unknown"}`);
         continue;
       }
 
-      trades[item.i] = {
-        ...trades[item.i],
-        status: "ERROR",
-        autoEntryStatus: "AUTO_ERROR",
-        reason: eligibility.reason,
-        error: eligibility.reason,
-        updatedAt: nowForPending,
-      };
-      counts.invalidMarked += 1;
-      counts.skipped += 1;
-      tradesChanged = true;
-      notes.push(`${eligibility.reason}:${ticker}:${tradeId || "unknown"}`);
-      continue;
+      if (!hasValidPendingRisk(workingTrade)) {
+        trades[item.i] = {
+          ...trades[item.i],
+          status: "ERROR",
+          autoEntryStatus: "AUTO_ERROR",
+          reason: "invalid_pending_missing_risk",
+          error: "invalid_pending_missing_risk",
+          errorDetails: {
+            entryPrice: workingTrade?.entryPrice ?? null,
+            stopPrice: workingTrade?.stopPrice ?? null,
+            takeProfitPrice: workingTrade?.takeProfitPrice ?? workingTrade?.targetPrice ?? null,
+          },
+          updatedAt: nowForPending,
+        };
+        counts.invalidMarked += 1;
+        counts.skipped += 1;
+        tradesChanged = true;
+        processed.add(item.i);
+        notes.push(`invalid_pending:${ticker}:${tradeId || "unknown"}`);
+        continue;
+      }
+
+      selectedIndex = item.i;
+      processed.add(item.i);
+      eligibleIndexes.push(item.i);
+      break;
     }
 
-    if (!hasValidPendingRisk(workingTrade)) {
-      trades[item.i] = {
-        ...trades[item.i],
-        status: "ERROR",
-        autoEntryStatus: "AUTO_ERROR",
-        reason: "invalid_pending_missing_risk",
-        error: "invalid_pending_missing_risk",
-        errorDetails: {
-          entryPrice: workingTrade?.entryPrice ?? null,
-          stopPrice: workingTrade?.stopPrice ?? null,
-          takeProfitPrice: workingTrade?.takeProfitPrice ?? workingTrade?.targetPrice ?? null,
-        },
-        updatedAt: nowForPending,
-      };
-      counts.invalidMarked += 1;
-      counts.skipped += 1;
-      tradesChanged = true;
-      notes.push(`invalid_pending:${ticker}:${tradeId || "unknown"}`);
-      continue;
+    if (selectedIndex != null) {
+      for (const item of sorted) {
+        if (processed.has(item.i)) continue;
+        trades[item.i] = {
+          ...trades[item.i],
+          status: "ARCHIVED",
+          autoEntryStatus: "AUTO_ARCHIVED",
+          reason: "duplicate_auto_pending",
+          error: undefined,
+          closedAt: trades[item.i]?.closedAt || nowForPending,
+          updatedAt: nowForPending,
+        };
+        counts.duplicatesArchived += 1;
+        counts.skipped += 1;
+        tradesChanged = true;
+      }
     }
-
-    eligibleIndexes.push(item.i);
   }
 
   counts.eligibleCount = eligibleIndexes.length;
@@ -732,18 +763,6 @@ export async function POST(req: Request) {
       },
       { status: 200 }
     );
-  }
-
-  let marketOpen = true;
-  let marketTimestamp = nowIso();
-  let marketReason: string | undefined;
-  try {
-    const clock = await fetchAlpacaClock();
-    marketOpen = Boolean(clock.is_open);
-    marketTimestamp = String((clock as any)?.timestamp || (clock as any)?.next_open || nowIso());
-  } catch {
-    marketOpen = false;
-    marketReason = "clock_unavailable";
   }
 
   if (!marketOpen) {
