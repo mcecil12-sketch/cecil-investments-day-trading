@@ -13,9 +13,37 @@ vi.mock("@/lib/alpaca", () => ({
   alpacaRequest: vi.fn(),
 }));
 
+vi.mock("@/lib/aiScoring", () => ({
+  scoreSignalWithAI: vi.fn(),
+}));
+
 import { readTrades } from "@/lib/tradesStore";
 import { fetchAlpacaClock } from "@/lib/alpacaClock";
 import { alpacaRequest } from "@/lib/alpaca";
+import { scoreSignalWithAI } from "@/lib/aiScoring";
+
+function isoMinutesAgo(mins: number) {
+  return new Date(Date.now() - mins * 60_000).toISOString();
+}
+
+let CURRENT_ET_DATE = "";
+let CURRENT_SESSION_TAG = "CLOSED";
+
+function deriveSessionFromIso(iso: string) {
+  const d = new Date(iso);
+  const etDate = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(d);
+  const hm = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(d).split(":");
+  const hour = Number(hm[0] || 0);
+  const minute = Number(hm[1] || 0);
+  const mins = hour * 60 + minute;
+  const sessionTag = mins >= 240 && mins < 570 ? "PRE" : mins >= 570 && mins < 960 ? "RTH" : mins >= 960 && mins < 1200 ? "POST" : "CLOSED";
+  return { etDate, sessionTag };
+}
 
 describe("runAutoEntryOnce diagnostics", () => {
   beforeEach(() => {
@@ -25,10 +53,28 @@ describe("runAutoEntryOnce diagnostics", () => {
     process.env.AUTO_ENTRY_TOKEN = "test-token";
     process.env.AUTO_ENTRY_MAX_OPEN = "10";
     process.env.AUTO_ENTRY_MAX_PER_DAY = "10";
-    process.env.AUTO_PENDING_MAX_AGE_HOURS = "48";
+    process.env.AUTO_ENTRY_PENDING_MAX_AGE_MIN = "15";
+    process.env.AUTO_ENTRY_PENDING_RESCORE_MAX_AGE_MIN = "30";
+    process.env.AUTO_ENTRY_RESCORE_ENABLED = "1";
+    process.env.AUTO_ENTRY_RESCORE_ONCE = "1";
 
-    vi.mocked(fetchAlpacaClock).mockResolvedValue({ is_open: false, timestamp: "2026-02-25T15:00:00Z" } as any);
+    const clockTs = new Date().toISOString();
+    const session = deriveSessionFromIso(clockTs);
+    CURRENT_ET_DATE = session.etDate;
+    CURRENT_SESSION_TAG = session.sessionTag;
+    vi.mocked(fetchAlpacaClock).mockResolvedValue({ is_open: false, timestamp: clockTs } as any);
     vi.mocked(alpacaRequest).mockResolvedValue({ ok: true, status: 200, text: "[]" });
+    vi.mocked(scoreSignalWithAI).mockResolvedValue({
+      ok: true,
+      scored: {
+        aiScore: 8.2,
+        qualified: true,
+        bestDirection: "LONG",
+        entryPrice: 100,
+        stopPrice: 98,
+        targetPrice: 104,
+      },
+    } as any);
   });
 
   it("selects newest canonical pending per ticker and counts duplicate_ticker skip", async () => {
@@ -42,7 +88,10 @@ describe("runAutoEntryOnce diagnostics", () => {
         entryPrice: 100,
         stopPrice: 101,
         takeProfitPrice: 98,
-        createdAt: "2026-02-25T10:00:00Z",
+        createdAt: isoMinutesAgo(8),
+        scoredAt: isoMinutesAgo(8),
+        etDate: CURRENT_ET_DATE,
+        sessionTag: CURRENT_SESSION_TAG,
       },
       {
         id: "new-aeis",
@@ -53,7 +102,10 @@ describe("runAutoEntryOnce diagnostics", () => {
         entryPrice: 100,
         stopPrice: 101,
         takeProfitPrice: 98,
-        createdAt: "2026-02-25T11:00:00Z",
+        createdAt: isoMinutesAgo(5),
+        scoredAt: isoMinutesAgo(5),
+        etDate: CURRENT_ET_DATE,
+        sessionTag: CURRENT_SESSION_TAG,
       },
       {
         id: "qqq",
@@ -64,7 +116,10 @@ describe("runAutoEntryOnce diagnostics", () => {
         entryPrice: 500,
         stopPrice: 495,
         takeProfitPrice: 510,
-        createdAt: "2026-02-25T12:00:00Z",
+        createdAt: isoMinutesAgo(4),
+        scoredAt: isoMinutesAgo(4),
+        etDate: CURRENT_ET_DATE,
+        sessionTag: CURRENT_SESSION_TAG,
       },
     ] as any);
 
@@ -99,7 +154,10 @@ describe("runAutoEntryOnce diagnostics", () => {
         entryPrice: 70,
         stopPrice: 68,
         takeProfitPrice: 74,
-        createdAt: "2026-02-25T12:00:00Z",
+        createdAt: isoMinutesAgo(10),
+        scoredAt: isoMinutesAgo(10),
+        etDate: CURRENT_ET_DATE,
+        sessionTag: CURRENT_SESSION_TAG,
       },
     ] as any);
 
@@ -127,7 +185,8 @@ describe("runAutoEntryOnce diagnostics", () => {
 
   it("counts guardrail skip reasons", async () => {
     process.env.AUTO_ENTRY_MAX_OPEN = "0";
-    vi.mocked(fetchAlpacaClock).mockResolvedValue({ is_open: true, timestamp: "2026-02-25T15:00:00Z" } as any);
+    const clockTs = new Date().toISOString();
+    vi.mocked(fetchAlpacaClock).mockResolvedValue({ is_open: true, timestamp: clockTs } as any);
 
     vi.mocked(readTrades).mockResolvedValue([
       {
@@ -147,7 +206,10 @@ describe("runAutoEntryOnce diagnostics", () => {
         entryPrice: 200,
         stopPrice: 198,
         takeProfitPrice: 204,
-        createdAt: "2026-02-25T12:00:00Z",
+        createdAt: isoMinutesAgo(10),
+        scoredAt: isoMinutesAgo(10),
+        etDate: CURRENT_ET_DATE,
+        sessionTag: CURRENT_SESSION_TAG,
       },
     ] as any);
 
@@ -163,4 +225,94 @@ describe("runAutoEntryOnce diagnostics", () => {
     expect(blocked?.decision).toBe("SKIP");
     expect(blocked?.reason).toBe("max_open_positions");
   });
+
+  it("applies age windows: <=15 eligible, >15<=30 rescore, >30 stale", async () => {
+    vi.mocked(readTrades).mockResolvedValue([
+      {
+        id: "age-10",
+        ticker: "AAPL",
+        side: "LONG",
+        status: "AUTO_PENDING",
+        source: "AUTO",
+        entryPrice: 100,
+        stopPrice: 98,
+        takeProfitPrice: 104,
+        createdAt: isoMinutesAgo(10),
+        scoredAt: isoMinutesAgo(10),
+        etDate: CURRENT_ET_DATE,
+        sessionTag: CURRENT_SESSION_TAG,
+      },
+      {
+        id: "age-20",
+        ticker: "MSFT",
+        side: "LONG",
+        status: "AUTO_PENDING",
+        source: "AUTO",
+        entryPrice: 100,
+        stopPrice: 98,
+        takeProfitPrice: 104,
+        createdAt: isoMinutesAgo(20),
+        scoredAt: isoMinutesAgo(20),
+        etDate: CURRENT_ET_DATE,
+        sessionTag: CURRENT_SESSION_TAG,
+      },
+      {
+        id: "age-40",
+        ticker: "NVDA",
+        side: "LONG",
+        status: "AUTO_PENDING",
+        source: "AUTO",
+        entryPrice: 100,
+        stopPrice: 98,
+        takeProfitPrice: 104,
+        createdAt: isoMinutesAgo(40),
+        scoredAt: isoMinutesAgo(40),
+        etDate: CURRENT_ET_DATE,
+        sessionTag: CURRENT_SESSION_TAG,
+      },
+    ] as any);
+
+    const req = new Request("http://localhost/api/auto-entry/run?dryRun=1", {
+      method: "POST",
+      headers: { "x-auto-entry-token": "test-token" },
+    });
+
+    const result: any = await runAutoEntryOnce(req);
+
+    expect(result.actions.find((a: any) => a.id === "age-10")?.decision).toBe("WOULD_EXECUTE");
+    expect(result.actions.find((a: any) => a.id === "age-20")?.decision).toBe("WOULD_EXECUTE");
+    expect(result.actions.find((a: any) => a.id === "age-40")?.reason).toBe("stale_trade");
+    expect(vi.mocked(scoreSignalWithAI)).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips stale_session when etDate/sessionTag do not match", async () => {
+    vi.mocked(readTrades).mockResolvedValue([
+      {
+        id: "stale-session",
+        ticker: "TSLA",
+        side: "LONG",
+        status: "AUTO_PENDING",
+        source: "AUTO",
+        entryPrice: 200,
+        stopPrice: 196,
+        takeProfitPrice: 208,
+        createdAt: isoMinutesAgo(8),
+        scoredAt: isoMinutesAgo(8),
+        etDate: "1999-01-01",
+        sessionTag: CURRENT_SESSION_TAG === "RTH" ? "PRE" : "RTH",
+      },
+    ] as any);
+
+    const req = new Request("http://localhost/api/auto-entry/run?dryRun=1", {
+      method: "POST",
+      headers: { "x-auto-entry-token": "test-token" },
+    });
+
+    const result: any = await runAutoEntryOnce(req);
+
+    const action = result.actions.find((a: any) => a.id === "stale-session");
+    expect(action?.decision).toBe("SKIP");
+    expect(action?.reason).toBe("stale_session");
+  });
 });
+

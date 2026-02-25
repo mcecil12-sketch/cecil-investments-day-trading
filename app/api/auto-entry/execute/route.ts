@@ -14,6 +14,13 @@ import { sendNotification } from "@/lib/notifications/notify";
 import { NotificationEvent } from "@/lib/notifications/types";
 import { normalizeStopPrice, normalizeLimitPrice, tickForEquityPrice } from "@/lib/tickSize";
 import { fetchBrokerTruth, type BrokerTruth } from "@/lib/broker/truth";
+import {
+  deriveSessionMeta,
+  evaluatePendingEligibility,
+  pickCanonicalPendingByTicker,
+  type EligibilityConfig,
+} from "@/lib/autoEntry/eligibility";
+import { scoreSignalWithAI } from "@/lib/aiScoring";
 
 function ensureBracketLegsValid(params: {
   side: "LONG" | "SHORT";
@@ -99,28 +106,6 @@ function safeNum(v: any, fb = 0) {
   return Number.isFinite(n) ? n : fb;
 }
 
-const AUTO_PENDING_MAX_AGE_HOURS = Number.isFinite(Number(process.env.AUTO_PENDING_MAX_AGE_HOURS))
-  ? Math.max(1, Number(process.env.AUTO_PENDING_MAX_AGE_HOURS))
-  : 24;
-
-/**
- * Check if a trade is stale (created more than 6 hours ago or not from today ET).
- * Returns true if stale, false if recent.
- */
-function isStaleAutoPending(createdAt: string | undefined, maxAgeHours: number): boolean {
-  if (!createdAt) return false;
-  try {
-    const createdDate = new Date(createdAt);
-    const nowMs = Date.now();
-    const ageMs = nowMs - createdDate.getTime();
-    const ageHours = ageMs / (1000 * 60 * 60);
-    if (ageHours > maxAgeHours) return true;
-  } catch {
-    return false;
-  }
-  return false;
-}
-
 function pendingTp(trade: any) {
   return safeNum(trade?.takeProfitPrice ?? trade?.targetPrice, 0);
 }
@@ -145,9 +130,59 @@ function hasValidPendingRisk(trade: any) {
 }
 
 function byNewestCreatedAtDesc(a: any, b: any) {
-  const aTs = Date.parse(String(a?.createdAt || 0)) || 0;
-  const bTs = Date.parse(String(b?.createdAt || 0)) || 0;
+  const aTs = Date.parse(String(a?.scoredAt || a?.createdAt || 0)) || 0;
+  const bTs = Date.parse(String(b?.scoredAt || b?.createdAt || 0)) || 0;
   return bTs - aTs;
+}
+
+function toRawSignal(trade: any) {
+  const sideRaw = String(trade?.side || "").toUpperCase();
+  const side: "LONG" | "SHORT" = sideRaw === "SHORT" ? "SHORT" : "LONG";
+  return {
+    id: trade?.signalId || trade?.id,
+    ticker: String(trade?.ticker || "").toUpperCase(),
+    timeframe: "1Min",
+    createdAt: String(trade?.scoredAt || trade?.createdAt || new Date().toISOString()),
+    entryPrice: safeNum(trade?.entryPrice, 0),
+    stopPrice: safeNum(trade?.stopPrice, 0),
+    targetPrice: safeNum(trade?.takeProfitPrice ?? trade?.targetPrice, 0),
+    side,
+    source: trade?.source || "AUTO",
+    status: "SCORED",
+  };
+}
+
+async function tryRescoreTrade(trade: any) {
+  const result = await scoreSignalWithAI(toRawSignal(trade));
+  const scored = (result as any)?.scored || {};
+  const score = Number(scored?.aiScore ?? scored?.score);
+  const qualified = scored?.qualified === true || Number.isFinite(score);
+  const sideRaw = String(scored?.bestDirection || scored?.direction || scored?.side || trade?.side || "").toUpperCase();
+  const side = sideRaw === "SHORT" ? "SHORT" : "LONG";
+  const entryPrice = Number(scored?.entryPrice ?? trade?.entryPrice);
+  const stopPrice = Number(scored?.stopPrice ?? trade?.stopPrice);
+  const tp = Number(scored?.targetPrice ?? scored?.takeProfitPrice ?? trade?.takeProfitPrice ?? trade?.targetPrice);
+
+  if (!qualified || !Number.isFinite(entryPrice) || !Number.isFinite(stopPrice) || !Number.isFinite(tp)) {
+    return { ok: false as const };
+  }
+
+  const now = new Date().toISOString();
+  return {
+    ok: true as const,
+    patch: {
+      aiScore: Number.isFinite(score) ? score : trade?.aiScore,
+      side,
+      entryPrice,
+      stopPrice,
+      targetPrice: tp,
+      takeProfitPrice: tp,
+      scoredAt: now,
+      rescoreAttemptedAt: now,
+      qualified: true,
+      updatedAt: now,
+    },
+  };
 }
 
 /**
@@ -461,52 +496,108 @@ export async function POST(req: Request) {
     .filter(({ t }) => Boolean(t && isAutoPendingTrade(t) && (t?.source === "auto-entry" || t?.source === "AUTO")));
   counts.pendingCount = pendingIndexes.length;
 
-  const byTickerPending = new Map<string, Array<{ t: any; i: number }>>();
-  for (const item of pendingIndexes) {
-    const ticker = String(item.t?.ticker || "").toUpperCase();
-    if (!ticker) continue;
-    const arr = byTickerPending.get(ticker) || [];
-    arr.push(item);
-    byTickerPending.set(ticker, arr);
-  }
-
   const eligibleIndexes: number[] = [];
   const nowForPending = nowIso();
+  const maxAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_PENDING_MAX_AGE_MIN))
+    ? Math.max(1, Number(process.env.AUTO_ENTRY_PENDING_MAX_AGE_MIN))
+    : 15;
+  const rescoreMaxAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_PENDING_RESCORE_MAX_AGE_MIN))
+    ? Math.max(maxAgeMin + 1, Number(process.env.AUTO_ENTRY_PENDING_RESCORE_MAX_AGE_MIN))
+    : 30;
+  const rescoreEnabled = ["1", "true", "yes", "on"].includes(
+    String(process.env.AUTO_ENTRY_RESCORE_ENABLED || "1").toLowerCase()
+  );
+  const rescoreOnce = ["1", "true", "yes", "on"].includes(
+    String(process.env.AUTO_ENTRY_RESCORE_ONCE || "1").toLowerCase()
+  );
+  const sessionMeta = deriveSessionMeta(nowForPending);
+  const eligibilityCfg: EligibilityConfig = {
+    todayET: sessionMeta.etDate,
+    currentSessionTag: sessionMeta.sessionTag,
+    maxAgeMin,
+    rescoreMaxAgeMin,
+    rescoreEnabled,
+    rescoreOnce,
+  };
   let tradesChanged = false;
 
-  for (const [ticker, group] of byTickerPending.entries()) {
-    const sorted = [...group].sort((a, b) => byNewestCreatedAtDesc(a.t, b.t));
-    const canonical = sorted.find((x) => hasValidPendingRisk(x.t)) || sorted[0];
-    const duplicateIds: string[] = [];
+  const pendingSorted = [...pendingIndexes].sort((a, b) => byNewestCreatedAtDesc(a.t, b.t));
+  const canonicalResult = pickCanonicalPendingByTicker(pendingSorted.map((x) => x.t));
+  const canonicalIdSet = new Set(canonicalResult.canonical.map((t) => String(t?.id || "")));
+  const duplicateIdSet = new Set(canonicalResult.duplicates.map((t) => String(t?.id || "")));
 
-    for (const item of sorted) {
-      counts.checked += 1;
-      const tradeId = String(item.t?.id || "");
-      const isCanonical = item.i === canonical.i;
+  for (const item of pendingSorted) {
+    counts.checked += 1;
+    const tradeId = String(item.t?.id || "");
+    const ticker = String(item.t?.ticker || "").toUpperCase();
 
-      if (!isCanonical) {
+    if (duplicateIdSet.has(tradeId) && !canonicalIdSet.has(tradeId)) {
+      trades[item.i] = {
+        ...trades[item.i],
+        status: "ARCHIVED",
+        autoEntryStatus: "AUTO_ARCHIVED",
+        reason: "duplicate_auto_pending",
+        error: undefined,
+        closedAt: trades[item.i]?.closedAt || nowForPending,
+        updatedAt: nowForPending,
+      };
+      counts.duplicatesArchived += 1;
+      counts.skipped += 1;
+      tradesChanged = true;
+      continue;
+    }
+
+    let workingTrade = item.t;
+    let eligibility = evaluatePendingEligibility(workingTrade, nowForPending, eligibilityCfg);
+
+    if (!eligibility.eligible && eligibility.requiresRescore) {
+      try {
+        const rescored = await tryRescoreTrade(workingTrade);
+        if (!rescored.ok) {
+          trades[item.i] = {
+            ...trades[item.i],
+            status: "ERROR",
+            autoEntryStatus: "AUTO_ERROR",
+            reason: "rescore_failed",
+            error: "rescore_failed",
+            updatedAt: nowForPending,
+            rescoreAttemptedAt: nowForPending,
+          };
+          counts.invalidMarked += 1;
+          counts.skipped += 1;
+          tradesChanged = true;
+          notes.push(`rescore_failed:${ticker}:${tradeId || "unknown"}`);
+          continue;
+        }
+        workingTrade = { ...workingTrade, ...rescored.patch };
+        trades[item.i] = { ...trades[item.i], ...rescored.patch };
+        tradesChanged = true;
+        eligibility = evaluatePendingEligibility(workingTrade, nowForPending, eligibilityCfg);
+      } catch {
         trades[item.i] = {
           ...trades[item.i],
-          status: "ARCHIVED",
-          autoEntryStatus: "AUTO_ARCHIVED",
-          reason: "duplicate_auto_pending",
-          error: undefined,
-          closedAt: trades[item.i]?.closedAt || nowForPending,
+          status: "ERROR",
+          autoEntryStatus: "AUTO_ERROR",
+          reason: "rescore_failed",
+          error: "rescore_failed",
           updatedAt: nowForPending,
+          rescoreAttemptedAt: nowForPending,
         };
-        counts.duplicatesArchived += 1;
+        counts.invalidMarked += 1;
         counts.skipped += 1;
         tradesChanged = true;
-        if (tradeId) duplicateIds.push(tradeId);
+        notes.push(`rescore_failed:${ticker}:${tradeId || "unknown"}`);
         continue;
       }
+    }
 
-      if (isStaleAutoPending(item.t?.createdAt, AUTO_PENDING_MAX_AGE_HOURS)) {
+    if (!eligibility.eligible) {
+      if (eligibility.reason === "stale_trade" || eligibility.reason === "stale_session") {
         trades[item.i] = {
           ...trades[item.i],
           status: "ARCHIVED",
           autoEntryStatus: "AUTO_ARCHIVED",
-          reason: "stale_auto_pending",
+          reason: eligibility.reason,
           error: undefined,
           closedAt: trades[item.i]?.closedAt || nowForPending,
           updatedAt: nowForPending,
@@ -514,37 +605,47 @@ export async function POST(req: Request) {
         counts.staleArchived += 1;
         counts.skipped += 1;
         tradesChanged = true;
-        notes.push(`stale_pending:${ticker}:${tradeId || "unknown"}`);
+        notes.push(`${eligibility.reason}:${ticker}:${tradeId || "unknown"}`);
         continue;
       }
 
-      if (!hasValidPendingRisk(item.t)) {
-        trades[item.i] = {
-          ...trades[item.i],
-          status: "ERROR",
-          autoEntryStatus: "AUTO_ERROR",
-          reason: "invalid_pending_missing_risk",
-          error: "invalid_pending_missing_risk",
-          errorDetails: {
-            entryPrice: item.t?.entryPrice ?? null,
-            stopPrice: item.t?.stopPrice ?? null,
-            takeProfitPrice: item.t?.takeProfitPrice ?? item.t?.targetPrice ?? null,
-          },
-          updatedAt: nowForPending,
-        };
-        counts.invalidMarked += 1;
-        counts.skipped += 1;
-        tradesChanged = true;
-        notes.push(`invalid_pending:${ticker}:${tradeId || "unknown"}`);
-        continue;
-      }
-
-      eligibleIndexes.push(item.i);
+      trades[item.i] = {
+        ...trades[item.i],
+        status: "ERROR",
+        autoEntryStatus: "AUTO_ERROR",
+        reason: eligibility.reason,
+        error: eligibility.reason,
+        updatedAt: nowForPending,
+      };
+      counts.invalidMarked += 1;
+      counts.skipped += 1;
+      tradesChanged = true;
+      notes.push(`${eligibility.reason}:${ticker}:${tradeId || "unknown"}`);
+      continue;
     }
 
-    notes.push(
-      `pending_dedupe:ticker=${ticker} canonical=${String(canonical.t?.id || "unknown")} skipped=[${duplicateIds.join(",")}]`
-    );
+    if (!hasValidPendingRisk(workingTrade)) {
+      trades[item.i] = {
+        ...trades[item.i],
+        status: "ERROR",
+        autoEntryStatus: "AUTO_ERROR",
+        reason: "invalid_pending_missing_risk",
+        error: "invalid_pending_missing_risk",
+        errorDetails: {
+          entryPrice: workingTrade?.entryPrice ?? null,
+          stopPrice: workingTrade?.stopPrice ?? null,
+          takeProfitPrice: workingTrade?.takeProfitPrice ?? workingTrade?.targetPrice ?? null,
+        },
+        updatedAt: nowForPending,
+      };
+      counts.invalidMarked += 1;
+      counts.skipped += 1;
+      tradesChanged = true;
+      notes.push(`invalid_pending:${ticker}:${tradeId || "unknown"}`);
+      continue;
+    }
+
+    eligibleIndexes.push(item.i);
   }
 
   counts.eligibleCount = eligibleIndexes.length;

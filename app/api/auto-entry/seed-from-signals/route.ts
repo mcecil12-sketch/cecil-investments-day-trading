@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { readTrades, upsertTrade } from "@/lib/tradesStore";
 import { getAutoConfig, tierForScore } from "@/lib/autoEntry/config";
+import { deriveSessionMeta } from "@/lib/autoEntry/eligibility";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -204,6 +205,8 @@ export async function POST(req: NextRequest) {
     }
 
     const now = new Date().toISOString();
+    const sessionMeta = deriveSessionMeta(now);
+    const scoredAt = String(s?.scoredAt || s?.updatedAt || s?.createdAt || now);
 
     const trade = {
       id: crypto.randomUUID(),
@@ -218,6 +221,9 @@ export async function POST(req: NextRequest) {
       paper: true,
       createdAt: now,
       updatedAt: now,
+      scoredAt,
+      etDate: sessionMeta.etDate,
+      sessionTag: sessionMeta.sessionTag,
       signalId,
       aiScore,
       tier,
