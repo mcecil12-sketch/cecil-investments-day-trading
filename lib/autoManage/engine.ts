@@ -2,9 +2,12 @@ import { getAutoManageConfig } from "@/lib/autoManage/config";
 import { getRuleForGrade, shouldMoveToBreakEven, shouldEnableTrailing } from "@/lib/autoManage/gradeRules";
 import { recordAutoManage } from "@/lib/autoManage/telemetry";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
-import { getLatestQuote, alpacaRequest, getPositions } from "@/lib/alpaca";
+import { getLatestQuote, alpacaRequest, getPositions, createOrder } from "@/lib/alpaca";
 import { syncStopForTrade, rescueStop } from "@/lib/autoManage/stopSync";
 import { reconcileOpenTrades } from "@/lib/maintenance/reconcileOpenTrades";
+import { sendNotification } from "@/lib/notifications/notify";
+import { selectCanonicalOpenTrade } from "@/lib/trades/canonical";
+import { decideCutLossAction } from "@/lib/autoManage/cutLoss";
 
 export type AutoManageResult = {
   ok: true;
@@ -69,6 +72,68 @@ function midFromQuote(q: any): number | null {
 function riskPerShare(entry: number, stop: number) {
   const r = Math.abs(entry - stop);
   return r > 0 ? r : null;
+}
+
+function normalizeQty(trade: any) {
+  const q = Number(trade?.quantity ?? trade?.qty ?? trade?.size ?? trade?.positionSize ?? trade?.shares ?? 0);
+  return Number.isFinite(q) && q > 0 ? q : 0;
+}
+
+function appendRuleNote(trade: any, note: string) {
+  const existing = typeof trade?.note === "string" ? trade.note.trim() : "";
+  if (!existing) return note;
+  if (existing.includes(note)) return existing;
+  return `${existing} | ${note}`;
+}
+
+async function submitMarketCloseForTrade(trade: any, ticker: string): Promise<
+  | { ok: true; qty: number; orderId: string; status?: string }
+  | { ok: false; error: string; detail?: string }
+> {
+  const side = String(trade?.side || "LONG").toUpperCase();
+  const closeSide = side === "SHORT" ? "buy" : "sell";
+
+  let qty = normalizeQty(trade);
+  if (!qty) {
+    try {
+      const posRaw = await getPositions(ticker);
+      const pos = Array.isArray(posRaw)
+        ? posRaw.find((p: any) => String(p?.symbol || "").toUpperCase() === ticker)
+        : posRaw;
+      qty = Math.abs(Number((pos as any)?.qty ?? 0));
+    } catch (err: any) {
+      return { ok: false, error: "close_qty_lookup_failed", detail: String(err?.message || err) };
+    }
+  }
+
+  if (!Number.isFinite(qty) || qty <= 0) {
+    return { ok: false, error: "close_qty_invalid" };
+  }
+
+  try {
+    const order: any = await createOrder({
+      symbol: ticker,
+      qty,
+      side: closeSide,
+      type: "market",
+      time_in_force: "day",
+      extended_hours: false,
+    });
+
+    const orderId = String(order?.id || "");
+    if (!orderId) {
+      return { ok: false, error: "close_order_missing_id" };
+    }
+
+    return {
+      ok: true,
+      qty,
+      orderId,
+      status: order?.status ? String(order.status) : undefined,
+    };
+  } catch (err: any) {
+    return { ok: false, error: "close_order_failed", detail: String(err?.message || err) };
+  }
 }
 
 /**
@@ -163,9 +228,55 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   const marketClosed = isMarketClosed(clock);
 
   const all = await readTrades();
-  const open = (all || []).filter((t: any) => String(t.status || "").toUpperCase() === "OPEN");
+  const next = [...all];
+
+  const openRaw = (all || []).filter((t: any) => String(t.status || "").toUpperCase() === "OPEN");
+
+  const byTicker = new Map<string, any[]>();
+  for (const t of openRaw) {
+    const ticker = String(t?.ticker || "").toUpperCase();
+    if (!ticker) continue;
+    const arr = byTicker.get(ticker) || [];
+    arr.push(t);
+    byTicker.set(ticker, arr);
+  }
+
+  const open: any[] = [];
+  let duplicateArchived = 0;
+
+  for (const [ticker, group] of byTicker.entries()) {
+    if (!group.length) continue;
+
+    const { canonical, duplicates } = selectCanonicalOpenTrade(group);
+    open.push(canonical);
+
+    if (duplicates.length <= 0) continue;
+
+    for (const dup of duplicates) {
+      const dupId = String(dup?.id || "");
+      if (!dupId) continue;
+      const dupIdx = next.findIndex((x: any) => String(x?.id || "") === dupId);
+      if (dupIdx < 0) continue;
+
+      next[dupIdx] = {
+        ...next[dupIdx],
+        status: "ERROR",
+        autoEntryStatus: "ARCHIVED_DUPLICATE_OPEN",
+        error: "duplicate_open_trade_for_ticker",
+        closeReason: "duplicate_open_archived",
+        closedAt: next[dupIdx].closedAt || now,
+        archivedAt: now,
+        updatedAt: now,
+      };
+      duplicateArchived += 1;
+      notes.push(`duplicate_archived:${ticker}:${dupId}`);
+    }
+  }
 
   if (!open.length) {
+    if (duplicateArchived > 0) {
+      await writeTrades(next);
+    }
     await recordAutoManage({ ts: now, outcome: "SKIP", reason: "no_open_trades", source: opts.source, runId: opts.runId });
     return { ok: true, skipped: true, reason: "no_open_trades", checked: 0, updated: 0, flattened: 0, enabled: true, now, market: clock, cfg, reconcile: reconcileResult };
   }
@@ -182,9 +293,8 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   let rescueOk = 0;
   let rescueFailed = 0;
   let hadFailures = false;
-
-  const next = [...all];
   const max = Math.min(cfg.maxPerRun, open.length);
+  updated += duplicateArchived;
 
   for (let i = 0; i < max; i++) {
     const t: any = open[i];
@@ -234,6 +344,97 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     const pnlPerShare = side === "SHORT" ? (entry - px) : (px - entry);
     const unrealizedPnL = r2(pnlPerShare * qty);
     const unrealizedR = r3(pnlPerShare / rps);
+
+    const cutLossAction = decideCutLossAction({
+      enabled: cfg.cutLossEnabled,
+      thresholdR: cfg.cutLossR,
+      trade: {
+        id,
+        ticker,
+        status: "OPEN",
+        unrealizedR,
+      },
+    });
+
+    if (cutLossAction) {
+      const closeRes = await submitMarketCloseForTrade(t, ticker);
+      const idx = next.findIndex((x: any) => x.id === id);
+
+      if (!closeRes.ok) {
+        notes.push(`cut_loss_fail:${ticker}:${closeRes.error}${closeRes.detail ? ":" + closeRes.detail : ""}`);
+        hadFailures = true;
+        if (idx >= 0) {
+          next[idx] = {
+            ...next[idx],
+            autoManage: {
+              ...(next[idx].autoManage || {}),
+              lastRunAt: now,
+              lastRule: "CUT_LOSS_R",
+              lastCutLossStatus: "FAIL",
+              lastCutLossError: `${closeRes.error}${closeRes.detail ? ":" + closeRes.detail : ""}`,
+            },
+            updatedAt: now,
+          };
+          updated++;
+        }
+        continue;
+      }
+
+      if (idx >= 0) {
+        const current = next[idx];
+        next[idx] = {
+          ...current,
+          status: "CLOSED",
+          autoEntryStatus: "CLOSED",
+          closedAt: now,
+          updatedAt: now,
+          closeReason: cutLossAction.reason,
+          note: appendRuleNote(current, `rule:${cutLossAction.rule}`),
+          unrealizedPnL,
+          unrealizedR,
+          lastPrice: r2(px),
+          closeOrderId: closeRes.orderId,
+          closeOrderStatus: closeRes.status,
+          autoManage: {
+            ...(current.autoManage || {}),
+            lastRunAt: now,
+            lastRule: "CUT_LOSS_R",
+            lastCutLossAt: now,
+            lastCutLossStatus: "OK",
+            cutLossR: cfg.cutLossR,
+          },
+          error: undefined,
+        };
+      }
+
+      notes.push(`cut_loss:${ticker}:r=${cutLossAction.r.toFixed(3)}:qty=${closeRes.qty}`);
+
+      try {
+        await sendNotification({
+          type: "AUTO_CUT_LOSS",
+          tradeId: id,
+          ticker,
+          paper: t?.paper !== false,
+          title: `Auto cut-loss ${ticker}`,
+          message: `Closed ${ticker} at ${cutLossAction.r.toFixed(3)}R qty ${closeRes.qty}`,
+          dedupeKey: `AUTO_CUT_LOSS:${id}`,
+          dedupeTtlSec: 3600,
+          meta: {
+            ticker,
+            r: cutLossAction.r,
+            qty: closeRes.qty,
+            closeReason: cutLossAction.reason,
+            rule: cutLossAction.rule,
+          },
+        });
+      } catch (notifyErr: any) {
+        notes.push(`cut_loss_notify_fail:${ticker}:${String(notifyErr?.message || notifyErr)}`);
+      }
+
+      flattened++;
+      updated++;
+      continue;
+    }
 
     // === GRADE-BASED STOP MANAGEMENT ===
     let nextStop = stop;
