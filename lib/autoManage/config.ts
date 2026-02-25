@@ -15,11 +15,16 @@ const num = (v: string | undefined, d: number) => {
 };
 
 export function getAutoManageConfig(): AutoManageConfig {
+  const cutLossEnabledRaw =
+    process.env.AUTO_MANAGE_CUT_LOSS_ENABLED ?? process.env.AUTO_CUT_LOSS_ENABLED ?? "0";
+  const cutLossRRaw =
+    process.env.AUTO_MANAGE_CUT_LOSS_R ?? process.env.AUTO_CUT_LOSS_R ?? "-1";
+
   return {
     enabled: process.env.AUTO_MANAGE_ENABLED === "1",
     eodFlatten: process.env.AUTO_MANAGE_EOD_FLATTEN === "1",
-    cutLossEnabled: process.env.AUTO_CUT_LOSS_ENABLED === "1",
-    cutLossR: num(process.env.AUTO_CUT_LOSS_R, -1.0),
+    cutLossEnabled: String(cutLossEnabledRaw) === "1",
+    cutLossR: num(cutLossRRaw, -1.0),
     trailEnabled: process.env.AUTO_MANAGE_TRAIL_ENABLED === "1",
     trailStartR: num(process.env.AUTO_MANAGE_TRAIL_R, 2.5),
     trailPct: num(process.env.AUTO_MANAGE_TRAIL_PCT, 0.005),

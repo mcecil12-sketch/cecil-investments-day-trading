@@ -20,6 +20,7 @@ describe("selectCanonicalOpenTrade", () => {
       source: "AUTO",
       entryPrice: 157.14,
       stopPrice: 155.57,
+      takeProfitPrice: 160.28,
       openedAt: "2026-02-25T15:00:00.000Z",
     };
 

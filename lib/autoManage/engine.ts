@@ -74,6 +74,89 @@ function riskPerShare(entry: number, stop: number) {
   return r > 0 ? r : null;
 }
 
+function hasValidRiskFields(trade: any) {
+  const entry = Number(trade?.entryPrice);
+  const stop = trade?.stopPrice;
+  const takeProfit = trade?.takeProfitPrice ?? trade?.targetPrice;
+  return Number.isFinite(entry) && entry > 0 && stop != null && takeProfit != null;
+}
+
+async function computeUnrealizedMetrics(args: {
+  ticker: string;
+  side: string;
+  entry: number | null;
+  stop: number | null;
+  qty: number;
+  quotePx: number | null;
+}): Promise<
+  | { ok: true; px: number; entry: number; qty: number; unrealizedPnL: number; unrealizedR: number; source: string }
+  | { ok: false; reason: string }
+> {
+  const stop = args.stop;
+  if (stop == null || !Number.isFinite(stop) || stop <= 0) {
+    return { ok: false, reason: "missing_stop" };
+  }
+
+  let px = args.quotePx;
+  let entry = args.entry;
+  let qty = args.qty;
+  let source = "quote";
+
+  if (px == null || entry == null || !Number.isFinite(entry) || entry <= 0 || !Number.isFinite(qty) || qty <= 0) {
+    try {
+      const posRaw = await getPositions(args.ticker);
+      const pos = Array.isArray(posRaw)
+        ? posRaw.find((p: any) => String(p?.symbol || "").toUpperCase() === args.ticker)
+        : posRaw;
+
+      const posQty = Math.abs(Number((pos as any)?.qty ?? 0));
+      const posEntry = Number((pos as any)?.avg_entry_price ?? 0);
+      const posPx = Number((pos as any)?.current_price ?? 0);
+      const posMv = Number((pos as any)?.market_value ?? 0);
+
+      if (!Number.isFinite(qty) || qty <= 0) qty = posQty;
+      if (entry == null || !Number.isFinite(entry) || entry <= 0) entry = posEntry;
+      if (px == null) {
+        if (Number.isFinite(posPx) && posPx > 0) {
+          px = posPx;
+        } else if (Number.isFinite(posMv) && Number.isFinite(qty) && qty > 0) {
+          px = Math.abs(posMv) / qty;
+        }
+      }
+
+      source = "position";
+    } catch {
+      // ignore and fall through to validations
+    }
+  }
+
+  if (entry == null || !Number.isFinite(entry) || entry <= 0) {
+    return { ok: false, reason: "missing_entry" };
+  }
+  if (px == null || !Number.isFinite(px) || px <= 0) {
+    return { ok: false, reason: "missing_price" };
+  }
+  if (!Number.isFinite(qty) || qty <= 0) {
+    return { ok: false, reason: "missing_qty" };
+  }
+
+  const rps = riskPerShare(entry, stop);
+  if (!rps) {
+    return { ok: false, reason: "no_risk" };
+  }
+
+  const pnlPerShare = args.side === "SHORT" ? (entry - px) : (px - entry);
+  return {
+    ok: true,
+    px,
+    entry,
+    qty,
+    unrealizedPnL: r2(pnlPerShare * qty),
+    unrealizedR: r3(pnlPerShare / rps),
+    source,
+  };
+}
+
 function normalizeQty(trade: any) {
   const q = Number(trade?.quantity ?? trade?.qty ?? trade?.size ?? trade?.positionSize ?? trade?.shares ?? 0);
   return Number.isFinite(q) && q > 0 ? q : 0;
@@ -258,19 +341,34 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
       const dupIdx = next.findIndex((x: any) => String(x?.id || "") === dupId);
       if (dupIdx < 0) continue;
 
+      const isGhostBackfill =
+        String(dup?.source || "") === "broker_backfill" &&
+        !hasValidRiskFields(dup);
+
+      const nextStatus = isGhostBackfill ? "ERROR" : "ARCHIVED";
+      const nextReason = isGhostBackfill
+        ? "invalid_backfill_missing_risk"
+        : "duplicate_noncanonical";
+
       next[dupIdx] = {
         ...next[dupIdx],
-        status: "ERROR",
+        status: nextStatus,
         autoEntryStatus: "ARCHIVED_DUPLICATE_OPEN",
-        error: "duplicate_open_trade_for_ticker",
-        closeReason: "duplicate_open_archived",
+        error: nextReason,
+        closeReason: nextReason,
         closedAt: next[dupIdx].closedAt || now,
         archivedAt: now,
         updatedAt: now,
       };
       duplicateArchived += 1;
-      notes.push(`duplicate_archived:${ticker}:${dupId}`);
+      notes.push(`duplicate_archived:${ticker}:${dupId}:${nextReason}`);
     }
+
+    notes.push(
+      `dedupe:ticker=${ticker} canonical=${String(canonical?.id || "unknown")} skipped=[${duplicates
+        .map((d: any) => String(d?.id || "unknown"))
+        .join(",")}]`
+    );
   }
 
   if (!open.length) {
@@ -308,7 +406,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     const entry = num(t.entryPrice);
     const stop = num(t.stopPrice);
 
-    if (!id || !ticker || !entry || !stop || !Number.isFinite(qty) || qty <= 0) {
+    if (!id || !ticker || !stop || !["LONG", "SHORT"].includes(side)) {
       notes.push(`skip_invalid:${id || ticker}`);
       continue;
     }
@@ -323,27 +421,32 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
       continue;
     }
 
-    let px: number | null = null;
+    let quotePx: number | null = null;
     try {
       const q: any = await getLatestQuote(ticker);
-      px = midFromQuote(q);
+      quotePx = midFromQuote(q);
     } catch {
-      px = null;
+      quotePx = null;
     }
-    if (px == null) {
-      notes.push(`no_price:${ticker}`);
+
+    const metrics = await computeUnrealizedMetrics({
+      ticker,
+      side,
+      entry,
+      stop,
+      qty,
+      quotePx,
+    });
+    if (!metrics.ok) {
+      notes.push(`skip_no_r:${ticker}:${metrics.reason}`);
       continue;
     }
 
-    const rps = riskPerShare(entry, stop);
-    if (!rps) {
-      notes.push(`no_risk:${ticker}`);
-      continue;
-    }
-
-    const pnlPerShare = side === "SHORT" ? (entry - px) : (px - entry);
-    const unrealizedPnL = r2(pnlPerShare * qty);
-    const unrealizedR = r3(pnlPerShare / rps);
+    const unrealizedPnL = metrics.unrealizedPnL;
+    const unrealizedR = metrics.unrealizedR;
+    const px = metrics.px;
+    const entryForCalc = metrics.entry;
+    const rps = riskPerShare(entryForCalc, stop)!;
 
     const cutLossAction = decideCutLossAction({
       enabled: cfg.cutLossEnabled,
@@ -407,7 +510,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
         };
       }
 
-      notes.push(`cut_loss:${ticker}:r=${cutLossAction.r.toFixed(3)}:qty=${closeRes.qty}`);
+      notes.push(`cut_loss_exit:ticker=${ticker} r=${cutLossAction.r.toFixed(3)} qty=${closeRes.qty}`);
 
       try {
         await sendNotification({
@@ -443,17 +546,17 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     
     // Check if already at break-even or better
     const alreadyAtBreakEven = side === "SHORT" 
-      ? (stop <= entry + 0.001) // SHORT: stop at or below entry
-      : (stop >= entry - 0.001); // LONG: stop at or above entry
+      ? (stop <= entryForCalc + 0.001) // SHORT: stop at or below entry
+      : (stop >= entryForCalc - 0.001); // LONG: stop at or above entry
     
     // Move to break-even based on grade rule
     if (shouldMoveToBreakEven(unrealizedR, tradeGrade, alreadyAtBreakEven)) {
-      nextStop = entry; // Move stop to entry (break-even)
+      nextStop = entryForCalc; // Move stop to entry (break-even)
     }
     
     // Lock in 1R profit at 2R (applicable to all grades)
     if (unrealizedR >= 2.0 && !alreadyAtBreakEven) {
-      const lock1R = side === "SHORT" ? (entry - rps) : (entry + rps);
+      const lock1R = side === "SHORT" ? (entryForCalc - rps) : (entryForCalc + rps);
       nextStop = side === "SHORT" ? Math.min(nextStop, lock1R) : Math.max(nextStop, lock1R);
     }
     

@@ -99,26 +99,55 @@ function safeNum(v: any, fb = 0) {
   return Number.isFinite(n) ? n : fb;
 }
 
+const AUTO_PENDING_MAX_AGE_HOURS = Number.isFinite(Number(process.env.AUTO_PENDING_MAX_AGE_HOURS))
+  ? Math.max(1, Number(process.env.AUTO_PENDING_MAX_AGE_HOURS))
+  : 24;
+
 /**
  * Check if a trade is stale (created more than 6 hours ago or not from today ET).
  * Returns true if stale, false if recent.
  */
-function isStaleAutoPending(createdAt: string | undefined, etDate: string): boolean {
-  if (!createdAt) return false; // Assume recent if no timestamp
+function isStaleAutoPending(createdAt: string | undefined, maxAgeHours: number): boolean {
+  if (!createdAt) return false;
   try {
     const createdDate = new Date(createdAt);
     const nowMs = Date.now();
     const ageMs = nowMs - createdDate.getTime();
     const ageHours = ageMs / (1000 * 60 * 60);
-    if (ageHours > 6) return true; // Older than 6 hours
-    
-    // Also check if createdAt is not from today ET
-    const createdETDate = etDateString(createdDate);
-    if (createdETDate !== etDate) return true; // Not from today
+    if (ageHours > maxAgeHours) return true;
   } catch {
-    return false; // If parsing fails, assume valid
+    return false;
   }
   return false;
+}
+
+function pendingTp(trade: any) {
+  return safeNum(trade?.takeProfitPrice ?? trade?.targetPrice, 0);
+}
+
+function hasValidPendingRisk(trade: any) {
+  const entryPrice = safeNum(trade?.entryPrice, 0);
+  const stopPrice = safeNum(trade?.stopPrice, 0);
+  const takeProfitPrice = pendingTp(trade);
+  const side = String(trade?.side || "LONG").toUpperCase();
+
+  if (!(entryPrice > 0 && stopPrice > 0 && takeProfitPrice > 0)) return false;
+  if (!(side === "LONG" || side === "SHORT")) return false;
+
+  if (side === "LONG") {
+    if (stopPrice >= entryPrice) return false;
+    if (takeProfitPrice <= entryPrice) return false;
+  } else {
+    if (stopPrice <= entryPrice) return false;
+    if (takeProfitPrice >= entryPrice) return false;
+  }
+  return true;
+}
+
+function byNewestCreatedAtDesc(a: any, b: any) {
+  const aTs = Date.parse(String(a?.createdAt || 0)) || 0;
+  const bTs = Date.parse(String(b?.createdAt || 0)) || 0;
+  return bTs - aTs;
 }
 
 /**
@@ -409,10 +438,15 @@ export async function POST(req: Request) {
   const cfg = auth.cfg;
   const counts = {
     checked: 0,
+    pendingCount: 0,
+    eligibleCount: 0,
+    staleArchived: 0,
+    duplicatesArchived: 0,
     invalidMarked: 0,
     executed: 0,
     skipped: 0,
   };
+  const notes: string[] = [];
   const guardConfig = getGuardrailConfig();
   const etDate = etDateString(new Date());
   const [guardState, toggleState, brokerTruth] = await Promise.all([
@@ -422,6 +456,103 @@ export async function POST(req: Request) {
   ]);
 
   const trades = await readTrades<any>();
+  const pendingIndexes = trades
+    .map((t, i) => ({ t, i }))
+    .filter(({ t }) => Boolean(t && isAutoPendingTrade(t) && (t?.source === "auto-entry" || t?.source === "AUTO")));
+  counts.pendingCount = pendingIndexes.length;
+
+  const byTickerPending = new Map<string, Array<{ t: any; i: number }>>();
+  for (const item of pendingIndexes) {
+    const ticker = String(item.t?.ticker || "").toUpperCase();
+    if (!ticker) continue;
+    const arr = byTickerPending.get(ticker) || [];
+    arr.push(item);
+    byTickerPending.set(ticker, arr);
+  }
+
+  const eligibleIndexes: number[] = [];
+  const nowForPending = nowIso();
+  let tradesChanged = false;
+
+  for (const [ticker, group] of byTickerPending.entries()) {
+    const sorted = [...group].sort((a, b) => byNewestCreatedAtDesc(a.t, b.t));
+    const canonical = sorted.find((x) => hasValidPendingRisk(x.t)) || sorted[0];
+    const duplicateIds: string[] = [];
+
+    for (const item of sorted) {
+      counts.checked += 1;
+      const tradeId = String(item.t?.id || "");
+      const isCanonical = item.i === canonical.i;
+
+      if (!isCanonical) {
+        trades[item.i] = {
+          ...trades[item.i],
+          status: "ARCHIVED",
+          autoEntryStatus: "AUTO_ARCHIVED",
+          reason: "duplicate_auto_pending",
+          error: undefined,
+          closedAt: trades[item.i]?.closedAt || nowForPending,
+          updatedAt: nowForPending,
+        };
+        counts.duplicatesArchived += 1;
+        counts.skipped += 1;
+        tradesChanged = true;
+        if (tradeId) duplicateIds.push(tradeId);
+        continue;
+      }
+
+      if (isStaleAutoPending(item.t?.createdAt, AUTO_PENDING_MAX_AGE_HOURS)) {
+        trades[item.i] = {
+          ...trades[item.i],
+          status: "ARCHIVED",
+          autoEntryStatus: "AUTO_ARCHIVED",
+          reason: "stale_auto_pending",
+          error: undefined,
+          closedAt: trades[item.i]?.closedAt || nowForPending,
+          updatedAt: nowForPending,
+        };
+        counts.staleArchived += 1;
+        counts.skipped += 1;
+        tradesChanged = true;
+        notes.push(`stale_pending:${ticker}:${tradeId || "unknown"}`);
+        continue;
+      }
+
+      if (!hasValidPendingRisk(item.t)) {
+        trades[item.i] = {
+          ...trades[item.i],
+          status: "ERROR",
+          autoEntryStatus: "AUTO_ERROR",
+          reason: "invalid_pending_missing_risk",
+          error: "invalid_pending_missing_risk",
+          errorDetails: {
+            entryPrice: item.t?.entryPrice ?? null,
+            stopPrice: item.t?.stopPrice ?? null,
+            takeProfitPrice: item.t?.takeProfitPrice ?? item.t?.targetPrice ?? null,
+          },
+          updatedAt: nowForPending,
+        };
+        counts.invalidMarked += 1;
+        counts.skipped += 1;
+        tradesChanged = true;
+        notes.push(`invalid_pending:${ticker}:${tradeId || "unknown"}`);
+        continue;
+      }
+
+      eligibleIndexes.push(item.i);
+    }
+
+    notes.push(
+      `pending_dedupe:ticker=${ticker} canonical=${String(canonical.t?.id || "unknown")} skipped=[${duplicateIds.join(",")}]`
+    );
+  }
+
+  counts.eligibleCount = eligibleIndexes.length;
+
+  if (tradesChanged) {
+    await writeTrades(trades);
+  }
+
   const openPositions = trades.filter(
     (t) =>
       Boolean(t?.status === "OPEN") &&
@@ -438,13 +569,43 @@ export async function POST(req: Request) {
 
   if (!cfg.enabled) {
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "AUTO_TRADING_ENABLED=false", counts, guardrails: guardSummary },
+      {
+        ok: true,
+        skipped: true,
+        reason: "AUTO_TRADING_ENABLED=false",
+        market: { isOpen: null, timestamp: nowIso(), reason: "auto_disabled" },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
       { status: 200 }
     );
   }
   if (!cfg.paperOnly) {
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "AUTO_TRADING_PAPER_ONLY=false (blocked in Phase 4)", counts, guardrails: guardSummary },
+      {
+        ok: true,
+        skipped: true,
+        reason: "AUTO_TRADING_PAPER_ONLY=false (blocked in Phase 4)",
+        market: { isOpen: null, timestamp: nowIso(), reason: "paper_only_disabled" },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
       { status: 200 }
     );
   }
@@ -452,24 +613,59 @@ export async function POST(req: Request) {
   if (!toggleState.enabled) {
     counts.skipped += 1;
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "auto_entry_disabled", counts, guardrails: guardSummary },
+      {
+        ok: true,
+        skipped: true,
+        reason: "auto_entry_disabled",
+        market: { isOpen: null, timestamp: nowIso(), reason: "auto_entry_disabled" },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
       { status: 200 }
     );
   }
 
   let marketOpen = true;
+  let marketTimestamp = nowIso();
+  let marketReason: string | undefined;
   try {
     const clock = await fetchAlpacaClock();
     marketOpen = Boolean(clock.is_open);
+    marketTimestamp = String((clock as any)?.timestamp || (clock as any)?.next_open || nowIso());
   } catch {
     marketOpen = false;
+    marketReason = "clock_unavailable";
   }
 
   if (!marketOpen) {
     counts.skipped += 1;
     await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "market_closed", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "market_closed", counts, guardrails: guardSummary },
+      {
+        ok: true,
+        skipped: true,
+        reason: "market_closed",
+        market: { isOpen: false, timestamp: marketTimestamp, reason: marketReason || "market_closed" },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        wouldExecuteCount: counts.eligibleCount,
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
       { status: 200 }
     );
   }
@@ -491,7 +687,16 @@ export async function POST(req: Request) {
         skipped: true,
         reason: "circuit_breaker",
         detail: guardState.autoDisabledReason,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
         counts,
+        notes: notes.slice(0, 40),
         guardrails: guardSummary,
       },
       { status: 200 }
@@ -515,7 +720,16 @@ export async function POST(req: Request) {
         skipped: true,
         reason: "broker_truth_unavailable",
         detail: brokerTruth.error,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
         counts,
+        notes: notes.slice(0, 40),
         guardrails: guardSummary,
       },
       { status: 200 }
@@ -539,7 +753,16 @@ export async function POST(req: Request) {
         skipped: true,
         reason: "max_open_positions",
         detail: `brokerPositionsCount=${brokerTruth.positionsCount}, maxOpenPositions=${guardConfig.maxOpenPositions}`,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
         counts,
+        notes: notes.slice(0, 40),
         guardrails: guardSummary,
       },
       { status: 200 }
@@ -550,7 +773,22 @@ export async function POST(req: Request) {
     counts.skipped += 1;
     await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "max_entries_per_day", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "max_entries_per_day", counts, guardrails: guardSummary },
+      {
+        ok: true,
+        skipped: true,
+        reason: "max_entries_per_day",
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
       { status: 200 }
     );
   }
@@ -567,70 +805,43 @@ export async function POST(req: Request) {
         skipped: true,
         reason: "cooldown_after_loss",
         detail: `${minsRemaining}m`,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
         counts,
+        notes: notes.slice(0, 40),
         guardrails: guardSummary,
       },
       { status: 200 }
     );
   }
-  let idx = -1;
-  for (let i = 0; i < trades.length; i += 1) {
-    const candidate = trades[i];
-    if (!candidate || !isAutoPendingTrade(candidate)) continue;
-    if (!(candidate.source === "auto-entry" || candidate.source === "AUTO")) continue;
-    counts.checked += 1;
-
-    const entryPrice = safeNum(candidate.entryPrice, 0);
-    const stopPrice = safeNum(candidate.stopPrice, 0);
-    const takeProfitPrice = safeNum(candidate.takeProfitPrice, 0);
-    const sideStr = String(candidate.side || "LONG").toUpperCase();
-    const isLong = sideStr === "LONG";
-    let invalidError: string | null = null;
-
-    // Check if trade is stale (created >6h ago or not from today ET)
-    if (isStaleAutoPending(candidate.createdAt, etDate)) {
-      invalidError = "stale_auto_pending";
-    }
-    // Check for price drift between decision price and entry price
-    else if (!invalidError && candidate.decisionPrice) {
-      const driftReason = checkPriceDrift(
-        safeNum(candidate.decisionPrice, 0),
-        entryPrice,
-        stopPrice
-      );
-      if (driftReason) invalidError = driftReason;
-    }
-    // Original basic validations
-    else if (entryPrice <= 0 || stopPrice <= 0 || takeProfitPrice <= 0) {
-      invalidError = "auto_entry_invalid_missing_prices_any";
-    } else if (isLong && stopPrice >= entryPrice) {
-      invalidError = "auto_entry_invalid_bad_stop";
-    }
-
-    if (invalidError) {
-      counts.invalidMarked += 1;
-      trades[i] = {
-        ...candidate,
-        status: "ERROR",
-        brokerStatus: candidate.brokerStatus,
-        error: invalidError,
-        autoEntryStatus: "AUTO_ERROR",
-        errorDetails: { entryPrice: candidate.entryPrice ?? null, stopPrice: candidate.stopPrice ?? null, takeProfitPrice: candidate.takeProfitPrice ?? null },
-        updatedAt: nowIso(),
-      };
-      await writeTrades(trades);
-      continue;
-    }
-
-    idx = i;
-    break;
-  }
+  let idx = eligibleIndexes.length > 0 ? eligibleIndexes[0] : -1;
 
   if (idx === -1) {
     counts.skipped += 1;
     await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "no_AUTO_PENDING", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "no_AUTO_PENDING_trades", counts, guardrails: guardSummary },
+      {
+        ok: true,
+        skipped: true,
+        reason: "no_AUTO_PENDING_trades",
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
       { status: 200 }
     );
   }
@@ -651,7 +862,16 @@ export async function POST(req: Request) {
         skipped: true,
         reason: "ticker_cooldown",
         detail: `${minsRemaining}m`,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
         counts,
+        notes: notes.slice(0, 40),
         guardrails: guardSummary,
       },
       { status: 200 }
@@ -674,7 +894,23 @@ export async function POST(req: Request) {
     counts.skipped += 1;
     await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "already_locked", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "already_locked", tradeId, counts, guardrails: guardSummary },
+      {
+        ok: true,
+        skipped: true,
+        reason: "already_locked",
+        tradeId,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
       { status: 200 }
     );
   }
@@ -687,6 +923,16 @@ export async function POST(req: Request) {
         status: open.status,
         error: open.text || "alpaca open orders lookup failed",
         tradeId,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        counts,
+        notes: notes.slice(0, 40),
         guardrails: guardSummary,
       },
       { status: 500 }
@@ -696,7 +942,24 @@ export async function POST(req: Request) {
     counts.skipped += 1;
     await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "open_order_exists", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     return NextResponse.json(
-      { ok: true, skipped: true, reason: "open_order_exists", tradeId, openOrders: open.orders.map((o: any) => ({ id: o.id, symbol: o.symbol, side: o.side, type: o.type, status: o.status })), counts, guardrails: guardSummary },
+      {
+        ok: true,
+        skipped: true,
+        reason: "open_order_exists",
+        tradeId,
+        openOrders: open.orders.map((o: any) => ({ id: o.id, symbol: o.symbol, side: o.side, type: o.type, status: o.status })),
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
       { status: 200 }
     );
   }
@@ -867,7 +1130,23 @@ export async function POST(req: Request) {
       await disableTradeAsPoison(tradeId, "invalid_stop_vs_base_price");
       await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "invalid_stop_vs_base_price", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
       return NextResponse.json(
-        { ok: true, skipped: true, reason: "invalid_stop_vs_base_price", tradeId, counts, guardrails: guardSummary },
+        {
+          ok: true,
+          skipped: true,
+          reason: "invalid_stop_vs_base_price",
+          tradeId,
+          market: { isOpen: marketOpen, timestamp: marketTimestamp },
+          openPositionsCount: brokerTruth.positionsCount,
+          maxOpenPositions: guardConfig.maxOpenPositions,
+          entriesToday: guardState.entriesToday,
+          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+          pendingCount: counts.pendingCount,
+          eligibleCount: counts.eligibleCount,
+          executedCount: counts.executed,
+          counts,
+          notes: notes.slice(0, 40),
+          guardrails: guardSummary,
+        },
         { status: 200 }
       );
     }
@@ -950,7 +1229,16 @@ export async function POST(req: Request) {
           takeProfitOrderId,
         },
         debug: dbg,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
         counts,
+        notes: notes.slice(0, 40),
         guardrails: guardSummary,
       },
       { status: 200 }
@@ -985,7 +1273,24 @@ export async function POST(req: Request) {
       dedupeTtlSec: 600,
     });
     return NextResponse.json(
-      { ok: false, error: message, stack, tradeId, debug: dbg, counts, guardrails: guardSummary },
+      {
+        ok: false,
+        error: message,
+        stack,
+        tradeId,
+        debug: dbg,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
       { status: 500 }
     );
   }

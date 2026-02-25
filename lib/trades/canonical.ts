@@ -1,9 +1,16 @@
 type CanonicalCandidate = {
+  status?: string | null;
   source?: string | null;
   entryPrice?: number | null;
   stopPrice?: number | null;
+  takeProfitPrice?: number | null;
+  targetPrice?: number | null;
   openedAt?: string | null;
 };
+
+function isOpenStatus(status: any) {
+  return String(status || "").toUpperCase() === "OPEN";
+}
 
 function isAutoSource(source: any) {
   return String(source || "").toUpperCase() === "AUTO";
@@ -12,7 +19,8 @@ function isAutoSource(source: any) {
 function hasValidEntryAndStop(trade: CanonicalCandidate) {
   const entry = Number(trade?.entryPrice);
   const stop = trade?.stopPrice;
-  return Number.isFinite(entry) && entry > 0 && stop != null;
+  const takeProfit = trade?.takeProfitPrice ?? trade?.targetPrice;
+  return Number.isFinite(entry) && entry > 0 && stop != null && takeProfit != null;
 }
 
 function openedAtEpoch(trade: CanonicalCandidate) {
@@ -31,6 +39,10 @@ export function selectCanonicalOpenTrade<T extends CanonicalCandidate>(trades: T
   const ranked = trades
     .map((trade, index) => ({ trade, index }))
     .sort((a, b) => {
+      const aOpen = isOpenStatus(a.trade?.status) ? 1 : 0;
+      const bOpen = isOpenStatus(b.trade?.status) ? 1 : 0;
+      if (aOpen !== bOpen) return bOpen - aOpen;
+
       const aAuto = isAutoSource(a.trade?.source) ? 1 : 0;
       const bAuto = isAutoSource(b.trade?.source) ? 1 : 0;
       if (aAuto !== bAuto) return bAuto - aAuto;
