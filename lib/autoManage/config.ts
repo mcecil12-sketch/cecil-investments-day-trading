@@ -7,6 +7,9 @@ export type AutoManageConfig = {
   trailStartR: number;
   trailPct: number;
   maxPerRun: number;
+  replaceEnabled: boolean;
+  replaceScoreDelta: number;
+  replaceUnknownROverride: boolean;
 };
 
 const num = (v: string | undefined, d: number) => {
@@ -29,5 +32,8 @@ export function getAutoManageConfig(): AutoManageConfig {
     trailStartR: num(process.env.AUTO_MANAGE_TRAIL_R, 2.5),
     trailPct: num(process.env.AUTO_MANAGE_TRAIL_PCT, 0.005),
     maxPerRun: Math.max(1, Math.floor(num(process.env.AUTO_MANAGE_MAX_PER_RUN, 50))),
+    replaceEnabled: process.env.AUTO_MANAGE_REPLACE_ENABLED === "1",
+    replaceScoreDelta: num(process.env.AUTO_MANAGE_REPLACE_SCORE_DELTA, 1.5),
+    replaceUnknownROverride: process.env.AUTO_MANAGE_REPLACE_ALLOW_UNKNOWN_R_OVERRIDE === "1",
   };
 }

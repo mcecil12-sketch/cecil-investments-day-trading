@@ -6,6 +6,15 @@ import { recordReconcile } from "@/lib/maintenance/reconcileTelemetry";
 const POSITION_OPEN_OVERRIDES_CANCELED_v1 = true;
 
 const up = (v: any) => String(v || "").toUpperCase();
+const num = (v: any) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+const isPos = (v: any) => {
+  const n = num(v);
+  return n != null && n > 0;
+};
 
 async function safeJsonArray(text: string | undefined): Promise<any[]> {
   try {
@@ -23,6 +32,36 @@ async function safeJsonObject(text: string | undefined): Promise<any | null> {
   } catch {
     return null;
   }
+}
+
+function collectStopBySymbol(order: any, bySymbol: Map<string, number>) {
+  const symbol = up(order?.symbol);
+  const stop = num(order?.stop_price ?? order?.stopPrice ?? order?.stop_loss?.stop_price);
+  const type = String(order?.type || "").toLowerCase();
+  const isStopLike = type.includes("stop") || stop != null;
+
+  if (symbol && isStopLike && stop != null && stop > 0 && !bySymbol.has(symbol)) {
+    bySymbol.set(symbol, stop);
+  }
+
+  const legs = Array.isArray(order?.legs) ? order.legs : [];
+  for (const leg of legs) {
+    collectStopBySymbol(leg, bySymbol);
+  }
+}
+
+async function fetchOpenStopBySymbol(): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  try {
+    const resp = await alpacaRequest({ method: "GET", path: "/v2/orders?status=open&nested=true&limit=500" });
+    if (!resp.ok) return out;
+    const parsed = JSON.parse(resp.text || "[]");
+    const orders = Array.isArray(parsed) ? parsed : [];
+    for (const order of orders) {
+      collectStopBySymbol(order, out);
+    }
+  } catch {}
+  return out;
 }
 
 export type ReconcileOpenTradesOptions = {
@@ -117,6 +156,7 @@ export async function reconcileOpenTrades(
     const openOrderSymSet = new Set(
       brokerTruth.openOrders.map((o) => up(o.symbol)).filter(Boolean)
     );
+    const openStopBySymbol = await fetchOpenStopBySymbol();
 
     const trades: any[] = await readTrades();
     const openTrades = trades
@@ -183,6 +223,7 @@ export async function reconcileOpenTrades(
       }
 
       if (syncToPositionOpen && existsPos) {
+        const brokerPos = posBySym.get(ticker);
         let orderStatus: string | null = null;
 
         if (alpacaOrderId) {
@@ -263,6 +304,28 @@ export async function reconcileOpenTrades(
           ) {
             t.avgFillPrice = Number(t.entryPrice);
           }
+
+          if (!isPos(t.entryPrice)) {
+            const brokerEntry = num((brokerPos as any)?.avg_entry_price);
+            if (brokerEntry != null && brokerEntry > 0) {
+              t.entryPrice = brokerEntry;
+              if (!isPos(t.avgFillPrice)) t.avgFillPrice = brokerEntry;
+            }
+          }
+
+          if (!isPos(t.stopPrice)) {
+            const stopFromOrder = openStopBySymbol.get(ticker);
+            if (stopFromOrder != null && stopFromOrder > 0) {
+              t.stopPrice = stopFromOrder;
+            }
+          }
+
+          if (!isPos(t.stopPrice)) {
+            t.status = "ERROR";
+            t.autoEntryStatus = "INVALID";
+            t.error = "missing_stop_price";
+            t.reason = "missing_stop_price";
+          }
         }
 
         synced += 1;
@@ -275,6 +338,9 @@ export async function reconcileOpenTrades(
           existsOrderSym,
           sync: dryRun ? "would_sync" : "synced",
           orderStatus: orderStatus || null,
+          hydratedEntry: !isPos(t?.entryPrice) ? false : undefined,
+          hydratedStop: !isPos(t?.stopPrice) ? false : undefined,
+          invalidReason: !isPos(t?.stopPrice) ? "missing_stop_price" : undefined,
         });
         continue;
       }
@@ -318,12 +384,19 @@ export async function reconcileOpenTrades(
         openedAt: pos.created_at || nowIso,
         updatedAt: nowIso,
         entryPrice: Number(pos.avg_entry_price || 0),
+        stopPrice: openStopBySymbol.get(posTicker) ?? null,
         filledQty: Math.abs(Number(pos.qty || 0)),
         avgFillPrice: Number(pos.avg_entry_price || 0),
-        autoEntryStatus: "OPEN",
+        autoEntryStatus: isPos(openStopBySymbol.get(posTicker)) ? "OPEN" : "INVALID",
         alpacaStatus: "position_open",
         brokerStatus: "position_open",
       };
+
+      if (!isPos(newTrade.stopPrice)) {
+        newTrade.status = "ERROR";
+        newTrade.error = "missing_stop_price";
+        newTrade.reason = "missing_stop_price";
+      }
 
       if (!dryRun) {
         trades.push(newTrade);

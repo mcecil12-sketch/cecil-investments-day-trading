@@ -8,6 +8,7 @@ import { reconcileOpenTrades } from "@/lib/maintenance/reconcileOpenTrades";
 import { sendNotification } from "@/lib/notifications/notify";
 import { selectCanonicalOpenTrade } from "@/lib/trades/canonical";
 import { decideCutLossAction } from "@/lib/autoManage/cutLoss";
+import { computeUnrealizedR, decideReplacement } from "@/lib/autoManage/risk";
 
 export type AutoManageResult = {
   ok: true;
@@ -69,6 +70,52 @@ function midFromQuote(q: any): number | null {
   return null;
 }
 
+function collectStopBySymbol(order: any, out: Map<string, number>) {
+  const symbol = String(order?.symbol || "").toUpperCase();
+  const stop = num(order?.stop_price ?? order?.stopPrice ?? order?.stop_loss?.stop_price);
+  const type = String(order?.type || "").toLowerCase();
+  const isStopLike = type.includes("stop") || stop != null;
+
+  if (symbol && isStopLike && stop != null && stop > 0 && !out.has(symbol)) {
+    out.set(symbol, stop);
+  }
+
+  const legs = Array.isArray(order?.legs) ? order.legs : [];
+  for (const leg of legs) {
+    collectStopBySymbol(leg, out);
+  }
+}
+
+async function fetchOpenStopBySymbol() {
+  const out = new Map<string, number>();
+  try {
+    const resp = await alpacaRequest({ method: "GET", path: "/v2/orders?status=open&nested=true&limit=500" });
+    if (!resp.ok) return out;
+    const parsed = JSON.parse(resp.text || "[]");
+    const orders = Array.isArray(parsed) ? parsed : [];
+    for (const order of orders) {
+      collectStopBySymbol(order, out);
+    }
+  } catch {}
+  return out;
+}
+
+async function fetchLatestBarClose(ticker: string): Promise<number | null> {
+  try {
+    const resp = await alpacaRequest({
+      method: "GET",
+      path: `/v2/stocks/${encodeURIComponent(ticker)}/bars/latest?timeframe=1Min`,
+    });
+    if (!resp.ok) return null;
+    const parsed = JSON.parse(resp.text || "{}");
+    const bar = (parsed as any)?.bar || (parsed as any)?.bars?.[ticker] || parsed;
+    const close = num((bar as any)?.c ?? (bar as any)?.close ?? (bar as any)?.close_price);
+    return close != null && close > 0 ? close : null;
+  } catch {
+    return null;
+  }
+}
+
 function riskPerShare(entry: number, stop: number) {
   const r = Math.abs(entry - stop);
   return r > 0 ? r : null;
@@ -82,56 +129,25 @@ function hasValidRiskFields(trade: any) {
 }
 
 async function computeUnrealizedMetrics(args: {
-  ticker: string;
   side: string;
   entry: number | null;
   stop: number | null;
   qty: number;
-  quotePx: number | null;
+  currentPrice: number | null;
 }): Promise<
-  | { ok: true; px: number; entry: number; qty: number; unrealizedPnL: number; unrealizedR: number; source: string }
+  | { ok: true; px: number; entry: number; qty: number; unrealizedPnL: number; unrealizedR: number }
   | { ok: false; reason: string }
 > {
+  const entry = args.entry;
   const stop = args.stop;
-  if (stop == null || !Number.isFinite(stop) || stop <= 0) {
-    return { ok: false, reason: "missing_stop" };
-  }
-
-  let px = args.quotePx;
-  let entry = args.entry;
-  let qty = args.qty;
-  let source = "quote";
-
-  if (px == null || entry == null || !Number.isFinite(entry) || entry <= 0 || !Number.isFinite(qty) || qty <= 0) {
-    try {
-      const posRaw = await getPositions(args.ticker);
-      const pos = Array.isArray(posRaw)
-        ? posRaw.find((p: any) => String(p?.symbol || "").toUpperCase() === args.ticker)
-        : posRaw;
-
-      const posQty = Math.abs(Number((pos as any)?.qty ?? 0));
-      const posEntry = Number((pos as any)?.avg_entry_price ?? 0);
-      const posPx = Number((pos as any)?.current_price ?? 0);
-      const posMv = Number((pos as any)?.market_value ?? 0);
-
-      if (!Number.isFinite(qty) || qty <= 0) qty = posQty;
-      if (entry == null || !Number.isFinite(entry) || entry <= 0) entry = posEntry;
-      if (px == null) {
-        if (Number.isFinite(posPx) && posPx > 0) {
-          px = posPx;
-        } else if (Number.isFinite(posMv) && Number.isFinite(qty) && qty > 0) {
-          px = Math.abs(posMv) / qty;
-        }
-      }
-
-      source = "position";
-    } catch {
-      // ignore and fall through to validations
-    }
-  }
+  const px = args.currentPrice;
+  const qty = args.qty;
 
   if (entry == null || !Number.isFinite(entry) || entry <= 0) {
     return { ok: false, reason: "missing_entry" };
+  }
+  if (stop == null || !Number.isFinite(stop) || stop <= 0) {
+    return { ok: false, reason: "missing_stop" };
   }
   if (px == null || !Number.isFinite(px) || px <= 0) {
     return { ok: false, reason: "missing_price" };
@@ -140,20 +156,30 @@ async function computeUnrealizedMetrics(args: {
     return { ok: false, reason: "missing_qty" };
   }
 
-  const rps = riskPerShare(entry, stop);
-  if (!rps) {
-    return { ok: false, reason: "no_risk" };
+  let rReason = "unknown";
+  const unrealizedRRaw = computeUnrealizedR({
+    side: args.side,
+    entryPrice: entry,
+    stopPrice: stop,
+    currentPrice: px,
+    clampAbs: 50,
+    onInvalid: (reason) => {
+      rReason = reason;
+    },
+  });
+
+  if (unrealizedRRaw == null) {
+    return { ok: false, reason: `r_compute_${rReason}` };
   }
 
-  const pnlPerShare = args.side === "SHORT" ? (entry - px) : (px - entry);
+  const pnlPerShare = String(args.side || "").toUpperCase() === "SHORT" ? (entry - px) : (px - entry);
   return {
     ok: true,
     px,
     entry,
     qty,
     unrealizedPnL: r2(pnlPerShare * qty),
-    unrealizedR: r3(pnlPerShare / rps),
-    source,
+    unrealizedR: r3(unrealizedRRaw),
   };
 }
 
@@ -276,6 +302,10 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   const cfg = getAutoManageConfig();
   const now = new Date().toISOString();
   const notes: string[] = [];
+  const pushNote = (note: string) => {
+    if (!note) return;
+    if (notes.length < 120) notes.push(note);
+  };
   const force = !!opts.force;
 
   // === RECONCILE at START ===
@@ -300,7 +330,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   }
   // Non-fatal: we continue even if reconcile failed
   console.log(`[autoManage] ${reconcileNote}`);
-  if (reconcileNote) notes.push(`${reconcileNote}`);
+  if (reconcileNote) pushNote(`${reconcileNote}`);
 
   if (!cfg.enabled) {
     await recordAutoManage({ ts: now, outcome: "SKIP", reason: "disabled", source: opts.source, runId: opts.runId });
@@ -361,10 +391,10 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
         updatedAt: now,
       };
       duplicateArchived += 1;
-      notes.push(`duplicate_archived:${ticker}:${dupId}:${nextReason}`);
+      pushNote(`duplicate_archived:${ticker}:${dupId}:${nextReason}`);
     }
 
-    notes.push(
+    pushNote(
       `dedupe:ticker=${ticker} canonical=${String(canonical?.id || "unknown")} skipped=[${duplicates
         .map((d: any) => String(d?.id || "unknown"))
         .join(",")}]`
@@ -390,9 +420,36 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   let rescueAttempted = 0;
   let rescueOk = 0;
   let rescueFailed = 0;
+  let replaceConsidered = 0;
+  let replaceExecuted = 0;
+  const replaceSkippedByReason: Record<string, number> = {};
   let hadFailures = false;
   const max = Math.min(cfg.maxPerRun, open.length);
   updated += duplicateArchived;
+
+  const pendingCandidates = all
+    .filter((t: any) => String(t?.status || "").toUpperCase() === "AUTO_PENDING")
+    .map((t: any) => {
+      const score = num(t?.aiScore ?? t?.score ?? t?.ai?.score);
+      return {
+        id: String(t?.id || ""),
+        ticker: String(t?.ticker || "").toUpperCase(),
+        score,
+      };
+    })
+    .filter((t: any) => t.ticker);
+  const topCandidate = [...pendingCandidates].sort((a, b) => (b.score ?? Number.NEGATIVE_INFINITY) - (a.score ?? Number.NEGATIVE_INFINITY))[0] || null;
+
+  const openStopBySymbol = await fetchOpenStopBySymbol();
+  const positionBySymbol = new Map<string, any>();
+  try {
+    const positionsRaw = await getPositions();
+    const positions = Array.isArray(positionsRaw) ? positionsRaw : [positionsRaw];
+    for (const p of positions) {
+      const symbol = String((p as any)?.symbol || "").toUpperCase();
+      if (symbol) positionBySymbol.set(symbol, p);
+    }
+  } catch {}
 
   for (let i = 0; i < max; i++) {
     const t: any = open[i];
@@ -401,18 +458,72 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     const id = String(t.id || "");
     const ticker = String(t.ticker || "").toUpperCase();
     const side = String(t.side || "LONG").toUpperCase();
-    const qty = Number(t.quantity ?? t.qty ?? 0);
+    const idx = next.findIndex((x: any) => x.id === id);
+    const brokerPos = positionBySymbol.get(ticker);
 
-    const entry = num(t.entryPrice);
-    const stop = num(t.stopPrice);
+    let qty = Number(t.quantity ?? t.qty ?? t.shares ?? 0);
+    if (!(Number.isFinite(qty) && qty > 0)) {
+      const brokerQty = Math.abs(Number((brokerPos as any)?.qty ?? 0));
+      if (Number.isFinite(brokerQty) && brokerQty > 0) qty = brokerQty;
+    }
 
-    if (!id || !ticker || !stop || !["LONG", "SHORT"].includes(side)) {
-      notes.push(`skip_invalid:${id || ticker}`);
+    let entry = num(t.entryPrice);
+    if (!(entry != null && entry > 0)) {
+      const brokerEntry = num((brokerPos as any)?.avg_entry_price);
+      if (brokerEntry != null && brokerEntry > 0) {
+        entry = brokerEntry;
+        if (idx >= 0) {
+          next[idx] = {
+            ...next[idx],
+            entryPrice: brokerEntry,
+            avgFillPrice: num(next[idx]?.avgFillPrice) ?? brokerEntry,
+            updatedAt: now,
+          };
+          updated++;
+        }
+        pushNote(`hydrate_entry_from_broker:${ticker}`);
+      }
+    }
+
+    let stop = num(t.stopPrice);
+    if (!(stop != null && stop > 0)) {
+      const stopFromOrder = openStopBySymbol.get(ticker);
+      if (stopFromOrder != null && stopFromOrder > 0) {
+        stop = stopFromOrder;
+        if (idx >= 0) {
+          next[idx] = {
+            ...next[idx],
+            stopPrice: stopFromOrder,
+            updatedAt: now,
+          };
+          updated++;
+        }
+        pushNote(`hydrate_stop_from_order:${ticker}`);
+      }
+    }
+
+    if (!id || !ticker || !["LONG", "SHORT"].includes(side)) {
+      pushNote(`skip_invalid:${id || ticker}`);
+      continue;
+    }
+
+    if (!(stop != null && stop > 0)) {
+      if (idx >= 0) {
+        next[idx] = {
+          ...next[idx],
+          status: "ERROR",
+          autoEntryStatus: "INVALID",
+          error: "missing_stop_price",
+          reason: "missing_stop_price",
+          updatedAt: now,
+        };
+        updated++;
+      }
+      pushNote(`mark_invalid_missing_stop:${ticker}`);
       continue;
     }
 
     if (cfg.eodFlatten && marketClosed) {
-      const idx = next.findIndex((x: any) => x.id === id);
       if (idx >= 0) {
         next[idx] = { ...next[idx], autoManage: { ...(next[idx].autoManage || {}), eodFlattenedAt: now } };
         updated++;
@@ -421,24 +532,115 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
       continue;
     }
 
+    let currentPrice: number | null = null;
+    let priceSource = "none";
+
+    const posPx = num((brokerPos as any)?.current_price);
+    const posMv = num((brokerPos as any)?.market_value);
+    if (posPx != null && posPx > 0) {
+      currentPrice = posPx;
+      priceSource = "position.current_price";
+    } else if (posMv != null && posMv > 0 && Number.isFinite(qty) && qty > 0) {
+      currentPrice = Math.abs(posMv) / qty;
+      priceSource = "position.market_value";
+    }
+
     let quotePx: number | null = null;
-    try {
-      const q: any = await getLatestQuote(ticker);
-      quotePx = midFromQuote(q);
-    } catch {
-      quotePx = null;
+    if (currentPrice == null) {
+      try {
+        const q: any = await getLatestQuote(ticker);
+        quotePx = midFromQuote(q);
+      } catch {
+        quotePx = null;
+      }
+      if (quotePx != null && quotePx > 0) {
+        currentPrice = quotePx;
+        priceSource = "quote.mid";
+      }
+    }
+
+    if (currentPrice == null) {
+      const barClose = await fetchLatestBarClose(ticker);
+      if (barClose != null && barClose > 0) {
+        currentPrice = barClose;
+        priceSource = "bar.1Min.close";
+      }
     }
 
     const metrics = await computeUnrealizedMetrics({
-      ticker,
       side,
       entry,
       stop,
       qty,
-      quotePx,
+      currentPrice,
     });
     if (!metrics.ok) {
-      notes.push(`skip_no_r:${ticker}:${metrics.reason}`);
+      if (metrics.reason === "missing_price") {
+        pushNote(`r_compute_failed_missing_price:${ticker}`);
+      } else {
+        pushNote(`r_compute_failed:${ticker}:${metrics.reason}`);
+      }
+      if (idx >= 0) {
+        next[idx] = {
+          ...next[idx],
+          lastPrice: currentPrice != null ? r2(currentPrice) : next[idx]?.lastPrice,
+          unrealizedR: null,
+          autoManage: {
+            ...(next[idx].autoManage || {}),
+            lastRunAt: now,
+            lastRule: "R_UNAVAILABLE",
+            lastPriceSource: priceSource,
+          },
+          updatedAt: now,
+        };
+        updated++;
+      }
+
+      if (cfg.replaceEnabled && topCandidate) {
+        const openScore = num(t?.aiScore ?? t?.score ?? t?.ai?.score);
+        const decision = decideReplacement({
+          openUnrealizedR: null,
+          openScore,
+          candidateScore: topCandidate.score,
+          allowUnknownROverride: cfg.replaceUnknownROverride,
+          overrideScoreDelta: cfg.replaceScoreDelta,
+        });
+        replaceConsidered += 1;
+        pushNote(
+          `replace_considered:${ticker}:candidate=${topCandidate.ticker}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
+        );
+        if (decision.execute && topCandidate.ticker && topCandidate.ticker !== ticker) {
+          const closeRes = await submitMarketCloseForTrade(t, ticker);
+          if (closeRes.ok && idx >= 0) {
+            replaceExecuted += 1;
+            next[idx] = {
+              ...next[idx],
+              status: "CLOSED",
+              autoEntryStatus: "CLOSED",
+              closeReason: "replace_for_better_candidate",
+              closeOrderId: closeRes.orderId,
+              closeOrderStatus: closeRes.status,
+              closedAt: now,
+              updatedAt: now,
+            };
+            pushNote(
+              `replace_executed:${ticker}:reason=${decision.reason}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
+            );
+            updated++;
+            flattened++;
+          } else {
+            const failReason = closeRes.ok ? "candidate_same_ticker" : `close_failed_${closeRes.error}`;
+            replaceSkippedByReason[failReason] = (replaceSkippedByReason[failReason] ?? 0) + 1;
+            pushNote(`replace_skipped_reason:${failReason}:${ticker}`);
+            if (!closeRes.ok) hadFailures = true;
+          }
+        } else {
+          replaceSkippedByReason[decision.reason] = (replaceSkippedByReason[decision.reason] ?? 0) + 1;
+          pushNote(
+            `replace_skipped_reason:${decision.reason}:${ticker}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
+          );
+        }
+      }
       continue;
     }
 
@@ -447,6 +649,55 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     const px = metrics.px;
     const entryForCalc = metrics.entry;
     const rps = riskPerShare(entryForCalc, stop)!;
+
+    if (cfg.replaceEnabled && topCandidate) {
+      const openScore = num(t?.aiScore ?? t?.score ?? t?.ai?.score);
+      const decision = decideReplacement({
+        openUnrealizedR: unrealizedR,
+        openScore,
+        candidateScore: topCandidate.score,
+        allowUnknownROverride: cfg.replaceUnknownROverride,
+        overrideScoreDelta: cfg.replaceScoreDelta,
+      });
+      replaceConsidered += 1;
+      pushNote(
+        `replace_considered:${ticker}:candidate=${topCandidate.ticker}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
+      );
+      if (decision.execute && topCandidate.ticker && topCandidate.ticker !== ticker) {
+        const closeRes = await submitMarketCloseForTrade(t, ticker);
+        if (closeRes.ok && idx >= 0) {
+          replaceExecuted += 1;
+          next[idx] = {
+            ...next[idx],
+            status: "CLOSED",
+            autoEntryStatus: "CLOSED",
+            closeReason: "replace_for_better_candidate",
+            closeOrderId: closeRes.orderId,
+            closeOrderStatus: closeRes.status,
+            unrealizedPnL,
+            unrealizedR,
+            lastPrice: r2(px),
+            closedAt: now,
+            updatedAt: now,
+          };
+          pushNote(
+            `replace_executed:${ticker}:reason=${decision.reason}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
+          );
+          updated++;
+          flattened++;
+          continue;
+        }
+        const failReason = closeRes.ok ? "candidate_same_ticker" : `close_failed_${closeRes.error}`;
+        replaceSkippedByReason[failReason] = (replaceSkippedByReason[failReason] ?? 0) + 1;
+        pushNote(`replace_skipped_reason:${failReason}:${ticker}`);
+        if (!closeRes.ok) hadFailures = true;
+      } else {
+        replaceSkippedByReason[decision.reason] = (replaceSkippedByReason[decision.reason] ?? 0) + 1;
+        pushNote(
+          `replace_skipped_reason:${decision.reason}:${ticker}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
+        );
+      }
+    }
 
     const cutLossAction = decideCutLossAction({
       enabled: cfg.cutLossEnabled,
@@ -461,10 +712,9 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
 
     if (cutLossAction) {
       const closeRes = await submitMarketCloseForTrade(t, ticker);
-      const idx = next.findIndex((x: any) => x.id === id);
 
       if (!closeRes.ok) {
-        notes.push(`cut_loss_fail:${ticker}:${closeRes.error}${closeRes.detail ? ":" + closeRes.detail : ""}`);
+        pushNote(`cut_loss_fail:${ticker}:${closeRes.error}${closeRes.detail ? ":" + closeRes.detail : ""}`);
         hadFailures = true;
         if (idx >= 0) {
           next[idx] = {
@@ -510,7 +760,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
         };
       }
 
-      notes.push(`cut_loss_exit:ticker=${ticker} r=${cutLossAction.r.toFixed(3)} qty=${closeRes.qty}`);
+      pushNote(`cut_loss_exit:ticker=${ticker} r=${cutLossAction.r.toFixed(3)} qty=${closeRes.qty}`);
 
       try {
         await sendNotification({
@@ -531,7 +781,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
           },
         });
       } catch (notifyErr: any) {
-        notes.push(`cut_loss_notify_fail:${ticker}:${String(notifyErr?.message || notifyErr)}`);
+        pushNote(`cut_loss_notify_fail:${ticker}:${String(notifyErr?.message || notifyErr)}`);
       }
 
       flattened++;
@@ -566,7 +816,6 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
       nextStop = side === "SHORT" ? Math.min(nextStop, trailStop) : Math.max(nextStop, trailStop);
     }
 
-    const idx = next.findIndex((x: any) => x.id === id);
     if (idx >= 0) {
       // STOP RESCUE FAILSAFE: ensure there's always an active protective stop
       let rescueAttemptedLocal = false;
@@ -593,7 +842,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
               },
               updatedAt: now,
             };
-            notes.push(`stop_rescue_ok:${ticker}:${rescueNote}`);
+            pushNote(`stop_rescue_ok:${ticker}:${rescueNote}`);
             updated++;
           } else {
             rescueFailed++;
@@ -608,12 +857,12 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
               },
               updatedAt: now,
             };
-            notes.push(`stop_rescue_fail:${ticker}:${rescueNote}`);
+            pushNote(`stop_rescue_fail:${ticker}:${rescueNote}`);
             hadFailures = true;
           }
         }
       } catch (rescueErr: any) {
-        notes.push(`stop_rescue_exception:${ticker}:${String(rescueErr?.message || rescueErr)}`);
+        pushNote(`stop_rescue_exception:${ticker}:${String(rescueErr?.message || rescueErr)}`);
       }
 
       const changedStop = Math.abs(nextStop - stop) > 1e-6;
@@ -638,7 +887,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
             error: undefined,
           };
           if (res.quantizationNote) {
-            notes.push(`quantize:${ticker}:${res.quantizationNote}`);
+            pushNote(`quantize:${ticker}:${res.quantizationNote}`);
           }
         } else {
           stopSyncOk = false;
@@ -667,7 +916,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
       if (changedStop) {
         syncTag = stopSyncOk ? " sync:OK" : " sync:FAIL";
       }
-      notes.push(
+      pushNote(
         `t:${ticker} r:${unrealizedR.toFixed(3)} px:${px2.toFixed(2)} stop:${stopFrom.toFixed(2)}→${stopTo.toFixed(2)} rule:${noteRule}${syncTag}`
       );
 
@@ -685,13 +934,21 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
       };
 
       if (!stopSyncOk) {
-        notes.push(`stop_sync_fail:${ticker}:${stopSyncNote}`);
+        pushNote(`stop_sync_fail:${ticker}:${stopSyncNote}`);
         hadFailures = true;
       } else if (changedStop) {
-        notes.push(`stop_sync_ok:${ticker}`);
+        pushNote(`stop_sync_ok:${ticker}`);
       }
 
       updated++;
+    }
+  }
+
+  if (replaceConsidered > 0 || replaceExecuted > 0 || Object.keys(replaceSkippedByReason).length > 0) {
+    pushNote(`replace_considered:${replaceConsidered}`);
+    pushNote(`replace_executed:${replaceExecuted}`);
+    for (const [reason, count] of Object.entries(replaceSkippedByReason)) {
+      pushNote(`replace_skipped_reason:${reason}:${count}`);
     }
   }
 
