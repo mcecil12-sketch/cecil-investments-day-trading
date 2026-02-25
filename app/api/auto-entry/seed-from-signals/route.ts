@@ -1,65 +1,68 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readSignals } from "@/lib/jsonDb";
 import { readTrades, upsertTrade } from "@/lib/tradesStore";
-import { alpacaRequest } from "@/lib/alpaca";
 import { getAutoConfig, tierForScore } from "@/lib/autoEntry/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+type RawSignal = Record<string, any>;
 
-function round2(n: number) {
-  return Number(Number(n).toFixed(2));
-}
-
-function ensureLegsLong(basePrice: number, stopPrice: number, takeProfitPrice: number) {
-  const base = Number(basePrice);
-  let sl = Number(stopPrice);
-  let tp = Number(takeProfitPrice);
-  const min = 0.01;
-  if (!(tp >= base + min)) tp = round2(base + min);
-  if (!(sl <= base - min)) sl = round2(base - min);
-  return { stopPrice: sl, takeProfitPrice: tp };
-}
-
-async function fetchBasePrice(ticker: string): Promise<number | null> {
-  const enc = encodeURIComponent(ticker);
-
-  const q = await alpacaRequest({ method: "GET", path: `/v2/stocks/${enc}/quotes/latest` });
-  if (q.ok && q.text) {
-    try {
-      const parsed = JSON.parse(q.text || "{}");
-      const qt = (parsed as any)?.quote || (parsed as any)?.quotes?.[0] || parsed;
-      const ap = Number(qt?.ap ?? qt?.ask_price ?? qt?.ask ?? NaN);
-      const bp = Number(qt?.bp ?? qt?.bid_price ?? qt?.bid ?? NaN);
-      const lp = Number(qt?.lp ?? qt?.last_price ?? qt?.p ?? qt?.price ?? NaN);
-      if (ap > 0 && bp > 0) return (ap + bp) / 2;
-      if (lp > 0) return lp;
-      if (ap > 0) return ap;
-      if (bp > 0) return bp;
-    } catch {}
+function getNum(obj: any, paths: string[]): number | null {
+  for (const path of paths) {
+    const parts = path.split(".");
+    let cur: any = obj;
+    for (const p of parts) {
+      if (cur == null) {
+        cur = undefined;
+        break;
+      }
+      cur = cur[p];
+    }
+    if (cur == null || cur === "") continue;
+    const n = Number(cur);
+    if (Number.isFinite(n)) return n;
   }
-
-  const t = await alpacaRequest({ method: "GET", path: `/v2/stocks/${enc}/trades/latest` });
-  if (t.ok && t.text) {
-    try {
-      const parsed = JSON.parse(t.text || "{}");
-      const tr = (parsed as any)?.trade || (parsed as any)?.trades?.[0] || parsed;
-      const px = Number(tr?.p ?? tr?.price ?? NaN);
-      if (px > 0) return px;
-    } catch {}
-  }
-
   return null;
 }
 
-function computeSeedPrices(base: number) {
-  const entryPrice = round2(base);
-  const rawStop = round2(base * 0.99);
-  const risk = Math.abs(entryPrice - rawStop);
-  const rawTp = round2(entryPrice + risk * 2.0);
-  const legs = ensureLegsLong(entryPrice, rawStop, rawTp);
-  return { entryPrice, stopPrice: legs.stopPrice, takeProfitPrice: legs.takeProfitPrice };
+function getSymbol(signal: RawSignal): string {
+  const raw = signal?.symbol ?? signal?.ticker;
+  return String(raw || "").trim().toUpperCase();
+}
+
+function normalizeDirection(raw: any): "LONG" | "SHORT" | null {
+  const d = String(raw || "").trim().toUpperCase();
+  if (d === "LONG" || d === "SHORT") return d;
+  return null;
+}
+
+function getDirection(signal: RawSignal): "LONG" | "SHORT" | null {
+  return (
+    normalizeDirection(signal?.bestDirection) ||
+    normalizeDirection(signal?.direction) ||
+    normalizeDirection(signal?.aiDirection) ||
+    normalizeDirection(signal?.side)
+  );
+}
+
+function parseSignalsPayload(payload: any): RawSignal[] {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.signals)) return payload.signals;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.items)) return payload.items;
+  return [];
+}
+
+async function fetchScoredSignalsFromInternalApi(): Promise<RawSignal[]> {
+  const base = process.env.NEXT_PUBLIC_BASE_URL ?? "http://127.0.0.1:3000";
+  const url = `${base.replace(/\/$/, "")}/api/signals/all?since=48h&onlyActive=1&order=desc&limit=1000&statuses=SCORED`;
+  const resp = await fetch(url, { method: "GET", cache: "no-store" });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`signals_all_fetch_failed:${resp.status}:${text.slice(0, 200)}`);
+  }
+  const json = await resp.json().catch(() => ({}));
+  return parseSignalsPayload(json);
 }
 
 function etDate(d = new Date()): string {
@@ -93,93 +96,130 @@ export async function POST(req: NextRequest) {
   // Apply defaults and bounds
   const limit = Number.isFinite(limitParsed)
     ? Math.max(1, Math.min(50, limitParsed))
-    : Math.max(1, Math.min(10, Number(process.env.AUTO_SEED_LIMIT ?? "3")));
+    : 1;
 
   const minScore = Number.isFinite(minScoreParsed)
     ? minScoreParsed
-    : Number(process.env.AUTO_SEED_MIN_SCORE ?? "7.5");
+    : 0;
 
   const today = etDate();
 
-  const [signals, trades] = await Promise.all([readSignals(), readTrades<any>()]);
+  const [signals, trades] = await Promise.all([
+    fetchScoredSignalsFromInternalApi(),
+    readTrades<any>(),
+  ]);
 
   const existingBySignalId = new Set<string>();
-  const existingByTickerToday = new Set<string>();
+  const existingPendingBySymbolSide = new Set<string>();
 
   for (const t of trades || []) {
     const sid = String(t?.signalId || "");
     if (sid) existingBySignalId.add(sid);
 
-    const createdAt = String(t?.createdAt || "");
-    const ticker = String(t?.ticker || "").toUpperCase();
-    if (ticker && createdAt.startsWith(today)) existingByTickerToday.add(ticker);
+    const status = String(t?.status || "").toUpperCase();
+    const symbol = String(t?.ticker || t?.symbol || "").toUpperCase();
+    const side = normalizeDirection(t?.side);
+    if (status === "AUTO_PENDING" && symbol && side) {
+      existingPendingBySymbolSide.add(`${symbol}:${side}`);
+    }
   }
-
-  const candidates = (signals || [])
-    .filter((s: any) => {
-      if (!s) return false;
-      const createdAt = String(s.createdAt || "");
-      if (!createdAt.startsWith(today)) return false;
-      if (s.shownInApp !== true) return false;
-      if (String(s.status || "").toUpperCase() !== "SCORED") return false;
-      const score = Number(s.score ?? 0);
-      if (!Number.isFinite(score) || score < minScore) return false;
-      const ticker = String(s.ticker || "").toUpperCase();
-      if (!ticker) return false;
-      return true;
-    })
-    .sort((a: any, b: any) => Number(b.score ?? 0) - Number(a.score ?? 0));
 
   const created: any[] = [];
   const skipped: any[] = [];
 
-  for (const s of candidates) {
-    if (created.length >= limit) break;
+  const seenCandidateSymbolSide = new Set<string>();
+  let totalCandidates = 0;
+
+  const sortedSignals = [...(signals || [])].sort(
+    (a: any, b: any) =>
+      (getNum(b, ["aiScore", "score"]) ?? Number.NEGATIVE_INFINITY) -
+      (getNum(a, ["aiScore", "score"]) ?? Number.NEGATIVE_INFINITY)
+  );
+
+  for (const s of sortedSignals) {
+
+    const status = String(s?.status || "").toUpperCase();
+    if (status !== "SCORED") continue;
+    if (s?.qualified !== true) {
+      skipped.push({ symbol: getSymbol(s) || "UNKNOWN", reason: "not_qualified" });
+      continue;
+    }
+
+    const symbol = getSymbol(s);
+    if (!symbol) {
+      skipped.push({ symbol: "UNKNOWN", reason: "missing_symbol" });
+      continue;
+    }
+
+    const side = getDirection(s);
+    if (!side) {
+      skipped.push({ symbol, reason: "missing_direction" });
+      continue;
+    }
+
+    const aiScore = getNum(s, ["aiScore", "score"]);
+    if (aiScore == null || aiScore < minScore) {
+      skipped.push({ symbol, reason: "below_minScore" });
+      continue;
+    }
+
+    const entryPrice = getNum(s, ["entryPrice", "ai.entryPrice"]);
+    const stopPrice = getNum(s, ["stopPrice", "ai.stopPrice"]);
+    const targetPrice = getNum(s, ["targetPrice", "takeProfitPrice", "ai.targetPrice", "ai.takeProfitPrice"]);
+
+    if (entryPrice == null || stopPrice == null || targetPrice == null) {
+      skipped.push({ symbol, reason: "missing_required_prices" });
+      continue;
+    }
+
+    const symbolSide = `${symbol}:${side}`;
+    if (seenCandidateSymbolSide.has(symbolSide)) {
+      skipped.push({ symbol, reason: "duplicate_symbol_side_in_batch" });
+      continue;
+    }
+    seenCandidateSymbolSide.add(symbolSide);
+    totalCandidates += 1;
+
+    if (created.length >= limit) {
+      skipped.push({ symbol, reason: "limit_reached" });
+      continue;
+    }
 
     const signalId = String(s.id || "");
-    const ticker = String(s.ticker || "").toUpperCase();
-    const score = Number(s.score ?? 0);
 
     if (signalId && existingBySignalId.has(signalId)) {
-      skipped.push({ ticker, signalId, reason: "already_has_trade_for_signal" });
+      skipped.push({ symbol, reason: "already_has_trade_for_signal" });
       continue;
     }
 
-    if (existingByTickerToday.has(ticker)) {
-      skipped.push({ ticker, signalId, reason: "already_has_trade_for_ticker_today" });
+    if (existingPendingBySymbolSide.has(symbolSide)) {
+      skipped.push({ symbol, reason: "already_has_pending_for_symbol_side" });
       continue;
     }
 
-    const tier = tierForScore(score) || "C";
+    const tier = tierForScore(aiScore) || "C";
     if (tier === "C" && !cfg.allowedTiers.includes("C")) {
-      skipped.push({ ticker, signalId, reason: "tier_c_disabled" });
+      skipped.push({ symbol, reason: "tier_c_disabled" });
       continue;
     }
-
-
-    const base = await fetchBasePrice(ticker);
-    if (!base) {
-      skipped.push({ ticker, signalId, reason: "no_base_price" });
-      continue;
-    }
-    const { entryPrice, stopPrice, takeProfitPrice } = computeSeedPrices(base);
 
     const now = new Date().toISOString();
 
     const trade = {
       id: crypto.randomUUID(),
-      ticker,
-      side: "LONG",
+      ticker: symbol,
+      side,
       entryPrice,
       stopPrice,
-      takeProfitPrice,
+      targetPrice,
+      takeProfitPrice: targetPrice,
       status: "AUTO_PENDING",
       source: "AUTO",
       paper: true,
       createdAt: now,
       updatedAt: now,
       signalId,
-      score,
+      aiScore,
       tier,
       autoEntryStatus: "AUTO_PENDING",
     };
@@ -187,8 +227,15 @@ export async function POST(req: NextRequest) {
     await upsertTrade(trade);
 
     existingBySignalId.add(signalId);
-    existingByTickerToday.add(ticker);
-    created.push({ id: trade.id, ticker, signalId, score, tier });
+    existingPendingBySymbolSide.add(symbolSide);
+    created.push({
+      id: trade.id,
+      symbol,
+      side,
+      signalId,
+      aiScore,
+      tier,
+    });
   }
 
   return NextResponse.json(
@@ -197,13 +244,8 @@ export async function POST(req: NextRequest) {
       today,
       limit,
       minScore,
-      // Echo raw query params for prod visibility
-      receivedQuery: {
-        limitRaw,
-        minScoreRaw,
-      },
       totalSignals: (signals || []).length,
-      totalCandidates: candidates.length,
+      totalCandidates,
       createdCount: created.length,
       skippedCount: skipped.length,
       created,
