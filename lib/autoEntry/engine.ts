@@ -1,22 +1,9 @@
+import { getAutoConfig } from "./config";
+import { readTrades } from "@/lib/tradesStore";
+import { fetchAlpacaClock } from "@/lib/alpacaClock";
+import { alpacaRequest } from "@/lib/alpaca";
 
-import { getAutoConfig, tierForScore, riskMultForTier, AutoTier } from "./config";
-
-type AnySignal = Record<string, any>;
 type AnyTrade = Record<string, any>;
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function etDateKey(d = new Date()) {
-  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" });
-  return fmt.format(d);
-}
-
-function safeNum(v: any, fb = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fb;
-}
 
 type EnsureTokenSuccess = {
   ok: true;
@@ -28,6 +15,33 @@ type EnsureTokenFailure =
   | { ok: false; status: 401; error: "unauthorized" };
 
 type EnsureTokenResult = EnsureTokenSuccess | EnsureTokenFailure;
+
+type RunAction = {
+  id: string;
+  ticker: string;
+  side: string;
+  decision: "WOULD_EXECUTE" | "SKIP";
+  reason: string;
+};
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function etDateKey(d = new Date()) {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return fmt.format(d);
+}
+
+function safeNum(v: any, fb = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fb;
+}
 
 function headerToken(req: Request) {
   const h = req.headers.get("x-auto-entry-token") || "";
@@ -44,115 +58,72 @@ function ensureToken(req: Request): EnsureTokenResult {
   return { ok: true as const, cfg };
 }
 
-function isMarketHoursGuard() {
+function isAutoPendingTrade(t: AnyTrade) {
+  return (
+    String(t?.status || "").toUpperCase() === "AUTO_PENDING" &&
+    ["AUTO", "AUTO-ENTRY"].includes(String(t?.source || "").toUpperCase())
+  );
+}
+
+function getTakeProfit(trade: AnyTrade) {
+  return safeNum(trade?.takeProfitPrice ?? trade?.targetPrice, 0);
+}
+
+function hasMissingFields(trade: AnyTrade) {
+  const ticker = String(trade?.ticker || "").toUpperCase();
+  const side = String(trade?.side || "").toUpperCase();
+  const entry = safeNum(trade?.entryPrice, 0);
+  const stop = safeNum(trade?.stopPrice, 0);
+  const tp = getTakeProfit(trade);
+
+  return !ticker || !["LONG", "SHORT"].includes(side) || !(entry > 0) || !(stop > 0) || !(tp > 0);
+}
+
+function hasInvalidPrices(trade: AnyTrade) {
+  const side = String(trade?.side || "").toUpperCase();
+  const entry = safeNum(trade?.entryPrice, 0);
+  const stop = safeNum(trade?.stopPrice, 0);
+  const tp = getTakeProfit(trade);
+
+  if (side === "LONG") {
+    return stop >= entry || tp <= entry;
+  }
+  if (side === "SHORT") {
+    return stop <= entry || tp >= entry;
+  }
   return true;
 }
 
-async function redis() {
-  const mod = await import("../redis");
-  return mod;
+function byNewestCreatedAtDesc(a: AnyTrade, b: AnyTrade) {
+  const aTs = Date.parse(String(a?.createdAt || 0)) || 0;
+  const bTs = Date.parse(String(b?.createdAt || 0)) || 0;
+  return bTs - aTs;
 }
 
-async function readRecentSignals(limit = 300): Promise<AnySignal[]> {
-  const r = await redis();
-  if (!r || !r.redis) return [];
-  const ids: string[] = await r.redis.lrange("signals:ids", 0, limit - 1);
-  if (!ids.length) return [];
-  const pipeline = r.redis.pipeline();
-  for (const id of ids) pipeline.get(`signal:${id}`);
-  const res = await pipeline.exec();
-  const out: AnySignal[] = [];
-  for (const item of res) {
-    const val = (item as [unknown, string | null] | undefined)?.[1];
-    if (!val) continue;
-    try { out.push(JSON.parse(val)); } catch {}
+function isStalePending(trade: AnyTrade, maxAgeHours: number) {
+  const createdAt = String(trade?.createdAt || "");
+  if (!createdAt) return false;
+  const ts = Date.parse(createdAt);
+  if (!Number.isFinite(ts)) return false;
+  const ageHours = (Date.now() - ts) / (1000 * 60 * 60);
+  return ageHours > maxAgeHours;
+}
+
+async function hasOpenOrderForTicker(ticker: string): Promise<boolean> {
+  const qs = `status=open&symbols=${encodeURIComponent(ticker)}&limit=50`;
+  const resp = await alpacaRequest({ method: "GET", path: `/v2/orders?${qs}` });
+  if (!resp.ok) return false;
+  try {
+    const parsed = JSON.parse(resp.text || "[]");
+    const arr = Array.isArray(parsed) ? parsed : [];
+    return arr.length > 0;
+  } catch {
+    return false;
   }
-  return out;
 }
 
-async function readTrades(): Promise<AnyTrade[]> {
-  const r = await redis();
-  if (!r || !r.redis) return [];
-  const ids: string[] = await r.redis.lrange("trades:ids", 0, 999);
-  if (!ids.length) return [];
-  const pipeline = r.redis.pipeline();
-  for (const id of ids) pipeline.get(`trade:${id}`);
-  const res = await pipeline.exec();
-  const out: AnyTrade[] = [];
-  for (const item of res) {
-    const val = (item as [unknown, string | null] | undefined)?.[1];
-    if (!val) continue;
-    try { out.push(JSON.parse(val)); } catch {}
-  }
-  return out;
-}
-
-function isOpenTrade(t: AnyTrade) {
-  const s = String(t?.status || "").toUpperCase();
-  return ["OPEN", "BROKER_PENDING", "UNMANAGED", "MANAGING"].includes(s);
-}
-
-async function setnxLock(key: string, ttlSec: number) {
-  const r = await redis();
-  if (!r || !r.redis) return false;
-  const ok = await r.redis.set(key, "1", { nx: true, ex: ttlSec });
-  return Boolean(ok);
-}
-
-async function bumpDailyCounter(key: string) {
-  const r = await redis();
-  if (!r || !r.redis) return 0;
-  const day = etDateKey();
-  const k = `${key}:${day}`;
-  const n = await r.redis.incr(k);
-  if (n === 1) await r.redis.expire(k, 60 * 60 * 36);
-  return n;
-}
-
-async function getDailyCounter(key: string) {
-  const r = await redis();
-  if (!r || !r.redis) return 0;
-  const day = etDateKey();
-  const k = `${key}:${day}`;
-  const v = await r.redis.get(k);
-  return safeNum(v, 0);
-}
-
-async function writeTrade(trade: AnyTrade) {
-  const r = await redis();
-  if (!r || !r.redis) return;
-  const id = trade.id;
-  await r.redis.set(`trade:${id}`, JSON.stringify(trade));
-  await r.redis.lrem("trades:ids", 0, id);
-  await r.redis.lpush("trades:ids", id);
-}
-
-function pickEntryFromSignal(s: AnySignal) {
-  // Use aiDirection if available (from bidirectional scoring), otherwise fall back to side
-  const direction = (s as any).aiDirection || s.side || "LONG";
-  return {
-    ticker: String(s.ticker || "").toUpperCase(),
-    side: String(direction).toUpperCase(),
-    entryPrice: safeNum(s.entryPrice, 0),
-    stopPrice: safeNum(s.stopPrice, 0),
-    targetPrice: safeNum(s.targetPrice, 0),
-  };
-}
-
-function shouldConsiderSignal(s: AnySignal) {
-  if (!s) return false;
-  if (!s.ticker) return false;
-  if (s.status && String(s.status).toUpperCase() === "ERROR") return false;
-  if (s.qualified !== true) return false;
-  if (typeof s.score !== "number") return false;
-  if (!s.signalContext) return false;
-  const barsUsed = safeNum(s.signalContext?.barsUsed, 0);
-  if (barsUsed < 20) return false;
-  return true;
-}
-
-function tierAllowed(tier: AutoTier, cfg: ReturnType<typeof getAutoConfig>) {
-  return cfg.allowedTiers.includes(tier);
+function inc(map: Record<string, number>, reason: string) {
+  map[reason] = (map[reason] ?? 0) + 1;
 }
 
 export async function runAutoEntryOnce(req: Request) {
@@ -161,97 +132,185 @@ export async function runAutoEntryOnce(req: Request) {
 
   const cfg = auth.cfg;
   const startedAt = nowIso();
+  const url = new URL(req.url);
+  const dryRun = ["1", "true", "yes", "on"].includes(
+    String(url.searchParams.get("dryRun") || "").toLowerCase()
+  );
 
   if (!cfg.enabled) {
-    return { ok: true, skipped: true, reason: "AUTO_TRADING_ENABLED=false", startedAt };
+    return { ok: true, skipped: true, reason: "AUTO_TRADING_ENABLED=false", startedAt, dryRun };
   }
   if (!cfg.paperOnly) {
-    return { ok: true, skipped: true, reason: "AUTO_TRADING_PAPER_ONLY=false (blocked in Phase 4)", startedAt };
-  }
-
-  if (!isMarketHoursGuard()) {
-    return { ok: true, skipped: true, reason: "marketClosed", startedAt };
-  }
-
-  const trades = await readTrades();
-  const openCount = trades.filter(isOpenTrade).length;
-  if (openCount >= cfg.maxOpen) {
-    return { ok: true, skipped: true, reason: `maxOpenReached:${openCount}/${cfg.maxOpen}`, startedAt };
-  }
-
-  const entriesToday = await getDailyCounter("auto:entries");
-  if (entriesToday >= cfg.maxPerDay) {
-    return { ok: true, skipped: true, reason: `maxPerDayReached:${entriesToday}/${cfg.maxPerDay}`, startedAt };
-  }
-
-  const signals = await readRecentSignals(300);
-  const candidates = signals
-    .filter(shouldConsiderSignal)
-    .sort((a, b) => safeNum(b.score, 0) - safeNum(a.score, 0));
-
-  const actions: any[] = [];
-
-  for (const s of candidates) {
-    const score = safeNum(s.score, 0);
-    const tier = tierForScore(score);
-    if (!tier) continue;
-    if (!tierAllowed(tier, cfg)) continue;
-
-    const lockKey = `auto:lock:signal:${String(s.id || s.signalId || s.ticker)}:${etDateKey()}`;
-    const locked = await setnxLock(lockKey, 60 * 60 * 12);
-    if (!locked) {
-      actions.push({ id: s.id, ticker: s.ticker, action: "skip", reason: "already_locked" });
-      continue;
-    }
-
-    const { ticker, side, entryPrice, stopPrice, targetPrice } = pickEntryFromSignal(s);
-    if (!ticker || entryPrice <= 0 || stopPrice <= 0) {
-      actions.push({ id: s.id, ticker, action: "skip", reason: "missing_prices" });
-      continue;
-    }
-
-    const riskMult = riskMultForTier(tier);
-
-    const tradeId = crypto.randomUUID();
-    const trade: AnyTrade = {
-      id: tradeId,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-      ticker,
-      side,
-      entryPrice,
-      stopPrice,
-      targetPrice,
-      status: "AUTO_PENDING",
-      source: "auto-entry",
-      signalId: s.id || null,
-      ai: { score, tier, riskMult },
-      paper: true,
+    return {
+      ok: true,
+      skipped: true,
+      reason: "AUTO_TRADING_PAPER_ONLY=false (blocked in Phase 4)",
+      startedAt,
+      dryRun,
     };
+  }
 
-    await writeTrade(trade);
+  let marketIsOpen = false;
+  let marketTimestamp = startedAt;
+  try {
+    const clock = await fetchAlpacaClock();
+    marketIsOpen = Boolean(clock.is_open);
+    marketTimestamp = String((clock as any)?.timestamp || (clock as any)?.next_open || startedAt);
+  } catch {
+    marketIsOpen = false;
+  }
 
-    await bumpDailyCounter("auto:entries");
+  const maxPendingAgeHours = Number.isFinite(Number(process.env.AUTO_PENDING_MAX_AGE_HOURS))
+    ? Math.max(1, Number(process.env.AUTO_PENDING_MAX_AGE_HOURS))
+    : 24;
 
-    actions.push({
-      id: s.id,
-      ticker,
-      action: "created_trade",
-      tradeId,
-      tier,
-      score,
-      riskMult,
-    });
+  const allTrades = await readTrades<AnyTrade>();
+  const pending = allTrades.filter(isAutoPendingTrade);
 
-    break;
+  const pendingSorted = [...pending].sort(byNewestCreatedAtDesc);
+  const pendingSample = pendingSorted.slice(0, 10).map((t) => ({
+    id: String(t?.id || ""),
+    ticker: String(t?.ticker || "").toUpperCase(),
+    side: String(t?.side || "").toUpperCase(),
+    entryPrice: t?.entryPrice ?? null,
+    stopPrice: t?.stopPrice ?? null,
+    takeProfitPrice: t?.takeProfitPrice ?? t?.targetPrice ?? null,
+    createdAt: t?.createdAt ?? null,
+  }));
+
+  const byTicker = new Map<string, AnyTrade[]>();
+  for (const t of pendingSorted) {
+    const ticker = String(t?.ticker || "").toUpperCase();
+    if (!ticker) continue;
+    const arr = byTicker.get(ticker) || [];
+    arr.push(t);
+    byTicker.set(ticker, arr);
+  }
+
+  const canonicalByTicker: AnyTrade[] = [];
+  const skipsByReason: Record<string, number> = {};
+  const actions: RunAction[] = [];
+
+  for (const [ticker, list] of byTicker.entries()) {
+    const sorted = [...list].sort(byNewestCreatedAtDesc);
+    const canonical = sorted[0];
+    canonicalByTicker.push(canonical);
+
+    if (sorted.length > 1) {
+      for (let i = 1; i < sorted.length; i++) {
+        const dup = sorted[i];
+        actions.push({
+          id: String(dup?.id || ""),
+          ticker,
+          side: String(dup?.side || "").toUpperCase(),
+          decision: "SKIP",
+          reason: "duplicate_ticker",
+        });
+        inc(skipsByReason, "duplicate_ticker");
+      }
+    }
+  }
+
+  const openTrades = allTrades.filter(
+    (t) => String(t?.status || "").toUpperCase() === "OPEN"
+  );
+  const openTickers = new Set(openTrades.map((t) => String(t?.ticker || "").toUpperCase()).filter(Boolean));
+  const openPositionsCount = openTickers.size;
+
+  const today = etDateKey();
+  const entriesToday = allTrades.filter((t) => {
+    const createdAt = String(t?.createdAt || "");
+    const src = String(t?.source || "").toUpperCase();
+    return createdAt.startsWith(today) && (src === "AUTO" || src === "AUTO-ENTRY");
+  }).length;
+
+  let eligibleCount = 0;
+
+  const globalMaxOpenBlocked = openPositionsCount >= cfg.maxOpen;
+  if (globalMaxOpenBlocked) inc(skipsByReason, "max_open_positions");
+
+  const globalMaxPerDayBlocked = entriesToday >= cfg.maxPerDay;
+  if (globalMaxPerDayBlocked) inc(skipsByReason, "max_entries_per_day");
+
+  if (!marketIsOpen) inc(skipsByReason, "market_closed");
+
+  for (const trade of canonicalByTicker) {
+    const id = String(trade?.id || "");
+    const ticker = String(trade?.ticker || "").toUpperCase();
+    const side = String(trade?.side || "").toUpperCase();
+
+    if (isStalePending(trade, maxPendingAgeHours)) {
+      actions.push({ id, ticker, side, decision: "SKIP", reason: "stale_trade" });
+      inc(skipsByReason, "stale_trade");
+      continue;
+    }
+
+    if (hasMissingFields(trade)) {
+      actions.push({ id, ticker, side, decision: "SKIP", reason: "missing_fields" });
+      inc(skipsByReason, "missing_fields");
+      continue;
+    }
+
+    if (hasInvalidPrices(trade)) {
+      actions.push({ id, ticker, side, decision: "SKIP", reason: "invalid_prices" });
+      inc(skipsByReason, "invalid_prices");
+      continue;
+    }
+
+    if (openTickers.has(ticker)) {
+      actions.push({ id, ticker, side, decision: "SKIP", reason: "already_open" });
+      inc(skipsByReason, "already_open");
+      continue;
+    }
+
+    if (globalMaxOpenBlocked) {
+      actions.push({ id, ticker, side, decision: "SKIP", reason: "max_open_positions" });
+      continue;
+    }
+
+    if (globalMaxPerDayBlocked) {
+      actions.push({ id, ticker, side, decision: "SKIP", reason: "max_entries_per_day" });
+      continue;
+    }
+
+    const hasOpenOrder = await hasOpenOrderForTicker(ticker);
+    if (hasOpenOrder) {
+      actions.push({ id, ticker, side, decision: "SKIP", reason: "already_has_open_order" });
+      inc(skipsByReason, "already_has_open_order");
+      continue;
+    }
+
+    eligibleCount += 1;
+
+    if (!marketIsOpen) {
+      actions.push({ id, ticker, side, decision: "WOULD_EXECUTE", reason: "market_closed" });
+      continue;
+    }
+
+    if (dryRun) {
+      actions.push({ id, ticker, side, decision: "WOULD_EXECUTE", reason: "dry_run" });
+    } else {
+      actions.push({ id, ticker, side, decision: "WOULD_EXECUTE", reason: "execution_delegated_to_execute_endpoint" });
+    }
   }
 
   return {
     ok: true,
     startedAt,
-    candidates: candidates.length,
-    openCount,
-    entriesToday: await getDailyCounter("auto:entries"),
+    dryRun,
+    market: {
+      isOpen: marketIsOpen,
+      timestamp: marketTimestamp,
+      reason: marketIsOpen ? undefined : "market_closed",
+    },
+    pendingCount: pending.length,
+    eligibleCount,
+    openPositionsCount,
+    maxOpenPositions: cfg.maxOpen,
+    entriesToday,
+    maxEntriesPerDay: cfg.maxPerDay,
+    skipsByReason,
+    pendingSample,
     actions,
   };
 }
