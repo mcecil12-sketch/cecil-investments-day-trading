@@ -7,7 +7,7 @@ import { syncStopForTrade, rescueStop } from "@/lib/autoManage/stopSync";
 import { reconcileOpenTrades } from "@/lib/maintenance/reconcileOpenTrades";
 import { sendNotification } from "@/lib/notifications/notify";
 import { selectCanonicalOpenTrade } from "@/lib/trades/canonical";
-import { decideCutLossAction } from "@/lib/autoManage/cutLoss";
+import { evaluateCutLoss } from "@/lib/autoManage/cutLoss";
 import { computeUnrealizedR, decideReplacement } from "@/lib/autoManage/risk";
 
 export type AutoManageResult = {
@@ -575,6 +575,9 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
       currentPrice,
     });
     if (!metrics.ok) {
+      if (metrics.reason.startsWith("missing_")) {
+        pushNote(`r_compute_failed_missing_fields:${ticker}`);
+      }
       if (metrics.reason === "missing_price") {
         pushNote(`r_compute_failed_missing_price:${ticker}`);
       } else {
@@ -699,7 +702,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
       }
     }
 
-    const cutLossAction = decideCutLossAction({
+    const cutLossEvaluation = evaluateCutLoss({
       enabled: cfg.cutLossEnabled,
       thresholdR: cfg.cutLossR,
       trade: {
@@ -709,6 +712,8 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
         unrealizedR,
       },
     });
+    if (cutLossEvaluation.note) pushNote(cutLossEvaluation.note);
+    const cutLossAction = cutLossEvaluation.action;
 
     if (cutLossAction) {
       const closeRes = await submitMarketCloseForTrade(t, ticker);

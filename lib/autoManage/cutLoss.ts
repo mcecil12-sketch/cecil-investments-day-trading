@@ -13,8 +13,49 @@ export type CutLossAction = {
   r: number;
 };
 
+export type CutLossEvaluation = {
+  action: CutLossAction | null;
+  note?: string;
+};
+
 function isOpen(status: any) {
   return String(status || "").toUpperCase() === "OPEN";
+}
+
+export function evaluateCutLoss(args: {
+  enabled: boolean;
+  thresholdR: number;
+  trade: CutLossTradeLike;
+}): CutLossEvaluation {
+  const { enabled, thresholdR, trade } = args;
+  const ticker = String(trade?.ticker || "").toUpperCase();
+
+  if (!enabled) {
+    return { action: null, note: "cutloss_skip_disabled" };
+  }
+  if (!trade || !isOpen(trade.status)) {
+    return { action: null };
+  }
+
+  const rawR = trade?.unrealizedR;
+  const r = rawR == null ? NaN : Number(rawR);
+  if (!Number.isFinite(r)) {
+    return { action: null, note: `cutloss_skip_r_unknown:${ticker}` };
+  }
+  if (r > thresholdR) {
+    return { action: null };
+  }
+
+  return {
+    action: {
+      tradeId: String(trade.id),
+      ticker,
+      reason: "cut_loss_r",
+      rule: "CUT_LOSS_R",
+      r,
+    },
+    note: `cutloss_trigger:${ticker}:r=${r.toFixed(3)}`,
+  };
 }
 
 export function decideCutLossAction(args: {
@@ -22,21 +63,7 @@ export function decideCutLossAction(args: {
   thresholdR: number;
   trade: CutLossTradeLike;
 }): CutLossAction | null {
-  const { enabled, thresholdR, trade } = args;
-  if (!enabled) return null;
-  if (!trade || !isOpen(trade.status)) return null;
-
-  const r = Number(trade.unrealizedR);
-  if (!Number.isFinite(r)) return null;
-  if (r > thresholdR) return null;
-
-  return {
-    tradeId: String(trade.id),
-    ticker: String(trade.ticker || "").toUpperCase(),
-    reason: "cut_loss_r",
-    rule: "CUT_LOSS_R",
-    r,
-  };
+  return evaluateCutLoss(args).action;
 }
 
 export function planCanonicalCutLossActions(args: {
