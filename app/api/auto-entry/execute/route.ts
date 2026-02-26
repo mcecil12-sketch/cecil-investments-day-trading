@@ -23,6 +23,11 @@ import {
 import { scoreSignalWithAI } from "@/lib/aiScoring";
 import { evaluateBreakerTransition } from "@/lib/autoEntry/breaker";
 import { getEtDateString } from "@/lib/time/etDate";
+import {
+  buildAutoEntryDisabledNotificationEvent,
+  notificationEnv,
+  shouldSendAutoEntryDisabledNotification,
+} from "@/lib/autoEntry/disabledNotification";
 
 function ensureBracketLegsValid(params: {
   side: "LONG" | "SHORT";
@@ -464,17 +469,30 @@ async function fireNotification(event: NotificationEvent) {
   }
 }
 
-async function emitAutoDisabledNotification(tradeId: string, reason: string, ticker: string) {
-  await fireNotification({
-    type: "AUTO_ENTRY_DISABLED",
-    tradeId,
-    ticker,
-    title: `Auto entry disabled ${ticker}`,
-    message: `Auto entry has been disabled: ${reason}`,
-    paper: true,
-    dedupeKey: "AUTO_ENTRY_DISABLED",
-    dedupeTtlSec: 3600,
-  });
+async function emitAutoDisabledNotification(args: {
+  tradeId: string;
+  reason: string;
+  ticker: string;
+  host: string;
+  env: string;
+  etDate: string;
+  runId: string;
+}) {
+  if (!shouldSendAutoEntryDisabledNotification(args.env)) {
+    return;
+  }
+
+  await fireNotification(
+    buildAutoEntryDisabledNotificationEvent({
+      tradeId: args.tradeId,
+      ticker: args.ticker,
+      reason: args.reason,
+      host: args.host,
+      env: args.env,
+      etDate: args.etDate,
+      runId: args.runId,
+    })
+  );
 }
 
 export async function POST(req: Request) {
@@ -496,6 +514,14 @@ export async function POST(req: Request) {
   const guardConfig = getGuardrailConfig();
   const etDate = getEtDateString();
   const guardKeyUsed = guardrailsStore.getGuardrailStateKey(etDate);
+  const env = notificationEnv();
+  const requestHost = (() => {
+    try {
+      const h = new URL(req.url).host;
+      if (h) return h;
+    } catch {}
+    return String(process.env.VERCEL_URL || "unknown-host");
+  })();
   const [guardState, toggleState, brokerTruth] = await Promise.all([
     guardrailsStore.getGuardrailsState(etDate),
     guardrailsStore.getAutoEntryEnabledState(guardConfig),
@@ -754,7 +780,15 @@ export async function POST(req: Request) {
         await guardrailsStore.setAutoDisabled(etDate, "max_consecutive_failures");
         guardSummary.autoDisabledReason = "max_consecutive_failures";
         if (params.tradeId && params.ticker) {
-          await emitAutoDisabledNotification(params.tradeId, "max_consecutive_failures", params.ticker);
+          await emitAutoDisabledNotification({
+            tradeId: params.tradeId,
+            reason: "max_consecutive_failures",
+            ticker: params.ticker,
+            host: requestHost,
+            env,
+            etDate,
+            runId,
+          });
         }
       }
     } else if (params.outcome === "SUCCESS") {
@@ -880,14 +914,14 @@ export async function POST(req: Request) {
 
   if (guardState.autoDisabledReason) {
     counts.skipped += 1;
-    await fireNotification({
-      type: "AUTO_ENTRY_DISABLED",
+    await emitAutoDisabledNotification({
+      tradeId: "guardrail-state",
+      reason: String(guardState.autoDisabledReason),
       ticker: "AUTO_ENTRY",
-      title: "Auto entry disabled",
-      message: `Circuit breaker: ${guardState.autoDisabledReason}`,
-      paper: true,
-      dedupeKey: `AUTO_ENTRY_DISABLED:${guardState.autoDisabledReason}`,
-      dedupeTtlSec: 3600,
+      host: requestHost,
+      env,
+      etDate,
+      runId,
     });
     return NextResponse.json(
       {
