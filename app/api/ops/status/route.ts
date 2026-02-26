@@ -9,11 +9,11 @@ import { getGuardrailConfig } from "@/lib/autoEntry/guardrails";
 import { readAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
 import { readSignals } from "@/lib/jsonDb";
 import { readTrades } from "@/lib/tradesStore";
-import { etDateString } from "@/lib/autoEntry/guardrails";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { readReconcileTelemetry } from "@/lib/maintenance/reconcileTelemetry";
 import { computeScoringWindows } from "@/lib/ops/scoringWindows";
 import { readTodayFunnel } from "@/lib/funnelRedis";
+import { getEtDateString } from "@/lib/time/etDate";
 
 export const dynamic = "force-dynamic";
 
@@ -47,7 +47,7 @@ export async function GET() {
       fetchBrokerTruth(),
       fetchAlpacaClock().catch(() => ({ is_open: null, next_open: null, next_close: null })),
       getGuardrailConfig(),
-      Promise.resolve(etDateString(new Date())),
+      Promise.resolve(getEtDateString()),
       readSignals(),
       readTrades(),
       getClockSafe(),

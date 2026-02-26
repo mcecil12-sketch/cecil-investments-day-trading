@@ -1,24 +1,12 @@
 import { NextResponse } from "next/server";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
+import { getEtDateString } from "@/lib/time/etDate";
 
 export const dynamic = "force-dynamic";
 
 function isAuthorized(req: Request) {
   const token = req.headers.get("x-cron-token") || "";
   return Boolean(process.env.CRON_TOKEN) && token === process.env.CRON_TOKEN;
-}
-
-function etDateNow(): string {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date());
-  const y = parts.find((p) => p.type === "year")?.value || "";
-  const m = parts.find((p) => p.type === "month")?.value || "";
-  const d = parts.find((p) => p.type === "day")?.value || "";
-  return `${y}-${m}-${d}`;
 }
 
 export async function POST(req: Request) {
@@ -28,7 +16,7 @@ export async function POST(req: Request) {
     }
 
     const body = await req.json().catch(() => ({}));
-    const dateET = String(body.dateET || etDateNow());
+    const dateET = String(body.dateET || getEtDateString());
     const reason = String(body.reason || "manual_reset");
 
     await guardrailsStore.resetFailures(dateET);

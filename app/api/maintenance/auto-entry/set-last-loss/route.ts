@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
-import { etDateString } from "@/lib/autoEntry/guardrails";
 import { recordLoss } from "@/lib/autoEntry/guardrailsStore";
+import { getEtDateString } from "@/lib/time/etDate";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,7 +18,7 @@ export async function POST(req: Request) {
   } catch {}
 
   const lastLossAt = body.atIso ? String(body.atIso) : new Date().toISOString();
-  const etDate = etDateString(new Date());
+  const etDate = getEtDateString();
 
   try {
     await recordLoss(etDate, lastLossAt);

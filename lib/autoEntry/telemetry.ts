@@ -29,6 +29,13 @@ function runsKey(etDate: string) {
   return `${PREFIX}:runs:${etDate}`;
 }
 
+export function getAutoEntryTelemetryKeys(etDate: string) {
+  return {
+    dayKey: dayKey(etDate),
+    runsKey: runsKey(etDate),
+  };
+}
+
 function truncErr(x: any, n = 180) {
   const t = String(x?.message || x || "");
   return t.length > n ? t.slice(0, n) + "…" : t;
@@ -132,7 +139,20 @@ export async function recordAutoEntryTelemetry(e: AutoEntryTelemetryEvent) {
 }
 
 export async function readAutoEntryTelemetry(etDate: string, limit: number = 50, debug: boolean = false) {
-  if (!redis) return { etDate, summary: {}, runs: [] };
+  if (!redis) {
+    const keys = getAutoEntryTelemetryKeys(etDate);
+    const debugInfo = debug
+      ? {
+          debugDayKey: keys.dayKey,
+          debugRunsKey: keys.runsKey,
+          debugRawRunsType: "none",
+          debugRawRunsLen: 0,
+          debugParsedRunsLen: 0,
+          debugPreview: "",
+        }
+      : {};
+    return { etDate, summary: {}, runs: [], redis: false, ...debugInfo };
+  }
   const dk = dayKey(etDate);
   const rk = runsKey(etDate);
 
@@ -177,6 +197,7 @@ export async function readAutoEntryTelemetry(etDate: string, limit: number = 50,
   const debugArr = Array.isArray(rawRows) ? rawRows : [];
   const debugInfo = debug
     ? {
+        debugDayKey: dk,
         debugRunsKey: rk,
         debugRawRunsType: rawRows === null ? "null" : Array.isArray(rawRows) ? "array" : typeof rawRows,
         debugRawRunsLen: Array.isArray(rawRows) ? rawRows.length : 0,
@@ -185,5 +206,5 @@ export async function readAutoEntryTelemetry(etDate: string, limit: number = 50,
           typeof debugArr?.[0] === "string" ? String(debugArr[0]).slice(0, 140) : "",
       }
     : {};
-  return { etDate, summary, runs, ...debugInfo };
+  return { etDate, summary, runs, redis: true, ...debugInfo };
 }

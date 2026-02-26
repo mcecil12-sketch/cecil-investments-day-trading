@@ -4,7 +4,7 @@ import { alpacaRequest, createOrder } from "@/lib/alpaca";
 import { redis } from "@/lib/redis";
 import { recordAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
 import { requireAuth } from "@/lib/auth";
-import { getGuardrailConfig, etDateString, minutesSince } from "@/lib/autoEntry/guardrails";
+import { getGuardrailConfig, minutesSince } from "@/lib/autoEntry/guardrails";
 import { getAutoConfig, tierForScore, riskMultForTier } from "@/lib/autoEntry/config";
 import { resolveDecisionPrice, computeBracket, type QuoteLike, type Side } from "@/lib/autoEntry/pricing";
 import { withRedisLock } from "@/lib/locks";
@@ -22,6 +22,7 @@ import {
 } from "@/lib/autoEntry/eligibility";
 import { scoreSignalWithAI } from "@/lib/aiScoring";
 import { evaluateBreakerTransition } from "@/lib/autoEntry/breaker";
+import { getEtDateString } from "@/lib/time/etDate";
 
 function ensureBracketLegsValid(params: {
   side: "LONG" | "SHORT";
@@ -487,7 +488,7 @@ export async function POST(req: Request) {
   };
   const notes: string[] = [];
   const guardConfig = getGuardrailConfig();
-  const etDate = etDateString(new Date());
+  const etDate = getEtDateString();
   const [guardState, toggleState, brokerTruth] = await Promise.all([
     guardrailsStore.getGuardrailsState(etDate),
     guardrailsStore.getAutoEntryEnabledState(guardConfig),

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { readTrades, upsertTrade } from "@/lib/tradesStore";
 import { getAutoConfig, tierForScore } from "@/lib/autoEntry/config";
 import { deriveSessionMeta } from "@/lib/autoEntry/eligibility";
+import { getEtDateString } from "@/lib/time/etDate";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -66,10 +67,6 @@ async function fetchScoredSignalsFromInternalApi(): Promise<RawSignal[]> {
   return parseSignalsPayload(json);
 }
 
-function etDate(d = new Date()): string {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(d);
-}
-
 export async function POST(req: NextRequest) {
   const cronToken = req.headers.get("x-cron-token") || "";
   const autoToken = req.headers.get("x-auto-entry-token") || "";
@@ -103,7 +100,7 @@ export async function POST(req: NextRequest) {
     ? minScoreParsed
     : 0;
 
-  const today = etDate();
+  const today = getEtDateString();
 
   const [signals, trades] = await Promise.all([
     fetchScoredSignalsFromInternalApi(),

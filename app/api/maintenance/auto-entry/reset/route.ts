@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
-import { etDateString } from "@/lib/autoEntry/guardrails";
 import { resetGuardrails } from "@/lib/autoEntry/guardrailsStore";
+import { getEtDateString } from "@/lib/time/etDate";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,7 +17,7 @@ export async function POST(req: Request) {
     body = (await req.json()) as typeof body;
   } catch {}
 
-  const etDate = body.etDate ? body.etDate : etDateString(new Date());
+  const etDate = body.etDate ? body.etDate : getEtDateString();
   const resetFailuresOnly = body.resetFailuresOnly !== false;
 
   await resetGuardrails(etDate, {

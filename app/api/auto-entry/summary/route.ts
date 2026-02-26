@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { etDateString } from "@/lib/autoEntry/guardrails";
 import { readAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
+import { getEtDateString } from "@/lib/time/etDate";
 
 export const dynamic = "force-dynamic";
 
@@ -102,7 +102,7 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const debug = String(url.searchParams.get("debug") || "") === "1";
 
-  const today = etDateString();
+  const today = getEtDateString();
   const wtdStart = startOfWeekET(today);
   const mtdStart = startOfMonth(today);
   const ytdStart = startOfYear(today);

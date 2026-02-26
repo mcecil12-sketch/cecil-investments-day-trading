@@ -1,4 +1,5 @@
 import { autoEnvBool, autoEnvNum } from "./config";
+import { getEtDateString } from "@/lib/time/etDate";
 
 export type GuardrailConfig = {
   enabled: boolean;
@@ -21,13 +22,7 @@ export function getGuardrailConfig(): GuardrailConfig {
 }
 
 export function etDateString(date = new Date()) {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  return fmt.format(date);
+  return getEtDateString(date);
 }
 
 export function minutesSince(iso?: string | null) : number | null {

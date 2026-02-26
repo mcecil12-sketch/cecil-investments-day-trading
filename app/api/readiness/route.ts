@@ -2,9 +2,10 @@ export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
-import { getGuardrailConfig, etDateString, minutesSince } from "@/lib/autoEntry/guardrails";
+import { getGuardrailConfig, minutesSince } from "@/lib/autoEntry/guardrails";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
+import { getEtDateString } from "@/lib/time/etDate";
 
 type Check = {
   name: string;
@@ -107,7 +108,7 @@ export async function GET(req: Request) {
     } catch {}
   }
 
-  const todayEt = etDateString(new Date());
+  const todayEt = getEtDateString();
   const guardConfig = getGuardrailConfig();
   const [guardState, toggleState, brokerTruth] = await Promise.all([
     guardrailsStore.getGuardrailsState(todayEt),
@@ -124,7 +125,7 @@ export async function GET(req: Request) {
     if (!createdAt) return false;
     const t = Date.parse(createdAt);
     if (!Number.isFinite(t)) return false;
-    return etDateString(new Date(t)) === todayEt;
+    return getEtDateString(new Date(t)) === todayEt;
   });
 
   const scoredToday = signalsToday.filter((s) => (s?.status || "").toUpperCase() === "SCORED");
