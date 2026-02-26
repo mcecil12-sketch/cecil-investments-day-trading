@@ -1,6 +1,8 @@
 export type AutoManageConfig = {
   enabled: boolean;
   eodFlatten: boolean;
+  fridayFlattenEnabled: boolean;
+  fridayFlattenAfterEt: string;
   cutLossEnabled: boolean;
   cutLossR: number;
   trailEnabled: boolean;
@@ -41,21 +43,29 @@ export function getAutoManageConfig(): AutoManageConfig {
   // AUTO_MANAGE_CUT_LOSS_R: R threshold that triggers flatten (default -1).
   const cutLossRRaw =
     process.env.AUTO_MANAGE_CUT_LOSS_R ?? process.env.AUTO_CUT_LOSS_R ?? "-1";
-  // REPLACE_ENABLED / AUTO_MANAGE_REPLACE_ENABLED: replacement toggle override.
+  // AUTO_MANAGE_REPLACE_ENABLED / REPLACE_ENABLED: replacement toggle override.
   // Defaults to true in paper mode, false in live mode.
   const replaceEnabledRaw =
-    process.env.REPLACE_ENABLED ?? process.env.AUTO_MANAGE_REPLACE_ENABLED;
-  // REPLACE_SCORE_DELTA / AUTO_MANAGE_REPLACE_SCORE_DELTA: min score gap to replace (default 1.5).
+    process.env.AUTO_MANAGE_REPLACE_ENABLED ?? process.env.REPLACE_ENABLED;
+  // AUTO_MANAGE_REPLACE_SCORE_DELTA / REPLACE_SCORE_DELTA: min score gap to replace (default 1.5).
   const replaceScoreDeltaRaw =
-    process.env.REPLACE_SCORE_DELTA ?? process.env.AUTO_MANAGE_REPLACE_SCORE_DELTA ?? "1.5";
-  // REPLACE_UNKNOWN_R_OVERRIDE / AUTO_MANAGE_REPLACE_ALLOW_UNKNOWN_R_OVERRIDE:
+    process.env.AUTO_MANAGE_REPLACE_SCORE_DELTA ?? process.env.REPLACE_SCORE_DELTA ?? "1.5";
+  // AUTO_MANAGE_REPLACE_UNKNOWN_R_OVERRIDE / REPLACE_UNKNOWN_R_OVERRIDE:
   // allow replacement when open R is unknown (default false).
   const replaceUnknownROverrideRaw =
-    process.env.REPLACE_UNKNOWN_R_OVERRIDE ?? process.env.AUTO_MANAGE_REPLACE_ALLOW_UNKNOWN_R_OVERRIDE;
+    process.env.AUTO_MANAGE_REPLACE_UNKNOWN_R_OVERRIDE ??
+    process.env.REPLACE_UNKNOWN_R_OVERRIDE ??
+    process.env.AUTO_MANAGE_REPLACE_ALLOW_UNKNOWN_R_OVERRIDE;
+  // AUTO_MANAGE_FRIDAY_FLATTEN_ENABLED: Friday flatten guard (default true in paper mode, false in live mode).
+  const fridayFlattenEnabledRaw = process.env.AUTO_MANAGE_FRIDAY_FLATTEN_ENABLED;
+  // AUTO_MANAGE_FRIDAY_FLATTEN_AFTER_ET: Friday flatten ET time gate (default 15:30).
+  const fridayFlattenAfterEt = String(process.env.AUTO_MANAGE_FRIDAY_FLATTEN_AFTER_ET ?? "15:30").trim() || "15:30";
 
   return {
     enabled: process.env.AUTO_MANAGE_ENABLED === "1",
     eodFlatten: process.env.AUTO_MANAGE_EOD_FLATTEN === "1",
+    fridayFlattenEnabled: bool(fridayFlattenEnabledRaw, paperMode),
+    fridayFlattenAfterEt,
     cutLossEnabled: bool(cutLossEnabledRaw, paperMode),
     cutLossR: num(cutLossRRaw, -1.0),
     trailEnabled: process.env.AUTO_MANAGE_TRAIL_ENABLED === "1",

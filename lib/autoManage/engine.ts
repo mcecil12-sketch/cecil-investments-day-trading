@@ -9,6 +9,7 @@ import { sendNotification } from "@/lib/notifications/notify";
 import { selectCanonicalOpenTrade } from "@/lib/trades/canonical";
 import { evaluateCutLoss } from "@/lib/autoManage/cutLoss";
 import { computeUnrealizedR, decideReplacement } from "@/lib/autoManage/risk";
+import { hydrateOpenTradeFromBroker } from "@/lib/autoManage/hydration";
 
 export type AutoManageResult = {
   ok: true;
@@ -194,6 +195,65 @@ function appendRuleNote(trade: any, note: string) {
   if (!existing) return note;
   if (existing.includes(note)) return existing;
   return `${existing} | ${note}`;
+}
+
+function getEtWeekdayHourMinute(d: Date) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour12: false,
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).formatToParts(d);
+
+  const weekdayLabel = parts.find((p) => p.type === "weekday")?.value ?? "";
+  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? "NaN");
+  const minute = Number(parts.find((p) => p.type === "minute")?.value ?? "NaN");
+
+  const weekdayMap: Record<string, number> = {
+    Sun: 0,
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6,
+  };
+
+  return {
+    weekday: weekdayMap[weekdayLabel] ?? -1,
+    hour: Number.isFinite(hour) ? hour : -1,
+    minute: Number.isFinite(minute) ? minute : -1,
+  };
+}
+
+function parseHourMinute(value: string) {
+  const m = String(value || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const hour = Number(m[1]);
+  const minute = Number(m[2]);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return { hour, minute };
+}
+
+function isNearEodWindowEt(nowIso: string, marketClosed: boolean) {
+  if (marketClosed) return false;
+  const now = new Date(nowIso);
+  const et = getEtWeekdayHourMinute(now);
+  return et.hour === 15 && et.minute >= 55;
+}
+
+function isFridayFlattenWindowEt(nowIso: string, afterEt: string, marketClosed: boolean) {
+  if (marketClosed) return false;
+  const now = new Date(nowIso);
+  const et = getEtWeekdayHourMinute(now);
+  if (et.weekday !== 5) return false;
+  const cutoff = parseHourMinute(afterEt);
+  if (!cutoff) return false;
+  if (et.hour > cutoff.hour) return true;
+  if (et.hour < cutoff.hour) return false;
+  return et.minute >= cutoff.minute;
 }
 
 async function submitMarketCloseForTrade(trade: any, ticker: string): Promise<
@@ -410,9 +470,25 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     return { ok: true, skipped: true, reason: "no_open_trades", checked: 0, updated: 0, flattened: 0, enabled: true, now, market: clock, cfg, reconcile: reconcileResult };
   }
 
-  if (marketClosed && !cfg.eodFlatten && !force) {
+  if (marketClosed && !force) {
     await recordAutoManage({ ts: now, outcome: "SKIP", reason: "market_closed", source: opts.source, runId: opts.runId });
     return { ok: true, skipped: true, reason: "market_closed", checked: 0, updated: 0, flattened: 0, enabled: true, now, market: clock, cfg, reconcile: reconcileResult };
+  }
+
+  const flattenAllowedForce = force;
+  const flattenAllowedEod = isNearEodWindowEt(now, marketClosed);
+  const flattenAllowedFriday =
+    cfg.fridayFlattenEnabled && isFridayFlattenWindowEt(now, cfg.fridayFlattenAfterEt, marketClosed);
+  const flattenAllowed = flattenAllowedForce || flattenAllowedEod || flattenAllowedFriday;
+
+  if (flattenAllowedForce) {
+    pushNote("flatten_allowed_force");
+  } else if (flattenAllowedEod) {
+    pushNote("flatten_allowed_eod");
+  } else if (flattenAllowedFriday) {
+    pushNote("flatten_allowed_friday");
+  } else {
+    pushNote("flatten_skip_not_allowed");
   }
 
   let checked = 0;
@@ -466,42 +542,46 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     const idx = next.findIndex((x: any) => x.id === id);
     const brokerPos = positionBySymbol.get(ticker);
 
-    let qty = Number(t.quantity ?? t.qty ?? t.shares ?? 0);
-    if (!(Number.isFinite(qty) && qty > 0)) {
-      const brokerQty = Math.abs(Number((brokerPos as any)?.qty ?? 0));
-      if (Number.isFinite(brokerQty) && brokerQty > 0) {
-        qty = brokerQty;
-        if (idx >= 0) {
-          next[idx] = {
-            ...next[idx],
-            quantity: brokerQty,
-            qty: brokerQty,
-            updatedAt: now,
-          };
-          updated++;
-        }
-        pushNote(`hydrate_qty_from_broker:${ticker}`);
-      } else {
-        pushNote(`hydrate_qty_missing_broker_pos:${ticker}`);
-      }
+    const hydrated = hydrateOpenTradeFromBroker(t, brokerPos);
+    let qty = hydrated.qty;
+    let entry = hydrated.entryPrice;
+
+    if (hydrated.qtyHydrated && qty != null && idx >= 0) {
+      next[idx] = {
+        ...next[idx],
+        quantity: qty,
+        qty,
+        updatedAt: now,
+      };
+      updated++;
+      pushNote(`hydrate_qty_from_broker:${ticker}`);
     }
 
-    let entry = num(t.entryPrice);
-    if (!(entry != null && entry > 0)) {
-      const brokerEntry = num((brokerPos as any)?.avg_entry_price);
-      if (brokerEntry != null && brokerEntry > 0) {
-        entry = brokerEntry;
-        if (idx >= 0) {
-          next[idx] = {
-            ...next[idx],
-            entryPrice: brokerEntry,
-            avgFillPrice: num(next[idx]?.avgFillPrice) ?? brokerEntry,
-            updatedAt: now,
-          };
-          updated++;
-        }
-        pushNote(`hydrate_entry_from_broker:${ticker}`);
+    if (hydrated.entryHydrated && entry != null && idx >= 0) {
+      next[idx] = {
+        ...next[idx],
+        entryPrice: entry,
+        avgFillPrice: num(next[idx]?.avgFillPrice) ?? entry,
+        updatedAt: now,
+      };
+      updated++;
+      pushNote(`hydrate_entry_from_broker:${ticker}`);
+    }
+
+    if (!(qty != null && Number.isFinite(qty) && qty > 0)) {
+      if (idx >= 0) {
+        next[idx] = {
+          ...next[idx],
+          status: "ERROR",
+          autoEntryStatus: "INVALID",
+          error: "invalid_missing_qty_or_broker_match",
+          reason: "invalid_missing_qty_or_broker_match",
+          updatedAt: now,
+        };
+        updated++;
       }
+      pushNote(`mark_invalid_missing_qty:${ticker}`);
+      continue;
     }
 
     let stop = num(t.stopPrice);
@@ -542,7 +622,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
       continue;
     }
 
-    if (cfg.eodFlatten && marketClosed) {
+    if (cfg.eodFlatten && flattenAllowed) {
       if (idx >= 0) {
         next[idx] = { ...next[idx], autoManage: { ...(next[idx].autoManage || {}), eodFlattenedAt: now } };
         updated++;
@@ -665,7 +745,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
           } else if (decision.reason === "replace_skip_r_positive") {
             pushNote(`replace_skip_r_positive:${ticker}`);
           } else if (decision.reason === "replace_skip_delta_too_small") {
-            pushNote(`replace_skip_delta_too_small:${ticker}`);
+            pushNote(`replace_skip_score_delta:${ticker}`);
           } else if (decision.reason === "replace_skip_no_candidates") {
             pushNote("replace_skip_no_candidates");
           }
@@ -730,7 +810,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
         } else if (decision.reason === "replace_skip_r_positive") {
           pushNote(`replace_skip_r_positive:${ticker}`);
         } else if (decision.reason === "replace_skip_delta_too_small") {
-          pushNote(`replace_skip_delta_too_small:${ticker}`);
+          pushNote(`replace_skip_score_delta:${ticker}`);
         } else if (decision.reason === "replace_skip_no_candidates") {
           pushNote("replace_skip_no_candidates");
         }
