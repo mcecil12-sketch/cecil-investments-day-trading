@@ -28,6 +28,22 @@ import {
   notificationEnv,
   shouldSendAutoEntryDisabledNotification,
 } from "@/lib/autoEntry/disabledNotification";
+import { bumpTodayFunnel } from "@/lib/funnelRedis";
+import { buildAutoEntryFunnelFields } from "./funnel";
+
+async function bumpAutoEntryFunnelSafe(fields: Record<string, number | undefined>) {
+  if (!fields || Object.keys(fields).length === 0) return;
+  const numericOnly: Record<string, number> = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (typeof value === "number") numericOnly[key] = value;
+  }
+  if (Object.keys(numericOnly).length === 0) return;
+  try {
+    await bumpTodayFunnel(numericOnly as any);
+  } catch (err) {
+    console.log("[funnel] auto-entry bump failed (non-fatal)", err);
+  }
+}
 
 function ensureBracketLegsValid(params: {
   side: "LONG" | "SHORT";
@@ -338,12 +354,12 @@ async function ensureToken(req: Request) {
   const cfg = getAutoConfig();
 
   const cookieOk = await requireAuth(req);
-  if (cookieOk.ok) return { ok: true as const, cfg };
+  if (cookieOk.ok) return { ok: true as const, cfg, hasCookieAuth: true };
 
-  if (!cfg.token) return { ok: false as const, status: 500, error: "AUTO_ENTRY_TOKEN missing" };
+  if (!cfg.token) return { ok: false as const, status: 500, error: "AUTO_ENTRY_TOKEN missing", hasCookieAuth: false };
   const got = headerToken(req);
-  if (!got || got !== cfg.token) return { ok: false as const, status: 401, error: "unauthorized" };
-  return { ok: true as const, cfg };
+  if (!got || got !== cfg.token) return { ok: false as const, status: 401, error: "unauthorized", hasCookieAuth: false };
+  return { ok: true as const, cfg, hasCookieAuth: false };
 }
 
 async function setnxLock(key: string, ttlSec: number) {
@@ -735,8 +751,12 @@ export async function POST(req: Request) {
     openPositions,
     brokerTruth,
   });
-  const runSource = String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown");
-  const runId = String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "");
+  const runSourceHeader = String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "").trim();
+  const runSource = runSourceHeader || (auth.hasCookieAuth ? "terminal" : "unknown");
+  const runIdHeader = String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "").trim();
+  const runId = runIdHeader || `ae-exec-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+
+  await bumpAutoEntryFunnelSafe({ autoEntryExecutes: 1 });
 
   const pushBreakerNote = (outcome: "SUCCESS" | "SKIP" | "FAIL", action: "increment" | "reset" | "none", after: number, reason: string) => {
     if (action === "increment") {
@@ -819,6 +839,11 @@ export async function POST(req: Request) {
       breakerAction: action,
       breakerReason: params.reason,
     });
+
+    await bumpAutoEntryFunnelSafe(buildAutoEntryFunnelFields({
+      outcome: params.outcome,
+      reason: params.reason,
+    }));
   };
 
   if (!cfg.enabled) {

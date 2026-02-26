@@ -75,7 +75,7 @@ function mergeBucket(acc: Bucket, daySummary: any): Bucket {
   acc.skipped += toNum(daySummary.skipped);
 
   const success = toNum(daySummary.success ?? daySummary["outcome:SUCCESS"] ?? 0);
-  const fail = toNum(daySummary.fail ?? daySummary["outcome:FAIL"] ?? 0);
+  const fail = toNum(daySummary.failed ?? daySummary.fail ?? daySummary["outcome:FAIL"] ?? 0);
   acc.success += success;
   acc.fail += fail;
 

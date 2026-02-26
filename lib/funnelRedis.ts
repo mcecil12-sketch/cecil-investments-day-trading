@@ -36,6 +36,7 @@ const NUMERIC_COUNTERS = [
   "autoEntrySkipMaxOpen",
   "autoEntrySkipNoPending",
   "autoEntrySkipMarketClosed",
+  "autoEntrySkipOther",
 ] as const;
 
 type NumericCounterKey = (typeof NUMERIC_COUNTERS)[number];
