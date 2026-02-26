@@ -21,6 +21,7 @@ import {
   type EligibilityConfig,
 } from "@/lib/autoEntry/eligibility";
 import { scoreSignalWithAI } from "@/lib/aiScoring";
+import { evaluateBreakerTransition } from "@/lib/autoEntry/breaker";
 
 function ensureBracketLegsValid(params: {
   side: "LONG" | "SHORT";
@@ -698,6 +699,78 @@ export async function POST(req: Request) {
     openPositions,
     brokerTruth,
   });
+  const runSource = String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown");
+  const runId = String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "");
+
+  const pushBreakerNote = (outcome: "SUCCESS" | "SKIP" | "FAIL", action: "increment" | "reset" | "none", after: number, reason: string) => {
+    if (action === "increment") {
+      notes.push(`breaker_increment:${after}:${reason}`);
+      return;
+    }
+    if (action === "reset") {
+      notes.push("breaker_reset");
+      return;
+    }
+    if (outcome === "SKIP") {
+      notes.push(`breaker_noop_skip:${reason}`);
+    }
+  };
+
+  const recordOutcome = async (params: {
+    outcome: "SUCCESS" | "SKIP" | "FAIL";
+    reason: string;
+    ticker?: string;
+    tradeId?: string;
+    detail?: string;
+  }) => {
+    const initial = evaluateBreakerTransition({
+      outcome: params.outcome,
+      reason: params.reason,
+      consecutiveFailuresBefore: guardSummary.consecutiveFailures,
+      maxConsecutiveFailures: guardConfig.maxConsecutiveFailures,
+    });
+
+    let after = initial.consecutiveFailuresAfter;
+    let action = initial.breakerAction;
+
+    if (params.outcome === "FAIL") {
+      after = await guardrailsStore.recordFailure(etDate, params.reason);
+      guardSummary.consecutiveFailures = after;
+      const shouldDisable = after >= guardConfig.maxConsecutiveFailures;
+      if (shouldDisable) {
+        await guardrailsStore.setAutoDisabled(etDate, "max_consecutive_failures");
+        guardSummary.autoDisabledReason = "max_consecutive_failures";
+        if (params.tradeId && params.ticker) {
+          await emitAutoDisabledNotification(params.tradeId, "max_consecutive_failures", params.ticker);
+        }
+      }
+    } else if (params.outcome === "SUCCESS") {
+      await guardrailsStore.resetFailures(etDate);
+      await guardrailsStore.clearAutoDisabled(etDate);
+      guardSummary.consecutiveFailures = 0;
+      guardSummary.autoDisabledReason = null;
+      after = 0;
+      action = "reset";
+    }
+
+    pushBreakerNote(params.outcome, action, after, params.reason);
+
+    await recordAutoEntryTelemetry({
+      etDate,
+      at: new Date().toISOString(),
+      outcome: params.outcome,
+      reason: params.reason,
+      ticker: params.ticker,
+      tradeId: params.tradeId,
+      source: runSource,
+      runId,
+      detail: params.detail,
+      consecutiveFailuresBefore: initial.consecutiveFailuresBefore,
+      consecutiveFailuresAfter: after,
+      breakerAction: action,
+      breakerReason: params.reason,
+    });
+  };
 
   if (!cfg.enabled) {
     return NextResponse.json(
@@ -767,7 +840,7 @@ export async function POST(req: Request) {
 
   if (!marketOpen) {
     counts.skipped += 1;
-    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "market_closed", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
+    await recordOutcome({ outcome: "SKIP", reason: "market_closed" });
     return NextResponse.json(
       {
         ok: true,
@@ -825,15 +898,7 @@ export async function POST(req: Request) {
 
   if (brokerTruth.error) {
     counts.skipped += 1;
-    await recordAutoEntryTelemetry({
-      etDate,
-      at: new Date().toISOString(),
-      outcome: "SKIP",
-      reason: "broker_truth_unavailable",
-      source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"),
-      runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || ""),
-      detail: brokerTruth.error,
-    });
+    await recordOutcome({ outcome: "SKIP", reason: "broker_truth_unavailable", detail: brokerTruth.error });
     return NextResponse.json(
       {
         ok: true,
@@ -858,13 +923,9 @@ export async function POST(req: Request) {
 
   if (brokerTruth.positionsCount >= guardConfig.maxOpenPositions) {
     counts.skipped += 1;
-    await recordAutoEntryTelemetry({
-      etDate,
-      at: new Date().toISOString(),
+    await recordOutcome({
       outcome: "SKIP",
       reason: "max_open_positions",
-      source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"),
-      runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || ""),
       detail: `brokerPositionsCount=${brokerTruth.positionsCount}, maxOpenPositions=${guardConfig.maxOpenPositions}`,
     });
     return NextResponse.json(
@@ -891,7 +952,7 @@ export async function POST(req: Request) {
 
   if (guardState.entriesToday >= guardConfig.maxEntriesPerDay) {
     counts.skipped += 1;
-    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "max_entries_per_day", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
+    await recordOutcome({ outcome: "SKIP", reason: "max_entries_per_day" });
     return NextResponse.json(
       {
         ok: true,
@@ -918,7 +979,7 @@ export async function POST(req: Request) {
     const minsRemaining = Math.ceil(guardConfig.cooldownAfterLossMin - sinceLoss);
     guardSummary.cooldownRemainingMin = minsRemaining;
     counts.skipped += 1;
-    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "cooldown_after_loss", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
+    await recordOutcome({ outcome: "SKIP", reason: "cooldown_after_loss" });
     return NextResponse.json(
       {
         ok: true,
@@ -944,7 +1005,7 @@ export async function POST(req: Request) {
 
   if (idx === -1) {
     counts.skipped += 1;
-    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "no_AUTO_PENDING", source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
+    await recordOutcome({ outcome: "SKIP", reason: "no_AUTO_PENDING" });
     return NextResponse.json(
       {
         ok: true,
@@ -975,7 +1036,7 @@ export async function POST(req: Request) {
   if (sinceTicker != null && sinceTicker < guardConfig.tickerCooldownMin) {
     const minsRemaining = Math.ceil(guardConfig.tickerCooldownMin - sinceTicker);
     counts.skipped += 1;
-    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "ticker_cooldown", ticker, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
+    await recordOutcome({ outcome: "SKIP", reason: "ticker_cooldown", ticker });
     return NextResponse.json(
       {
         ok: true,
@@ -1012,7 +1073,7 @@ export async function POST(req: Request) {
   const locked = await setnxLock(lockKey, 60 * 10);
   if (!locked) {
     counts.skipped += 1;
-    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "already_locked", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
+    await recordOutcome({ outcome: "SKIP", reason: "already_locked", ticker, tradeId });
     return NextResponse.json(
       {
         ok: true,
@@ -1037,6 +1098,13 @@ export async function POST(req: Request) {
 
   const open = await hasOpenOrdersForSymbol(ticker);
   if (!open.ok) {
+    await recordOutcome({
+      outcome: "FAIL",
+      reason: "broker_open_orders_lookup_failed",
+      ticker,
+      tradeId,
+      detail: open.text || "alpaca open orders lookup failed",
+    });
     return NextResponse.json(
       {
         ok: false,
@@ -1060,7 +1128,7 @@ export async function POST(req: Request) {
   }
   if (open.orders.length > 0) {
     counts.skipped += 1;
-    await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "open_order_exists", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
+    await recordOutcome({ outcome: "SKIP", reason: "open_order_exists", ticker, tradeId });
     return NextResponse.json(
       {
         ok: true,
@@ -1223,12 +1291,11 @@ export async function POST(req: Request) {
   });
 
   if (!lock.ok) {
-    const failureCount = await guardrailsStore.recordFailure(etDate, "alpaca_error");
-    guardSummary.consecutiveFailures = failureCount;
-    if (failureCount >= guardConfig.maxConsecutiveFailures) {
-      await guardrailsStore.setAutoDisabled(etDate, "max_consecutive_failures");
-      guardSummary.autoDisabledReason = "max_consecutive_failures";
-      await emitAutoDisabledNotification(tradeId, "max_consecutive_failures", ticker);
+    if (lock.error === "LOCKED") {
+      counts.skipped += 1;
+      await recordOutcome({ outcome: "SKIP", reason: "already_locked", ticker, tradeId });
+    } else {
+      await recordOutcome({ outcome: "FAIL", reason: "alpaca_error", ticker, tradeId, detail: lock.error });
     }
     return NextResponse.json(
       {
@@ -1248,7 +1315,8 @@ export async function POST(req: Request) {
     if ((order as any)?.__poison) {
       counts.invalidMarked += 1;
       await disableTradeAsPoison(tradeId, "invalid_stop_vs_base_price");
-      await recordAutoEntryTelemetry({ etDate, at: new Date().toISOString(), outcome: "SKIP", reason: "invalid_stop_vs_base_price", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
+      counts.skipped += 1;
+      await recordOutcome({ outcome: "SKIP", reason: "invalid_stop_vs_base_price", ticker, tradeId });
       return NextResponse.json(
         {
           ok: true,
@@ -1311,12 +1379,7 @@ export async function POST(req: Request) {
     await guardrailsStore.bumpEntry(etDate, ticker);
     guardSummary.entriesToday += 1;
     guardSummary.openPositions += 1;
-    await guardrailsStore.resetFailures(etDate);
-    guardSummary.consecutiveFailures = 0;
-    await guardrailsStore.clearAutoDisabled(etDate);
-    guardSummary.autoDisabledReason = null;
-
-    await recordAutoEntryTelemetry({ etDate, at: startedAt, outcome: "SUCCESS", reason: "placed", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
+    await recordOutcome({ outcome: "SUCCESS", reason: "placed", ticker, tradeId });
     await fireNotification({
       type: "AUTO_ENTRY_PLACED",
       tradeId,
@@ -1366,13 +1429,7 @@ export async function POST(req: Request) {
   } catch (e: any) {
     const message = String(e?.message || e || "unknown_error");
     const stack = String(e?.stack || "");
-    const failureCount = await guardrailsStore.recordFailure(etDate, "execute_error");
-    guardSummary.consecutiveFailures = failureCount;
-    if (failureCount >= guardConfig.maxConsecutiveFailures) {
-      await guardrailsStore.setAutoDisabled(etDate, "max_consecutive_failures");
-      guardSummary.autoDisabledReason = "max_consecutive_failures";
-      await emitAutoDisabledNotification(tradeId, "max_consecutive_failures", ticker);
-    }
+    await recordOutcome({ outcome: "FAIL", reason: "execute_error", ticker, tradeId, detail: message });
     const updated = {
       ...trade,
       status: "ERROR",
@@ -1381,7 +1438,6 @@ export async function POST(req: Request) {
     };
     trades[idx] = updated;
     await writeTrades(trades);
-    await recordAutoEntryTelemetry({ etDate, at: startedAt, outcome: "FAIL", reason: "execute_error", ticker, tradeId, source: String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "unknown"), runId: String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "") });
     await fireNotification({
       type: "AUTO_ENTRY_FAILED",
       tradeId,

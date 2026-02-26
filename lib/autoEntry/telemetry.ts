@@ -13,6 +13,10 @@ export type AutoEntryTelemetryEvent = {
   source?: string;
   runId?: string;
   detail?: string;  // Additional detail like broker position counts
+  consecutiveFailuresBefore?: number;
+  consecutiveFailuresAfter?: number;
+  breakerAction?: "increment" | "reset" | "none";
+  breakerReason?: string;
 };
 
 const PREFIX = "autoentry:telemetry:v1";
@@ -102,6 +106,10 @@ export async function recordAutoEntryTelemetry(e: AutoEntryTelemetryEvent) {
       lastSource: e.source ?? "",
       lastRunId: e.runId ?? "",
       lastDetail: e.detail ?? "",
+      lastConsecutiveFailuresBefore: Number.isFinite(Number(e.consecutiveFailuresBefore)) ? Number(e.consecutiveFailuresBefore) : "",
+      lastConsecutiveFailuresAfter: Number.isFinite(Number(e.consecutiveFailuresAfter)) ? Number(e.consecutiveFailuresAfter) : "",
+      lastBreakerAction: e.breakerAction ?? "",
+      lastBreakerReason: e.breakerReason ?? "",
     });
 
     await safeLpush(rk, JSON.stringify(e));
