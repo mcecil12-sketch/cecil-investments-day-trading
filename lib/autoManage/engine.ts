@@ -159,6 +159,7 @@ async function computeUnrealizedMetrics(args: {
   let rReason = "unknown";
   const unrealizedRRaw = computeUnrealizedR({
     side: args.side,
+    qty,
     entryPrice: entry,
     stopPrice: stop,
     currentPrice: px,
@@ -422,7 +423,6 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   let rescueFailed = 0;
   let replaceConsidered = 0;
   let replaceExecuted = 0;
-  const replaceSkippedByReason: Record<string, number> = {};
   let hadFailures = false;
   const max = Math.min(cfg.maxPerRun, open.length);
   updated += duplicateArchived;
@@ -439,6 +439,11 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     })
     .filter((t: any) => t.ticker);
   const topCandidate = [...pendingCandidates].sort((a, b) => (b.score ?? Number.NEGATIVE_INFINITY) - (a.score ?? Number.NEGATIVE_INFINITY))[0] || null;
+  if (!cfg.replaceEnabled) {
+    pushNote("replace_skip_disabled");
+  } else if (!topCandidate) {
+    pushNote("replace_skip_no_candidates");
+  }
 
   const openStopBySymbol = await fetchOpenStopBySymbol();
   const positionBySymbol = new Map<string, any>();
@@ -464,7 +469,21 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     let qty = Number(t.quantity ?? t.qty ?? t.shares ?? 0);
     if (!(Number.isFinite(qty) && qty > 0)) {
       const brokerQty = Math.abs(Number((brokerPos as any)?.qty ?? 0));
-      if (Number.isFinite(brokerQty) && brokerQty > 0) qty = brokerQty;
+      if (Number.isFinite(brokerQty) && brokerQty > 0) {
+        qty = brokerQty;
+        if (idx >= 0) {
+          next[idx] = {
+            ...next[idx],
+            quantity: brokerQty,
+            qty: brokerQty,
+            updatedAt: now,
+          };
+          updated++;
+        }
+        pushNote(`hydrate_qty_from_broker:${ticker}`);
+      } else {
+        pushNote(`hydrate_qty_missing_broker_pos:${ticker}`);
+      }
     }
 
     let entry = num(t.entryPrice);
@@ -599,20 +618,25 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
         updated++;
       }
 
-      if (cfg.replaceEnabled && topCandidate) {
-        const openScore = num(t?.aiScore ?? t?.score ?? t?.ai?.score);
+      if (cfg.replaceEnabled) {
+        const candidateTicker = String(topCandidate?.ticker || "").toUpperCase();
+        const openScoreRaw = num(t?.aiScore ?? t?.score ?? t?.ai?.score);
+        const openScore = openScoreRaw ?? 0;
+        if (openScoreRaw == null) {
+          pushNote(`replace_baseline_score_used:${ticker}`);
+        }
         const decision = decideReplacement({
           openUnrealizedR: null,
           openScore,
-          candidateScore: topCandidate.score,
+          candidateScore: topCandidate?.score,
           allowUnknownROverride: cfg.replaceUnknownROverride,
           overrideScoreDelta: cfg.replaceScoreDelta,
         });
         replaceConsidered += 1;
-        pushNote(
-          `replace_considered:${ticker}:candidate=${topCandidate.ticker}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
-        );
-        if (decision.execute && topCandidate.ticker && topCandidate.ticker !== ticker) {
+        if (candidateTicker) {
+          pushNote(`replace_considered:${ticker}->${candidateTicker}`);
+        }
+        if (decision.execute && candidateTicker && candidateTicker !== ticker) {
           const closeRes = await submitMarketCloseForTrade(t, ticker);
           if (closeRes.ok && idx >= 0) {
             replaceExecuted += 1;
@@ -626,22 +650,25 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
               closedAt: now,
               updatedAt: now,
             };
-            pushNote(
-              `replace_executed:${ticker}:reason=${decision.reason}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
-            );
+            pushNote(`replace_executed:${ticker}->${candidateTicker}`);
             updated++;
             flattened++;
           } else {
-            const failReason = closeRes.ok ? "candidate_same_ticker" : `close_failed_${closeRes.error}`;
-            replaceSkippedByReason[failReason] = (replaceSkippedByReason[failReason] ?? 0) + 1;
-            pushNote(`replace_skipped_reason:${failReason}:${ticker}`);
+            pushNote(`replace_skip_close_failed:${ticker}`);
             if (!closeRes.ok) hadFailures = true;
           }
         } else {
-          replaceSkippedByReason[decision.reason] = (replaceSkippedByReason[decision.reason] ?? 0) + 1;
-          pushNote(
-            `replace_skipped_reason:${decision.reason}:${ticker}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
-          );
+          if (candidateTicker && candidateTicker === ticker) {
+            pushNote(`replace_skip_same_ticker:${ticker}`);
+          } else if (decision.reason === "replace_skip_r_unknown") {
+            pushNote(`replace_skip_r_unknown:${ticker}`);
+          } else if (decision.reason === "replace_skip_r_positive") {
+            pushNote(`replace_skip_r_positive:${ticker}`);
+          } else if (decision.reason === "replace_skip_delta_too_small") {
+            pushNote(`replace_skip_delta_too_small:${ticker}`);
+          } else if (decision.reason === "replace_skip_no_candidates") {
+            pushNote("replace_skip_no_candidates");
+          }
         }
       }
       continue;
@@ -653,20 +680,25 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     const entryForCalc = metrics.entry;
     const rps = riskPerShare(entryForCalc, stop)!;
 
-    if (cfg.replaceEnabled && topCandidate) {
-      const openScore = num(t?.aiScore ?? t?.score ?? t?.ai?.score);
+    if (cfg.replaceEnabled) {
+      const candidateTicker = String(topCandidate?.ticker || "").toUpperCase();
+      const openScoreRaw = num(t?.aiScore ?? t?.score ?? t?.ai?.score);
+      const openScore = openScoreRaw ?? 0;
+      if (openScoreRaw == null) {
+        pushNote(`replace_baseline_score_used:${ticker}`);
+      }
       const decision = decideReplacement({
         openUnrealizedR: unrealizedR,
         openScore,
-        candidateScore: topCandidate.score,
+        candidateScore: topCandidate?.score,
         allowUnknownROverride: cfg.replaceUnknownROverride,
         overrideScoreDelta: cfg.replaceScoreDelta,
       });
       replaceConsidered += 1;
-      pushNote(
-        `replace_considered:${ticker}:candidate=${topCandidate.ticker}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
-      );
-      if (decision.execute && topCandidate.ticker && topCandidate.ticker !== ticker) {
+      if (candidateTicker) {
+        pushNote(`replace_considered:${ticker}->${candidateTicker}`);
+      }
+      if (decision.execute && candidateTicker && candidateTicker !== ticker) {
         const closeRes = await submitMarketCloseForTrade(t, ticker);
         if (closeRes.ok && idx >= 0) {
           replaceExecuted += 1;
@@ -683,22 +715,25 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
             closedAt: now,
             updatedAt: now,
           };
-          pushNote(
-            `replace_executed:${ticker}:reason=${decision.reason}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
-          );
+          pushNote(`replace_executed:${ticker}->${candidateTicker}`);
           updated++;
           flattened++;
           continue;
         }
-        const failReason = closeRes.ok ? "candidate_same_ticker" : `close_failed_${closeRes.error}`;
-        replaceSkippedByReason[failReason] = (replaceSkippedByReason[failReason] ?? 0) + 1;
-        pushNote(`replace_skipped_reason:${failReason}:${ticker}`);
+        pushNote(`replace_skip_close_failed:${ticker}`);
         if (!closeRes.ok) hadFailures = true;
       } else {
-        replaceSkippedByReason[decision.reason] = (replaceSkippedByReason[decision.reason] ?? 0) + 1;
-        pushNote(
-          `replace_skipped_reason:${decision.reason}:${ticker}:candidateScore=${topCandidate.score ?? "na"}:openScore=${openScore ?? "na"}`
-        );
+        if (candidateTicker && candidateTicker === ticker) {
+          pushNote(`replace_skip_same_ticker:${ticker}`);
+        } else if (decision.reason === "replace_skip_r_unknown") {
+          pushNote(`replace_skip_r_unknown:${ticker}`);
+        } else if (decision.reason === "replace_skip_r_positive") {
+          pushNote(`replace_skip_r_positive:${ticker}`);
+        } else if (decision.reason === "replace_skip_delta_too_small") {
+          pushNote(`replace_skip_delta_too_small:${ticker}`);
+        } else if (decision.reason === "replace_skip_no_candidates") {
+          pushNote("replace_skip_no_candidates");
+        }
       }
     }
 
@@ -949,12 +984,9 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     }
   }
 
-  if (replaceConsidered > 0 || replaceExecuted > 0 || Object.keys(replaceSkippedByReason).length > 0) {
+  if (replaceConsidered > 0 || replaceExecuted > 0) {
     pushNote(`replace_considered:${replaceConsidered}`);
     pushNote(`replace_executed:${replaceExecuted}`);
-    for (const [reason, count] of Object.entries(replaceSkippedByReason)) {
-      pushNote(`replace_skipped_reason:${reason}:${count}`);
-    }
   }
 
   if (updated > 0) await writeTrades(next);

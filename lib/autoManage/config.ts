@@ -41,6 +41,17 @@ export function getAutoManageConfig(): AutoManageConfig {
   // AUTO_MANAGE_CUT_LOSS_R: R threshold that triggers flatten (default -1).
   const cutLossRRaw =
     process.env.AUTO_MANAGE_CUT_LOSS_R ?? process.env.AUTO_CUT_LOSS_R ?? "-1";
+  // REPLACE_ENABLED / AUTO_MANAGE_REPLACE_ENABLED: replacement toggle override.
+  // Defaults to true in paper mode, false in live mode.
+  const replaceEnabledRaw =
+    process.env.REPLACE_ENABLED ?? process.env.AUTO_MANAGE_REPLACE_ENABLED;
+  // REPLACE_SCORE_DELTA / AUTO_MANAGE_REPLACE_SCORE_DELTA: min score gap to replace (default 1.5).
+  const replaceScoreDeltaRaw =
+    process.env.REPLACE_SCORE_DELTA ?? process.env.AUTO_MANAGE_REPLACE_SCORE_DELTA ?? "1.5";
+  // REPLACE_UNKNOWN_R_OVERRIDE / AUTO_MANAGE_REPLACE_ALLOW_UNKNOWN_R_OVERRIDE:
+  // allow replacement when open R is unknown (default false).
+  const replaceUnknownROverrideRaw =
+    process.env.REPLACE_UNKNOWN_R_OVERRIDE ?? process.env.AUTO_MANAGE_REPLACE_ALLOW_UNKNOWN_R_OVERRIDE;
 
   return {
     enabled: process.env.AUTO_MANAGE_ENABLED === "1",
@@ -51,8 +62,8 @@ export function getAutoManageConfig(): AutoManageConfig {
     trailStartR: num(process.env.AUTO_MANAGE_TRAIL_R, 2.5),
     trailPct: num(process.env.AUTO_MANAGE_TRAIL_PCT, 0.005),
     maxPerRun: Math.max(1, Math.floor(num(process.env.AUTO_MANAGE_MAX_PER_RUN, 50))),
-    replaceEnabled: process.env.AUTO_MANAGE_REPLACE_ENABLED === "1",
-    replaceScoreDelta: num(process.env.AUTO_MANAGE_REPLACE_SCORE_DELTA, 1.5),
-    replaceUnknownROverride: process.env.AUTO_MANAGE_REPLACE_ALLOW_UNKNOWN_R_OVERRIDE === "1",
+    replaceEnabled: bool(replaceEnabledRaw, paperMode),
+    replaceScoreDelta: num(replaceScoreDeltaRaw, 1.5),
+    replaceUnknownROverride: bool(replaceUnknownROverrideRaw, false),
   };
 }

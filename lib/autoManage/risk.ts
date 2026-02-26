@@ -1,5 +1,6 @@
 export type ComputeUnrealizedRArgs = {
   side: string;
+  qty?: number | null | undefined;
   entryPrice: number | null | undefined;
   stopPrice: number | null | undefined;
   currentPrice: number | null | undefined;
@@ -15,12 +16,18 @@ const num = (v: any) => {
 
 export function computeUnrealizedR(args: ComputeUnrealizedRArgs): number | null {
   const side = String(args.side || "").toUpperCase();
+  const qty = num(args.qty);
   const entry = num(args.entryPrice);
   const stop = num(args.stopPrice);
   const current = num(args.currentPrice);
 
   if (side !== "LONG" && side !== "SHORT") {
     args.onInvalid?.("invalid_side");
+    return null;
+  }
+
+  if (qty == null || qty <= 0) {
+    args.onInvalid?.("missing_qty");
     return null;
   }
 
@@ -76,11 +83,11 @@ export type ReplacementDecisionArgs = {
 export type ReplacementDecision = {
   execute: boolean;
   reason:
-    | "replace_execute_flat_or_negative"
-    | "replace_skip_open_positive"
-    | "replace_skip_candidate_not_better"
+    | "replace_execute"
+    | "replace_skip_r_positive"
+    | "replace_skip_delta_too_small"
     | "replace_skip_r_unknown"
-    | "replace_override_r_unknown_delta";
+    | "replace_skip_no_candidates";
   scoreDelta: number | null;
 };
 
@@ -88,25 +95,37 @@ export function decideReplacement(args: ReplacementDecisionArgs): ReplacementDec
   const openR = num(args.openUnrealizedR);
   const openScore = num(args.openScore);
   const candidateScore = num(args.candidateScore);
+
+  if (candidateScore == null) {
+    return {
+      execute: false,
+      reason: "replace_skip_no_candidates",
+      scoreDelta: null,
+    };
+  }
+
   const scoreDelta =
     openScore != null && candidateScore != null ? candidateScore - openScore : null;
+  const minDelta = Math.max(0, Number(args.overrideScoreDelta) || 0);
 
   if (openR == null) {
-    if (
-      args.allowUnknownROverride &&
-      scoreDelta != null &&
-      scoreDelta >= Math.max(0, Number(args.overrideScoreDelta) || 0)
-    ) {
+    if (!args.allowUnknownROverride) {
       return {
-        execute: true,
-        reason: "replace_override_r_unknown_delta",
+        execute: false,
+        reason: "replace_skip_r_unknown",
         scoreDelta,
       };
     }
-
+    if (scoreDelta == null || scoreDelta < minDelta) {
+      return {
+        execute: false,
+        reason: "replace_skip_delta_too_small",
+        scoreDelta,
+      };
+    }
     return {
-      execute: false,
-      reason: "replace_skip_r_unknown",
+      execute: true,
+      reason: "replace_execute",
       scoreDelta,
     };
   }
@@ -114,22 +133,22 @@ export function decideReplacement(args: ReplacementDecisionArgs): ReplacementDec
   if (openR > 0) {
     return {
       execute: false,
-      reason: "replace_skip_open_positive",
+      reason: "replace_skip_r_positive",
       scoreDelta,
     };
   }
 
-  if (scoreDelta == null || scoreDelta <= 0) {
+  if (scoreDelta == null || scoreDelta < minDelta) {
     return {
       execute: false,
-      reason: "replace_skip_candidate_not_better",
+      reason: "replace_skip_delta_too_small",
       scoreDelta,
     };
   }
 
   return {
     execute: true,
-    reason: "replace_execute_flat_or_negative",
+    reason: "replace_execute",
     scoreDelta,
   };
 }
