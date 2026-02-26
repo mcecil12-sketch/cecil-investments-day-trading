@@ -101,8 +101,9 @@ function mergeBucket(acc: Bucket, daySummary: any): Bucket {
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const debug = String(url.searchParams.get("debug") || "") === "1";
+  const requestedEtDate = String(url.searchParams.get("etDate") || "").trim();
 
-  const today = getEtDateString();
+  const today = requestedEtDate || getEtDateString();
   const wtdStart = startOfWeekET(today);
   const mtdStart = startOfMonth(today);
   const ytdStart = startOfYear(today);
@@ -114,7 +115,11 @@ export async function GET(req: Request) {
     ["ytd", ytdStart, today],
   ] as const;
 
-  const out: any = { ok: true, etDate: today, periods: {} as Record<string, any> };
+  const out: any = {
+    ok: true,
+    etDateUsed: today,
+    periods: {} as Record<string, any>,
+  };
 
   for (const [name, start, end] of periods) {
     const dates = dateRange(start, end);
@@ -131,6 +136,8 @@ export async function GET(req: Request) {
     out.periods[name] = acc;
     if (debug) out.periods[name].days = days;
   }
+
+  out.dayTotals = out.periods.today;
 
   return NextResponse.json(out, { status: 200 });
 }

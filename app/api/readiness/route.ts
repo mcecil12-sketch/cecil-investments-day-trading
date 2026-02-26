@@ -109,6 +109,7 @@ export async function GET(req: Request) {
   }
 
   const todayEt = getEtDateString();
+  const guardKeyUsed = guardrailsStore.getGuardrailStateKey(todayEt);
   const guardConfig = getGuardrailConfig();
   const [guardState, toggleState, brokerTruth] = await Promise.all([
     guardrailsStore.getGuardrailsState(todayEt),
@@ -271,6 +272,8 @@ export async function GET(req: Request) {
       lastScoredAt,
     },
     autoEntry: {
+      etDateUsed: todayEt,
+      guardKeyUsed,
       enabled: toggleState.enabled,
       envEnabled: guardConfig.enabled,
       toggleReason: toggleState.reason,

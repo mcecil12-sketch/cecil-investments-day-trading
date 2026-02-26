@@ -403,6 +403,8 @@ async function cancelConflictingOrders(symbol: string, entrySide: "buy" | "sell"
 }
 
 type GuardSummary = {
+  etDateUsed: string;
+  guardKeyUsed: string;
   enabled: boolean;
   autoEntryToggleReason: string | null;
   entriesToday: number;
@@ -424,6 +426,8 @@ type GuardSummary = {
 const APP_BASE_URL = (process.env.APP_URL || "").replace(/\/$/, "");
 
 function buildGuardSummary(params: {
+  etDate: string;
+  guardKeyUsed: string;
   guardState: guardrailsStore.GuardrailState;
   guardConfig: import("@/lib/autoEntry/guardrails").GuardrailConfig;
   toggleState: { enabled: boolean; reason: string | null };
@@ -431,6 +435,8 @@ function buildGuardSummary(params: {
   brokerTruth?: BrokerTruth;
 }): GuardSummary {
   return {
+    etDateUsed: params.etDate,
+    guardKeyUsed: params.guardKeyUsed,
     enabled: params.toggleState.enabled,
     autoEntryToggleReason: params.toggleState.reason,
     entriesToday: params.guardState.entriesToday,
@@ -489,6 +495,7 @@ export async function POST(req: Request) {
   const notes: string[] = [];
   const guardConfig = getGuardrailConfig();
   const etDate = getEtDateString();
+  const guardKeyUsed = guardrailsStore.getGuardrailStateKey(etDate);
   const [guardState, toggleState, brokerTruth] = await Promise.all([
     guardrailsStore.getGuardrailsState(etDate),
     guardrailsStore.getAutoEntryEnabledState(guardConfig),
@@ -694,6 +701,8 @@ export async function POST(req: Request) {
   ).length;
 
   let guardSummary = buildGuardSummary({
+    etDate,
+    guardKeyUsed,
     guardState,
     guardConfig,
     toggleState,

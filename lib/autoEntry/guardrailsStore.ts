@@ -10,6 +10,10 @@ function guardKey(etDate: string) {
   return `${PREFIX}:${etDate}`;
 }
 
+export function getGuardrailStateKey(etDate: string) {
+  return guardKey(etDate);
+}
+
 function tickerField(ticker: string) {
   return `lastTickerEntryAt:${ticker.toUpperCase()}`;
 }
