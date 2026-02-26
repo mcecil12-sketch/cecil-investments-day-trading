@@ -20,6 +20,10 @@ export type GuardrailState = {
   lastLossAt: string | null;
   consecutiveFailures: number;
   autoDisabledReason: string | null;
+  lastFailureAt: string | null;
+  lastFailureReason: string | null;
+  lastFailureRunId: string | null;
+  lastFailureTradeId: string | null;
   tickerEntries: Record<string, string>;
 };
 
@@ -31,6 +35,10 @@ export async function getGuardrailsState(etDate: string): Promise<GuardrailState
       lastLossAt: null,
       consecutiveFailures: 0,
       autoDisabledReason: null,
+      lastFailureAt: null,
+      lastFailureReason: null,
+      lastFailureRunId: null,
+      lastFailureTradeId: null,
       tickerEntries: {},
     };
   }
@@ -50,6 +58,14 @@ export async function getGuardrailsState(etDate: string): Promise<GuardrailState
   const lastLossAt = typeof data.lastLossAt === "string" ? data.lastLossAt : null;
   const autoDisabledReason =
     typeof data.autoDisabledReason === "string" ? data.autoDisabledReason : null;
+  const lastFailureAt =
+    typeof data.lastFailureAt === "string" ? data.lastFailureAt : null;
+  const lastFailureReason =
+    typeof data.lastFailureReason === "string" ? data.lastFailureReason : null;
+  const lastFailureRunId =
+    typeof data.lastFailureRunId === "string" ? data.lastFailureRunId : null;
+  const lastFailureTradeId =
+    typeof data.lastFailureTradeId === "string" ? data.lastFailureTradeId : null;
 
   return {
     entriesToday,
@@ -57,6 +73,10 @@ export async function getGuardrailsState(etDate: string): Promise<GuardrailState
     lastLossAt,
     consecutiveFailures,
     autoDisabledReason,
+    lastFailureAt,
+    lastFailureReason,
+    lastFailureRunId,
+    lastFailureTradeId,
     tickerEntries,
   };
 }
@@ -81,10 +101,20 @@ export async function resetFailures(etDate: string) {
   await ensureExpire(redis, key, ttl);
 }
 
-export async function recordFailure(etDate: string, reason: string, opts?: { markLoss?: boolean }) {
+export async function recordFailure(
+  etDate: string,
+  reason: string,
+  opts?: { markLoss?: boolean; runId?: string; tradeId?: string }
+) {
   if (!redis) return 0;
   const key = guardKey(etDate);
   const now = new Date().toISOString();
+  await redis.hset(key, {
+    lastFailureAt: now,
+    lastFailureReason: String(reason || "unknown"),
+    lastFailureRunId: opts?.runId ? String(opts.runId) : "",
+    lastFailureTradeId: opts?.tradeId ? String(opts.tradeId) : "",
+  });
   if (opts?.markLoss) {
     await redis.hset(key, { lastLossAt: now });
   }

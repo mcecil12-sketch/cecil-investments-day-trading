@@ -28,6 +28,19 @@ describe("evaluateBreakerTransition", () => {
     expect(result.shouldDisable).toBe(false);
   });
 
+  it("does not increment on any other SKIP reason", () => {
+    const result = evaluateBreakerTransition({
+      outcome: "SKIP",
+      reason: "max_open_positions",
+      consecutiveFailuresBefore: 2,
+      maxConsecutiveFailures: 3,
+    });
+
+    expect(result.breakerAction).toBe("none");
+    expect(result.consecutiveFailuresAfter).toBe(2);
+    expect(result.shouldDisable).toBe(false);
+  });
+
   it("increments on FAIL", () => {
     const result = evaluateBreakerTransition({
       outcome: "FAIL",
@@ -51,6 +64,7 @@ describe("evaluateBreakerTransition", () => {
 
     expect(result.breakerAction).toBe("reset");
     expect(result.consecutiveFailuresAfter).toBe(0);
+    expect(result.clearAutoDisabled).toBe(true);
     expect(result.shouldDisable).toBe(false);
   });
 

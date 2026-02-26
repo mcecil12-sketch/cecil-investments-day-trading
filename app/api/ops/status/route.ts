@@ -171,6 +171,10 @@ export async function GET() {
           consecutiveFailures: guardState.consecutiveFailures,
           lastLossAt: guardState.lastLossAt,
           autoDisabledReason: guardState.autoDisabledReason,
+          lastFailureAt: guardState.lastFailureAt,
+          lastFailureReason: guardState.lastFailureReason,
+          lastFailureRunId: guardState.lastFailureRunId,
+          lastFailureTradeId: guardState.lastFailureTradeId,
         },
         // BROKER-TRUTH based openTrades (not DB, to eliminate ghost trade reporting)
         openTrades: {
@@ -189,6 +193,16 @@ export async function GET() {
             ? `DB has ${dbOpenTradesCount} open trades but broker has ${brokerTruthOpenTrades} positions. Run reconcile-open-trades to cleanup.`
             : null,
         },
+      },
+
+      autoEntry: {
+        consecutiveFailures: guardState.consecutiveFailures,
+        maxConsecutiveFailures: guardConfig.maxConsecutiveFailures,
+        autoDisabledReason: guardState.autoDisabledReason,
+        lastFailureAt: guardState.lastFailureAt,
+        lastFailureReason: guardState.lastFailureReason,
+        lastFailureRunId: guardState.lastFailureRunId,
+        lastFailureTradeId: guardState.lastFailureTradeId,
       },
 
       // Scoring backlog

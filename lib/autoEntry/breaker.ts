@@ -8,6 +8,7 @@ export type BreakerTransition = {
   breakerAction: BreakerAction;
   breakerReason: string;
   shouldDisable: boolean;
+  clearAutoDisabled: boolean;
 };
 
 export function evaluateBreakerTransition(args: {
@@ -28,6 +29,7 @@ export function evaluateBreakerTransition(args: {
       breakerAction: "increment",
       breakerReason: reason,
       shouldDisable: after >= max,
+      clearAutoDisabled: false,
     };
   }
 
@@ -38,6 +40,7 @@ export function evaluateBreakerTransition(args: {
       breakerAction: "reset",
       breakerReason: reason,
       shouldDisable: false,
+      clearAutoDisabled: true,
     };
   }
 
@@ -47,5 +50,6 @@ export function evaluateBreakerTransition(args: {
     breakerAction: "none",
     breakerReason: reason,
     shouldDisable: false,
+    clearAutoDisabled: false,
   };
 }

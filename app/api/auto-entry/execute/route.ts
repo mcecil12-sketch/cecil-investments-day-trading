@@ -734,7 +734,10 @@ export async function POST(req: Request) {
     let action = initial.breakerAction;
 
     if (params.outcome === "FAIL") {
-      after = await guardrailsStore.recordFailure(etDate, params.reason);
+      after = await guardrailsStore.recordFailure(etDate, params.reason, {
+        runId,
+        tradeId: params.tradeId,
+      });
       guardSummary.consecutiveFailures = after;
       const shouldDisable = after >= guardConfig.maxConsecutiveFailures;
       if (shouldDisable) {
@@ -746,7 +749,9 @@ export async function POST(req: Request) {
       }
     } else if (params.outcome === "SUCCESS") {
       await guardrailsStore.resetFailures(etDate);
-      await guardrailsStore.clearAutoDisabled(etDate);
+      if (initial.clearAutoDisabled) {
+        await guardrailsStore.clearAutoDisabled(etDate);
+      }
       guardSummary.consecutiveFailures = 0;
       guardSummary.autoDisabledReason = null;
       after = 0;

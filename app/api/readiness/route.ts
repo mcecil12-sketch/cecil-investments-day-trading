@@ -278,6 +278,10 @@ export async function GET(req: Request) {
       consecutiveFailures: guardState.consecutiveFailures,
       maxConsecutiveFailures: guardConfig.maxConsecutiveFailures,
       autoDisabledReason: guardState.autoDisabledReason,
+      lastFailureAt: guardState.lastFailureAt,
+      lastFailureReason: guardState.lastFailureReason,
+      lastFailureRunId: guardState.lastFailureRunId,
+      lastFailureTradeId: guardState.lastFailureTradeId,
       maxOpenPositions: guardConfig.maxOpenPositions,
       lastLossAt: guardState.lastLossAt,
       // Broker truth for open positions (not DB)
