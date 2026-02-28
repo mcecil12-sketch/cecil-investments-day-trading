@@ -78,6 +78,28 @@ function isAlpacaInvalidStopVsBase(err: any) {
   );
 }
 
+function parseAlpacaError(err: any): { code: string; message: string } {
+  const raw = String(err?.message || err || "");
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      code: String(parsed?.code ?? ""),
+      message: String(parsed?.message ?? raw),
+    };
+  } catch {
+    return { code: "", message: raw };
+  }
+}
+
+function isAlpacaInvalidTakeProfitVsBase(err: any) {
+  const parsed = parseAlpacaError(err);
+  const msg = String(parsed.message || "").toLowerCase();
+  const code = String(parsed.code || "");
+  const hasTpConstraint = msg.includes("take_profit.limit_price") && msg.includes("base_price");
+  const hasConstraintWords = msg.includes("must") || msg.includes("constraint") || msg.includes("higher") || msg.includes("lower");
+  return code === "42210000" && hasTpConstraint && hasConstraintWords;
+}
+
 async function disableTradeAsPoison(tradeId: string, reason: string) {
   const trades = await readTrades();
   const now = new Date().toISOString();
@@ -1239,6 +1261,10 @@ export async function POST(req: Request) {
 
   const quote = await fetchQuoteForSymbol(ticker);
   const decision = resolveDecisionPrice({ seedEntryPrice: entryPrice, quote });
+  const basePriceForValidation =
+    Number.isFinite(decision.decisionPrice) && decision.decisionPrice > 0
+      ? Number(decision.decisionPrice)
+      : Number(entryPrice);
 
   const stopDistance = Math.abs(entryPrice - stopPrice);
   const rr = 1;
@@ -1287,6 +1313,7 @@ export async function POST(req: Request) {
     quote,
     decisionPrice: decision.decisionPrice,
     decisionSource: decision.source,
+    basePriceForValidation,
     stopDistance,
     takeProfitPrice: tp,
     bracketStopPrice: bracketStop,
@@ -1304,7 +1331,7 @@ export async function POST(req: Request) {
       // Validate and repair bracket BEFORE submitting order
       const bracketCheck = validateAndRepairBracket({
         side: sideDirection === "buy" ? "LONG" : "SHORT",
-        basePrice: entryPrice,
+        basePrice: basePriceForValidation,
         takeProfitPrice: tp,
         stopPrice: bracketStop,
       });
@@ -1332,9 +1359,24 @@ export async function POST(req: Request) {
       finalStop = stopNorm.stop;
 
       finalTp = normalizeLimitPrice({ price: finalTp, tick });
+      finalTp = Number(finalTp.toFixed(2));
+      const baseRounded = Number(basePriceForValidation.toFixed(2));
 
-      const minTpLong = Number((entryPrice + tick).toFixed(2));
-      const maxTpShort = Number((entryPrice - tick).toFixed(2));
+      const takeProfitValid =
+        sideDirection === "buy"
+          ? finalTp >= Number((baseRounded + 0.01).toFixed(2))
+          : finalTp <= Number((baseRounded - 0.01).toFixed(2));
+
+      if (!takeProfitValid) {
+        return {
+          __poison: true,
+          reason: "invalid_take_profit_vs_base_price",
+          detail: JSON.stringify({ base_price: baseRounded, take_profit: finalTp }),
+        } as any;
+      }
+
+      const minTpLong = Number((baseRounded + tick).toFixed(2));
+      const maxTpShort = Number((baseRounded - tick).toFixed(2));
 
       const wantTp =
         sideDirection === "buy"
@@ -1357,7 +1399,22 @@ export async function POST(req: Request) {
         return await createOrder(payload);
       } catch (e: any) {
         if (isAlpacaInvalidStopVsBase(e)) {
-          return { __poison: true, message: String(e?.message || e || "") } as any;
+          return {
+            __poison: true,
+            reason: "invalid_stop_vs_base_price",
+            message: String(e?.message || e || ""),
+          } as any;
+        }
+        if (isAlpacaInvalidTakeProfitVsBase(e)) {
+          return {
+            __poison: true,
+            reason: "invalid_take_profit_vs_base_price",
+            detail: JSON.stringify({
+              base_price: Number(basePriceForValidation.toFixed(2)),
+              take_profit: finalTp,
+            }),
+            message: String(e?.message || e || ""),
+          } as any;
         }
         throw e;
       }
@@ -1387,15 +1444,28 @@ export async function POST(req: Request) {
   try {
     const order = lock.value;
     if ((order as any)?.__poison) {
+      const poisonReason =
+        (order as any)?.reason === "invalid_take_profit_vs_base_price"
+          ? "invalid_take_profit_vs_base_price"
+          : "invalid_stop_vs_base_price";
       counts.invalidMarked += 1;
-      await disableTradeAsPoison(tradeId, "invalid_stop_vs_base_price");
+      await disableTradeAsPoison(tradeId, poisonReason);
       counts.skipped += 1;
-      await recordOutcome({ outcome: "SKIP", reason: "invalid_stop_vs_base_price", ticker, tradeId });
+      await recordOutcome({
+        outcome: "SKIP",
+        reason: poisonReason,
+        ticker,
+        tradeId,
+        detail:
+          poisonReason === "invalid_take_profit_vs_base_price"
+            ? (order as any)?.detail || JSON.stringify({ base_price: Number(basePriceForValidation.toFixed(2)), take_profit: Number(tp.toFixed(2)) })
+            : undefined,
+      });
       return NextResponse.json(
         {
           ok: true,
           skipped: true,
-          reason: "invalid_stop_vs_base_price",
+          reason: poisonReason,
           tradeId,
           market: { isOpen: marketOpen, timestamp: marketTimestamp },
           openPositionsCount: brokerTruth.positionsCount,

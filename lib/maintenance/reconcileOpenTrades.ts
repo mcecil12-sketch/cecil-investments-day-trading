@@ -34,6 +34,180 @@ async function safeJsonObject(text: string | undefined): Promise<any | null> {
   }
 }
 
+function isTerminalOrderStatus(status: string | null): boolean {
+  const s = String(status || "").toLowerCase();
+  return Boolean(
+    s &&
+      [
+        "filled",
+        "canceled",
+        "cancelled",
+        "expired",
+        "rejected",
+        "done_for_day",
+        "stopped",
+        "calculated",
+      ].includes(s)
+  );
+}
+
+function collectOrderLegIds(order: any): string[] {
+  const out = new Set<string>();
+  const walk = (node: any) => {
+    const id = String(node?.id || "");
+    if (id) out.add(id);
+    const legs = Array.isArray(node?.legs) ? node.legs : [];
+    for (const leg of legs) walk(leg);
+  };
+  walk(order);
+  return Array.from(out);
+}
+
+function extractBestFillFromOrder(order: any): { price: number | null; qty: number | null; at: string | null } {
+  const fills: Array<{ price: number; qty: number | null; atTs: number; at: string | null }> = [];
+  const walk = (node: any) => {
+    const status = String(node?.status || "").toLowerCase();
+    const px = num(node?.filled_avg_price);
+    const q = num(node?.filled_qty);
+    const atRaw = String(node?.filled_at || node?.updated_at || node?.submitted_at || "");
+    const atTs = Date.parse(atRaw);
+    if (status === "filled" && px != null && px > 0) {
+      fills.push({
+        price: px,
+        qty: q != null && q > 0 ? q : null,
+        atTs: Number.isFinite(atTs) ? atTs : 0,
+        at: atRaw || null,
+      });
+    }
+    const legs = Array.isArray(node?.legs) ? node.legs : [];
+    for (const leg of legs) walk(leg);
+  };
+  walk(order);
+
+  if (fills.length === 0) return { price: null, qty: null, at: null };
+  fills.sort((a, b) => b.atTs - a.atTs);
+  return {
+    price: fills[0].price,
+    qty: fills[0].qty,
+    at: fills[0].at,
+  };
+}
+
+async function fetchOrderById(orderId: string): Promise<{ found: boolean; status: number; order: any | null }> {
+  try {
+    const resp = await alpacaRequest({
+      method: "GET",
+      path: `/v2/orders/${encodeURIComponent(orderId)}?nested=true`,
+    });
+    if (!resp.ok) return { found: false, status: resp.status, order: null };
+    const obj = await safeJsonObject(resp.text);
+    return { found: Boolean(obj), status: resp.status, order: obj };
+  } catch {
+    return { found: false, status: 0, order: null };
+  }
+}
+
+async function fetchFillActivitiesByOrderIds(orderIds: string[]): Promise<any[]> {
+  const seen = new Set<string>();
+  const fills: any[] = [];
+
+  for (const idRaw of orderIds) {
+    const id = String(idRaw || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    try {
+      const qs = new URLSearchParams();
+      qs.set("activity_types", "FILL");
+      qs.set("order_id", id);
+      qs.set("page_size", "100");
+      qs.set("direction", "desc");
+      const resp = await alpacaRequest({
+        method: "GET",
+        path: `/v2/account/activities?${qs.toString()}`,
+      });
+      if (!resp.ok) continue;
+      const arr = await safeJsonArray(resp.text);
+      for (const a of arr) {
+        fills.push(a);
+      }
+    } catch {}
+  }
+
+  return fills;
+}
+
+function extractFillFromActivities(activities: any[]): { price: number | null; qty: number | null; at: string | null } {
+  if (!Array.isArray(activities) || activities.length === 0) {
+    return { price: null, qty: null, at: null };
+  }
+
+  let weightedNotional = 0;
+  let weightedQty = 0;
+  let latestAt: string | null = null;
+  let latestTs = 0;
+
+  for (const a of activities) {
+    const px = num(a?.price);
+    const q = Math.abs(num(a?.qty) ?? 0);
+    const tsRaw = String(a?.transaction_time || a?.date || a?.settle_date || "");
+    const ts = Date.parse(tsRaw);
+    if (px != null && px > 0 && q > 0) {
+      weightedNotional += px * q;
+      weightedQty += q;
+    }
+    if (Number.isFinite(ts) && ts > latestTs) {
+      latestTs = ts;
+      latestAt = tsRaw;
+    }
+  }
+
+  if (weightedQty > 0) {
+    return {
+      price: Number((weightedNotional / weightedQty).toFixed(4)),
+      qty: Number(weightedQty.toFixed(6)),
+      at: latestAt,
+    };
+  }
+
+  return { price: null, qty: null, at: latestAt };
+}
+
+function computeRealizedFromClose(args: {
+  side: string;
+  entryPrice: any;
+  stopPrice: any;
+  closePrice: number | null;
+  qty: any;
+}): { realizedPnL?: number; realizedR?: number } {
+  const side = up(args.side);
+  const entry = num(args.entryPrice);
+  const stop = num(args.stopPrice);
+  const close = num(args.closePrice);
+  const qty = Math.abs(num(args.qty) ?? 0);
+
+  if (!(entry != null && entry > 0 && close != null && close > 0 && qty > 0)) {
+    return {};
+  }
+
+  const pnlPerShare = side === "SHORT" ? entry - close : close - entry;
+  const realizedPnL = Number((pnlPerShare * qty).toFixed(2));
+
+  if (!(stop != null && stop > 0)) {
+    return { realizedPnL };
+  }
+
+  const riskPerShare = Math.abs(entry - stop);
+  const riskAmount = riskPerShare * qty;
+  if (!(riskAmount > 0)) {
+    return { realizedPnL };
+  }
+
+  return {
+    realizedPnL,
+    realizedR: Number((realizedPnL / riskAmount).toFixed(4)),
+  };
+}
+
 function collectStopBySymbol(order: any, bySymbol: Map<string, number>) {
   const symbol = up(order?.symbol);
   const stop = num(order?.stop_price ?? order?.stopPrice ?? order?.stop_loss?.stop_price);
@@ -198,11 +372,167 @@ export async function reconcileOpenTrades(
       const stale = !existsPos && !existsOrderId && !existsOrderSym;
 
       if (stale) {
+        const linkedOrderId = String(t?.alpacaOrderId || t?.brokerOrderId || "").trim();
+        const linkedLegIds = [
+          String(t?.stopOrderId || "").trim(),
+          String(t?.takeProfitOrderId || "").trim(),
+        ].filter(Boolean);
+
+        if (linkedOrderId) {
+          const orderLookup = await fetchOrderById(linkedOrderId);
+
+          if (orderLookup.found && orderLookup.order) {
+            const orderObj = orderLookup.order;
+            const orderStatus = String(orderObj?.status || "").toLowerCase() || null;
+            const orderLegIds = collectOrderLegIds(orderObj);
+            const allOrderIds = Array.from(new Set([linkedOrderId, ...linkedLegIds, ...orderLegIds]));
+
+            if (isTerminalOrderStatus(orderStatus)) {
+              let fill = extractBestFillFromOrder(orderObj);
+              if (fill.price == null) {
+                const acts = await fetchFillActivitiesByOrderIds(allOrderIds);
+                const fillFromActs = extractFillFromActivities(acts);
+                if (fillFromActs.price != null) {
+                  fill = fillFromActs;
+                }
+              }
+
+              const closePrice = fill.price != null ? Number(fill.price) : num(t?.entryPrice);
+              const closeAt = fill.at || nowIso;
+              const qtyForCalc =
+                fill.qty ??
+                num(t?.filledQty) ??
+                num(t?.qty) ??
+                num(t?.quantity) ??
+                num(orderObj?.filled_qty) ??
+                0;
+
+              if (!dryRun) {
+                t.status = "CLOSED";
+                t.autoEntryStatus = "CLOSED";
+                t.closedAt = t.closedAt || closeAt;
+                t.finalizedAt = nowIso;
+                t.updatedAt = nowIso;
+                t.alpacaStatus = orderStatus || t.alpacaStatus || "terminal";
+                t.brokerStatus = orderStatus || t.brokerStatus || "terminal";
+                if (closePrice != null && closePrice > 0) {
+                  t.closePrice = closePrice;
+                }
+                const realized = computeRealizedFromClose({
+                  side: t?.side,
+                  entryPrice: t?.entryPrice,
+                  stopPrice: t?.stopPrice,
+                  closePrice: closePrice ?? null,
+                  qty: qtyForCalc,
+                });
+                if (typeof realized.realizedPnL === "number") t.realizedPnL = realized.realizedPnL;
+                if (typeof realized.realizedR === "number") t.realizedR = realized.realizedR;
+              }
+
+              closed += 1;
+              results.push({
+                id: t?.id,
+                ticker,
+                stale: false,
+                action: dryRun ? "would_finalize_from_order" : "finalized_from_order",
+                orderId: linkedOrderId,
+                orderStatus,
+                closePrice,
+                closeAt,
+                usedActivityFallback: fill.price == null,
+              });
+              continue;
+            }
+
+            if (!dryRun) {
+              t.status = "OPEN";
+              t.autoEntryStatus = "OPEN";
+              t.updatedAt = nowIso;
+              t.alpacaStatus = orderStatus || t.alpacaStatus || "order_exists";
+              t.brokerStatus = orderStatus || t.brokerStatus || "order_exists";
+            }
+            synced += 1;
+            results.push({
+              id: t?.id,
+              ticker,
+              stale: false,
+              action: dryRun ? "would_keep_open_order_exists" : "kept_open_order_exists",
+              orderId: linkedOrderId,
+              orderStatus,
+            });
+            continue;
+          }
+
+          if (orderLookup.status !== 404) {
+            results.push({
+              id: t?.id,
+              ticker,
+              stale: false,
+              action: "skip_close_lookup_non_404",
+              orderId: linkedOrderId,
+              lookupStatus: orderLookup.status,
+            });
+            continue;
+          }
+
+          const fallbackOrderIds = Array.from(new Set([linkedOrderId, ...linkedLegIds]));
+          const fallbackActs = await fetchFillActivitiesByOrderIds(fallbackOrderIds);
+          const fillFallback = extractFillFromActivities(fallbackActs);
+
+          if (fillFallback.price != null) {
+            const closePrice = Number(fillFallback.price);
+            const closeAt = fillFallback.at || nowIso;
+            const qtyForCalc =
+              fillFallback.qty ??
+              num(t?.filledQty) ??
+              num(t?.qty) ??
+              num(t?.quantity) ??
+              0;
+
+            if (!dryRun) {
+              t.status = "CLOSED";
+              t.autoEntryStatus = "CLOSED";
+              t.closedAt = t.closedAt || closeAt;
+              t.finalizedAt = nowIso;
+              t.updatedAt = nowIso;
+              t.alpacaStatus = t.alpacaStatus || "filled_activity_only";
+              t.brokerStatus = t.brokerStatus || "filled_activity_only";
+              t.closePrice = closePrice;
+              const realized = computeRealizedFromClose({
+                side: t?.side,
+                entryPrice: t?.entryPrice,
+                stopPrice: t?.stopPrice,
+                closePrice,
+                qty: qtyForCalc,
+              });
+              if (typeof realized.realizedPnL === "number") t.realizedPnL = realized.realizedPnL;
+              if (typeof realized.realizedR === "number") t.realizedR = realized.realizedR;
+            }
+
+            closed += 1;
+            results.push({
+              id: t?.id,
+              ticker,
+              stale: false,
+              action: dryRun ? "would_finalize_from_fill_activity" : "finalized_from_fill_activity",
+              orderId: linkedOrderId,
+              closePrice,
+              closeAt,
+            });
+            continue;
+          }
+        }
+
+        const debugOrderId = linkedOrderId || "none";
+        const debugLegIds = linkedLegIds.length > 0 ? linkedLegIds.join("|") : "none";
+        const debugStatus = linkedOrderId ? "404" : "none";
+        const closeReasonWithDebug = `${closeReason}:order_lookup_failed(orderId=${debugOrderId},legIds=${debugLegIds},http=${debugStatus})`;
+
         if (!dryRun) {
           t.status = "CLOSED";
           t.closedAt = t.closedAt || nowIso;
           t.updatedAt = nowIso;
-          t.closeReason = closeReason;
+          t.closeReason = closeReasonWithDebug;
           t.autoEntryStatus = "CLOSED";
           t.alpacaStatus = t.alpacaStatus || "not_found_in_broker";
           t.brokerStatus = t.brokerStatus || "not_found_in_broker";
@@ -214,10 +544,11 @@ export async function reconcileOpenTrades(
           stale: true,
           action: dryRun ? "would_close" : "closed",
           reason: "not_in_broker_positions_or_orders",
+          closeReason: closeReasonWithDebug,
         });
         console.log(
           `[reconcile] closing stale trade (source=${runSource}, id=${runId})`,
-          { tradeId: t?.id, ticker, alpacaOrderId }
+          { tradeId: t?.id, ticker, alpacaOrderId: linkedOrderId, legIds: linkedLegIds, lookupStatus: debugStatus }
         );
         continue;
       }
