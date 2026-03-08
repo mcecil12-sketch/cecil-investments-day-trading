@@ -98,15 +98,13 @@ export async function GET() {
     // (assume all open positions count against the gate).
     const brokerTruthFromAutoEntry = brokerPositionsCount;
 
-    // Diagnostics: All counts use broker-truth as authoritative source
-    // This ensures complete alignment across all metrics
+    // Diagnostics: Compute operational counts from DB using the same filter as entryState.openTrades
     const dbOpenTradesCount = brokerTruthOpenTrades;
-    const dbActualOperationalCount = brokerTruthOpenTrades;
+    const dbActualOperationalCount = countOperationalOpenTickers(trades);
     const dbAutoOpenTradesCount = countOperationalOpenAutoTickers(trades);
     
-    // For visibility: show raw DB operational count if different from broker truth
-    const dbStoredOperationalCount = countOperationalOpenTickers(trades);
-    const openTradesMismatch = dbStoredOperationalCount !== brokerTruthOpenTrades;
+    // Mismatch detection: compare broker positions count vs actual operational DB count
+    const openTradesMismatch = brokerPositionsCount !== dbActualOperationalCount;
 
     // Legacy flags for backward compatibility
     const pause = process.env.PAUSE_AUTOTRADING === "1";
@@ -192,10 +190,9 @@ export async function GET() {
           dbOpenTradesCount,
           dbAutoOpenTradesCount,
           dbActualOperationalCount,
-                    dbStoredOperationalCount,
           openTradesMismatch,
           mismatchNote: openTradesMismatch
-            ? `DB stored operational count=${dbStoredOperationalCount} but broker positions=${brokerTruthOpenTrades}. Run reconcile-open-trades to cleanup stale conflicts.`
+            ? `DB operational count=${dbActualOperationalCount} but broker positions=${brokerPositionsCount}. Run reconcile-open-trades to cleanup stale conflicts.`
             : null,
         },
       },
