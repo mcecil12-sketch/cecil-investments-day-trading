@@ -262,6 +262,9 @@ export type ReconcileOpenTradesResult = {
   cleanedPendingTickers: string[];
   cleanedStaleBackfill: number;
   cleanedStaleBackfillIds: string[];
+  cleanedDuplicateBackfill: number;
+  cleanedDuplicateBackfillIds: string[];
+  cleanedDuplicateBackfillTickers: string[];
   broker: {
     positionsCount: number;
     openOrdersCount: number;
@@ -315,6 +318,9 @@ export async function reconcileOpenTrades(
         cleanedPendingTickers: [],
         cleanedStaleBackfill: 0,
         cleanedStaleBackfillIds: [],
+        cleanedDuplicateBackfill: 0,
+        cleanedDuplicateBackfillIds: [],
+        cleanedDuplicateBackfillTickers: [],
         broker: {
           positionsCount: 0,
           openOrdersCount: 0,
@@ -909,7 +915,55 @@ export async function reconcileOpenTrades(
 
     checkDeadline();
 
-    if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0 || cleanedPending > 0 || cleanedStaleBackfill > 0)) {
+    // Clean duplicate OPEN broker_backfill rows when AUTO trade exists for same ticker
+    let cleanedDuplicateBackfill = 0;
+    const cleanedDuplicateBackfillIds: string[] = [];
+    const cleanedDuplicateBackfillTickers: string[] = [];
+
+    // Build map of tickers with OPEN AUTO trades
+    const autoOpenTickers = new Set<string>();
+    for (const t of trades) {
+      if (t?.status === "OPEN" && (t?.source === "AUTO" || t?.source === "AUTO-ENTRY")) {
+        const ticker = up(t.ticker);
+        if (ticker) autoOpenTickers.add(ticker);
+      }
+    }
+
+    // Archive any OPEN broker_backfill rows for tickers that have AUTO trades
+    for (const t of trades) {
+      if (t?.source === "broker_backfill" && t?.status === "OPEN" && t?.ticker) {
+        const ticker = up(t.ticker);
+        if (ticker && autoOpenTickers.has(ticker)) {
+          // AUTO trade exists, archive this duplicate broker_backfill
+          if (!dryRun) {
+            Object.assign(t, {
+              status: "ARCHIVED",
+              closedAt: nowIso,
+              updatedAt: nowIso,
+              closeReason: "duplicate_broker_backfill",
+              alpacaStatus: null,
+              brokerStatus: null,
+              note: (t?.note || "") + " [Archived: duplicate broker_backfill when AUTO trade exists]",
+            });
+          }
+          cleanedDuplicateBackfill += 1;
+          if (cleanedDuplicateBackfillIds.length < 10) {
+            cleanedDuplicateBackfillIds.push(t.id);
+          }
+          if (!cleanedDuplicateBackfillTickers.includes(ticker) && cleanedDuplicateBackfillTickers.length < 10) {
+            cleanedDuplicateBackfillTickers.push(ticker);
+          }
+          console.log(
+            `[reconcile] archived duplicate OPEN broker_backfill (source=${runSource}, id=${runId})`,
+            { ticker, tradeId: t.id, reason: "AUTO trade exists", dryRun }
+          );
+        }
+      }
+    }
+
+    checkDeadline();
+
+    if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0 || cleanedPending > 0 || cleanedStaleBackfill > 0 || cleanedDuplicateBackfill > 0)) {
       await writeTrades(trades);
     }
 
@@ -924,6 +978,7 @@ export async function reconcileOpenTrades(
         repairedOpenedAt,
         cleanedPending,
         cleanedStaleBackfill,
+        cleanedDuplicateBackfill,
       }
     );
 
@@ -941,6 +996,9 @@ export async function reconcileOpenTrades(
       cleanedPendingTickers,
       cleanedStaleBackfill,
       cleanedStaleBackfillIds,
+      cleanedDuplicateBackfill,
+      cleanedDuplicateBackfillIds,
+      cleanedDuplicateBackfillTickers,
       broker: {
         positionsCount: brokerTruth.positionsCount,
         openOrdersCount: brokerTruth.openOrdersCount,
@@ -997,6 +1055,9 @@ export async function reconcileOpenTrades(
       cleanedPendingTickers: [],
       cleanedStaleBackfill: 0,
       cleanedStaleBackfillIds: [],
+      cleanedDuplicateBackfill: 0,
+      cleanedDuplicateBackfillIds: [],
+      cleanedDuplicateBackfillTickers: [],
       broker: {
         positionsCount: 0,
         openOrdersCount: 0,

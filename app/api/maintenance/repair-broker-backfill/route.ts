@@ -21,6 +21,14 @@ export async function POST(req: NextRequest) {
     const trades = await readTrades();
     const nowIso = new Date().toISOString();
 
+    // Build set of tickers with OPEN AUTO trades
+    const autoOpenTickers = new Set<string>();
+    for (const t of trades) {
+      if (t?.status === "OPEN" && (t?.source === "AUTO" || t?.source === "AUTO-ENTRY") && t?.ticker) {
+        autoOpenTickers.add(t.ticker.toUpperCase());
+      }
+    }
+
     // Group broker_backfill rows by ticker
     const backfillByTicker = new Map<string, any[]>();
     for (const t of trades) {
@@ -38,10 +46,40 @@ export async function POST(req: NextRequest) {
     const repairedTickers: string[] = [];
 
     // For each ticker, keep only the best broker_backfill row, archive the rest
+    // Exception: if an AUTO trade exists for the ticker, archive ALL broker_backfill rows
     for (const [ticker, rows] of backfillByTicker.entries()) {
       if (rows.length === 0) continue;
 
-      // Sort to find best: prefer OPEN, then newest by updatedAt
+      // If AUTO trade exists for this ticker, archive ALL broker_backfill rows
+      if (autoOpenTickers.has(ticker)) {
+        for (const row of rows) {
+          if (row.status === "ARCHIVED" || row.status === "CLOSED") continue;
+          if (repaired >= limit) break;
+
+          if (!dryRun) {
+            Object.assign(row, {
+              status: "ARCHIVED",
+              closedAt: nowIso,
+              updatedAt: nowIso,
+              closeReason: "duplicate_broker_backfill",
+              alpacaStatus: null,
+              brokerStatus: null,
+              note: (row?.note || "") + " [Archived: duplicate broker_backfill when AUTO trade exists]",
+            });
+          }
+
+          repaired += 1;
+          if (repairedIds.length < 20) {
+            repairedIds.push(row.id);
+          }
+          if (!repairedTickers.includes(ticker) && repairedTickers.length < 20) {
+            repairedTickers.push(ticker);
+          }
+        }
+        continue; // All rows archived, move to next ticker
+      }
+
+      // No AUTO trade - sort to find best: prefer OPEN, then newest by updatedAt
       const sorted = rows.sort((a, b) => {
         if (a.status === "OPEN" && b.status !== "OPEN") return -1;
         if (b.status === "OPEN" && a.status !== "OPEN") return 1;
