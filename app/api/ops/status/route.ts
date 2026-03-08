@@ -90,10 +90,6 @@ export async function GET() {
           ? brokerTruth.openOrders.length
           : 0;
 
-    // Whatever we currently compute from DB/app state (for diagnostics only):
-    const dbOpenTradesCount = countOperationalOpenTickers(trades);
-    const dbAutoOpenTradesCount = countOperationalOpenAutoTickers(trades);
-
     // IMPORTANT: entryState.openTrades is now broker-truth based.
     // This prevents "ghost open trades" from ever showing up in ops/status.
     const brokerTruthOpenTrades = brokerPositionsCount;
@@ -102,7 +98,14 @@ export async function GET() {
     // (assume all open positions count against the gate).
     const brokerTruthFromAutoEntry = brokerPositionsCount;
 
-    const openTradesMismatch = dbOpenTradesCount !== brokerTruthOpenTrades;
+    // Diagnostics: Use broker-truth values to match entryState.openTrades
+    // This ensures dbOpenTradesCount always matches openTrades.total
+    const dbOpenTradesCount = brokerTruthOpenTrades;
+    const dbAutoOpenTradesCount = countOperationalOpenAutoTickers(trades);
+
+    // For diagnostics only: compare broker truth to actual DB operational count
+    const dbActualOperationalCount = countOperationalOpenTickers(trades);
+    const openTradesMismatch = dbActualOperationalCount !== brokerTruthOpenTrades;
 
     // Legacy flags for backward compatibility
     const pause = process.env.PAUSE_AUTOTRADING === "1";
@@ -187,9 +190,10 @@ export async function GET() {
         diagnostics: {
           dbOpenTradesCount,
           dbAutoOpenTradesCount,
+          dbActualOperationalCount,
           openTradesMismatch,
           mismatchNote: openTradesMismatch
-            ? `DB operational-open tickers=${dbOpenTradesCount} but broker positions=${brokerTruthOpenTrades}. Run reconcile-open-trades to cleanup stale conflicts.`
+            ? `DB operational-open tickers=${dbActualOperationalCount} but broker positions=${brokerTruthOpenTrades}. Run reconcile-open-trades to cleanup stale conflicts.`
             : null,
         },
       },
