@@ -2,6 +2,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import { redis } from "@/lib/redis";
 import { setWithTtl, getTtlSeconds } from "@/lib/redis/ttl";
+import { normalizeClosedTrades } from "@/lib/trades/closeReasonNormalization";
 
 const DATA_PATH = path.join(process.cwd(), "data");
 const TRADES_FILE = path.join(DATA_PATH, "trades.json");
@@ -65,11 +66,12 @@ export async function readTrades<T = any>(): Promise<T[]> {
 }
 
 export async function writeTrades<T = any>(trades: T[]): Promise<void> {
+  const normalized = normalizeClosedTrades(trades as any[]) as T[];
   if (redis) {
-    await writeToRedis(trades);
+    await writeToRedis(normalized);
     return;
   }
-  return writeToFile(trades);
+  return writeToFile(normalized);
 }
 
 export async function upsertTrade<T extends { id: string }>(trade: T): Promise<void> {

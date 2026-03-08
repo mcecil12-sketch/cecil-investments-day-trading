@@ -2,6 +2,12 @@ import { NextResponse } from "next/server";
 import { submitOrder } from "@/lib/alpaca";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
+import {
+  getOperationallyActiveTickers,
+  isLegacyErrorNoiseTrade,
+  isOperationallyActiveTrade,
+  normalizedOperationalStatus,
+} from "@/lib/trades/operational";
 
 export const runtime = "nodejs";
 
@@ -137,6 +143,9 @@ export async function GET(req: Request) {
     const statusParam = url.searchParams.get("status") ?? undefined;
     const limitParam = url.searchParams.get("limit");
     const orderParam = url.searchParams.get("order") ?? "desc";
+    const viewParam = String(url.searchParams.get("view") || "").toLowerCase();
+    const includeLegacyErrorsParam = String(url.searchParams.get("includeLegacyErrors") || "").toLowerCase();
+    const includeLegacyErrors = includeLegacyErrorsParam === "1" || includeLegacyErrorsParam === "true";
 
     // Parse limit with validation
     let limit = 1000;
@@ -159,6 +168,17 @@ export async function GET(req: Request) {
     // Apply filtering by status
     if (statusParam && statusParam !== "ALL") {
       trades = trades.filter((trade) => trade.status === statusParam);
+    } else {
+      // Default view keeps history but suppresses ticker-duplicate legacy ERROR rows
+      // that hide currently active OPEN/AUTO_PENDING records during investigations.
+      if (!includeLegacyErrors) {
+        const activeTickers = getOperationallyActiveTickers(trades);
+        trades = trades.filter((trade) => !isLegacyErrorNoiseTrade(trade, activeTickers));
+      }
+    }
+
+    if (viewParam === "operational") {
+      trades = trades.filter((trade) => isOperationallyActiveTrade(trade));
     }
 
     // Apply sorting by createdAt
@@ -223,6 +243,8 @@ export async function GET(req: Request) {
       qty: mapQty(trade),
       filledQty: mapFilledQty(trade),
       avgFillPrice: mapAvgFillPrice(trade),
+      normalizedStatus: normalizedOperationalStatus(trade),
+      operationallyActive: isOperationallyActiveTrade(trade),
     }));
 
     return NextResponse.json({
@@ -234,6 +256,8 @@ export async function GET(req: Request) {
         limit,
         order,
         status: statusParam ?? null,
+        view: viewParam || "default",
+        includeLegacyErrors,
       },
     });
   } catch (err: any) {

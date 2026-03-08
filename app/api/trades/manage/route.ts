@@ -72,6 +72,7 @@ type Trade = {
   updatedAt?: string;
   realizedPnL?: number;
   realizedR?: number;
+  closeReason?: string;
   alpacaOrderId?: string;
   alpacaClientOrderId?: string;
   alpacaStatus?: string;
@@ -223,6 +224,9 @@ export async function GET() {
         });
         const nextTrade = { ...t, status: nextStatus, updatedAt: nowIso };
         if (nextStatus === "CLOSED" && !nextTrade.closedAt) nextTrade.closedAt = nowIso;
+        if (nextStatus === "CLOSED" && !nextTrade.closeReason) {
+          nextTrade.closeReason = "manual_close";
+        }
         if (nextStatus === "CLOSED" && t.alpacaOrderId && typeof t.realizedPnL !== "number") {
           closedWithOrder.push(nextTrade);
         }

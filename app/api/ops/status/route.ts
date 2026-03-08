@@ -14,6 +14,7 @@ import { readReconcileTelemetry } from "@/lib/maintenance/reconcileTelemetry";
 import { computeScoringWindows } from "@/lib/ops/scoringWindows";
 import { readTodayFunnel } from "@/lib/funnelRedis";
 import { getEtDateString } from "@/lib/time/etDate";
+import { countOperationalOpenAutoTickers, countOperationalOpenTickers } from "@/lib/trades/operational";
 
 export const dynamic = "force-dynamic";
 
@@ -90,10 +91,8 @@ export async function GET() {
           : 0;
 
     // Whatever we currently compute from DB/app state (for diagnostics only):
-    const dbOpenTradesCount = trades.filter((t: any) => t.status === "OPEN").length;
-    const dbAutoOpenTradesCount = trades.filter(
-      (t: any) => t.status === "OPEN" && (t.source === "auto-entry" || t.source === "AUTO")
-    ).length;
+    const dbOpenTradesCount = countOperationalOpenTickers(trades);
+    const dbAutoOpenTradesCount = countOperationalOpenAutoTickers(trades);
 
     // IMPORTANT: entryState.openTrades is now broker-truth based.
     // This prevents "ghost open trades" from ever showing up in ops/status.
@@ -190,7 +189,7 @@ export async function GET() {
           dbAutoOpenTradesCount,
           openTradesMismatch,
           mismatchNote: openTradesMismatch
-            ? `DB has ${dbOpenTradesCount} open trades but broker has ${brokerTruthOpenTrades} positions. Run reconcile-open-trades to cleanup.`
+            ? `DB operational-open tickers=${dbOpenTradesCount} but broker positions=${brokerTruthOpenTrades}. Run reconcile-open-trades to cleanup stale conflicts.`
             : null,
         },
       },

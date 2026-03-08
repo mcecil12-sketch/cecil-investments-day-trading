@@ -257,6 +257,9 @@ export type ReconcileOpenTradesResult = {
   backfilled: number;
   backfilledTickers: string[];
   repairedOpenedAt: number;
+  cleanedPending: number;
+  cleanedPendingIds: string[];
+  cleanedPendingTickers: string[];
   broker: {
     positionsCount: number;
     openOrdersCount: number;
@@ -305,6 +308,9 @@ export async function reconcileOpenTrades(
         backfilled: 0,
         backfilledTickers: [],
         repairedOpenedAt: 0,
+        cleanedPending: 0,
+        cleanedPendingIds: [],
+        cleanedPendingTickers: [],
         broker: {
           positionsCount: 0,
           openOrdersCount: 0,
@@ -337,6 +343,55 @@ export async function reconcileOpenTrades(
       .filter((t) => (t?.status || "").toUpperCase() === "OPEN")
       .slice(0, max);
 
+    const results: any[] = [];
+
+    // Cleanup: archive AUTO_PENDING that conflicts with an existing broker position or OPEN trade.
+    const conflictingTickerSet = new Set<string>();
+    for (const p of brokerTruth.positions) {
+      const ticker = up(p?.symbol);
+      if (ticker) conflictingTickerSet.add(ticker);
+    }
+    for (const t of openTrades) {
+      const ticker = up(t?.ticker);
+      if (ticker) conflictingTickerSet.add(ticker);
+    }
+
+    let cleanedPending = 0;
+    const cleanedPendingIds: string[] = [];
+    const cleanedPendingTickersSet = new Set<string>();
+    for (const t of trades) {
+      const status = up(t?.status);
+      const autoEntryStatus = up(t?.autoEntryStatus);
+      const isAutoPending = status === "AUTO_PENDING" || autoEntryStatus === "AUTO_PENDING";
+      const ticker = up(t?.ticker);
+      if (!isAutoPending || !ticker || !conflictingTickerSet.has(ticker)) continue;
+
+      cleanedPending += 1;
+      if (cleanedPendingIds.length < 200) {
+        cleanedPendingIds.push(String(t?.id || ""));
+      }
+      cleanedPendingTickersSet.add(ticker);
+
+      if (!dryRun) {
+        t.status = "ARCHIVED";
+        t.autoEntryStatus = "AUTO_ARCHIVED";
+        t.reason = "conflicting_open_position";
+        t.closeReason = "conflicting_open_position";
+        t.cancelReason = "conflicting_open_position";
+        t.closedAt = t.closedAt || nowIso;
+        t.updatedAt = nowIso;
+      }
+
+      results.push({
+        id: t?.id,
+        ticker,
+        stale: false,
+        action: dryRun ? "would_archive_conflicting_auto_pending" : "archived_conflicting_auto_pending",
+        reason: "conflicting_open_position",
+      });
+    }
+    const cleanedPendingTickers = Array.from(cleanedPendingTickersSet);
+
     // Repair: Ensure all OPEN trades have openedAt set
     let repairedOpenedAt = 0;
     for (const t of openTrades) {
@@ -356,8 +411,6 @@ export async function reconcileOpenTrades(
 
     let closed = 0;
     let synced = 0;
-
-    const results: any[] = [];
 
     for (const t of openTrades) {
       checkDeadline();
@@ -415,6 +468,7 @@ export async function reconcileOpenTrades(
                 t.updatedAt = nowIso;
                 t.alpacaStatus = orderStatus || t.alpacaStatus || "terminal";
                 t.brokerStatus = orderStatus || t.brokerStatus || "terminal";
+                t.closeReason = t.closeReason || `reconciled_terminal_order:${orderStatus || "unknown"}`;
                 if (closePrice != null && closePrice > 0) {
                   t.closePrice = closePrice;
                 }
@@ -497,6 +551,7 @@ export async function reconcileOpenTrades(
               t.updatedAt = nowIso;
               t.alpacaStatus = t.alpacaStatus || "filled_activity_only";
               t.brokerStatus = t.brokerStatus || "filled_activity_only";
+              t.closeReason = t.closeReason || "reconciled_fill_activity";
               t.closePrice = closePrice;
               const realized = computeRealizedFromClose({
                 side: t?.side,
@@ -652,10 +707,8 @@ export async function reconcileOpenTrades(
           }
 
           if (!isPos(t.stopPrice)) {
-            t.status = "ERROR";
             t.autoEntryStatus = "INVALID";
-            t.error = "missing_stop_price";
-            t.reason = "missing_stop_price";
+            t.reason = t.reason || "missing_stop_price";
           }
         }
 
@@ -724,8 +777,7 @@ export async function reconcileOpenTrades(
       };
 
       if (!isPos(newTrade.stopPrice)) {
-        newTrade.status = "ERROR";
-        newTrade.error = "missing_stop_price";
+        newTrade.autoEntryStatus = "INVALID";
         newTrade.reason = "missing_stop_price";
       }
 
@@ -746,7 +798,7 @@ export async function reconcileOpenTrades(
 
     checkDeadline();
 
-    if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0)) {
+    if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0 || cleanedPending > 0)) {
       await writeTrades(trades);
     }
 
@@ -759,6 +811,7 @@ export async function reconcileOpenTrades(
         synced,
         backfilled,
         repairedOpenedAt,
+        cleanedPending,
       }
     );
 
@@ -771,6 +824,9 @@ export async function reconcileOpenTrades(
       backfilled,
       backfilledTickers,
       repairedOpenedAt,
+      cleanedPending,
+      cleanedPendingIds,
+      cleanedPendingTickers,
       broker: {
         positionsCount: brokerTruth.positionsCount,
         openOrdersCount: brokerTruth.openOrdersCount,
@@ -822,6 +878,9 @@ export async function reconcileOpenTrades(
       backfilled: 0,
       backfilledTickers: [],
       repairedOpenedAt: 0,
+      cleanedPending: 0,
+      cleanedPendingIds: [],
+      cleanedPendingTickers: [],
       broker: {
         positionsCount: 0,
         openOrdersCount: 0,
