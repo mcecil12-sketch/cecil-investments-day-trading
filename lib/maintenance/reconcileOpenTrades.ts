@@ -260,6 +260,8 @@ export type ReconcileOpenTradesResult = {
   cleanedPending: number;
   cleanedPendingIds: string[];
   cleanedPendingTickers: string[];
+  cleanedStaleBackfill: number;
+  cleanedStaleBackfillIds: string[];
   broker: {
     positionsCount: number;
     openOrdersCount: number;
@@ -311,6 +313,8 @@ export async function reconcileOpenTrades(
         cleanedPending: 0,
         cleanedPendingIds: [],
         cleanedPendingTickers: [],
+        cleanedStaleBackfill: 0,
+        cleanedStaleBackfillIds: [],
         broker: {
           positionsCount: 0,
           openOrdersCount: 0,
@@ -741,20 +745,92 @@ export async function reconcileOpenTrades(
 
     checkDeadline();
 
-    // Backfill: Create DB trades for broker positions not represented in DB
+    // Clean stale broker_backfill rows before backfill
+    let cleanedStaleBackfill = 0;
+    const cleanedStaleBackfillIds: string[] = [];
+    const activeBrokerTickers = new Set(brokerTruth.positions.map((p) => up(p.symbol)).filter(Boolean));
+
+    for (const t of trades) {
+      if (t?.source === "broker_backfill" && t?.ticker) {
+        const ticker = up(t.ticker);
+        // If broker_backfill row exists for ticker NOT in live broker positions, it's stale
+        if (ticker && !activeBrokerTickers.has(ticker) && t?.status !== "ARCHIVED" && t?.status !== "CLOSED") {
+          if (!dryRun) {
+            Object.assign(t, {
+              status: "ARCHIVED",
+              closedAt: nowIso,
+              updatedAt: nowIso,
+              closeReason: "stale_broker_backfill",
+              note: (t?.note || "") + " [Archived: stale broker_backfill position closed at broker]",
+            });
+          }
+          cleanedStaleBackfill += 1;
+          if (cleanedStaleBackfillIds.length < 10) {
+            cleanedStaleBackfillIds.push(t.id);
+          }
+          console.log(
+            `[reconcile] archived stale broker_backfill (source=${runSource}, id=${runId})`,
+            { ticker, tradeId: t.id, reason: "stale_broker_backfill", dryRun }
+          );
+        }
+      }
+    }
+
+    checkDeadline();
+
+    // Backfill: Create or reuse DB trades for broker positions
     let backfilled = 0;
     const backfilledTickers: string[] = [];
-    const dbOpenTickerSet = new Set(openTrades.map((t) => up(t?.ticker)).filter(Boolean));
 
     for (const pos of brokerTruth.positions) {
       checkDeadline();
 
       const posTicker = up(pos.symbol);
-      if (!posTicker || dbOpenTickerSet.has(posTicker)) {
-        continue; // Already exists in DB
+      if (!posTicker) continue;
+
+      // Look for existing broker_backfill row for this ticker (any status)
+      const existingBackfill = trades.find(
+        (t) => t?.source === "broker_backfill" && up(t?.ticker) === posTicker
+      );
+
+      if (existingBackfill) {
+        // Reuse existing broker_backfill row, sync it to current broker state
+        if (existingBackfill.status !== "OPEN") {
+          // Re-open if it was closed/archived
+          if (!dryRun) {
+            Object.assign(existingBackfill, {
+              status: "OPEN",
+              closedAt: null,
+              closeReason: null,
+              updatedAt: nowIso,
+              note: (existingBackfill?.note || "") + " [Reopened: broker position active again]",
+            });
+          }
+          console.log(
+            `[reconcile] reopened existing broker_backfill (source=${runSource}, id=${runId})`,
+            { ticker: posTicker, tradeId: existingBackfill.id, dryRun }
+          );
+        }
+
+        // Sync position data
+        if (!dryRun) {
+          Object.assign(existingBackfill, {
+            qty: Math.abs(Number(pos.qty || 0)),
+            side: (Number(pos.qty) > 0 ? "LONG" : "SHORT") as "LONG" | "SHORT",
+            entryPrice: Number(pos.avg_entry_price || 0),
+            avgFillPrice: Number(pos.avg_entry_price || 0),
+            filledQty: Math.abs(Number(pos.qty || 0)),
+            stopPrice: openStopBySymbol.get(posTicker) ?? existingBackfill.stopPrice,
+            autoEntryStatus: isPos(existingBackfill.stopPrice || openStopBySymbol.get(posTicker)) ? "OPEN" : "INVALID",
+            alpacaStatus: "position_open",
+            brokerStatus: "position_open",
+            updatedAt: nowIso,
+          });
+        }
+        continue; // Reused existing, no new backfill
       }
 
-      // Broker position not in DB, backfill it
+      // No existing broker_backfill row, create new one
       const newTrade: any = {
         id: crypto.randomUUID(),
         ticker: posTicker,
@@ -798,7 +874,7 @@ export async function reconcileOpenTrades(
 
     checkDeadline();
 
-    if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0 || cleanedPending > 0)) {
+    if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0 || cleanedPending > 0 || cleanedStaleBackfill > 0)) {
       await writeTrades(trades);
     }
 
@@ -812,6 +888,7 @@ export async function reconcileOpenTrades(
         backfilled,
         repairedOpenedAt,
         cleanedPending,
+        cleanedStaleBackfill,
       }
     );
 
@@ -827,6 +904,8 @@ export async function reconcileOpenTrades(
       cleanedPending,
       cleanedPendingIds,
       cleanedPendingTickers,
+      cleanedStaleBackfill,
+      cleanedStaleBackfillIds,
       broker: {
         positionsCount: brokerTruth.positionsCount,
         openOrdersCount: brokerTruth.openOrdersCount,
@@ -881,6 +960,8 @@ export async function reconcileOpenTrades(
       cleanedPending: 0,
       cleanedPendingIds: [],
       cleanedPendingTickers: [],
+      cleanedStaleBackfill: 0,
+      cleanedStaleBackfillIds: [],
       broker: {
         positionsCount: 0,
         openOrdersCount: 0,
