@@ -761,6 +761,8 @@ export async function reconcileOpenTrades(
               closedAt: nowIso,
               updatedAt: nowIso,
               closeReason: "stale_broker_backfill",
+              alpacaStatus: null,
+              brokerStatus: null,
               note: (t?.note || "") + " [Archived: stale broker_backfill position closed at broker]",
             });
           }
@@ -788,40 +790,73 @@ export async function reconcileOpenTrades(
       const posTicker = up(pos.symbol);
       if (!posTicker) continue;
 
-      // Look for existing broker_backfill row for this ticker (any status)
-      const existingBackfill = trades.find(
+      // Find ALL broker_backfill rows for this ticker (not just first)
+      const allBackfillsForTicker = trades.filter(
         (t) => t?.source === "broker_backfill" && up(t?.ticker) === posTicker
       );
 
-      if (existingBackfill) {
-        // Reuse existing broker_backfill row, sync it to current broker state
-        if (existingBackfill.status !== "OPEN") {
+      if (allBackfillsForTicker.length > 0) {
+        // Pick the best one to keep: prefer OPEN, then newest by updatedAt
+        const toKeep = allBackfillsForTicker.sort((a, b) => {
+          if (a.status === "OPEN" && b.status !== "OPEN") return -1;
+          if (b.status === "OPEN" && a.status !== "OPEN") return 1;
+          return (b.updatedAt || "").localeCompare(a.updatedAt || "");
+        })[0];
+
+        // Archive all duplicates
+        for (const dup of allBackfillsForTicker) {
+          if (dup.id === toKeep.id) continue;
+          if (dup.status === "ARCHIVED" || dup.status === "CLOSED") continue;
+
+          if (!dryRun) {
+            Object.assign(dup, {
+              status: "ARCHIVED",
+              closedAt: nowIso,
+              updatedAt: nowIso,
+              closeReason: "duplicate_broker_backfill",
+              alpacaStatus: null,
+              brokerStatus: null,
+              note: (dup?.note || "") + " [Archived: duplicate broker_backfill superseded]",
+            });
+          }
+          cleanedStaleBackfill += 1;
+          if (cleanedStaleBackfillIds.length < 10) {
+            cleanedStaleBackfillIds.push(dup.id);
+          }
+          console.log(
+            `[reconcile] archived duplicate broker_backfill (source=${runSource}, id=${runId})`,
+            { ticker: posTicker, tradeId: dup.id, reason: "duplicate_broker_backfill", dryRun }
+          );
+        }
+
+        // Reuse the kept broker_backfill row, sync it to current broker state
+        if (toKeep.status !== "OPEN") {
           // Re-open if it was closed/archived
           if (!dryRun) {
-            Object.assign(existingBackfill, {
+            Object.assign(toKeep, {
               status: "OPEN",
               closedAt: null,
               closeReason: null,
               updatedAt: nowIso,
-              note: (existingBackfill?.note || "") + " [Reopened: broker position active again]",
+              note: (toKeep?.note || "") + " [Reopened: broker position active again]",
             });
           }
           console.log(
             `[reconcile] reopened existing broker_backfill (source=${runSource}, id=${runId})`,
-            { ticker: posTicker, tradeId: existingBackfill.id, dryRun }
+            { ticker: posTicker, tradeId: toKeep.id, dryRun }
           );
         }
 
         // Sync position data
         if (!dryRun) {
-          Object.assign(existingBackfill, {
+          Object.assign(toKeep, {
             qty: Math.abs(Number(pos.qty || 0)),
             side: (Number(pos.qty) > 0 ? "LONG" : "SHORT") as "LONG" | "SHORT",
             entryPrice: Number(pos.avg_entry_price || 0),
             avgFillPrice: Number(pos.avg_entry_price || 0),
             filledQty: Math.abs(Number(pos.qty || 0)),
-            stopPrice: openStopBySymbol.get(posTicker) ?? existingBackfill.stopPrice,
-            autoEntryStatus: isPos(existingBackfill.stopPrice || openStopBySymbol.get(posTicker)) ? "OPEN" : "INVALID",
+            stopPrice: openStopBySymbol.get(posTicker) ?? toKeep.stopPrice,
+            autoEntryStatus: isPos(toKeep.stopPrice || openStopBySymbol.get(posTicker)) ? "OPEN" : "INVALID",
             alpacaStatus: "position_open",
             brokerStatus: "position_open",
             updatedAt: nowIso,

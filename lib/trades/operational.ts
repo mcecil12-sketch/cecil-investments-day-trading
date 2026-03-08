@@ -17,7 +17,10 @@ export function hasLivePositionMarker(trade: any): boolean {
 }
 
 export function isOperationallyOpenTrade(trade: any): boolean {
-  return up(trade?.status) === "OPEN" || hasLivePositionMarker(trade);
+  const status = up(trade?.status);
+  // Never count ARCHIVED or CLOSED as operational, even if they have position markers
+  if (status === "ARCHIVED" || status === "CLOSED") return false;
+  return status === "OPEN" || hasLivePositionMarker(trade);
 }
 
 export function isOperationallyActiveTrade(trade: any): boolean {
