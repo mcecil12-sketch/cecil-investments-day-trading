@@ -2,6 +2,7 @@ import { shouldQualify } from "@/lib/aiQualify";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { computeDirection } from "@/lib/scannerUtils";
 import { normalizeAiDirectionForStorage } from "@/lib/jsonDb";
+import type { SkipReason } from "@/lib/ai/eligibilityGates";
 
 type ParseFailedMeta = {
   aiModel?: string | null;
@@ -31,6 +32,69 @@ export function applyInsufficientBars(signal: any, reason: string, nowIso: strin
   
   // Track as skip (not error) in funnel
   bumpTodayFunnel({ skipInsufficientBars: 1 }).catch(console.warn);
+  
+  return signal;
+}
+
+/**
+ * Apply pre-GPT skip reason for signals that don't meet eligibility gates.
+ * Used for hard gates: bars, volume, price, etc. (before AI scoring).
+ * 
+ * @param signal The signal being skipped
+ * @param reason The specific skip reason (e.g., "volume_too_low", "price_too_low")
+ * @param detail Optional diagnostic detail (e.g., "actual=500 < required=600")
+ * @param nowIso Current time ISO string
+ */
+export function applyPreGptSkip(
+  signal: any,
+  reason: SkipReason,
+  detail: string | undefined,
+  nowIso: string
+) {
+  signal.status = "ARCHIVED";
+  signal.skipReason = reason;
+  signal.aiScore = 0;
+  signal.aiGrade = "F";
+  signal.qualified = false;
+  signal.shownInApp = false;
+  signal.scoredAt = nowIso;
+  signal.updatedAt = nowIso;
+  signal.scoringLockUntil = undefined;
+  signal.scoringStartedAt = undefined;
+  
+  // Build summary with detail if available
+  const summaryMap: Record<SkipReason, string> = {
+    insufficient_bars: "Insufficient recent bars",
+    volume_too_low: "Average volume below minimum",
+    dollar_volume_too_low: "Dollar volume below minimum",
+    price_too_low: "Entry price below minimum",
+    spread_too_wide: "Spread exceeds maximum",
+    stale: "Signal too old (stale)",
+  };
+  
+  signal.aiSummary = detail
+    ? `${summaryMap[reason]}: ${detail}`
+    : summaryMap[reason];
+  
+  // Clear other score fields
+  delete signal.score;
+  delete signal.grade;
+  delete signal.totalScore;
+  delete signal.tradePlan;
+  delete signal.error;
+  
+  // Track in funnel by reason
+  const funnelMetrics: Record<SkipReason, string> = {
+    insufficient_bars: "skipInsufficientBars",
+    volume_too_low: "skipVolumeTooLow",
+    dollar_volume_too_low: "skipDollarVolume",
+    price_too_low: "skipPriceTooLow",
+    spread_too_wide: "skipSpreadTooWide",
+    stale: "skipStale",
+  };
+  
+  const funnelKey = funnelMetrics[reason];
+  bumpTodayFunnel({ [funnelKey]: 1 } as any).catch(console.warn);
   
   return signal;
 }

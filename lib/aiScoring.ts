@@ -548,7 +548,7 @@ Return ONLY valid JSON:
     try {
       completion = await openai.chat.completions.create({
         model,
-        ...(supportsCustomTemperature(model) ? { temperature: 0.3 } : {}),
+        ...(supportsCustomTemperature(model) ? { temperature: 0 } : {}),
         response_format: {
           type: "json_schema",
           json_schema: {

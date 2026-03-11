@@ -9,7 +9,9 @@ import {
   applyParseFailed,
   applyScoreError,
   applyScoreSuccess,
+  applyPreGptSkip,
 } from "@/lib/ai/scoreDrainApply";
+import { evaluateSignalEligibility } from "@/lib/ai/eligibilityGates";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -22,6 +24,15 @@ const SOFT_STOP_MARGIN_MS = 2000; // Stop starting new work when <2s remaining (
 const MAX_PER_RUN = Number(process.env.AI_SCORE_DRAIN_MAX ?? 25);
 const SCORING_CONCURRENCY = Number(process.env.AI_SCORE_DRAIN_CONCURRENCY ?? 5); // Parallel scoring workers
 const MAX_PICK_POOL = 500; // Max signals to consider for sorting/picking (CPU optimization)
+
+// Fresh signal window configuration for live vs recovery modes
+const AI_SCORE_FRESH_HOURS = Number(process.env.AI_SCORE_FRESH_HOURS ?? 24); // Window for live mode (default 24h)
+const AI_SCORE_RECOVERY_HOURS = Number(process.env.AI_SCORE_RECOVERY_HOURS ?? 48); // Window for recovery mode (default 48h)
+
+// Performance tuning: batching and parse reliability
+const AI_SCORE_BATCH_SIZE = Number(process.env.AI_SCORE_BATCH_SIZE ?? 5); // Batch size for concurrent scoring
+const AI_SCORE_RETRY_ON_PARSE_FAIL = (process.env.AI_SCORE_RETRY_ON_PARSE_FAIL ?? "1") === "1";
+const MAX_PARSE_RETRY = Number(process.env.MAX_PARSE_RETRY ?? 2); // Retry count for parse failures
 
 const DRAIN_LOCK_KEY = "ai:score:drain:lock";
 const DRAIN_LOCK_TTL = 30; // seconds
@@ -460,6 +471,22 @@ export async function POST(req: Request) {
     deadlineMsConfigured?: number;
     softStopMarginMs?: number;
     effectiveLimit?: number;
+    scanned?: number;
+    eligible?: number;
+    skippedStale?: number;
+    skippedStatus?: number;
+    mode?: "live" | "recovery";
+    freshHoursUsed?: number;
+    // Pre-GPT gating skip counters
+    skippedInsufficientBars?: number;
+    skippedVolumeTooLow?: number;
+    skippedDollarVolume?: number;
+    skippedPriceTooLow?: number;
+    skippedSpreadTooWide?: number;
+    // Batch/diagnostics
+    batchSize?: number;
+    selectedCount?: number;
+    preGptSkipped?: number;
   } = {
     ok: true,
     processed: 0,
@@ -482,6 +509,18 @@ export async function POST(req: Request) {
     deadlineMsConfigured,
     softStopMarginMs: SOFT_STOP_MARGIN_MS,
     effectiveLimit: maxPerRunComputed,
+    scanned: 0,
+    eligible: 0,
+    skippedStale: 0,
+    skippedStatus: 0,
+    skippedInsufficientBars: 0,
+    skippedVolumeTooLow: 0,
+    skippedDollarVolume: 0,
+    skippedPriceTooLow: 0,
+    skippedSpreadTooWide: 0,
+    batchSize: AI_SCORE_BATCH_SIZE,
+    selectedCount: 0,
+    preGptSkipped: 0,
   };
 
 
@@ -498,10 +537,21 @@ export async function POST(req: Request) {
     }
 
     // If authorization passed and lock acquired, proceed
-    // --- AI scoring drain: always prioritize newest PENDING signals for real-time funnel health ---
-    // Why newest-first? Ensures the most recent signals are scored promptly, keeping the funnel responsive and preventing backlog starvation.
+    // --- AI scoring drain: prioritize fresh PENDING signals for real-time funnel health ---
+    // Default live mode: only score signals within AI_SCORE_FRESH_HOURS window
+    // Recovery mode (optional): score signals within AI_SCORE_RECOVERY_HOURS window
     const signals = await readSignals();
     const now = new Date();
+    
+    // Parse mode: "live" (default, fresh signals only) or "recovery" (broader window)
+    const modeParam = (qp.get("mode") || "live").toLowerCase();
+    const mode: "live" | "recovery" = ["recovery"].includes(modeParam) ? "recovery" : "live";
+    
+    // Determine fresh window based on mode
+    const freshHoursUsed = mode === "recovery" ? AI_SCORE_RECOVERY_HOURS : AI_SCORE_FRESH_HOURS;
+    const freshWindowStart = new Date(now.getTime() - freshHoursUsed * 60 * 60 * 1000);
+    result.mode = mode;
+    result.freshHoursUsed = freshHoursUsed;
     
     // Parse query params (budgetMs and limit already parsed above)
     const backlog = ["1", "true", "yes", "y", "on"].includes(
@@ -514,12 +564,9 @@ export async function POST(req: Request) {
       strategyParam === "backlog_oldest_first";
     const releaseLimit = Number(qp.get("releaseLimit") ?? "-1"); // -1 = release all
     
-    // Parse recentWindowHours parameter (default from env or 6 hours)
-    const recentWindowHoursParam = Number(qp.get("recentWindowHours") ?? "NaN");
-    const RECENT_WINDOW_HOURS = Number.isFinite(recentWindowHoursParam) && recentWindowHoursParam > 0 
-      ? recentWindowHoursParam 
-      : Number(process.env.AI_SCORE_DRAIN_RECENT_HOURS ?? 6);
-    const recentWindowStart = new Date(now.getTime() - RECENT_WINDOW_HOURS * 60 * 60 * 1000);
+    // Use fresh window for default live mode (no legacy backlog processing in normal drain)
+    const RECENT_WINDOW_HOURS = freshHoursUsed;
+    const recentWindowStart = freshWindowStart;
 
     // === RECLAIM STALE SCORING SIGNALS ===
     // Before picking new signals, find any stuck SCORING signals older than 10 minutes and revert them to PENDING
@@ -579,14 +626,15 @@ export async function POST(req: Request) {
 
     type PickStrategy = "recent_first" | "backlog_fallback" | "backlog_oldest_first";
 
-    // Decide strategy (default stays recent_first)
+    // Decide strategy (default stays recent_first with fresh window filtering)
     let pickedStrategy: PickStrategy = wantBacklogStrategy
       ? "backlog_oldest_first"
       : "recent_first";
     let pickedSignals: any[] = [];
 
     if (pickedStrategy === "backlog_oldest_first") {
-      // Backlog mode: pick oldest-first (no recent window filter)
+      // Backlog mode: pick oldest-first from ALL PENDING (legacy recovery)
+      // Note: User must explicitly request backlog=true or strategy=backlog_oldest_first
       // Optimization: limit sorting pool to MAX_PICK_POOL
       const pendingSignals = signals.filter((s) => s.status === "PENDING");
       const poolSize = Math.min(pendingSignals.length, MAX_PICK_POOL * 2); // 2x for safety
@@ -595,33 +643,38 @@ export async function POST(req: Request) {
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
         .slice(0, maxPerRunComputed);
     } else {
-      // Recent-first: pick newest within recent window with CPU optimization
-      // Filter PENDING signals within the recent window
-      const recentPending = signals.filter(
-        (s) => s.status === "PENDING" && new Date(s.createdAt) >= recentWindowStart
-      );
+      // Default live mode: pick signals ONLY within fresh window, sorted oldest-to-newest within that window
+      // This prevents legacy backlog from monopolizing scoring throughput
       
-      if (recentPending.length > 0) {
-        // Optimization: if pool is large, only sort the newest MAX_PICK_POOL candidates
-        const poolSize = Math.min(recentPending.length, MAX_PICK_POOL);
-        // Take last N items (assuming signals array is roughly chronological)
-        const pool = recentPending.slice(-poolSize);
-        pickedSignals = pool
-          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-          .slice(0, maxPerRunComputed);
-      } else {
-        // Fallback: if recent window yields nothing, pick oldest-first from ALL PENDING
-        console.log("[score/drain] recent window empty, falling back to backlog oldest-first", {
-          recentWindowHours: RECENT_WINDOW_HOURS,
-          recentWindowStart: recentWindowStart.toISOString(),
-        });
-        pickedStrategy = "backlog_fallback";
-        const pendingSignals = signals.filter((s) => s.status === "PENDING");
-        const poolSize = Math.min(pendingSignals.length, MAX_PICK_POOL * 2);
-        const pool = pendingSignals.slice(0, poolSize);
+      // Count diagnostics: total scanned
+      const pendingSignals = signals.filter((s) => s.status === "PENDING");
+      result.scanned = pendingSignals.length;
+      
+      // Filter to fresh window
+      const freshPending = pendingSignals.filter(
+        (s) => new Date(s.createdAt) >= freshWindowStart
+      );
+      result.eligible = freshPending.length;
+      
+      // Count stale signals (outside fresh window)
+      result.skippedStale = pendingSignals.length - freshPending.length;
+      
+      if (freshPending.length > 0) {
+        // Pick from fresh signals, sorted oldest-to-newest (first eligible = need to process first)
+        // Optimization: if pool is large, only sort the oldest MAX_PICK_POOL candidates
+        const poolSize = Math.min(freshPending.length, MAX_PICK_POOL);
+        const pool = freshPending.slice(0, poolSize);
         pickedSignals = pool
           .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
           .slice(0, maxPerRunComputed);
+      } else {
+        // Fallback: if fresh window yields nothing (e.g., no activity in last 24h)
+        console.log("[score/drain] fresh window empty, no signals to process", {
+          mode: result.mode,
+          freshHoursUsed,
+          freshWindowStart: freshWindowStart.toISOString(),
+        });
+        // Leave pickedSignals empty; this run processes 0 signals
       }
     }
 
@@ -636,6 +689,75 @@ export async function POST(req: Request) {
       claimedIds.push(s.id);
     }
     await writeSignals(signals);
+
+    // === PRE-GPT GATING: Filter for eligibility before sending to AI ===
+    // This prevents junk signals from consuming API quota
+    const nowIso = new Date().toISOString();
+    const eligibleForScoring: any[] = [];
+    const preGptSkippedIds: string[] = [];
+
+    for (const signal of pickedSignals) {
+      const eligResult = evaluateSignalEligibility(
+        signal.signalContext || null,
+        signal.entryPrice,
+        signal.createdAt
+      );
+
+      if (!eligResult.eligible) {
+        // Mark as pre-GPT skipped (don't send to AI)
+        applyPreGptSkip(signal, eligResult.reason, eligResult.detail, nowIso);
+        preGptSkippedIds.push(signal.id);
+        result.preGptSkipped = (result.preGptSkipped ?? 0) + 1;
+
+        // Track by reason
+        switch (eligResult.reason) {
+          case "insufficient_bars":
+            result.skippedInsufficientBars = (result.skippedInsufficientBars ?? 0) + 1;
+            break;
+          case "volume_too_low":
+            result.skippedVolumeTooLow = (result.skippedVolumeTooLow ?? 0) + 1;
+            break;
+          case "dollar_volume_too_low":
+            result.skippedDollarVolume = (result.skippedDollarVolume ?? 0) + 1;
+            break;
+          case "price_too_low":
+            result.skippedPriceTooLow = (result.skippedPriceTooLow ?? 0) + 1;
+            break;
+          case "spread_too_wide":
+            result.skippedSpreadTooWide = (result.skippedSpreadTooWide ?? 0) + 1;
+            break;
+        }
+
+        console.log("[score/drain] signal blocked by pre-GPT gate", {
+          id: signal.id,
+          ticker: signal.ticker,
+          reason: eligResult.reason,
+          detail: eligResult.detail,
+        });
+        finalizedIds.push(signal.id);
+        continue;
+      }
+
+      // Signal is eligible for AI scoring
+      eligibleForScoring.push(signal);
+    }
+
+    // Write pre-GPT skipped signals
+    if (preGptSkippedIds.length > 0) {
+      await writeSignals(signals);
+      console.log("[score/drain] pre-GPT gating archived", {
+        count: preGptSkippedIds.length,
+        reasons: {
+          insufficient_bars: result.skippedInsufficientBars,
+          volume_too_low: result.skippedVolumeTooLow,
+          dollar_volume_too_low: result.skippedDollarVolume,
+          price_too_low: result.skippedPriceTooLow,
+          spread_too_wide: result.skippedSpreadTooWide,
+        },
+      });
+    }
+
+    result.selectedCount = eligibleForScoring.length;
 
     // For response visibility: compute createdAt range based on picked signals
     const newestPickedCreatedAt = pickedSignals.length > 0
@@ -657,11 +779,13 @@ export async function POST(req: Request) {
       recentWindowHours: RECENT_WINDOW_HOURS,
       newestPickedCreatedAt,
       oldestPickedCreatedAt,
+      preGptSkipped: result.preGptSkipped,
+      selectedForScoring: eligibleForScoring.length,
     });
 
-    // Process signals with concurrency
+    // Process eligible signals with concurrency (pre-GPT filtered)
     const concurrentResult = await scoreSignalsConcurrent(
-      pickedSignals,
+      eligibleForScoring,
       deadlineAtMs,
       SCORING_CONCURRENCY
     );
@@ -914,13 +1038,19 @@ export async function POST(req: Request) {
       }
     }
     
-    // Track drain metrics
+    // Track drain metrics + pre-GPT skipping
     try {
       await bumpTodayFunnel({
         drainsRun: 1,
         drainScored: result.scoredCount,
         drainTimeout: result.timeoutCount,
         drainError: result.errorCount,
+        drainPreGptSkipped: result.preGptSkipped ?? 0,
+        drainSkippedInsufficientBars: result.skippedInsufficientBars ?? 0,
+        drainSkippedVolumeTooLow: result.skippedVolumeTooLow ?? 0,
+        drainSkippedDollarVolume: result.skippedDollarVolume ?? 0,
+        drainSkippedPriceTooLow: result.skippedPriceTooLow ?? 0,
+        drainSkippedSpreadTooWide: result.skippedSpreadTooWide ?? 0,
       });
     } catch (err) {
       console.warn("[score/drain] drain metrics update error", err);
