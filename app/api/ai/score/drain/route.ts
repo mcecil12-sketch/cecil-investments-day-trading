@@ -29,10 +29,8 @@ const MAX_PICK_POOL = 500; // Max signals to consider for sorting/picking (CPU o
 const AI_SCORE_FRESH_HOURS = Number(process.env.AI_SCORE_FRESH_HOURS ?? 24); // Window for live mode (default 24h)
 const AI_SCORE_RECOVERY_HOURS = Number(process.env.AI_SCORE_RECOVERY_HOURS ?? 48); // Window for recovery mode (default 48h)
 
-// Performance tuning: batching and parse reliability
+// Performance tuning: batching
 const AI_SCORE_BATCH_SIZE = Number(process.env.AI_SCORE_BATCH_SIZE ?? 5); // Batch size for concurrent scoring
-const AI_SCORE_RETRY_ON_PARSE_FAIL = (process.env.AI_SCORE_RETRY_ON_PARSE_FAIL ?? "1") === "1";
-const MAX_PARSE_RETRY = Number(process.env.MAX_PARSE_RETRY ?? 2); // Retry count for parse failures
 
 const DRAIN_LOCK_KEY = "ai:score:drain:lock";
 const DRAIN_LOCK_TTL = 30; // seconds
@@ -437,6 +435,13 @@ export async function POST(req: Request) {
     bodyLimit !== undefined && Number.isFinite(bodyLimit) && bodyLimit > 0 ? bodyLimit : undefined
   ) ?? MAX_PER_RUN;
   const maxPerRunComputed = Math.min(MAX_PER_RUN, effectiveLimit);
+  const hasExplicitLimitOverride =
+    queryLimit !== undefined ||
+    (bodyLimit !== undefined && Number.isFinite(bodyLimit) && bodyLimit > 0);
+  const configuredBatchSize = Math.max(1, Math.trunc(AI_SCORE_BATCH_SIZE) || 1);
+  const runtimeBatchSize = hasExplicitLimitOverride
+    ? maxPerRunComputed
+    : Math.min(maxPerRunComputed, configuredBatchSize);
 
   // Initialize result object (guaranteed to be returned as JSON)
   const result: {
@@ -460,9 +465,10 @@ export async function POST(req: Request) {
     details: Array<{
       id: string;
       ticker: string;
-      status: "SCORED" | "ERROR";
+      status: "SCORED" | "ERROR" | "ARCHIVED";
       aiScore?: number | null;
       error?: string;
+      skipReason?: string;
     }>;
     pickedStrategy?: "recent_first" | "backlog_fallback" | "backlog_oldest_first";
     recentWindowHours?: number;
@@ -487,6 +493,7 @@ export async function POST(req: Request) {
     batchSize?: number;
     selectedCount?: number;
     preGptSkipped?: number;
+    skippedCount?: number;
   } = {
     ok: true,
     processed: 0,
@@ -518,9 +525,10 @@ export async function POST(req: Request) {
     skippedDollarVolume: 0,
     skippedPriceTooLow: 0,
     skippedSpreadTooWide: 0,
-    batchSize: AI_SCORE_BATCH_SIZE,
+    batchSize: runtimeBatchSize,
     selectedCount: 0,
     preGptSkipped: 0,
+    skippedCount: 0,
   };
 
 
@@ -700,7 +708,8 @@ export async function POST(req: Request) {
       const eligResult = evaluateSignalEligibility(
         signal.signalContext || null,
         signal.entryPrice,
-        signal.createdAt
+        signal.createdAt,
+        { staleAgeHours: freshHoursUsed }
       );
 
       if (!eligResult.eligible) {
@@ -725,6 +734,9 @@ export async function POST(req: Request) {
             break;
           case "spread_too_wide":
             result.skippedSpreadTooWide = (result.skippedSpreadTooWide ?? 0) + 1;
+            break;
+          case "stale":
+            result.skippedStale = (result.skippedStale ?? 0) + 1;
             break;
         }
 
@@ -757,7 +769,19 @@ export async function POST(req: Request) {
       });
     }
 
-    result.selectedCount = eligibleForScoring.length;
+    const selectedForScoring = eligibleForScoring.slice(0, runtimeBatchSize);
+    const overflowEligible = eligibleForScoring.slice(runtimeBatchSize);
+
+    // Keep selection bounded by runtime batch size unless explicit limit override is set.
+    for (const signal of overflowEligible) {
+      signal.status = "PENDING";
+      signal.scoringLockUntil = undefined;
+      signal.scoringStartedAt = undefined;
+      signal.updatedAt = nowIso;
+      result.releasedCount += 1;
+    }
+
+    result.selectedCount = selectedForScoring.length;
 
     // For response visibility: compute createdAt range based on picked signals
     const newestPickedCreatedAt = pickedSignals.length > 0
@@ -780,12 +804,13 @@ export async function POST(req: Request) {
       newestPickedCreatedAt,
       oldestPickedCreatedAt,
       preGptSkipped: result.preGptSkipped,
-      selectedForScoring: eligibleForScoring.length,
+      selectedForScoring: selectedForScoring.length,
+      overflowReleased: overflowEligible.length,
     });
 
     // Process eligible signals with concurrency (pre-GPT filtered)
     const concurrentResult = await scoreSignalsConcurrent(
-      eligibleForScoring,
+      selectedForScoring,
       deadlineAtMs,
       SCORING_CONCURRENCY
     );
@@ -877,7 +902,7 @@ export async function POST(req: Request) {
             nowIso
           );
         } else {
-          applyScoreError(signal, procResult.errorReason, nowIso);
+          applyScoreError(signal, procResult.errorReason, nowIso, procResult.errorCode);
         }
 
         finalizedIds.push(signal.id);
@@ -924,15 +949,23 @@ export async function POST(req: Request) {
 
     result.processed = concurrentResult.scoredCount + concurrentResult.errorCount;
     result.timeoutCount = concurrentResult.timeoutCount;
+    result.skippedCount =
+      (result.preGptSkipped ?? 0) +
+      result.timeoutCount +
+      result.skippedAlreadyClaimed +
+      result.releasedCount;
 
     // Rebuild details from actual persisted signal state (post-apply)
     const finalizedSignals = signals.filter((s) => finalizedIds.includes(s.id));
     result.details = finalizedSignals.slice(0, 20).map((s) => ({
       id: s.id,
       ticker: s.ticker,
-      status: s.status as "SCORED" | "ERROR",
+      status: (s.status === "SCORED" || s.status === "ERROR" || s.status === "ARCHIVED")
+        ? s.status
+        : "ERROR",
       aiScore: s.status === "SCORED" ? s.aiScore : undefined,
       error: s.status === "ERROR" ? (s.error ?? undefined) : undefined,
+      skipReason: s.status === "ARCHIVED" ? ((s as any).skipReason ?? undefined) : undefined,
     }));
 
     // CLEANUP: Release any unfinalized claims (signals stuck in SCORING)
@@ -967,10 +1000,11 @@ export async function POST(req: Request) {
     for (const sig of signals.filter((s) => finalizedIds.includes(s.id))) {
       const signal = sig as any; // Allow dynamic properties like scoredAt
       if (signal.status === "SCORED" && !Number.isFinite(signal.aiScore)) {
+        const invalidAiScore = signal.aiScore;
         console.warn("[score/drain] write guard: SCORED signal has non-finite aiScore, converting to ERROR", {
           id: signal.id,
           ticker: signal.ticker,
-          aiScore: signal.aiScore,
+          aiScore: invalidAiScore,
         });
 
         // Determine which error code to use based on aiSummary or default to parse_failed
@@ -992,7 +1026,7 @@ export async function POST(req: Request) {
         
         signal.aiScore = 0;
         signal.aiGrade = "F";
-        signal.aiSummary = `guard: non-finite aiScore (was ${signal.aiScore})`;
+        signal.aiSummary = `guard: non-finite aiScore (was ${String(invalidAiScore)})`;
         signal.scoredAt = new Date().toISOString();
         signal.updatedAt = new Date().toISOString();
 
@@ -1068,6 +1102,7 @@ export async function POST(req: Request) {
       scored: result.scored,
       errored: result.errored,
       timeoutCount: result.timeoutCount,
+      skippedCount: result.skippedCount,
       expired: result.expired,
       durationMs: Date.now() - startedAtMs,
       remainingTimeMs: deadlineAtMs - Date.now(),

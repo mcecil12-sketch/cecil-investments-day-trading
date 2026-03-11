@@ -131,9 +131,18 @@ export function applyParseFailed(
   return signal;
 }
 
-export function applyScoreError(signal: any, reason: string | undefined, nowIso: string) {
+export function applyScoreError(
+  signal: any,
+  reason: string | undefined,
+  nowIso: string,
+  errorCode?: string
+) {
   signal.status = "ERROR";
-  signal.error = reason?.includes("timeout") ? "model_timeout" : "scoring_failed";
+  if (errorCode === "breaker_open" || errorCode === "scoring_disabled") {
+    signal.error = errorCode;
+  } else {
+    signal.error = reason?.includes("timeout") ? "model_timeout" : "scoring_failed";
+  }
   signal.aiErrorReason = reason;
   signal.scoredAt = nowIso;
   signal.updatedAt = nowIso;

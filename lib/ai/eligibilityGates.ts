@@ -45,7 +45,8 @@ export type EligibilityResult =
 export function evaluateSignalEligibility(
   context: SignalContext | null,
   entryPrice: number,
-  createdAt?: string
+  createdAt?: string,
+  options?: { staleAgeHours?: number }
 ): EligibilityResult {
   // Gate 1: Bars used (context requirement)
   if (!context || !Number.isFinite(context.barsUsed)) {
@@ -61,6 +62,15 @@ export function evaluateSignalEligibility(
       eligible: false,
       reason: "insufficient_bars",
       detail: `${context.barsUsed} < ${MIN_BARS_REQUIRED}`,
+    };
+  }
+
+  // Gate 1b: Staleness guard (live/recovery mode controlled by caller)
+  if (typeof options?.staleAgeHours === "number" && isSignalStale(createdAt, options.staleAgeHours)) {
+    return {
+      eligible: false,
+      reason: "stale",
+      detail: `createdAt older than ${options.staleAgeHours}h`,
     };
   }
 

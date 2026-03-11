@@ -28,6 +28,19 @@ async function getClockSafe() {
   }
 }
 
+function isTimestampOnEtDate(value: unknown, etDate: string): boolean {
+  if (typeof value !== "string" || !value) return false;
+  const ts = Date.parse(value);
+  if (!Number.isFinite(ts)) return false;
+  const stampEt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(ts));
+  return stampEt === etDate;
+}
+
 export async function GET() {
   const startedAt = new Date();
 
@@ -277,9 +290,23 @@ export async function GET() {
           signalsReceivedToday: funnelToday.signalsReceived ?? 0,
           pendingNow: signals.filter((s) => s.status === "PENDING").length,
           scoredToday: funnelToday.gptScored ?? 0,
-          errorsToday: signals.filter((s) => s.status === "ERROR" && s.createdAt.startsWith(funnelToday.date)).length,
+          errorsToday: signals.filter((s) => s.status === "ERROR" && isTimestampOnEtDate(s.createdAt, funnelToday.date)).length,
           drainsRun: funnelToday.drainsRun ?? 0,
           drainScored: funnelToday.drainScored ?? 0,
+          drainPreGptSkipped: funnelToday.drainPreGptSkipped ?? 0,
+          recentSkippedStale: funnelToday.skipStale ?? 0,
+          recentSkippedInsufficientBars:
+            (funnelToday.drainSkippedInsufficientBars ?? 0) || (funnelToday.skipInsufficientBars ?? 0),
+          recentSkippedLowVolume:
+            (funnelToday.drainSkippedVolumeTooLow ?? 0) || (funnelToday.skipVolumeTooLow ?? 0),
+          recentSkippedDollarVolume:
+            (funnelToday.drainSkippedDollarVolume ?? 0) || (funnelToday.skipDollarVolume ?? 0),
+          recentSkippedPriceTooLow:
+            (funnelToday.drainSkippedPriceTooLow ?? 0) || (funnelToday.skipPriceTooLow ?? 0),
+          recentSkippedSpreadTooWide:
+            (funnelToday.drainSkippedSpreadTooWide ?? 0) || (funnelToday.skipSpreadTooWide ?? 0),
+          recentParseFailures: funnelToday.errorParseFailed ?? 0,
+          recentDeadlineExceeded: funnelToday.drainTimeout ?? 0,
           drainTimeout: funnelToday.drainTimeout ?? 0,
           drainError: funnelToday.drainError ?? 0,
           modelUsage: funnelToday.gptScoredByModel ?? {},
@@ -299,6 +326,11 @@ export async function GET() {
         // Skip breakdown (not errors)
         skips: {
           insufficientBars: funnelToday.skipInsufficientBars ?? 0,
+          stale: funnelToday.skipStale ?? 0,
+          volumeTooLow: funnelToday.skipVolumeTooLow ?? 0,
+          dollarVolumeTooLow: funnelToday.skipDollarVolume ?? 0,
+          priceTooLow: funnelToday.skipPriceTooLow ?? 0,
+          spreadTooWide: funnelToday.skipSpreadTooWide ?? 0,
         },
         
         // Auto-entry stage

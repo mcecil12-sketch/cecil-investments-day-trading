@@ -1,30 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-type RepairBrokerBackfillResult = {
-  ok: boolean;
-  dryRun: boolean;
-  limit: number;
-  repaired: number;
-  scannedBackfillRows: number;
-  scannedTickers: number;
-  archivedAutoConflict: number;
-  archivedDuplicates: number;
-  archivedErrorPrimary: number;
-  repairedIds: string[];
-  repairedTickers: string[];
-  message: string;
-  error?: string;
-};
-
-function appendRepairNote(current: string | undefined, suffix: string): string {
-  const base = current || "";
-  return base.includes(suffix) ? base : `${base}${suffix}`;
-}
-
 /**
  * POST /api/maintenance/repair-broker-backfill
  *
@@ -37,25 +13,10 @@ function appendRepairNote(current: string | undefined, suffix: string): string {
  * - limit=N - max rows to repair (default: 1000)
  */
 export async function POST(req: NextRequest) {
-  const token = req.headers.get("x-cron-token") || "";
-  const hasSession = req.headers.get("cookie")?.includes("session=") ?? false;
-  const hasToken = !!process.env.CRON_TOKEN && token === process.env.CRON_TOKEN;
-
-  if (!hasSession && !hasToken) {
-    return NextResponse.json(
-      { ok: false, error: "unauthorized" },
-      { status: 401, headers: { "Cache-Control": "no-store" } }
-    );
-  }
-
   try {
-    const body = await req.json().catch(() => ({}));
     const { searchParams } = new URL(req.url);
-    const dryRunFromBody = typeof (body as any)?.dryRun === "boolean" ? (body as any).dryRun : undefined;
-    const dryRun = dryRunFromBody ?? searchParams.get("dryRun") !== "false";
-
-    const rawLimit = Number((body as any)?.limit ?? searchParams.get("limit") ?? "1000");
-    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(5000, Math.floor(rawLimit))) : 1000;
+    const dryRun = searchParams.get("dryRun") !== "false";
+    const limit = parseInt(searchParams.get("limit") || "1000", 10);
 
     const trades = await readTrades();
     const nowIso = new Date().toISOString();
@@ -80,13 +41,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const scannedBackfillRows = Array.from(backfillByTicker.values()).reduce((sum, rows) => sum + rows.length, 0);
-    const scannedTickers = backfillByTicker.size;
-
     let repaired = 0;
-    let archivedAutoConflict = 0;
-    let archivedDuplicates = 0;
-    let archivedErrorPrimary = 0;
     const repairedIds: string[] = [];
     const repairedTickers: string[] = [];
 
@@ -109,15 +64,11 @@ export async function POST(req: NextRequest) {
               closeReason: "duplicate_broker_backfill",
               alpacaStatus: null,
               brokerStatus: null,
-              note: appendRepairNote(
-                row?.note,
-                " [Archived: duplicate broker_backfill when AUTO trade exists]"
-              ),
+              note: (row?.note || "") + " [Archived: duplicate broker_backfill when AUTO trade exists]",
             });
           }
 
           repaired += 1;
-          archivedAutoConflict += 1;
           if (repairedIds.length < 20) {
             repairedIds.push(row.id);
           }
@@ -151,12 +102,11 @@ export async function POST(req: NextRequest) {
             closeReason: "duplicate_broker_backfill",
             alpacaStatus: null,
             brokerStatus: null,
-            note: appendRepairNote(dup?.note, " [Archived: duplicate broker_backfill cleaned up by repair]"),
+            note: (dup?.note || "") + " [Archived: duplicate broker_backfill cleaned up by repair]",
           });
         }
 
         repaired += 1;
-        archivedDuplicates += 1;
         if (repairedIds.length < 20) {
           repairedIds.push(dup.id);
         }
@@ -175,12 +125,11 @@ export async function POST(req: NextRequest) {
             closeReason: "stale_broker_backfill",
             alpacaStatus: null,
             brokerStatus: null,
-            note: appendRepairNote(toKeep?.note, " [Archived: ERROR broker_backfill cleaned up by repair]"),
+            note: (toKeep?.note || "") + " [Archived: ERROR broker_backfill cleaned up by repair]",
           });
         }
 
         repaired += 1;
-        archivedErrorPrimary += 1;
         if (repairedIds.length < 20) {
           repairedIds.push(toKeep.id);
         }
@@ -194,35 +143,21 @@ export async function POST(req: NextRequest) {
       await writeTrades(trades);
     }
 
-    const response: RepairBrokerBackfillResult = {
+    return NextResponse.json({
       ok: true,
       dryRun,
-      limit,
       repaired,
-      scannedBackfillRows,
-      scannedTickers,
-      archivedAutoConflict,
-      archivedDuplicates,
-      archivedErrorPrimary,
       repairedIds,
       repairedTickers,
       message: dryRun
         ? `Would repair ${repaired} broker_backfill rows`
         : `Repaired ${repaired} broker_backfill rows`,
-    };
-
-    return NextResponse.json(response, {
-      status: 200,
-      headers: { "Cache-Control": "no-store" },
     });
-  } catch (error: unknown) {
+  } catch (error: any) {
     console.error("[repair-broker-backfill] Error:", error);
     return NextResponse.json(
-      {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      },
-      { status: 500, headers: { "Cache-Control": "no-store" } }
+      { ok: false, error: error.message },
+      { status: 500 }
     );
   }
 }

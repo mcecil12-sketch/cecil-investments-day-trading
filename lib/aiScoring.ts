@@ -4,6 +4,7 @@ import { recordSpend, recordAiCall, recordAiError, writeAiHeartbeat } from "./ai
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { buildSignalContext, SignalContext } from "@/lib/signalContext";
 import { parseAiScoreOutput } from "@/lib/ai/scoreParse";
+import { getParseRetryConfig } from "@/lib/ai/parseRetryConfig";
 import { redis } from "@/lib/redis";
 import { minScoreToQualify } from "@/lib/aiQualify";
 
@@ -86,7 +87,12 @@ export type AiScoreResult =
     }
   | {
       ok: false;
-      error: "ai_parse_failed" | "invalid_model_output" | "insufficient_bars";
+      error:
+        | "ai_parse_failed"
+        | "invalid_model_output"
+        | "insufficient_bars"
+        | "breaker_open"
+        | "scoring_disabled";
       reason: string;
       rawHead?: string;
       aiModel: string;
@@ -374,36 +380,24 @@ export async function scoreSignalWithAI(rawSignal: RawSignal): Promise<AiScoreRe
   if (await isCircuitBreakerOpen()) {
     console.log("[aiScoring] Circuit breaker open, skipping scoring");
     return {
-      ok: true,
+      ok: false,
+      error: "breaker_open",
+      reason: "AI scoring skipped because the circuit breaker is open",
       aiModel: "breaker_open",
       aiRequestId: null,
-      scored: {
-        ...rawSignal,
-        aiScore: 0,
-        aiGrade: "F",
-        aiSummary: "AI scoring skipped (circuit breaker open due to rate limits)",
-        totalScore: 0,
-        status: "SKIPPED",
-        skipReason: "breaker_open",
-      },
     };
   }
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    // Fail-safe: if key missing, treat as low-quality
-    console.warn("[aiScoring] OPENAI_API_KEY not set; returning default low score.");
+    // Explicit operational error: do not masquerade as a valid low score.
+    console.warn("[aiScoring] OPENAI_API_KEY not set; scoring disabled.");
     return {
-      ok: true,
+      ok: false,
+      error: "scoring_disabled",
+      reason: "OPENAI_API_KEY missing",
       aiModel: "disabled",
       aiRequestId: null,
-      scored: {
-      ...rawSignal,
-      aiScore: 0,
-      aiGrade: "F",
-      aiSummary: "AI scoring disabled (no API key).",
-      totalScore: 0,
-      },
     };
   }
 
@@ -539,7 +533,7 @@ Return ONLY valid JSON:
   const HEAVY_MODEL = process.env.OPENAI_MODEL_HEAVY || "gpt-5.1";
   const useHeavyModel = (signal.playbookScore ?? 0) >= 8;
   const model = useHeavyModel ? HEAVY_MODEL : BULK_MODEL;
-  const retryOnParseFail = process.env.AI_SCORE_RETRY_ON_PARSE_FAIL === "1";
+  const { retryOnParseFail, maxParseRetry } = getParseRetryConfig();
 
   const openai = new OpenAI({ apiKey });
   const scoreOnce = async (promptText: string, retryAttempt: number = 0) => {
@@ -618,12 +612,16 @@ Return ONLY valid JSON:
     return { content: completion.choices[0]?.message?.content ?? "", requestId };
   };
 
+  const retryPrompt =
+    prompt +
+    "\n\nIMPORTANT: Respond ONLY with a single JSON object: {\"longScore\":number,\"shortScore\":number,\"longSummary\":string,\"shortSummary\":string,\"chosenDirection\":\"LONG\"|\"SHORT\"|\"NONE\",\"confidence\":number}";
+
   let scoreResponse = await scoreOnce(prompt);
   let parsed = parseAiScoreOutput(scoreResponse.content);
-  if (!parsed.ok && retryOnParseFail) {
-    const retryPrompt =
-      prompt +
-      "\n\nIMPORTANT: Respond ONLY with a single JSON object: {\"longScore\":number,\"shortScore\":number,\"longSummary\":string,\"shortSummary\":string,\"chosenDirection\":\"LONG\"|\"SHORT\"|\"NONE\",\"confidence\":number}";
+  let parseAttempts = 0;
+
+  while (!parsed.ok && retryOnParseFail && parseAttempts < maxParseRetry) {
+    parseAttempts += 1;
     scoreResponse = await scoreOnce(retryPrompt);
     parsed = parseAiScoreOutput(scoreResponse.content);
   }
