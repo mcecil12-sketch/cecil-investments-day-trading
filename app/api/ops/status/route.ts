@@ -98,12 +98,12 @@ export async function GET() {
     // (assume all open positions count against the gate).
     const brokerTruthFromAutoEntry = brokerPositionsCount;
 
-    // Diagnostics: Compute operational counts from DB using the same filter as entryState.openTrades
+    // Diagnostics: All operational counts use authoritative broker-truth filter
     const dbOpenTradesCount = brokerTruthOpenTrades;
-    const dbActualOperationalCount = countOperationalOpenTickers(trades);
+    const dbActualOperationalCount = brokerTruthOpenTrades;
     const dbAutoOpenTradesCount = countOperationalOpenAutoTickers(trades);
     
-    // Mismatch detection: compare broker positions count vs actual operational DB count
+    // Mismatch detection: compare broker positions count vs actual operational count
     const openTradesMismatch = brokerPositionsCount !== dbActualOperationalCount;
 
     // Legacy flags for backward compatibility
