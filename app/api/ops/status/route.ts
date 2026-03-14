@@ -312,6 +312,16 @@ export async function GET() {
           errorsToday: signals.filter((s) => s.status === "ERROR" && isTimestampOnEtDate(s.createdAt, funnelToday.date)).length,
           drainsRun: funnelToday.drainsRun ?? 0,
           drainScored: funnelToday.drainScored ?? 0,
+          drainClaimedThisRun: funnelToday.drainClaimedThisRun ?? 0,
+          drainSentToScorer: funnelToday.drainSentToScorer ?? 0,
+          persistedScored: funnelToday.drainPersistedScored ?? 0,
+          persistedArchived: funnelToday.drainPersistedArchived ?? 0,
+          persistedError: funnelToday.drainPersistedError ?? 0,
+          backlogDeltaToday:
+            (funnelToday.signalsReceived ?? 0) -
+            ((funnelToday.drainPersistedScored ?? 0) +
+              (funnelToday.drainPersistedArchived ?? 0) +
+              (funnelToday.drainPersistedError ?? 0)),
           drainPreGptSkipped: funnelToday.drainPreGptSkipped ?? 0,
           recentSkippedStale: funnelToday.skipStale ?? 0,
           recentSkippedInsufficientBars:
@@ -376,7 +386,9 @@ export async function GET() {
           note: 
             (funnelToday.candidatesFound ?? 0) === 0 ? "No candidates found by scanners today" :
             (funnelToday.signalsPosted ?? 0) === 0 ? "Candidates found but not persisted (check caps/dedupe)" :
-            signals.filter((s) => s.status === "PENDING").length > 20 ? `${signals.filter((s) => s.status === "PENDING").length} signals pending scoring` :
+            signals.filter((s) => s.status === "PENDING").length > 20
+              ? `${signals.filter((s) => s.status === "PENDING").length} signals pending scoring (receivedToday=${funnelToday.signalsReceived ?? 0}, drainScored=${funnelToday.drainScored ?? 0}, sentToScorer=${funnelToday.drainSentToScorer ?? 0})`
+              :
             (funnelToday.gptScored ?? 0) === 0 ? "Signals created but not scored yet" :
             (funnelToday.autoEntryPlaced ?? 0) === 0 && wouldSkipMaxOpenPositions ? `Max open positions reached (${brokerTruth.positionsCount}/${guardConfig.maxOpenPositions})` :
             (funnelToday.autoEntryPlaced ?? 0) === 0 ? "Scored signals but no auto-entry executions" :

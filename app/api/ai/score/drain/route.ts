@@ -23,17 +23,22 @@ export const maxDuration = 120; // Allow up to 120s runtime on Vercel/Next.js
 const HARD_CAP_MS = 110000; // ~110s internal budget (maxDuration=120s with safety margin)
 const SOFT_STOP_MARGIN_MS = 2000; // Stop starting new work when <2s remaining (reduced from 8s)
 const MAX_PER_RUN = Number(process.env.AI_SCORE_DRAIN_MAX ?? 25);
-const SCORING_CONCURRENCY = Number(process.env.AI_SCORE_DRAIN_CONCURRENCY ?? 5); // Parallel scoring workers
+const SCORING_CONCURRENCY = Number(
+  process.env.AI_SCORE_CONCURRENCY ?? process.env.AI_SCORE_DRAIN_CONCURRENCY ?? 5
+); // Parallel scoring workers
 
 // Fresh signal window configuration for live vs recovery modes
 const AI_SCORE_FRESH_HOURS = Number(process.env.AI_SCORE_FRESH_HOURS ?? 24); // Window for live mode (default 24h)
 const AI_SCORE_RECOVERY_HOURS = Number(process.env.AI_SCORE_RECOVERY_HOURS ?? 48); // Window for recovery mode (default 48h)
 
 // Performance tuning: batching
-const AI_SCORE_BATCH_SIZE = Number(process.env.AI_SCORE_BATCH_SIZE ?? 5); // Batch size for concurrent scoring
+const AI_SCORE_BATCH_SIZE = Number(process.env.AI_SCORE_BATCH_SIZE ?? 10); // Target number of scorer attempts per run
+const AI_SCORE_CLAIM_BATCH_SIZE = Number(process.env.AI_SCORE_CLAIM_BATCH_SIZE ?? 0); // 0 means auto sizing
+const AI_SCORE_MAX_CANDIDATE_SCAN = Number(process.env.AI_SCORE_MAX_CANDIDATE_SCAN ?? 60);
+const AI_SCORE_DEFAULT_CLAIM_MULTIPLIER = Number(process.env.AI_SCORE_CLAIM_MULTIPLIER ?? 2);
 
 const DRAIN_LOCK_KEY = "ai:score:drain:lock";
-const DRAIN_LOCK_TTL = 30; // seconds
+const DRAIN_LOCK_TTL_MAX = 120; // seconds
 const CLAIM_TTL_SEC = 300; // 5 minutes per signal claim
 
 /**
@@ -88,7 +93,7 @@ async function acquireDrainLock(deadlineAtMs: number): Promise<boolean> {
     const ttlSec = Math.ceil(ttlMs / 1000);
     const ok = await redis.set(DRAIN_LOCK_KEY, "1", {
       nx: true,
-      ex: Math.min(ttlSec, DRAIN_LOCK_TTL),
+      ex: Math.min(ttlSec, DRAIN_LOCK_TTL_MAX),
     });
     return Boolean(ok);
   } catch (err) {
@@ -304,7 +309,7 @@ async function scoreSignalsConcurrent(
   // Process with concurrency limit
   let i = 0;
   while (i < signals.length) {
-    // Check soft stop margin: if <8s remaining, stop starting new work
+    // Check soft stop margin: if little time remains, stop starting new work
     const remainingMs = deadlineAtMs - Date.now();
     if (remainingMs < SOFT_STOP_MARGIN_MS) {
       console.log("[score/drain] soft stop margin reached", {
@@ -482,13 +487,24 @@ export async function POST(req: Request) {
     bodyLimit !== undefined && Number.isFinite(bodyLimit) && bodyLimit > 0 ? bodyLimit : undefined
   ) ?? MAX_PER_RUN;
   const maxPerRunComputed = Math.min(MAX_PER_RUN, effectiveLimit);
-  const hasExplicitLimitOverride =
-    queryLimit !== undefined ||
-    (bodyLimit !== undefined && Number.isFinite(bodyLimit) && bodyLimit > 0);
   const configuredBatchSize = Math.max(1, Math.trunc(AI_SCORE_BATCH_SIZE) || 1);
-  const runtimeBatchSize = hasExplicitLimitOverride
-    ? maxPerRunComputed
-    : Math.min(maxPerRunComputed, configuredBatchSize);
+  const runtimeBatchSize = Math.min(maxPerRunComputed, configuredBatchSize);
+  const autoClaimBatchSize = Math.max(
+    runtimeBatchSize,
+    Math.ceil(runtimeBatchSize * Math.max(1, AI_SCORE_DEFAULT_CLAIM_MULTIPLIER || 1))
+  );
+  const configuredClaimBatchSize = Math.max(
+    0,
+    Math.trunc(Number.isFinite(AI_SCORE_CLAIM_BATCH_SIZE) ? AI_SCORE_CLAIM_BATCH_SIZE : 0)
+  );
+  const claimBatchTarget = Math.min(
+    maxPerRunComputed,
+    configuredClaimBatchSize > 0 ? configuredClaimBatchSize : autoClaimBatchSize
+  );
+  const maxCandidateScan = Math.max(
+    runtimeBatchSize,
+    Math.min(maxPerRunComputed, Math.trunc(AI_SCORE_MAX_CANDIDATE_SCAN) || runtimeBatchSize)
+  );
 
   // Initialize result object (guaranteed to be returned as JSON)
   const result: {
@@ -538,10 +554,13 @@ export async function POST(req: Request) {
     skippedSpreadTooWide?: number;
     // Batch/diagnostics
     batchSize?: number;
+    claimBatchTarget?: number;
+    candidateScanBudget?: number;
     selectedCount?: number;
     preGptSkipped?: number;
     skippedCount?: number;
     pendingScanned?: number;
+    freshCandidatesAvailable?: number;
     freshCandidatesScanned?: number;
     claimedThisRun?: number;
     contextHydrated?: number;
@@ -595,10 +614,13 @@ export async function POST(req: Request) {
     skippedPriceTooLow: 0,
     skippedSpreadTooWide: 0,
     batchSize: runtimeBatchSize,
+    claimBatchTarget,
+    candidateScanBudget: maxCandidateScan,
     selectedCount: 0,
     preGptSkipped: 0,
     skippedCount: 0,
     pendingScanned: 0,
+    freshCandidatesAvailable: 0,
     freshCandidatesScanned: 0,
     claimedThisRun: 0,
     contextHydrated: 0,
@@ -737,67 +759,52 @@ export async function POST(req: Request) {
       const pendingSignals = signals.filter((s) => s.status === "PENDING");
       result.pendingScanned = pendingSignals.length;
       result.scanned = pendingSignals.length;
+      result.freshCandidatesAvailable = pendingSignals.length;
       pickedSignals = [...pendingSignals]
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
-        .slice(0, maxPerRunComputed);
+        .slice(0, Math.min(maxCandidateScan, claimBatchTarget));
     } else {
       // Default live mode: pick freshest signals within the live window first.
       // Recovery mode handles older backlog separately.
-      
-      // Count diagnostics: total scanned
       const pendingSignals = signals.filter((s) => s.status === "PENDING");
       result.scanned = pendingSignals.length;
       result.pendingScanned = pendingSignals.length;
-      
-      // Filter to fresh window
+
       const freshPending = pendingSignals.filter(
         (s) => new Date(s.createdAt) >= freshWindowStart
       );
       result.eligible = freshPending.length;
-      result.freshCandidatesScanned = freshPending.length;
-      
+      result.freshCandidatesAvailable = freshPending.length;
+
       // Count stale signals (outside fresh window)
       result.skippedStale = pendingSignals.length - freshPending.length;
-      
+
       if (freshPending.length > 0) {
         pickedSignals = [...freshPending]
           .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-          .slice(0, maxPerRunComputed);
+          .slice(0, Math.min(maxCandidateScan, claimBatchTarget));
       } else {
-        // Fallback: if fresh window yields nothing (e.g., no activity in last 24h)
         console.log("[score/drain] fresh window empty, no signals to process", {
           mode: result.mode,
           freshHoursUsed,
           freshWindowStart: freshWindowStart.toISOString(),
         });
-        // Leave pickedSignals empty; this run processes 0 signals
       }
     }
 
-    // Claim/lock: mark as SCORING with a short TTL (2 min), revert to PENDING if not processed
-    const claimUntil = new Date(Date.now() + 2 * 60 * 1000).toISOString();
-    const claimBatchSize = pickedSignals.length;
-    for (const s of pickedSignals) {
-      s.status = "SCORING";
-      s.scoringLockUntil = claimUntil;
-      s.scoringStartedAt = new Date().toISOString();
-      s.updatedAt = new Date().toISOString();
-      claimedIds.push(s.id);
-    }
-    await writeSignals(signals);
-    result.claimedThisRun = claimBatchSize;
-    result.pipeline!.pendingScanned = result.pendingScanned ?? 0;
-    result.pipeline!.freshCandidatesScanned = result.freshCandidatesScanned ?? 0;
-    result.pipeline!.claimedThisRun = claimBatchSize;
-
     // === PRE-GPT GATING: Filter for eligibility before sending to AI ===
-    // This prevents junk signals from consuming API quota
+    // Stop early once we have enough scorer-eligible signals for this run.
     const nowIso = new Date().toISOString();
-    const eligibleForScoring: any[] = [];
+    const selectedForScoring: any[] = [];
     const preGptSkippedIds: string[] = [];
     const eligibilityThresholds = getEligibilityThresholds();
 
     for (const signal of pickedSignals) {
+      if (selectedForScoring.length >= runtimeBatchSize) {
+        break;
+      }
+
+      result.freshCandidatesScanned = (result.freshCandidatesScanned ?? 0) + 1;
       const hydration = await hydrateSignalContextIfNeeded(signal, eligibilityThresholds.minBars);
       if (hydration.hydrated) {
         result.contextHydrated = (result.contextHydrated ?? 0) + 1;
@@ -814,13 +821,11 @@ export async function POST(req: Request) {
       );
 
       if (!eligResult.eligible) {
-        // Mark as pre-GPT skipped (don't send to AI)
         applyPreGptSkip(signal, eligResult.reason, eligResult.detail, nowIso);
         preGptSkippedIds.push(signal.id);
         result.preGptSkipped = (result.preGptSkipped ?? 0) + 1;
         result.persistedArchived = (result.persistedArchived ?? 0) + 1;
 
-        // Track by reason
         switch (eligResult.reason) {
           case "insufficient_bars":
             result.skippedInsufficientBars = (result.skippedInsufficientBars ?? 0) + 1;
@@ -852,13 +857,35 @@ export async function POST(req: Request) {
         continue;
       }
 
-      // Signal is eligible for AI scoring
-      eligibleForScoring.push(signal);
+      selectedForScoring.push(signal);
     }
 
-    // Write pre-GPT skipped signals
-    if (preGptSkippedIds.length > 0) {
+    // Claim selected signals only (reduces claim/release churn).
+    const claimUntil = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+    for (const signal of selectedForScoring) {
+      signal.status = "SCORING";
+      signal.scoringLockUntil = claimUntil;
+      signal.scoringStartedAt = nowIso;
+      signal.updatedAt = nowIso;
+      claimedIds.push(signal.id);
+    }
+
+    result.claimedThisRun = selectedForScoring.length;
+    result.selectedCount = selectedForScoring.length;
+    result.sentToScorer = selectedForScoring.length;
+    result.pipeline!.pendingScanned = result.pendingScanned ?? 0;
+    result.pipeline!.freshCandidatesScanned = result.freshCandidatesScanned ?? 0;
+    result.pipeline!.claimedThisRun = result.claimedThisRun;
+    result.pipeline!.contextHydrated = result.contextHydrated ?? 0;
+    result.pipeline!.contextHydrationFailed = result.contextHydrationFailed ?? 0;
+    result.pipeline!.preGptSkipped = result.preGptSkipped ?? 0;
+    result.pipeline!.sentToScorer = selectedForScoring.length;
+
+    if (preGptSkippedIds.length > 0 || selectedForScoring.length > 0) {
       await writeSignals(signals);
+    }
+
+    if (preGptSkippedIds.length > 0) {
       console.log("[score/drain] pre-GPT gating archived", {
         count: preGptSkippedIds.length,
         reasons: {
@@ -871,25 +898,6 @@ export async function POST(req: Request) {
       });
     }
 
-    const selectedForScoring = eligibleForScoring.slice(0, runtimeBatchSize);
-    const overflowEligible = eligibleForScoring.slice(runtimeBatchSize);
-
-    // Keep selection bounded by runtime batch size unless explicit limit override is set.
-    for (const signal of overflowEligible) {
-      signal.status = "PENDING";
-      signal.scoringLockUntil = undefined;
-      signal.scoringStartedAt = undefined;
-      signal.updatedAt = nowIso;
-      result.releasedCount += 1;
-    }
-
-    result.selectedCount = selectedForScoring.length;
-    result.sentToScorer = selectedForScoring.length;
-    result.pipeline!.contextHydrated = result.contextHydrated ?? 0;
-    result.pipeline!.contextHydrationFailed = result.contextHydrationFailed ?? 0;
-    result.pipeline!.preGptSkipped = result.preGptSkipped ?? 0;
-    result.pipeline!.sentToScorer = selectedForScoring.length;
-
     // For response visibility: compute createdAt range based on picked signals
     const newestPickedCreatedAt = pickedSignals.length > 0
       ? pickedSignals.reduce((max, s) => (new Date(s.createdAt) > new Date(max) ? s.createdAt : max), pickedSignals[0].createdAt)
@@ -901,8 +909,13 @@ export async function POST(req: Request) {
     console.log("[score/drain] start", {
       pickedStrategy,
       pickedCount: pickedSignals.length,
-      claimBatchSize,
+      claimBatchTarget,
+      claimedThisRun: result.claimedThisRun,
+      candidateScanBudget: maxCandidateScan,
+      freshCandidatesAvailable: result.freshCandidatesAvailable,
+      freshCandidatesScanned: result.freshCandidatesScanned,
       maxPerRun: maxPerRunComputed,
+      batchSize: runtimeBatchSize,
       budgetMs,
       hardCapMs: HARD_CAP_MS,
       softStopMarginMs: SOFT_STOP_MARGIN_MS,
@@ -912,7 +925,6 @@ export async function POST(req: Request) {
       oldestPickedCreatedAt,
       preGptSkipped: result.preGptSkipped,
       selectedForScoring: selectedForScoring.length,
-      overflowReleased: overflowEligible.length,
     });
 
     // Process eligible signals with concurrency (pre-GPT filtered)
@@ -951,21 +963,15 @@ export async function POST(req: Request) {
       
       result.attemptedCount += 1;
 
-      // Try to acquire exclusive claim for this signal
-      const claimed = await acquireSignalClaim(signal.id);
-      if (!claimed) {
-        result.skippedAlreadyClaimed += 1;
-        console.log("[score/drain] signal already claimed, skipping", {
-          id: signal.id,
-          ticker: signal.ticker,
-        });
-        continue;
-      }
-
       if (procResult.status === "TIMEOUT") {
-        // Leave as SCORING; will be reclaimed on next run if not finished
-        await releaseSignalClaim(signal.id); // Release claim on timeout
-        console.log("[score/drain] timeout", {
+        const nowIso = new Date().toISOString();
+        applyScoreError(signal, "timeout_deadline_exceeded", nowIso, "timeout");
+        finalizedIds.push(signal.id);
+        result.errored += 1;
+        result.errorCount += 1;
+        result.persistedError = (result.persistedError ?? 0) + 1;
+        await releaseSignalClaim(signal.id);
+        console.log("[score/drain] timeout finalized as error", {
           id: signal.id,
           ticker: signal.ticker,
         });
@@ -1084,16 +1090,22 @@ export async function POST(req: Request) {
 
     // CLEANUP: Release any unfinalized claims (signals stuck in SCORING)
     // releaseLimit controls how many to release: 0 = none, -1 = all, N > 0 = up to N
-    // STRICT LIMIT: Never release more than the original claim batch size to honor limit
-    const toRelease = claimedIds.filter(id => !finalizedIds.includes(id));
-    const effectiveReleaseLimit = releaseLimit === 0 ? 0 : releaseLimit === -1 ? Math.min(toRelease.length, claimBatchSize) : Math.min(releaseLimit, claimBatchSize);
+    // STRICT LIMIT: Never release more than actually claimed this run.
+    const toRelease = claimedIds.filter((id) => !finalizedIds.includes(id));
+    const claimedThisRun = claimedIds.length;
+    const effectiveReleaseLimit =
+      releaseLimit === 0
+        ? 0
+        : releaseLimit === -1
+          ? Math.min(toRelease.length, claimedThisRun)
+          : Math.min(releaseLimit, claimedThisRun);
     const toReleaseSliced = toRelease.slice(0, effectiveReleaseLimit);
-    
+
     if (toReleaseSliced.length > 0) {
       console.log("[score/drain] releasing unfinalized claims", {
         count: toReleaseSliced.length,
         limit: releaseLimit,
-        claimBatchSize,
+        claimedThisRun,
         effectiveReleaseLimit,
         ids: toReleaseSliced,
       });
@@ -1203,6 +1215,11 @@ export async function POST(req: Request) {
         drainScored: result.scoredCount,
         drainTimeout: result.timeoutCount,
         drainError: result.errorCount,
+        drainClaimedThisRun: result.claimedThisRun ?? 0,
+        drainSentToScorer: result.sentToScorer ?? 0,
+        drainPersistedScored: result.persistedScored ?? 0,
+        drainPersistedArchived: result.persistedArchived ?? 0,
+        drainPersistedError: result.persistedError ?? 0,
         drainPreGptSkipped: result.preGptSkipped ?? 0,
         drainSkippedInsufficientBars: result.skippedInsufficientBars ?? 0,
         drainSkippedVolumeTooLow: result.skippedVolumeTooLow ?? 0,
@@ -1243,7 +1260,8 @@ export async function POST(req: Request) {
     // Add drain-specific response fields
     const response = {
       ...result,
-      claimBatchSize,
+      claimBatchSize: result.claimedThisRun ?? 0,
+      claimBatchTarget,
       budgetMs,
       effectiveLimit: maxPerRunComputed,
     };
