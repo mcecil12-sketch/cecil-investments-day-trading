@@ -10,6 +10,7 @@ export type CreatedWindowStats = {
   pending: number;
   scored: number;
   error: number;
+  archived: number;
 };
 
 export type ScoredWindowStats = {
@@ -52,6 +53,7 @@ export function computeScoringWindows(signals: SignalLike[], now = new Date()) {
     pending: createdLast6Hours.filter((s) => normalizeStatus(s.status) === "PENDING").length,
     scored: createdLast6Hours.filter((s) => normalizeStatus(s.status) === "SCORED").length,
     error: createdLast6Hours.filter((s) => normalizeStatus(s.status) === "ERROR").length,
+    archived: createdLast6Hours.filter((s) => normalizeStatus(s.status) === "ARCHIVED").length,
   };
 
   const scoredLast6Hours = signals.filter((s) => {

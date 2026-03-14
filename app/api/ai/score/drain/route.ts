@@ -11,7 +11,8 @@ import {
   applyScoreSuccess,
   applyPreGptSkip,
 } from "@/lib/ai/scoreDrainApply";
-import { evaluateSignalEligibility } from "@/lib/ai/eligibilityGates";
+import { evaluateSignalEligibility, getEligibilityThresholds } from "@/lib/ai/eligibilityGates";
+import { buildSignalContext } from "@/lib/signalContext";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -23,7 +24,6 @@ const HARD_CAP_MS = 110000; // ~110s internal budget (maxDuration=120s with safe
 const SOFT_STOP_MARGIN_MS = 2000; // Stop starting new work when <2s remaining (reduced from 8s)
 const MAX_PER_RUN = Number(process.env.AI_SCORE_DRAIN_MAX ?? 25);
 const SCORING_CONCURRENCY = Number(process.env.AI_SCORE_DRAIN_CONCURRENCY ?? 5); // Parallel scoring workers
-const MAX_PICK_POOL = 500; // Max signals to consider for sorting/picking (CPU optimization)
 
 // Fresh signal window configuration for live vs recovery modes
 const AI_SCORE_FRESH_HOURS = Number(process.env.AI_SCORE_FRESH_HOURS ?? 24); // Window for live mode (default 24h)
@@ -193,6 +193,53 @@ async function scoreWithTimeout(
       error: "scoring_failed",
       reason: errStr,
     };
+  }
+}
+
+async function hydrateSignalContextIfNeeded(
+  signal: any,
+  minBarsRequired: number
+): Promise<{ hydrated: boolean; failed: boolean }> {
+  if (signal?.signalContext?.barsUsed != null) {
+    return { hydrated: false, failed: false };
+  }
+
+  try {
+    let context = await buildSignalContext({
+      ticker: signal.ticker,
+      timeframe: signal.timeframe || "1Min",
+      limit: 90,
+      endTimeIso: signal.createdAt,
+    });
+
+    if (context && context.barsUsed < minBarsRequired) {
+      try {
+        const retry = await buildSignalContext({
+          ticker: signal.ticker,
+          timeframe: signal.timeframe || "1Min",
+          limit: 90,
+        });
+        if (retry && retry.barsUsed > context.barsUsed) {
+          context = retry;
+        }
+      } catch (err) {
+        console.log("[score/drain] signalContext retry failed", {
+          id: signal?.id,
+          ticker: signal?.ticker,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    signal.signalContext = context;
+    return { hydrated: true, failed: false };
+  } catch (err) {
+    console.log("[score/drain] signalContext build failed", {
+      id: signal?.id,
+      ticker: signal?.ticker,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { hydrated: false, failed: true };
   }
 }
 
@@ -494,6 +541,28 @@ export async function POST(req: Request) {
     selectedCount?: number;
     preGptSkipped?: number;
     skippedCount?: number;
+    pendingScanned?: number;
+    freshCandidatesScanned?: number;
+    claimedThisRun?: number;
+    contextHydrated?: number;
+    contextHydrationFailed?: number;
+    sentToScorer?: number;
+    persistedScored?: number;
+    persistedError?: number;
+    persistedArchived?: number;
+    pipeline?: {
+      pendingScanned: number;
+      freshCandidatesScanned: number;
+      claimedThisRun: number;
+      reclaimedOldClaims: number;
+      contextHydrated: number;
+      contextHydrationFailed: number;
+      preGptSkipped: number;
+      sentToScorer: number;
+      persistedScored: number;
+      persistedError: number;
+      persistedArchived: number;
+    };
   } = {
     ok: true,
     processed: 0,
@@ -529,6 +598,28 @@ export async function POST(req: Request) {
     selectedCount: 0,
     preGptSkipped: 0,
     skippedCount: 0,
+    pendingScanned: 0,
+    freshCandidatesScanned: 0,
+    claimedThisRun: 0,
+    contextHydrated: 0,
+    contextHydrationFailed: 0,
+    sentToScorer: 0,
+    persistedScored: 0,
+    persistedError: 0,
+    persistedArchived: 0,
+    pipeline: {
+      pendingScanned: 0,
+      freshCandidatesScanned: 0,
+      claimedThisRun: 0,
+      reclaimedOldClaims: 0,
+      contextHydrated: 0,
+      contextHydrationFailed: 0,
+      preGptSkipped: 0,
+      sentToScorer: 0,
+      persistedScored: 0,
+      persistedError: 0,
+      persistedArchived: 0,
+    },
   };
 
 
@@ -574,7 +665,6 @@ export async function POST(req: Request) {
     
     // Use fresh window for default live mode (no legacy backlog processing in normal drain)
     const RECENT_WINDOW_HOURS = freshHoursUsed;
-    const recentWindowStart = freshWindowStart;
 
     // === RECLAIM STALE SCORING SIGNALS ===
     // Before picking new signals, find any stuck SCORING signals older than 10 minutes and revert them to PENDING
@@ -599,6 +689,7 @@ export async function POST(req: Request) {
         reclaimedCount: result.reclaimedCount,
       });
     }
+    result.pipeline!.reclaimedOldClaims = result.reclaimedCount;
 
     // === TRACK CLAIMED AND FINALIZED SIGNAL IDs ===
     const claimedIds: string[] = [];
@@ -643,37 +734,34 @@ export async function POST(req: Request) {
     if (pickedStrategy === "backlog_oldest_first") {
       // Backlog mode: pick oldest-first from ALL PENDING (legacy recovery)
       // Note: User must explicitly request backlog=true or strategy=backlog_oldest_first
-      // Optimization: limit sorting pool to MAX_PICK_POOL
       const pendingSignals = signals.filter((s) => s.status === "PENDING");
-      const poolSize = Math.min(pendingSignals.length, MAX_PICK_POOL * 2); // 2x for safety
-      const pool = pendingSignals.slice(0, poolSize);
-      pickedSignals = pool
+      result.pendingScanned = pendingSignals.length;
+      result.scanned = pendingSignals.length;
+      pickedSignals = [...pendingSignals]
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
         .slice(0, maxPerRunComputed);
     } else {
-      // Default live mode: pick signals ONLY within fresh window, sorted oldest-to-newest within that window
-      // This prevents legacy backlog from monopolizing scoring throughput
+      // Default live mode: pick freshest signals within the live window first.
+      // Recovery mode handles older backlog separately.
       
       // Count diagnostics: total scanned
       const pendingSignals = signals.filter((s) => s.status === "PENDING");
       result.scanned = pendingSignals.length;
+      result.pendingScanned = pendingSignals.length;
       
       // Filter to fresh window
       const freshPending = pendingSignals.filter(
         (s) => new Date(s.createdAt) >= freshWindowStart
       );
       result.eligible = freshPending.length;
+      result.freshCandidatesScanned = freshPending.length;
       
       // Count stale signals (outside fresh window)
       result.skippedStale = pendingSignals.length - freshPending.length;
       
       if (freshPending.length > 0) {
-        // Pick from fresh signals, sorted oldest-to-newest (first eligible = need to process first)
-        // Optimization: if pool is large, only sort the oldest MAX_PICK_POOL candidates
-        const poolSize = Math.min(freshPending.length, MAX_PICK_POOL);
-        const pool = freshPending.slice(0, poolSize);
-        pickedSignals = pool
-          .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+        pickedSignals = [...freshPending]
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
           .slice(0, maxPerRunComputed);
       } else {
         // Fallback: if fresh window yields nothing (e.g., no activity in last 24h)
@@ -697,14 +785,27 @@ export async function POST(req: Request) {
       claimedIds.push(s.id);
     }
     await writeSignals(signals);
+    result.claimedThisRun = claimBatchSize;
+    result.pipeline!.pendingScanned = result.pendingScanned ?? 0;
+    result.pipeline!.freshCandidatesScanned = result.freshCandidatesScanned ?? 0;
+    result.pipeline!.claimedThisRun = claimBatchSize;
 
     // === PRE-GPT GATING: Filter for eligibility before sending to AI ===
     // This prevents junk signals from consuming API quota
     const nowIso = new Date().toISOString();
     const eligibleForScoring: any[] = [];
     const preGptSkippedIds: string[] = [];
+    const eligibilityThresholds = getEligibilityThresholds();
 
     for (const signal of pickedSignals) {
+      const hydration = await hydrateSignalContextIfNeeded(signal, eligibilityThresholds.minBars);
+      if (hydration.hydrated) {
+        result.contextHydrated = (result.contextHydrated ?? 0) + 1;
+      }
+      if (hydration.failed) {
+        result.contextHydrationFailed = (result.contextHydrationFailed ?? 0) + 1;
+      }
+
       const eligResult = evaluateSignalEligibility(
         signal.signalContext || null,
         signal.entryPrice,
@@ -717,6 +818,7 @@ export async function POST(req: Request) {
         applyPreGptSkip(signal, eligResult.reason, eligResult.detail, nowIso);
         preGptSkippedIds.push(signal.id);
         result.preGptSkipped = (result.preGptSkipped ?? 0) + 1;
+        result.persistedArchived = (result.persistedArchived ?? 0) + 1;
 
         // Track by reason
         switch (eligResult.reason) {
@@ -782,6 +884,11 @@ export async function POST(req: Request) {
     }
 
     result.selectedCount = selectedForScoring.length;
+    result.sentToScorer = selectedForScoring.length;
+    result.pipeline!.contextHydrated = result.contextHydrated ?? 0;
+    result.pipeline!.contextHydrationFailed = result.contextHydrationFailed ?? 0;
+    result.pipeline!.preGptSkipped = result.preGptSkipped ?? 0;
+    result.pipeline!.sentToScorer = selectedForScoring.length;
 
     // For response visibility: compute createdAt range based on picked signals
     const newestPickedCreatedAt = pickedSignals.length > 0
@@ -891,6 +998,7 @@ export async function POST(req: Request) {
           });
           
           finalizedIds.push(signal.id);
+          result.persistedArchived = (result.persistedArchived ?? 0) + 1;
           await releaseSignalClaim(signal.id);
           // Don't increment error counters - this is a skip
           continue;
@@ -909,6 +1017,7 @@ export async function POST(req: Request) {
         await releaseSignalClaim(signal.id); // Release claim after finalizing
         result.errored += 1;
         result.errorCount += 1;
+        result.persistedError = (result.persistedError ?? 0) + 1;
         console.warn("[score/drain] score error", {
           id: signal.id,
           ticker: signal.ticker,
@@ -933,6 +1042,7 @@ export async function POST(req: Request) {
         await releaseSignalClaim(signal.id); // Release claim after finalizing
         result.errored += 1;
         result.errorCount += 1;
+        result.persistedError = (result.persistedError ?? 0) + 1;
         console.warn("[score/drain] score error: null score", {
           id: signal.id,
           ticker: signal.ticker,
@@ -945,9 +1055,13 @@ export async function POST(req: Request) {
 
       result.scored += 1;
       result.scoredCount += 1;
+      result.persistedScored = (result.persistedScored ?? 0) + 1;
     }
 
-    result.processed = concurrentResult.scoredCount + concurrentResult.errorCount;
+    result.processed =
+      (result.persistedScored ?? 0) +
+      (result.persistedError ?? 0) +
+      (result.persistedArchived ?? 0);
     result.timeoutCount = concurrentResult.timeoutCount;
     result.skippedCount =
       (result.preGptSkipped ?? 0) +
@@ -1049,8 +1163,18 @@ export async function POST(req: Request) {
         result.scoredCount -= 1;
         result.errored += 1;
         result.errorCount += 1;
+        result.persistedScored = Math.max(0, (result.persistedScored ?? 0) - 1);
+        if (signal.status === "ARCHIVED") {
+          result.persistedArchived = (result.persistedArchived ?? 0) + 1;
+        } else {
+          result.persistedError = (result.persistedError ?? 0) + 1;
+        }
       }
     }
+
+    result.pipeline!.persistedScored = result.persistedScored ?? 0;
+    result.pipeline!.persistedError = result.persistedError ?? 0;
+    result.pipeline!.persistedArchived = result.persistedArchived ?? 0;
 
     if (guardsApplied.length > 0) {
       console.warn("[score/drain] write guard applied corrections", {
@@ -1101,6 +1225,7 @@ export async function POST(req: Request) {
       processed: result.processed,
       scored: result.scored,
       errored: result.errored,
+      persistedArchived: result.persistedArchived,
       timeoutCount: result.timeoutCount,
       skippedCount: result.skippedCount,
       expired: result.expired,

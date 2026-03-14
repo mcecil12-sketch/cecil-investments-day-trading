@@ -128,6 +128,26 @@ export async function GET() {
     if (!autoEntry.enabled) reasons.push("auto_entry_disabled");
     if (!autoManage.enabled) reasons.push("auto_manage_disabled");
 
+    const skips = {
+      insufficientBars: funnelToday.skipInsufficientBars ?? 0,
+      stale: funnelToday.skipStale ?? 0,
+      volumeTooLow: funnelToday.skipVolumeTooLow ?? 0,
+      dollarVolumeTooLow: funnelToday.skipDollarVolume ?? 0,
+      priceTooLow: funnelToday.skipPriceTooLow ?? 0,
+      spreadTooWide: funnelToday.skipSpreadTooWide ?? 0,
+    };
+
+    const readiness = {
+      entryReadiness:
+        !brokerTruth.error &&
+        !wouldSkipMaxOpenPositions &&
+        !guardState.autoDisabledReason &&
+        (alpacaClock?.is_open ?? true),
+      brokerConnected: !brokerTruth.error,
+      scoringHealthy: createdLast6Hours.pending + createdLast6Hours.error < 50,
+      marketOpen: alpacaClock?.is_open ?? null,
+    };
+
     const response = {
       ok: true,
       now: startedAt.toISOString(),
@@ -227,6 +247,7 @@ export async function GET() {
           pending: createdLast6Hours.pending,
           scored: createdLast6Hours.scored,
           error: createdLast6Hours.error,
+          archived: createdLast6Hours.archived,
         },
         scoredLast6Hours: {
           total: scoredLast6Hours.total,
@@ -259,14 +280,12 @@ export async function GET() {
 
       // Health check
       health: {
-        brokerConnected: !brokerTruth.error,
-        scoringHealthy: createdLast6Hours.pending + createdLast6Hours.error < 50, // Alert if >50 pending+error
-        entryReadiness:
-          !brokerTruth.error &&
-          !wouldSkipMaxOpenPositions &&
-          !guardState.autoDisabledReason &&
-          (alpacaClock?.is_open ?? true),
+        brokerConnected: readiness.brokerConnected,
+        scoringHealthy: readiness.scoringHealthy, // Alert if >50 pending+error
+        entryReadiness: readiness.entryReadiness,
       },
+      readiness,
+      skips,
 
       // Funnel visibility - comprehensive metrics for "why no trades happened"
       funnel: {
@@ -324,14 +343,7 @@ export async function GET() {
         },
         
         // Skip breakdown (not errors)
-        skips: {
-          insufficientBars: funnelToday.skipInsufficientBars ?? 0,
-          stale: funnelToday.skipStale ?? 0,
-          volumeTooLow: funnelToday.skipVolumeTooLow ?? 0,
-          dollarVolumeTooLow: funnelToday.skipDollarVolume ?? 0,
-          priceTooLow: funnelToday.skipPriceTooLow ?? 0,
-          spreadTooWide: funnelToday.skipSpreadTooWide ?? 0,
-        },
+        skips,
         
         // Auto-entry stage
         autoEntry: {
