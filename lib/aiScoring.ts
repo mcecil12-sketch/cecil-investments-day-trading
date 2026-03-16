@@ -49,6 +49,17 @@ export type RawSignal = {
 
 export type AiGrade = "A+" | "A" | "B" | "C" | "D" | "F";
 
+// Short-specific quality diagnostics
+export type ShortQualityDiagnostics = {
+  shortTrendQuality?: number; // 0-1.0: how clean/confident is the bearish trend
+  vwapAlignmentQuality?: number; // 0-1.0: how well entry aligns with VWAP thesis
+  relativeWeaknessQuality?: number; // 0-1.0: relative weakness vs market proxy
+  bearishStructureQuality?: number; // 0-1.0: quality of structure (rejections, lower highs, etc)
+  participationQuality?: number; // 0-1.0: volume/liquidity confirmation
+  contextAgreement?: boolean; // scan reasoning matches actual VWAP/trend context
+  shortPenaltyReasons?: string[]; // array of reason codes for penalty application
+};
+
 export type ScoredSignal = RawSignal & {
   aiScore: number | null; // 0–10, numeric (finalScore)
   aiGrade: AiGrade | null;
@@ -66,6 +77,8 @@ export type ScoredSignal = RawSignal & {
   longScore?: number | null; // 0-10 score for LONG hypothesis
   shortScore?: number | null; // 0-10 score for SHORT hypothesis
   bestDirection?: "LONG" | "SHORT" | "NONE";
+  // Short-quality diagnostics (populated for SHORT signals)
+  shortDiagnostics?: ShortQualityDiagnostics;
 };
 
 type ModelResponse = {
@@ -320,6 +333,160 @@ const BREAKER_WINDOW_SEC = 120; // 2 minutes
 const BREAKER_OPEN_TTL_SEC = 120; // 2 minutes
 
 /**
+ * Evaluate SHORT-specific quality factors and determine penalties/adjustments
+ * Returns: { adjustedScore, diagnostics, penaltyReasons }
+ */
+function evaluateShortQuality(params: {
+  rawScore: number;
+  summary: string;
+  context: SignalContext | null;
+  entryPrice: number;
+  stopPrice: number;
+  targetPrice: number;
+  reasoning?: string;
+}): {
+  adjustedScore: number;
+  diagnostics: ShortQualityDiagnostics;
+  penaltyReasons: string[];
+} {
+  const { rawScore, summary, context, entryPrice, stopPrice, targetPrice, reasoning } = params;
+  let adjustedScore = rawScore;
+  const reasons: string[] = [];
+  const diagnostics: ShortQualityDiagnostics = {};
+
+  // No context = no adjustments possible
+  if (!context) {
+    return { adjustedScore, diagnostics, penaltyReasons: reasons };
+  }
+
+  // ===== TREND QUALITY ASSESSMENT =====
+  const trendQuality = context.trend === "DOWN" ? 0.9 : context.trend === "FLAT" ? 0.3 : 0.1;
+  diagnostics.shortTrendQuality = trendQuality;
+
+  if (context.trend === "FLAT") {
+    // FLAT trend SHORT: harsh penalty
+    adjustedScore -= 1.0;
+    reasons.push("flat_trend_short");
+  } else if (context.trend !== "DOWN") {
+    // Uptrend SHORT: very harsh penalty
+    adjustedScore -= 0.8;
+    reasons.push("uptrend_short_contradiction");
+  }
+
+  // ===== VWAP ALIGNMENT ASSESSMENT =====
+  let vwapQuality = 0.5; // neutral default
+  const priceVsVwap =
+    context.vwap && context.vwap > 0
+      ? ((entryPrice - context.vwap) / context.vwap) * 100
+      : null;
+
+  if (priceVsVwap !== null) {
+    if (priceVsVwap < -1.0) {
+      // Well below VWAP: good SHORT setup
+      vwapQuality = 0.85;
+      diagnostics.vwapAlignmentQuality = vwapQuality;
+    } else if (priceVsVwap < 0) {
+      // Slightly below VWAP: decent
+      vwapQuality = 0.65;
+      diagnostics.vwapAlignmentQuality = vwapQuality;
+    } else if (priceVsVwap < 0.5) {
+      // Near VWAP: mediocre
+      vwapQuality = 0.4;
+      diagnostics.vwapAlignmentQuality = vwapQuality;
+      adjustedScore -= 0.4;
+      reasons.push("entry_at_or_above_vwap");
+    } else {
+      // Above VWAP: bad for SHORT
+      vwapQuality = 0.1;
+      diagnostics.vwapAlignmentQuality = vwapQuality;
+      adjustedScore -= 1.5;
+      reasons.push("entry_above_vwap_short");
+    }
+  } else {
+    diagnostics.vwapAlignmentQuality = 0.5;
+  }
+
+  // ===== CONTEXT AGREEMENT CHECK =====
+  // See if scan reasoning mentions VWAP but context contradicts
+  const reasoningLower = (reasoning || "").toLowerCase();
+  const summaryLower = (summary || "").toLowerCase();
+  const mentionsBelow = reasoningLower.includes("below") || summaryLower.includes("below vwap");
+  const actuallyAbove = priceVsVwap !== null && priceVsVwap > 0.2;
+
+  if (mentionsBelow && actuallyAbove) {
+    // Contradiction: scan says below, actual context shows above
+    diagnostics.contextAgreement = false;
+    adjustedScore -= 1.2;
+    reasons.push("vwap_context_contradiction");
+  } else {
+    diagnostics.contextAgreement = true;
+  }
+
+  // ===== TREND SLOPE ASSESSMENT =====
+  const trendSlopeAbs = Math.abs(context.trendSlopePct || 0);
+  if (context.trend === "DOWN" && trendSlopeAbs < 0.03) {
+    // Weak downtrend slope
+    adjustedScore -= 0.3;
+    reasons.push("weak_downtrend_slope");
+  }
+
+  // ===== PARTICIPATION / VOLUME ASSESSMENT =====
+  let participationQuality = 0.6; // default neutral
+  if (context.relVolume !== null && context.relVolume !== undefined) {
+    if (context.relVolume >= 1.3) {
+      participationQuality = 0.9;
+    } else if (context.relVolume >= 1.0) {
+      participationQuality = 0.7;
+    } else if (context.relVolume >= 0.7) {
+      participationQuality = 0.5;
+    } else {
+      // Light volume
+      participationQuality = 0.3;
+      adjustedScore -= 0.4;
+      reasons.push("light_volume_participation");
+    }
+  }
+  diagnostics.participationQuality = participationQuality;
+
+  // ===== RELATIVE WEAKNESS ASSESSMENT =====
+  // This is a softer check; context may not always have this data
+  let relativeWeaknessQuality = 0.5; // neutral default
+  // Note: Full relative strength analysis would need SPY/QQQ last bar data from context
+  // For now, we mark it as neutral but provide the hook for future enhancement
+  diagnostics.relativeWeaknessQuality = relativeWeaknessQuality;
+
+  // ===== BEARISH STRUCTURE ASSESSMENT =====
+  let bearishStructureQuality = 0.6; // default, improved by AI summary quality
+  // Check if summary mentions "lower highs", "rejection", "reversal", "breakdown"
+  const summaryLowerCase = (summary || "").toLowerCase();
+  const hasStructure =
+    summaryLowerCase.includes("lower high") ||
+    summaryLowerCase.includes("rejection") ||
+    summaryLowerCase.includes("breakdown") ||
+    summaryLowerCase.includes("failed") ||
+    summaryLowerCase.includes("reversal");
+
+  if (hasStructure) {
+    bearishStructureQuality = 0.8;
+  } else if (summaryLowerCase.includes("reasonable") || summaryLowerCase.includes("moderate")) {
+    bearishStructureQuality = 0.4;
+    adjustedScore -= 0.3;
+    reasons.push("weak_bearish_conviction");
+  }
+  diagnostics.bearishStructureQuality = bearishStructureQuality;
+
+  // ===== FINAL CLAMP =====
+  // Ensure score stays within 0-10 range
+  adjustedScore = Math.max(0, Math.min(10, adjustedScore));
+
+  return {
+    adjustedScore,
+    diagnostics,
+    penaltyReasons: reasons,
+  };
+}
+
+/**
  * Check if circuit breaker is open (too many recent errors)
  */
 async function isCircuitBreakerOpen(): Promise<boolean> {
@@ -402,15 +569,15 @@ export async function scoreSignalWithAI(rawSignal: RawSignal): Promise<AiScoreRe
   }
 
   const systemPrompt = `
-You are a seasoned intraday equities trader.
+You are a seasoned intraday equities trader with deep experience in both long and short setups.
 You evaluate each trading setup from BOTH directions independently.
 
 Rules:
 - Score from 0 to 10 (decimals allowed) where:
-  - 9-10 = elite, A-level, high-conviction setups.
-  - 7-8.9 = good but not elite.
-  - 5-6.9 = marginal/meh.
-  - 0-4.9 = avoid.
+  - 9-10 = elite, A-level, high-conviction setups with excellent structure and confirmation.
+  - 7-8.9 = good but not elite. Solid but with some minor gaps.
+  - 5-6.9 = marginal/weak. Possible but requires strong edge elsewhere.
+  - 0-4.9 = avoid. Low conviction or contradictory signals.
 - Evaluate BOTH:
   1. LONG hypothesis (buy, profit on upside)
   2. SHORT hypothesis (sell/short, profit on downside)
@@ -419,6 +586,51 @@ Rules:
   - Entry quality relative to VWAP and recent price action
   - Risk/reward setup
   - Liquidity and volume support
+
+** ENHANCED SHORT SCORING RUBRIC **
+SHORT setups must meet HIGHER standards than LONG setups to score well. Apply these gates:
+
+1. BEARISH TREND QUALITY (Required for scores >=7.0):
+   - Trend MUST be explicitly DOWN, not FLAT. FLAT-trend shorts should score <=6.5.
+   - Trend slope should show clear weakness (not just -0.001% per bar).
+   - Confirmed by recent lower highs pattern (last 3-5 bars).
+   - If trend is FLAT and relying on pullback, penalty of -1.0 from base score.
+
+2. VWAP / ENTRY ALIGNMENT (Critical for quality):
+   - Clean below-VWAP trading: reward, score boost +0.3 for high-confidence structure.
+   - Clear rejection from above VWAP: reward, score boost +0.2 if well-defined candle.
+   - Above-VWAP shorts: harsh penalty (-1.5). Require exceptional R:R or ultra-clear structure to overcome.
+   - Ambiguous or contradictory VWAP context: penalty -0.8 to -1.2 depending on severity.
+   - Check for mismatch between scan reasoning ("below VWAP") and actual context (price above VWAP): harsh penalty -1.2.
+
+3. MARKET-RELATIVE WEAKNESS (For best SHORT scores):
+   - Compare ticker weakness to SPY / QQQ / broad market proxy from context.
+   - Mega-cap shorts (TSLA, NVDA, SPY, QQQ) MUST show meaningful relative weakness vs their sector/market.
+   - Shorts without significant relative weakness: penalty -0.6 to -0.8.
+   - Strong relative weakness (ticker down 2-3%+ while market flat): boost +0.3.
+
+4. BEARISH STRUCTURE & CONFIRMATION (Required):
+   - Lower highs, failed pops, rejection candles: reward.
+   - Distribution or volume on downs: reward +0.2.
+   - Light volume on bearish move: penalty -0.5.
+   - No clear SHORT structure (just mean-reversion): score <=6.8 unless other factors exceptional.
+
+5. QUALITY OF R:R (For scoring differentiation):
+   - If R:R is poor for SHORT (tight target, wide stop): penalty -0.5.
+   - If R:R is excellent (2:1+): boost +0.2 for short.
+   - Stops too wide for size (>2% risk): discourage for intraday.
+
+6. LIQUIDITY / PARTICIPATION:
+   - Good volume participation on SHORT move: standard scoring.
+   - Light/weak volume on SHORT move: penalty -0.4.
+   - Hard gates (dollar volume) are separate; this is softer soft-gate.
+
+** AVOID INFLATING MEDIOCRE SHORTS **
+- Shorts with "reasonable" or "moderate" thesis (not "strong" or "clear"): max 6.8-7.0.
+- Shorts with weak participation: max 7.0.
+- Shorts with flat trend: max 6.5-6.8.
+- Shorts without strong extension from recent range: max 6.8.
+
 - Return ONLY a compact JSON object with fields:
   {"longScore": number, "shortScore": number, "longSummary": string, "shortSummary": string, "chosenDirection": "LONG"|"SHORT"|"NONE", "confidence": number}.
   No extra text.
@@ -734,6 +946,37 @@ Return ONLY valid JSON:
     }
   }
   
+  // ===== APPLY SHORT-SPECIFIC QUALITY PENALTIES =====
+  let shortDiagnostics: ShortQualityDiagnostics | undefined;
+  if (bestDirection === "SHORT") {
+    const shortQualityResult = evaluateShortQuality({
+      rawScore: winnerScore,
+      summary: _summary,
+      context: signal.signalContext || null,
+      entryPrice: signal.entryPrice,
+      stopPrice: signal.stopPrice,
+      targetPrice: signal.targetPrice,
+      reasoning: signal.reasoning,
+    });
+    
+    winnerScore = shortQualityResult.adjustedScore;
+    shortDiagnostics = shortQualityResult.diagnostics;
+    shortDiagnostics.shortPenaltyReasons = shortQualityResult.penaltyReasons;
+    
+    // Update summary to include penalty info if penalties were applied
+    if (shortQualityResult.penaltyReasons.length > 0) {
+      const penaltyNote = `(penalties: ${shortQualityResult.penaltyReasons.join(", ")})`;
+      _summary = `${_summary} ${penaltyNote}`;
+    }
+    
+    // Recalculate qualification after applying SHORT penalties
+    if (hasExplicitSide) {
+      // For explicit SHORT signals, re-check qualification threshold
+      isQualified = winnerScore >= MIN_QUALIFY_SCORE;
+    }
+    // For neutral signals, bestDirection evaluation already handles qualification via MIN_SHORT_SCORE gate
+  }
+  
   const _grade: AiGrade = gradeFromScore(winnerScore);
   const _direction: "LONG" | "SHORT" | "NONE" = bestDirection;
 
@@ -749,6 +992,8 @@ Return ONLY valid JSON:
     longScore,
     shortScore,
     bestDirection,
+    // Short-quality diagnostics
+    shortDiagnostics,
   };
 
   if (bestDirection === "LONG") {
@@ -759,7 +1004,8 @@ Return ONLY valid JSON:
     await bumpTodayFunnel({ aiDirectionNone: 1 }).catch(console.warn);
   }
 
-  console.log("[aiScoring] Result:", {
+  // Log with SHORT diagnostics if applicable
+  const logData: any = {
     ticker: result.ticker,
     score: winnerScore,
     grade: _grade,
@@ -769,7 +1015,13 @@ Return ONLY valid JSON:
     confidence,
     bestDirection,
     edge,
-  });
+  };
+  
+  if (shortDiagnostics) {
+    logData.shortDiagnostics = shortDiagnostics;
+  }
+  
+  console.log("[aiScoring] Result:", logData);
 
   try {
     await writeAiHeartbeat();
