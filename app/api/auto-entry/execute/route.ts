@@ -455,14 +455,58 @@ function nowIso() {
 
 async function ensureToken(req: Request) {
   const cfg = getAutoConfig();
+  const cronHeader = String(req.headers.get("x-cron-token") || "").trim();
+  const hasCronToken = Boolean(cronHeader) && Boolean(process.env.CRON_TOKEN) && cronHeader === String(process.env.CRON_TOKEN);
 
   const cookieOk = await requireAuth(req);
-  if (cookieOk.ok) return { ok: true as const, cfg, hasCookieAuth: true };
+  if (cookieOk.ok) {
+    return {
+      ok: true as const,
+      cfg,
+      hasCookieAuth: true,
+      hasCronToken,
+      authModeUsed: "cookie" as const,
+    };
+  }
 
-  if (!cfg.token) return { ok: false as const, status: 500, error: "AUTO_ENTRY_TOKEN missing", hasCookieAuth: false };
+  if (hasCronToken) {
+    return {
+      ok: true as const,
+      cfg,
+      hasCookieAuth: false,
+      hasCronToken: true,
+      authModeUsed: "cron_token" as const,
+    };
+  }
+
+  if (!cfg.token) {
+    return {
+      ok: false as const,
+      status: 500,
+      error: "AUTO_ENTRY_TOKEN missing",
+      hasCookieAuth: false,
+      hasCronToken,
+      authModeUsed: "none" as const,
+    };
+  }
   const got = headerToken(req);
-  if (!got || got !== cfg.token) return { ok: false as const, status: 401, error: "unauthorized", hasCookieAuth: false };
-  return { ok: true as const, cfg, hasCookieAuth: false };
+  if (!got || got !== cfg.token) {
+    return {
+      ok: false as const,
+      status: 401,
+      error: "unauthorized",
+      hasCookieAuth: false,
+      hasCronToken,
+      authModeUsed: "none" as const,
+    };
+  }
+  return {
+    ok: true as const,
+    cfg,
+    hasCookieAuth: false,
+    hasCronToken,
+    authModeUsed: "auto_entry_token" as const,
+  };
 }
 
 async function setnxLock(key: string, ttlSec: number) {
@@ -545,6 +589,9 @@ type GuardSummary = {
   cooldownAfterLossMin: number;
   cooldownRemainingMin: number | null;
   tickerCooldownMin: number;
+  authModeUsed?: "cookie" | "cron_token" | "auto_entry_token" | "none";
+  hasCookieAuth?: boolean;
+  hasCronToken?: boolean;
 };
 
 const APP_BASE_URL = (process.env.APP_URL || "").replace(/\/$/, "");
@@ -854,6 +901,12 @@ export async function POST(req: Request) {
     openPositions,
     brokerTruth,
   });
+  guardSummary = {
+    ...guardSummary,
+    authModeUsed: auth.authModeUsed,
+    hasCookieAuth: auth.hasCookieAuth,
+    hasCronToken: auth.hasCronToken,
+  };
   const runSourceHeader = String(req.headers.get("x-run-source") || req.headers.get("x-scan-source") || "").trim();
   const runSource = runSourceHeader || (auth.hasCookieAuth ? "terminal" : "unknown");
   const runIdHeader = String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "").trim();
