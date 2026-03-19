@@ -100,26 +100,6 @@ function isAlpacaInvalidTakeProfitVsBase(err: any) {
   return code === "42210000" && hasTpConstraint && hasConstraintWords;
 }
 
-async function disableTradeAsPoison(tradeId: string, reason: string) {
-  const trades = await readTrades();
-  const now = new Date().toISOString();
-  let updated = 0;
-  const next = trades.map((t: any) => {
-    if (t.id !== tradeId) return t;
-    updated += 1;
-    return {
-      ...t,
-      status: "ERROR",
-      autoEntryStatus: "DISABLED",
-      error: "invalid_trade_payload",
-      reason,
-      updatedAt: now,
-    };
-  });
-  if (updated) await writeTrades(next);
-  return updated;
-}
-
 async function markTradeValidationSkipped(tradeId: string, reason: string, detail?: any) {
   const trades = await readTrades();
   const now = new Date().toISOString();
@@ -350,6 +330,70 @@ function validateAndRepairBracket(params: {
   }
   
   return { valid: true, tp, stop };
+}
+
+function sideAwareBaseFromQuote(side: "LONG" | "SHORT", quote: QuoteLike | null, fallbackBase: number) {
+  const candidates: number[] = [];
+  const add = (value: any) => {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) candidates.push(n);
+  };
+
+  add(quote?.last);
+  add(quote?.mid);
+  add(quote?.bid);
+  add(quote?.ask);
+  add(fallbackBase);
+
+  if (candidates.length === 0) return Number(fallbackBase.toFixed(2));
+  const selected = side === "LONG" ? Math.min(...candidates) : Math.max(...candidates);
+  return Number(selected.toFixed(2));
+}
+
+function stopValidationSummary(params: {
+  side: "LONG" | "SHORT";
+  base: number;
+  stop: number;
+}) {
+  const epsilon = 0.000001;
+  if (params.side === "LONG") {
+    const passed = params.stop < params.base - epsilon;
+    return {
+      comparison: `stop(${params.stop.toFixed(2)}) < base(${params.base.toFixed(2)})`,
+      passed,
+    };
+  }
+  const passed = params.stop > params.base + epsilon;
+  return {
+    comparison: `stop(${params.stop.toFixed(2)}) > base(${params.base.toFixed(2)})`,
+    passed,
+  };
+}
+
+function repairBracketForBase(params: {
+  side: "LONG" | "SHORT";
+  base: number;
+  stop: number;
+  tp: number;
+}) {
+  const tick = 0.01;
+  const base = Number(params.base.toFixed(2));
+  let stop = Number(params.stop.toFixed(2));
+  let tp = Number(params.tp.toFixed(2));
+
+  if (params.side === "LONG") {
+    const maxStop = Number((base - tick).toFixed(2));
+    if (stop > maxStop) stop = maxStop;
+    const minTp = Number((base + tick).toFixed(2));
+    if (tp < minTp) tp = minTp;
+  } else {
+    const minStop = Number((base + tick).toFixed(2));
+    if (stop < minStop) stop = minStop;
+    const maxTp = Number((base - tick).toFixed(2));
+    if (tp > maxTp) tp = maxTp;
+  }
+
+  return { stop, tp };
 }
 
 function headerToken(req: Request) {
@@ -1346,11 +1390,18 @@ export async function POST(req: Request) {
   tp = Number(tp.toFixed(2));
   bracketStop = Number(bracketStop.toFixed(2));
 
+  const initialStopCheck = stopValidationSummary({
+    side: sideEnum,
+    base: submitBasePrice,
+    stop: bracketStop,
+  });
+
   const dbg: any = {
     ticker,
     side,
     entryPrice,
     stopPrice,
+    targetPrice,
     quote,
     decisionPrice: decision.decisionPrice,
     decisionSource: decision.source,
@@ -1359,6 +1410,8 @@ export async function POST(req: Request) {
     submitBasePrice,
     stopDistance,
     originalTargetPrice: targetPrice,
+    stopValidationComparison: initialStopCheck.comparison,
+    stopValidationPassed: initialStopCheck.passed,
     takeProfitPrice: tp,
     bracketStopPrice: bracketStop,
     qty,
@@ -1373,6 +1426,7 @@ export async function POST(req: Request) {
     owner: `execute:${tradeId}`,
     fn: async () => {
       let validationReason = "ok";
+      let failureReasonDetailed = "";
       // Validate and repair bracket BEFORE submitting order
       const bracketCheck = validateAndRepairBracket({
         side: sideDirection === "buy" ? "LONG" : "SHORT",
@@ -1394,6 +1448,9 @@ export async function POST(req: Request) {
             computedBasePrice,
             side: sideEnum,
             validationReason,
+            stopValidationComparison: initialStopCheck.comparison,
+            stopValidationPassed: initialStopCheck.passed,
+            failureReasonDetailed: validationReason,
             payloadPreview: {
               symbol: ticker,
               qty,
@@ -1424,6 +1481,7 @@ export async function POST(req: Request) {
       });
       if (!stopNorm.ok) {
         validationReason = `stop_normalization_failed:${stopNorm.reason}`;
+        failureReasonDetailed = validationReason;
         return {
           __poison: true,
           reason: "invalid_stop_vs_base_price",
@@ -1435,6 +1493,9 @@ export async function POST(req: Request) {
             computedBasePrice,
             side: sideEnum,
             validationReason,
+            stopValidationComparison: initialStopCheck.comparison,
+            stopValidationPassed: false,
+            failureReasonDetailed,
           },
         } as any;
       }
@@ -1509,20 +1570,58 @@ export async function POST(req: Request) {
         return await createOrder(payload);
       } catch (e: any) {
         if (isAlpacaInvalidStopVsBase(e)) {
-          return {
-            __poison: true,
-            reason: "invalid_stop_vs_base_price",
-            message: String(e?.message || e || ""),
-            validation: {
-              entryPrice,
-              stopPrice,
-              targetPrice,
-              computedBasePrice,
-              side: sideEnum,
-              validationReason: "alpaca_rejected_stop_vs_base",
-              payloadPreview: payload,
-            },
-          } as any;
+          const refreshedQuote = await fetchQuoteForSymbol(ticker);
+          const refreshedBase = sideAwareBaseFromQuote(sideEnum, refreshedQuote, submitBasePrice);
+          const repaired = repairBracketForBase({
+            side: sideEnum,
+            base: refreshedBase,
+            stop: finalStop,
+            tp: finalTp,
+          });
+          const refreshedStopCheck = stopValidationSummary({
+            side: sideEnum,
+            base: refreshedBase,
+            stop: repaired.stop,
+          });
+
+          const retryPayload: any = {
+            ...payload,
+            stop_loss: { stop_price: repaired.stop },
+          };
+          const retryTpValid =
+            sideEnum === "LONG"
+              ? repaired.tp >= Number((refreshedBase + tick).toFixed(2))
+              : repaired.tp <= Number((refreshedBase - tick).toFixed(2));
+          if (retryTpValid) {
+            retryPayload.order_class = "bracket";
+            retryPayload.take_profit = { limit_price: repaired.tp };
+          } else {
+            retryPayload.order_class = "oto";
+            delete retryPayload.take_profit;
+          }
+
+          try {
+            return await createOrder(retryPayload);
+          } catch (retryErr: any) {
+            failureReasonDetailed = `alpaca_rejected_stop_vs_base_retry_failed:${String(retryErr?.message || retryErr || "")}`;
+            return {
+              __poison: true,
+              reason: "invalid_stop_vs_base_price",
+              message: String(retryErr?.message || retryErr || ""),
+              validation: {
+                entryPrice,
+                stopPrice,
+                targetPrice,
+                computedBasePrice: refreshedBase,
+                side: sideEnum,
+                validationReason: "alpaca_rejected_stop_vs_base",
+                stopValidationComparison: refreshedStopCheck.comparison,
+                stopValidationPassed: refreshedStopCheck.passed,
+                failureReasonDetailed,
+                payloadPreview: retryPayload,
+              },
+            } as any;
+          }
         }
         if (isAlpacaInvalidTakeProfitVsBase(e)) {
           return {
@@ -1540,6 +1639,9 @@ export async function POST(req: Request) {
               computedBasePrice,
               side: sideEnum,
               validationReason: "alpaca_rejected_tp_vs_base",
+              stopValidationComparison: initialStopCheck.comparison,
+              stopValidationPassed: initialStopCheck.passed,
+              failureReasonDetailed: String(e?.message || e || ""),
               payloadPreview: payload,
             },
           } as any;
@@ -1583,6 +1685,9 @@ export async function POST(req: Request) {
         computedBasePrice,
         side: sideEnum,
         validationReason: poisonReason,
+        stopValidationComparison: initialStopCheck.comparison,
+        stopValidationPassed: initialStopCheck.passed,
+        failureReasonDetailed: poisonReason,
       };
       counts.invalidMarked += 1;
       await markTradeValidationSkipped(tradeId, poisonReason, validation);
