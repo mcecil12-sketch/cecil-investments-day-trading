@@ -1,6 +1,8 @@
 export type AutoManageConfig = {
   enabled: boolean;
   eodFlatten: boolean;
+  eodFlattenAfterEt: string;
+  staleAfterEt: string;
   fridayFlattenEnabled: boolean;
   fridayFlattenAfterEt: string;
   cutLossEnabled: boolean;
@@ -12,6 +14,8 @@ export type AutoManageConfig = {
   replaceEnabled: boolean;
   replaceScoreDelta: number;
   replaceUnknownROverride: boolean;
+  replaceMinAgeMin: number;
+  replaceProtectWinnerAboveR: number;
 };
 
 const num = (v: string | undefined, d: number) => {
@@ -58,12 +62,22 @@ export function getAutoManageConfig(): AutoManageConfig {
     process.env.AUTO_MANAGE_REPLACE_ALLOW_UNKNOWN_R_OVERRIDE;
   // AUTO_MANAGE_FRIDAY_FLATTEN_ENABLED: Friday flatten guard (default true in paper mode, false in live mode).
   const fridayFlattenEnabledRaw = process.env.AUTO_MANAGE_FRIDAY_FLATTEN_ENABLED;
+  // AUTO_MANAGE_EOD_FLATTEN_AFTER_ET: regular end-of-day flatten gate in ET (default 15:55).
+  const eodFlattenAfterEt = String(process.env.AUTO_MANAGE_EOD_FLATTEN_AFTER_ET ?? "15:55").trim() || "15:55";
+  // AUTO_MANAGE_STALE_AFTER_ET: stale-open diagnostic gate in ET (default 16:05).
+  const staleAfterEt = String(process.env.AUTO_MANAGE_STALE_AFTER_ET ?? "16:05").trim() || "16:05";
   // AUTO_MANAGE_FRIDAY_FLATTEN_AFTER_ET: Friday flatten ET time gate (default 15:30).
   const fridayFlattenAfterEt = String(process.env.AUTO_MANAGE_FRIDAY_FLATTEN_AFTER_ET ?? "15:30").trim() || "15:30";
+  // AUTO_MANAGE_REPLACE_MIN_AGE_MIN: minimum age before a healthy position can be rotated (default 10m).
+  const replaceMinAgeMinRaw = process.env.AUTO_MANAGE_REPLACE_MIN_AGE_MIN ?? "10";
+  // AUTO_MANAGE_REPLACE_MAX_WINNING_R: do not rotate a winner above this open R unless stale (default 0.25R).
+  const replaceProtectWinnerAboveRRaw = process.env.AUTO_MANAGE_REPLACE_MAX_WINNING_R ?? "0.25";
 
   return {
     enabled: process.env.AUTO_MANAGE_ENABLED === "1",
     eodFlatten: process.env.AUTO_MANAGE_EOD_FLATTEN === "1",
+    eodFlattenAfterEt,
+    staleAfterEt,
     fridayFlattenEnabled: bool(fridayFlattenEnabledRaw, paperMode),
     fridayFlattenAfterEt,
     cutLossEnabled: bool(cutLossEnabledRaw, paperMode),
@@ -75,5 +89,7 @@ export function getAutoManageConfig(): AutoManageConfig {
     replaceEnabled: bool(replaceEnabledRaw, paperMode),
     replaceScoreDelta: num(replaceScoreDeltaRaw, 1.5),
     replaceUnknownROverride: bool(replaceUnknownROverrideRaw, false),
+    replaceMinAgeMin: Math.max(0, num(replaceMinAgeMinRaw, 10)),
+    replaceProtectWinnerAboveR: num(replaceProtectWinnerAboveRRaw, 0.25),
   };
 }

@@ -9,6 +9,19 @@ export type AutoManageRun = {
   checked?: number;
   updated?: number;
   flattened?: number;
+  eodFlattenAttempted?: number;
+  eodFlattenSucceeded?: number;
+  eodFlattenFailed?: number;
+  flattenOrderCount?: number;
+  flattenClosedCount?: number;
+  staleOpenPositionsCount?: number;
+  staleOpenTradesCount?: number;
+  lastFlattenAt?: string;
+  lastFlattenOutcome?: string;
+  flattenFailures?: number;
+  replacementConsidered?: boolean;
+  replacementExecuted?: boolean;
+  replacementReason?: string;
   rescueAttempted?: number;
   rescueOk?: number;
   rescueFailed?: number;
@@ -32,6 +45,14 @@ export async function recordAutoManage(run: AutoManageRun) {
   if (outcome === "SUCCESS") incr.success = 1;
   if (outcome === "FAIL") incr.fail = 1;
   if (outcome === "SKIP") incr.skipped = 1;
+  if (run.eodFlattenAttempted) incr.eodFlattenAttempted = run.eodFlattenAttempted;
+  if (run.eodFlattenSucceeded) incr.eodFlattenSucceeded = run.eodFlattenSucceeded;
+  if (run.eodFlattenFailed) incr.eodFlattenFailed = run.eodFlattenFailed;
+  if (run.flattenOrderCount) incr.flattenOrderCount = run.flattenOrderCount;
+  if (run.flattenClosedCount) incr.flattenClosedCount = run.flattenClosedCount;
+  if (run.flattenFailures) incr.flattenFailures = run.flattenFailures;
+  if (run.staleOpenPositionsCount) incr.staleOpenPositionsCount = run.staleOpenPositionsCount;
+  if (run.staleOpenTradesCount) incr.staleOpenTradesCount = run.staleOpenTradesCount;
   if (run.rescueAttempted) incr.rescueAttempted = run.rescueAttempted;
   if (run.rescueOk) incr.rescueOk = run.rescueOk;
   if (run.rescueFailed) incr.rescueFailed = run.rescueFailed;
@@ -49,6 +70,14 @@ export async function recordAutoManage(run: AutoManageRun) {
       lastReason: run.reason || "",
       lastSource: run.source || "",
       lastRunId: run.runId || "",
+      lastFlattenAt: run.lastFlattenAt || "",
+      lastFlattenOutcome: run.lastFlattenOutcome || "",
+      lastFlattenFailures: run.flattenFailures || 0,
+      lastStaleOpenPositionsCount: run.staleOpenPositionsCount || 0,
+      lastStaleOpenTradesCount: run.staleOpenTradesCount || 0,
+      lastReplacementConsidered: run.replacementConsidered ? 1 : 0,
+      lastReplacementExecuted: run.replacementExecuted ? 1 : 0,
+      lastReplacementReason: run.replacementReason || "",
       lastRescueAttempted: run.rescueAttempted || 0,
       lastRescueOk: run.rescueOk || 0,
       lastRescueFailed: run.rescueFailed || 0,

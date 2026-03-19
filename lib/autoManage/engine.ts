@@ -8,8 +8,17 @@ import { reconcileOpenTrades } from "@/lib/maintenance/reconcileOpenTrades";
 import { sendNotification } from "@/lib/notifications/notify";
 import { selectCanonicalOpenTrade } from "@/lib/trades/canonical";
 import { evaluateCutLoss } from "@/lib/autoManage/cutLoss";
-import { computeUnrealizedR, decideReplacement } from "@/lib/autoManage/risk";
+import { computeUnrealizedR } from "@/lib/autoManage/risk";
 import { hydrateOpenTradeFromBroker } from "@/lib/autoManage/hydration";
+import {
+  applyFlattenDiagnosticsToTrade,
+  attemptFlattenPosition,
+  buildOpenOrdersBySymbol,
+  classifyStaleOpenTrade,
+  fetchOpenOrdersDetailed,
+  finalizeTradeWithoutBroker,
+  isEtAtOrAfter,
+} from "@/lib/autoManage/reliability";
 
 export type AutoManageResult = {
   ok: true;
@@ -23,6 +32,16 @@ export type AutoManageResult = {
   market?: any;
   notes?: string[];
   forced?: boolean;
+  eodFlattenAttempted?: number;
+  eodFlattenSucceeded?: number;
+  eodFlattenFailed?: number;
+  flattenOrderCount?: number;
+  flattenClosedCount?: number;
+  staleOpenPositionsCount?: number;
+  staleOpenTradesCount?: number;
+  lastFlattenAt?: string;
+  lastFlattenOutcome?: string;
+  flattenFailures?: number;
   cfg: ReturnType<typeof getAutoManageConfig>;
   reconcile?: {
     ok: boolean;
@@ -237,11 +256,9 @@ function parseHourMinute(value: string) {
   return { hour, minute };
 }
 
-function isNearEodWindowEt(nowIso: string, marketClosed: boolean) {
+function isNearEodWindowEt(nowIso: string, marketClosed: boolean, afterEt: string) {
   if (marketClosed) return false;
-  const now = new Date(nowIso);
-  const et = getEtWeekdayHourMinute(now);
-  return et.hour === 15 && et.minute >= 55;
+  return isEtAtOrAfter(nowIso, afterEt);
 }
 
 function isFridayFlattenWindowEt(nowIso: string, afterEt: string, marketClosed: boolean) {
@@ -470,13 +487,8 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     return { ok: true, skipped: true, reason: "no_open_trades", checked: 0, updated: 0, flattened: 0, enabled: true, now, market: clock, cfg, reconcile: reconcileResult };
   }
 
-  if (marketClosed && !force) {
-    await recordAutoManage({ ts: now, outcome: "SKIP", reason: "market_closed", source: opts.source, runId: opts.runId });
-    return { ok: true, skipped: true, reason: "market_closed", checked: 0, updated: 0, flattened: 0, enabled: true, now, market: clock, cfg, reconcile: reconcileResult };
-  }
-
   const flattenAllowedForce = force;
-  const flattenAllowedEod = isNearEodWindowEt(now, marketClosed);
+  const flattenAllowedEod = isNearEodWindowEt(now, marketClosed, cfg.eodFlattenAfterEt);
   const flattenAllowedFriday =
     cfg.fridayFlattenEnabled && isFridayFlattenWindowEt(now, cfg.fridayFlattenAfterEt, marketClosed);
   const flattenAllowed = flattenAllowedForce || flattenAllowedEod || flattenAllowedFriday;
@@ -497,31 +509,23 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   let rescueAttempted = 0;
   let rescueOk = 0;
   let rescueFailed = 0;
-  let replaceConsidered = 0;
-  let replaceExecuted = 0;
+  let eodFlattenAttempted = 0;
+  let eodFlattenSucceeded = 0;
+  let eodFlattenFailed = 0;
+  let flattenOrderCount = 0;
+  let flattenClosedCount = 0;
+  let staleOpenPositionsCount = 0;
+  let staleOpenTradesCount = 0;
+  let flattenFailures = 0;
+  let lastFlattenAt: string | undefined;
+  let lastFlattenOutcome: string | undefined;
   let hadFailures = false;
   const max = Math.min(cfg.maxPerRun, open.length);
   updated += duplicateArchived;
 
-  const pendingCandidates = all
-    .filter((t: any) => String(t?.status || "").toUpperCase() === "AUTO_PENDING")
-    .map((t: any) => {
-      const score = num(t?.aiScore ?? t?.score ?? t?.ai?.score);
-      return {
-        id: String(t?.id || ""),
-        ticker: String(t?.ticker || "").toUpperCase(),
-        score,
-      };
-    })
-    .filter((t: any) => t.ticker);
-  const topCandidate = [...pendingCandidates].sort((a, b) => (b.score ?? Number.NEGATIVE_INFINITY) - (a.score ?? Number.NEGATIVE_INFINITY))[0] || null;
-  if (!cfg.replaceEnabled) {
-    pushNote("replace_skip_disabled");
-  } else if (!topCandidate) {
-    pushNote("replace_skip_no_candidates");
-  }
-
   const openStopBySymbol = await fetchOpenStopBySymbol();
+  const openOrdersDetailed = await fetchOpenOrdersDetailed();
+  const openOrdersBySymbol = buildOpenOrdersBySymbol(openOrdersDetailed);
   const positionBySymbol = new Map<string, any>();
   try {
     const positionsRaw = await getPositions();
@@ -541,6 +545,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     const side = String(t.side || "LONG").toUpperCase();
     const idx = next.findIndex((x: any) => x.id === id);
     const brokerPos = positionBySymbol.get(ticker);
+    const symbolOpenOrders = openOrdersBySymbol.get(ticker) || [];
 
     const hydrated = hydrateOpenTradeFromBroker(t, brokerPos);
     let qty = hydrated.qty;
@@ -603,6 +608,83 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
 
     if (!id || !ticker || !["LONG", "SHORT"].includes(side)) {
       pushNote(`skip_invalid:${id || ticker}`);
+      continue;
+    }
+
+    const staleOpen = classifyStaleOpenTrade({
+      trade: t,
+      brokerPosition: brokerPos,
+      openOrders: symbolOpenOrders,
+      nowIso: now,
+      marketClosed,
+      staleAfterEt: cfg.staleAfterEt,
+      eodFlattenEnabled: cfg.eodFlatten,
+    });
+    if (staleOpen.stale) {
+      staleOpenTradesCount += 1;
+      if (staleOpen.hasBrokerPosition) staleOpenPositionsCount += 1;
+      pushNote(`stale_open:${ticker}:${staleOpen.reason}`);
+    }
+
+    if (cfg.eodFlatten && (flattenAllowed || staleOpen.stale)) {
+      const flattenReason = flattenAllowedForce
+        ? "forced_flatten"
+        : flattenAllowedEod
+          ? "eod_window"
+          : flattenAllowedFriday
+            ? "friday_flatten_window"
+            : staleOpen.reason || "stale_open_cleanup";
+      const flattenResult = await attemptFlattenPosition({
+        trade: t,
+        brokerPosition: brokerPos,
+        openOrders: symbolOpenOrders,
+        nowIso: now,
+        reason: flattenReason,
+        marketClosed,
+      });
+      eodFlattenAttempted += flattenResult.attempted ? 1 : 0;
+      eodFlattenSucceeded += flattenResult.succeeded ? 1 : 0;
+      eodFlattenFailed += flattenResult.failed ? 1 : 0;
+      flattenOrderCount += flattenResult.flattenOrderCount;
+      flattenClosedCount += flattenResult.flattenClosedCount;
+      if (flattenResult.failed) flattenFailures += 1;
+      lastFlattenAt = flattenResult.lastFlattenAt;
+      lastFlattenOutcome = flattenResult.failed ? "failed" : flattenResult.flattenClosedCount > 0 ? "close_submitted" : "cleanup_only";
+
+      if (idx >= 0) {
+        if (!staleOpen.hasBrokerPosition && (staleOpen.stale || flattenResult.flattenClosedCount === 0)) {
+          next[idx] = finalizeTradeWithoutBroker({
+            trade: applyFlattenDiagnosticsToTrade({
+              trade: next[idx],
+              nowIso: now,
+              flatten: flattenResult,
+              stale: staleOpen,
+            }),
+            nowIso: now,
+            reason: staleOpen.reason || flattenReason,
+            stale: staleOpen,
+          });
+        } else {
+          next[idx] = applyFlattenDiagnosticsToTrade({
+            trade: next[idx],
+            nowIso: now,
+            flatten: flattenResult,
+            stale: staleOpen,
+          });
+        }
+        updated++;
+      }
+
+      if (flattenResult.failed) {
+        hadFailures = true;
+        pushNote(`flatten_fail:${ticker}:${flattenResult.flattenErrorMessage || flattenReason}`);
+      } else if (flattenResult.flattenClosedCount > 0) {
+        flattened += flattenResult.flattenClosedCount;
+        pushNote(`flatten_submit:${ticker}:${flattenReason}`);
+      } else {
+        flattened += staleOpen.hasBrokerPosition ? 0 : 1;
+        pushNote(`flatten_cleanup:${ticker}:${flattenReason}`);
+      }
       continue;
     }
 
@@ -698,59 +780,6 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
         updated++;
       }
 
-      if (cfg.replaceEnabled) {
-        const candidateTicker = String(topCandidate?.ticker || "").toUpperCase();
-        const openScoreRaw = num(t?.aiScore ?? t?.score ?? t?.ai?.score);
-        const openScore = openScoreRaw ?? 0;
-        if (openScoreRaw == null) {
-          pushNote(`replace_baseline_score_used:${ticker}`);
-        }
-        const decision = decideReplacement({
-          openUnrealizedR: null,
-          openScore,
-          candidateScore: topCandidate?.score,
-          allowUnknownROverride: cfg.replaceUnknownROverride,
-          overrideScoreDelta: cfg.replaceScoreDelta,
-        });
-        replaceConsidered += 1;
-        if (candidateTicker) {
-          pushNote(`replace_considered:${ticker}->${candidateTicker}`);
-        }
-        if (decision.execute && candidateTicker && candidateTicker !== ticker) {
-          const closeRes = await submitMarketCloseForTrade(t, ticker);
-          if (closeRes.ok && idx >= 0) {
-            replaceExecuted += 1;
-            next[idx] = {
-              ...next[idx],
-              status: "CLOSED",
-              autoEntryStatus: "CLOSED",
-              closeReason: "replace_for_better_candidate",
-              closeOrderId: closeRes.orderId,
-              closeOrderStatus: closeRes.status,
-              closedAt: now,
-              updatedAt: now,
-            };
-            pushNote(`replace_executed:${ticker}->${candidateTicker}`);
-            updated++;
-            flattened++;
-          } else {
-            pushNote(`replace_skip_close_failed:${ticker}`);
-            if (!closeRes.ok) hadFailures = true;
-          }
-        } else {
-          if (candidateTicker && candidateTicker === ticker) {
-            pushNote(`replace_skip_same_ticker:${ticker}`);
-          } else if (decision.reason === "replace_skip_r_unknown") {
-            pushNote(`replace_skip_r_unknown:${ticker}`);
-          } else if (decision.reason === "replace_skip_r_positive") {
-            pushNote(`replace_skip_r_positive:${ticker}`);
-          } else if (decision.reason === "replace_skip_delta_too_small") {
-            pushNote(`replace_skip_score_delta:${ticker}`);
-          } else if (decision.reason === "replace_skip_no_candidates") {
-            pushNote("replace_skip_no_candidates");
-          }
-        }
-      }
       continue;
     }
 
@@ -759,63 +788,6 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     const px = metrics.px;
     const entryForCalc = metrics.entry;
     const rps = riskPerShare(entryForCalc, stop)!;
-
-    if (cfg.replaceEnabled) {
-      const candidateTicker = String(topCandidate?.ticker || "").toUpperCase();
-      const openScoreRaw = num(t?.aiScore ?? t?.score ?? t?.ai?.score);
-      const openScore = openScoreRaw ?? 0;
-      if (openScoreRaw == null) {
-        pushNote(`replace_baseline_score_used:${ticker}`);
-      }
-      const decision = decideReplacement({
-        openUnrealizedR: unrealizedR,
-        openScore,
-        candidateScore: topCandidate?.score,
-        allowUnknownROverride: cfg.replaceUnknownROverride,
-        overrideScoreDelta: cfg.replaceScoreDelta,
-      });
-      replaceConsidered += 1;
-      if (candidateTicker) {
-        pushNote(`replace_considered:${ticker}->${candidateTicker}`);
-      }
-      if (decision.execute && candidateTicker && candidateTicker !== ticker) {
-        const closeRes = await submitMarketCloseForTrade(t, ticker);
-        if (closeRes.ok && idx >= 0) {
-          replaceExecuted += 1;
-          next[idx] = {
-            ...next[idx],
-            status: "CLOSED",
-            autoEntryStatus: "CLOSED",
-            closeReason: "replace_for_better_candidate",
-            closeOrderId: closeRes.orderId,
-            closeOrderStatus: closeRes.status,
-            unrealizedPnL,
-            unrealizedR,
-            lastPrice: r2(px),
-            closedAt: now,
-            updatedAt: now,
-          };
-          pushNote(`replace_executed:${ticker}->${candidateTicker}`);
-          updated++;
-          flattened++;
-          continue;
-        }
-        pushNote(`replace_skip_close_failed:${ticker}`);
-        if (!closeRes.ok) hadFailures = true;
-      } else {
-        if (candidateTicker && candidateTicker === ticker) {
-          pushNote(`replace_skip_same_ticker:${ticker}`);
-        } else if (decision.reason === "replace_skip_r_unknown") {
-          pushNote(`replace_skip_r_unknown:${ticker}`);
-        } else if (decision.reason === "replace_skip_r_positive") {
-          pushNote(`replace_skip_r_positive:${ticker}`);
-        } else if (decision.reason === "replace_skip_delta_too_small") {
-          pushNote(`replace_skip_score_delta:${ticker}`);
-        } else if (decision.reason === "replace_skip_no_candidates") {
-          pushNote("replace_skip_no_candidates");
-        }
-      }
-    }
 
     const cutLossEvaluation = evaluateCutLoss({
       enabled: cfg.cutLossEnabled,
@@ -1064,27 +1036,85 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     }
   }
 
-  if (replaceConsidered > 0 || replaceExecuted > 0) {
-    pushNote(`replace_considered:${replaceConsidered}`);
-    pushNote(`replace_executed:${replaceExecuted}`);
-  }
-
   if (updated > 0) await writeTrades(next);
+
+  if (eodFlattenAttempted > 0 || staleOpenTradesCount > 0) {
+    try {
+      const reconcileRunId = `${opts.runId || "auto-manage"}-post-flatten`;
+      const postFlattenReconcile = await reconcileOpenTrades({
+        dryRun: false,
+        runSource: "auto-manage-post-flatten",
+        runId: reconcileRunId,
+        deadlineMs: 5000,
+      });
+      reconcileResult = postFlattenReconcile;
+      if (postFlattenReconcile.ok) {
+        pushNote(`post_flatten_reconcile_ok:${postFlattenReconcile.closed ?? 0}:${postFlattenReconcile.synced ?? 0}`);
+        if (!lastFlattenOutcome && eodFlattenAttempted > 0) lastFlattenOutcome = "reconciled";
+      } else {
+        hadFailures = true;
+        pushNote(`post_flatten_reconcile_fail:${postFlattenReconcile.error || "unknown"}`);
+      }
+    } catch (err: any) {
+      hadFailures = true;
+      pushNote(`post_flatten_reconcile_error:${String(err?.message || err)}`);
+    }
+  }
 
   await recordAutoManage({
     ts: now,
     outcome: hadFailures ? "FAIL" : "SUCCESS",
-    reason: hadFailures ? "stop_sync_failed" : undefined,
+    reason: hadFailures
+      ? eodFlattenFailed > 0
+        ? "eod_flatten_failed"
+        : flattenFailures > 0
+          ? "stale_cleanup_failed"
+          : "stop_sync_failed"
+      : undefined,
     source: opts.source,
     runId: opts.runId,
     checked,
     updated,
     flattened,
+    eodFlattenAttempted: eodFlattenAttempted || undefined,
+    eodFlattenSucceeded: eodFlattenSucceeded || undefined,
+    eodFlattenFailed: eodFlattenFailed || undefined,
+    flattenOrderCount: flattenOrderCount || undefined,
+    flattenClosedCount: flattenClosedCount || undefined,
+    staleOpenPositionsCount: staleOpenPositionsCount || undefined,
+    staleOpenTradesCount: staleOpenTradesCount || undefined,
+    lastFlattenAt,
+    lastFlattenOutcome,
+    flattenFailures: flattenFailures || undefined,
+    replacementConsidered: false,
+    replacementExecuted: false,
     rescueAttempted: rescueAttempted || undefined,
     rescueOk: rescueOk || undefined,
     rescueFailed: rescueFailed || undefined,
   });
 
   const notesCapped = notes.slice(0, 50);
-  return { ok: true, checked, updated, flattened, enabled: true, now, market: clock, notes: notesCapped, forced: force ? true : undefined, cfg, reconcile: reconcileResult };
+  return {
+    ok: true,
+    checked,
+    updated,
+    flattened,
+    enabled: true,
+    now,
+    market: clock,
+    notes: notesCapped,
+    forced: force ? true : undefined,
+    eodFlattenAttempted,
+    eodFlattenSucceeded,
+    eodFlattenFailed,
+    flattenOrderCount,
+    flattenClosedCount,
+    staleOpenPositionsCount,
+    staleOpenTradesCount,
+    lastFlattenAt,
+    lastFlattenOutcome,
+    flattenFailures,
+    cfg,
+    reconcile: reconcileResult,
+  };
 }

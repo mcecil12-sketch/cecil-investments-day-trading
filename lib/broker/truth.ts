@@ -17,8 +17,12 @@ export type BrokerTruth = {
     qty: number;
     avg_entry_price?: string | number;
     created_at?: string;
+    current_price?: string | number;
+    market_value?: string | number;
+    unrealized_pl?: string | number;
+    unrealized_plpc?: string | number;
   }>;
-  openOrders: Array<{ id: string; symbol: string; side: string; status: string }>;
+  openOrders: Array<{ id: string; symbol: string; side: string; status: string; type?: string; order_class?: string; client_order_id?: string }>;
   error?: string;
 };
 
@@ -99,7 +103,7 @@ export async function fetchBrokerTruth(): Promise<BrokerTruth> {
  * Fetch positions from Alpaca GET /v2/positions
  */
 async function fetchPositions(): Promise<
-  | { ok: true; data: Array<{ symbol: string; qty: number }> }
+  | { ok: true; data: Array<{ symbol: string; qty: number; avg_entry_price?: string | number; created_at?: string; current_price?: string | number; market_value?: string | number; unrealized_pl?: string | number; unrealized_plpc?: string | number }> }
   | { ok: false; error: string }
 > {
   try {
@@ -122,6 +126,12 @@ async function fetchPositions(): Promise<
           .map((p: any) => ({
             symbol: String(p.symbol),
             qty: Number(p.qty),
+            avg_entry_price: p.avg_entry_price,
+            created_at: p.created_at,
+            current_price: p.current_price,
+            market_value: p.market_value,
+            unrealized_pl: p.unrealized_pl,
+            unrealized_plpc: p.unrealized_plpc,
           }))
       : [];
 
@@ -138,7 +148,7 @@ async function fetchPositions(): Promise<
  * Fetch open orders from Alpaca GET /v2/orders?status=open
  */
 async function fetchOpenOrders(): Promise<
-  | { ok: true; data: Array<{ id: string; symbol: string; side: string; status: string }> }
+  | { ok: true; data: Array<{ id: string; symbol: string; side: string; status: string; type?: string; order_class?: string; client_order_id?: string }> }
   | { ok: false; error: string }
 > {
   try {
@@ -163,6 +173,9 @@ async function fetchOpenOrders(): Promise<
             symbol: String(o.symbol),
             side: String(o.side || ""),
             status: String(o.status || ""),
+            type: String(o.type || ""),
+            order_class: String(o.order_class || ""),
+            client_order_id: String(o.client_order_id || ""),
           }))
       : [];
 

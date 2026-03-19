@@ -120,6 +120,29 @@ async function disableTradeAsPoison(tradeId: string, reason: string) {
   return updated;
 }
 
+async function markTradeValidationSkipped(tradeId: string, reason: string, detail?: any) {
+  const trades = await readTrades();
+  const now = new Date().toISOString();
+  let updated = 0;
+  const next = trades.map((t: any) => {
+    if (t.id !== tradeId) return t;
+    updated += 1;
+    const previousSkips = Number(t?.validationSkips ?? 0);
+    return {
+      ...t,
+      status: "AUTO_PENDING",
+      autoEntryStatus: "AUTO_PENDING",
+      validationStatus: "PAYLOAD_VALIDATION_SKIPPED",
+      validationReason: reason,
+      validationSkips: Number.isFinite(previousSkips) ? previousSkips + 1 : 1,
+      validationDetails: detail ?? t?.validationDetails,
+      updatedAt: now,
+    };
+  });
+  if (updated) await writeTrades(next);
+  return updated;
+}
+
 
 function isAutoPendingTrade(t: any) {
   return (
@@ -273,46 +296,60 @@ function validateAndRepairBracket(params: {
   const { side, basePrice, takeProfitPrice, stopPrice } = params;
   const isLong = side === "LONG";
   const tick = 0.01;
+  const roundedBase = Number(basePrice.toFixed(2));
   
   const roundUp = (x: number) => Number((Math.ceil(x / tick) * tick).toFixed(2));
   const roundDown = (x: number) => Number((Math.floor(x / tick) * tick).toFixed(2));
-  
-  // Validate stop price direction
-  if (isLong && stopPrice >= basePrice) {
-    return { valid: false, tp: takeProfitPrice, stop: stopPrice, reason: "stop_price_invalid_for_side" };
+  const roundNearest = (x: number) => Number((Math.round(x / tick) * tick).toFixed(2));
+
+  let tp = roundNearest(takeProfitPrice);
+  let stop = isLong ? roundDown(stopPrice) : roundUp(stopPrice);
+
+  const maxStopLong = roundDown(roundedBase - tick);
+  const minStopShort = roundUp(roundedBase + tick);
+
+  if (isLong && stop > maxStopLong) {
+    stop = maxStopLong;
   }
-  if (!isLong && stopPrice <= basePrice) {
-    return { valid: false, tp: takeProfitPrice, stop: stopPrice, reason: "stop_price_invalid_for_side" };
+  if (!isLong && stop < minStopShort) {
+    stop = minStopShort;
+  }
+  
+  // Validate stop price direction after repair.
+  if (isLong && !(stop <= maxStopLong)) {
+    return { valid: false, tp, stop, reason: "stop_price_invalid_for_side" };
+  }
+  if (!isLong && !(stop >= minStopShort)) {
+    return { valid: false, tp, stop, reason: "stop_price_invalid_for_side" };
   }
   
   // Validate TP meets minimum requirements
-  const minTpLong = basePrice + tick;
-  const maxTpShort = basePrice - tick;
+  const minTpLong = roundUp(roundedBase + tick);
+  const maxTpShort = roundDown(roundedBase - tick);
   
-  let tp = takeProfitPrice;
   const tpIsValid = isLong ? (tp >= minTpLong) : (tp <= maxTpShort);
   
   if (!tpIsValid) {
     // Try to repair TP using risk multiple
-    const stopDist = Math.abs(basePrice - stopPrice);
+    const stopDist = Math.abs(roundedBase - stop);
     if (stopDist < tick) {
-      return { valid: false, tp, stop: stopPrice, reason: "stop_distance_too_small" };
+      return { valid: false, tp, stop, reason: "stop_distance_too_small" };
     }
     
     const repairedTp = isLong 
-      ? roundUp(basePrice + 2 * stopDist) 
-      : roundDown(basePrice - 2 * stopDist);
+      ? roundUp(roundedBase + 2 * stopDist)
+      : roundDown(roundedBase - 2 * stopDist);
     
     // Check if repaired TP is now valid
     const repairedTpValid = isLong ? (repairedTp >= minTpLong) : (repairedTp <= maxTpShort);
     if (!repairedTpValid) {
-      return { valid: false, tp: repairedTp, stop: stopPrice, reason: "invalid_bracket_prices_unrepairable" };
+      return { valid: false, tp: repairedTp, stop, reason: "invalid_bracket_prices_unrepairable" };
     }
     
-    return { valid: true, tp: repairedTp, stop: stopPrice, reason: "bracket_repaired_with_risk_multiple" };
+    return { valid: true, tp: repairedTp, stop, reason: "bracket_repaired_with_risk_multiple" };
   }
   
-  return { valid: true, tp, stop: stopPrice };
+  return { valid: true, tp, stop };
 }
 
 function headerToken(req: Request) {
@@ -1160,6 +1197,8 @@ export async function POST(req: Request) {
 
   const entryPrice = safeNum(trade.entryPrice, 0);
   const stopPrice = safeNum(trade.stopPrice, 0);
+  const targetPriceRaw = safeNum(trade.takeProfitPrice ?? trade.targetPrice, 0);
+  const targetPrice = targetPriceRaw > 0 ? targetPriceRaw : null;
 
   if (!ticker || (side !== "LONG" && side !== "SHORT") || entryPrice <= 0 || stopPrice <= 0) {
     return NextResponse.json({ ok: false, error: "trade missing ticker/side/entryPrice/stopPrice", tradeId }, { status: 400 });
@@ -1266,19 +1305,21 @@ export async function POST(req: Request) {
       ? Number(decision.decisionPrice)
       : Number(entryPrice);
 
+  const computedBasePrice = Number(basePriceForValidation.toFixed(4));
+  const submitBasePrice = Number(basePriceForValidation.toFixed(2));
   const stopDistance = Math.abs(entryPrice - stopPrice);
   const rr = 1;
 
   const tpRaw = sideEnum === "LONG"
-    ? entryPrice + stopDistance * rr
-    : entryPrice - stopDistance * rr;
+    ? submitBasePrice + stopDistance * rr
+    : submitBasePrice - stopDistance * rr;
 
   let tp = Math.round(tpRaw * 100) / 100;
-  let bracketStop = Math.round(stopPrice * 100) / 100;
+  let bracketStop = Math.round((sideEnum === "LONG" ? submitBasePrice - stopDistance : submitBasePrice + stopDistance) * 100) / 100;
 
   const bracketGuard = ensureBracketLegsValid({
     side: sideEnum,
-    basePrice: entryPrice,
+    basePrice: submitBasePrice,
     takeProfitLimit: tp,
     stopLossStop: bracketStop,
   });
@@ -1287,18 +1328,18 @@ export async function POST(req: Request) {
 
   const TP_MIN_OFFSET_FORCE = 0.50;
   if (sideEnum === "LONG") {
-    const minTp = Number((entryPrice + TP_MIN_OFFSET_FORCE).toFixed(2));
+    const minTp = Number((submitBasePrice + TP_MIN_OFFSET_FORCE).toFixed(2));
     if (tp < minTp) tp = minTp;
   } else {
-    const maxTp = Number((entryPrice - TP_MIN_OFFSET_FORCE).toFixed(2));
+    const maxTp = Number((submitBasePrice - TP_MIN_OFFSET_FORCE).toFixed(2));
     if (tp > maxTp) tp = maxTp;
   }
 
   if (sideDirection === "buy") {
-    const minTpAbs = Number((entryPrice + AUTO_ENTRY_TP_MIN_ABS).toFixed(2));
+    const minTpAbs = Number((submitBasePrice + AUTO_ENTRY_TP_MIN_ABS).toFixed(2));
     if (tp < minTpAbs) tp = minTpAbs;
   } else {
-    const maxTpAbs = Number((entryPrice - AUTO_ENTRY_TP_MIN_ABS).toFixed(2));
+    const maxTpAbs = Number((submitBasePrice - AUTO_ENTRY_TP_MIN_ABS).toFixed(2));
     if (tp > maxTpAbs) tp = maxTpAbs;
   }
 
@@ -1313,8 +1354,11 @@ export async function POST(req: Request) {
     quote,
     decisionPrice: decision.decisionPrice,
     decisionSource: decision.source,
+    computedBasePrice,
     basePriceForValidation,
+    submitBasePrice,
     stopDistance,
+    originalTargetPrice: targetPrice,
     takeProfitPrice: tp,
     bracketStopPrice: bracketStop,
     qty,
@@ -1328,39 +1372,88 @@ export async function POST(req: Request) {
     ttlSeconds: 90,
     owner: `execute:${tradeId}`,
     fn: async () => {
+      let validationReason = "ok";
       // Validate and repair bracket BEFORE submitting order
       const bracketCheck = validateAndRepairBracket({
         side: sideDirection === "buy" ? "LONG" : "SHORT",
-        basePrice: basePriceForValidation,
+        basePrice: submitBasePrice,
         takeProfitPrice: tp,
         stopPrice: bracketStop,
       });
       
       if (!bracketCheck.valid) {
-        // Return poison flag to trigger disabling
-        return { __poison: true, message: `bracket_validation_failed: ${bracketCheck.reason || "unknown"}` } as any;
+        validationReason = bracketCheck.reason || "bracket_validation_failed";
+        return {
+          __poison: true,
+          reason: "invalid_stop_vs_base_price",
+          message: `bracket_validation_failed: ${validationReason}`,
+          validation: {
+            entryPrice,
+            stopPrice,
+            targetPrice,
+            computedBasePrice,
+            side: sideEnum,
+            validationReason,
+            payloadPreview: {
+              symbol: ticker,
+              qty,
+              side: sideDirection,
+              type: "market",
+              time_in_force: "day",
+              stop_loss: { stop_price: bracketCheck.stop },
+              take_profit: { limit_price: bracketCheck.tp },
+            },
+          },
+        } as any;
       }
       
       // Use repaired bracket if it was corrected
       let finalTp = bracketCheck.tp;
       let finalStop = bracketCheck.stop;
+      if (bracketCheck.reason) {
+        validationReason = bracketCheck.reason;
+      }
 
       // Apply FINAL tick normalization
       const tick = tickForEquityPrice(entryPrice);
       const stopNorm = normalizeStopPrice({
         side: sideDirection === "buy" ? "LONG" : "SHORT",
-        entryPrice,
+        entryPrice: submitBasePrice,
         stopPrice: finalStop,
         tick,
       });
       if (!stopNorm.ok) {
-        return { __poison: true, message: `stop_normalization_failed: ${stopNorm.reason}` } as any;
+        validationReason = `stop_normalization_failed:${stopNorm.reason}`;
+        return {
+          __poison: true,
+          reason: "invalid_stop_vs_base_price",
+          message: validationReason,
+          validation: {
+            entryPrice,
+            stopPrice,
+            targetPrice,
+            computedBasePrice,
+            side: sideEnum,
+            validationReason,
+          },
+        } as any;
       }
       finalStop = stopNorm.stop;
 
       finalTp = normalizeLimitPrice({ price: finalTp, tick });
       finalTp = Number(finalTp.toFixed(2));
-      const baseRounded = Number(basePriceForValidation.toFixed(2));
+      const baseRounded = Number(submitBasePrice.toFixed(2));
+
+      const maxStopLong = Number((baseRounded - tick).toFixed(2));
+      const minStopShort = Number((baseRounded + tick).toFixed(2));
+      if (sideDirection === "buy" && finalStop > maxStopLong) {
+        finalStop = maxStopLong;
+        validationReason = "stop_adjusted_to_base_tick";
+      }
+      if (sideDirection === "sell" && finalStop < minStopShort) {
+        finalStop = minStopShort;
+        validationReason = "stop_adjusted_to_base_tick";
+      }
 
       const takeProfitValid =
         sideDirection === "buy"
@@ -1372,6 +1465,23 @@ export async function POST(req: Request) {
           __poison: true,
           reason: "invalid_take_profit_vs_base_price",
           detail: JSON.stringify({ base_price: baseRounded, take_profit: finalTp }),
+          validation: {
+            entryPrice,
+            stopPrice,
+            targetPrice,
+            computedBasePrice,
+            side: sideEnum,
+            validationReason: "take_profit_invalid_vs_base",
+            payloadPreview: {
+              symbol: ticker,
+              qty,
+              side: sideDirection,
+              type: "market",
+              time_in_force: "day",
+              stop_loss: { stop_price: finalStop },
+              take_profit: { limit_price: finalTp },
+            },
+          },
         } as any;
       }
 
@@ -1403,6 +1513,15 @@ export async function POST(req: Request) {
             __poison: true,
             reason: "invalid_stop_vs_base_price",
             message: String(e?.message || e || ""),
+            validation: {
+              entryPrice,
+              stopPrice,
+              targetPrice,
+              computedBasePrice,
+              side: sideEnum,
+              validationReason: "alpaca_rejected_stop_vs_base",
+              payloadPreview: payload,
+            },
           } as any;
         }
         if (isAlpacaInvalidTakeProfitVsBase(e)) {
@@ -1410,10 +1529,19 @@ export async function POST(req: Request) {
             __poison: true,
             reason: "invalid_take_profit_vs_base_price",
             detail: JSON.stringify({
-              base_price: Number(basePriceForValidation.toFixed(2)),
+              base_price: Number(submitBasePrice.toFixed(2)),
               take_profit: finalTp,
             }),
             message: String(e?.message || e || ""),
+            validation: {
+              entryPrice,
+              stopPrice,
+              targetPrice,
+              computedBasePrice,
+              side: sideEnum,
+              validationReason: "alpaca_rejected_tp_vs_base",
+              payloadPreview: payload,
+            },
           } as any;
         }
         throw e;
@@ -1448,8 +1576,16 @@ export async function POST(req: Request) {
         (order as any)?.reason === "invalid_take_profit_vs_base_price"
           ? "invalid_take_profit_vs_base_price"
           : "invalid_stop_vs_base_price";
+      const validation = (order as any)?.validation || {
+        entryPrice,
+        stopPrice,
+        targetPrice,
+        computedBasePrice,
+        side: sideEnum,
+        validationReason: poisonReason,
+      };
       counts.invalidMarked += 1;
-      await disableTradeAsPoison(tradeId, poisonReason);
+      await markTradeValidationSkipped(tradeId, poisonReason, validation);
       counts.skipped += 1;
       await recordOutcome({
         outcome: "SKIP",
@@ -1458,14 +1594,16 @@ export async function POST(req: Request) {
         tradeId,
         detail:
           poisonReason === "invalid_take_profit_vs_base_price"
-            ? (order as any)?.detail || JSON.stringify({ base_price: Number(basePriceForValidation.toFixed(2)), take_profit: Number(tp.toFixed(2)) })
-            : undefined,
+            ? (order as any)?.detail || JSON.stringify({ base_price: Number(submitBasePrice.toFixed(2)), take_profit: Number(tp.toFixed(2)) })
+            : JSON.stringify(validation),
       });
       return NextResponse.json(
         {
           ok: true,
           skipped: true,
           reason: poisonReason,
+          classification: "payload_validation_retryable",
+          validation,
           tradeId,
           market: { isOpen: marketOpen, timestamp: marketTimestamp },
           openPositionsCount: brokerTruth.positionsCount,
