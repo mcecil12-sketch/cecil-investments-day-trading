@@ -6,6 +6,7 @@ import { recordAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
 import { requireAuth } from "@/lib/auth";
 import { getGuardrailConfig, minutesSince } from "@/lib/autoEntry/guardrails";
 import { getAutoConfig, tierForScore, riskMultForTier } from "@/lib/autoEntry/config";
+import { getAutoManageConfig } from "@/lib/autoManage/config";
 import { resolveDecisionPrice, computeBracket, type QuoteLike, type Side } from "@/lib/autoEntry/pricing";
 import { withRedisLock } from "@/lib/locks";
 import { fetchAlpacaClock } from "@/lib/alpacaClock";
@@ -30,6 +31,8 @@ import {
 } from "@/lib/autoEntry/disabledNotification";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { buildAutoEntryFunnelFields } from "./funnel";
+import { isOperationallyOpenTrade } from "@/lib/trades/operational";
+import { buildOpenOrdersBySymbol, planConservativeReplacement } from "@/lib/autoManage/reliability";
 
 async function bumpAutoEntryFunnelSafe(fields: Record<string, number | undefined>) {
   if (!fields || Object.keys(fields).length === 0) return;
@@ -675,6 +678,8 @@ export async function POST(req: Request) {
     invalidMarked: 0,
     executed: 0,
     skipped: 0,
+    replacementConsidered: 0,
+    replacementExecuted: 0,
   };
   const notes: string[] = [];
   const guardConfig = getGuardrailConfig();
@@ -1151,34 +1156,7 @@ export async function POST(req: Request) {
     );
   }
 
-  if (brokerTruth.positionsCount >= guardConfig.maxOpenPositions) {
-    counts.skipped += 1;
-    await recordOutcome({
-      outcome: "SKIP",
-      reason: "max_open_positions",
-      detail: `brokerPositionsCount=${brokerTruth.positionsCount}, maxOpenPositions=${guardConfig.maxOpenPositions}`,
-    });
-    return NextResponse.json(
-      {
-        ok: true,
-        skipped: true,
-        reason: "max_open_positions",
-        detail: `brokerPositionsCount=${brokerTruth.positionsCount}, maxOpenPositions=${guardConfig.maxOpenPositions}`,
-        market: { isOpen: marketOpen, timestamp: marketTimestamp },
-        openPositionsCount: brokerTruth.positionsCount,
-        maxOpenPositions: guardConfig.maxOpenPositions,
-        entriesToday: guardState.entriesToday,
-        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-        pendingCount: counts.pendingCount,
-        eligibleCount: counts.eligibleCount,
-        executedCount: counts.executed,
-        counts,
-        notes: notes.slice(0, 40),
-        guardrails: guardSummary,
-      },
-      { status: 200 }
-    );
-  }
+  const maxOpenReached = brokerTruth.positionsCount >= guardConfig.maxOpenPositions;
 
   if (guardState.entriesToday >= guardConfig.maxEntriesPerDay) {
     counts.skipped += 1;
@@ -1260,6 +1238,180 @@ export async function POST(req: Request) {
   const trade = trades[idx];
   const ticker = String(trade.ticker || "").toUpperCase();
   const side = String(trade.side || "LONG").toUpperCase();
+
+  const autoManageCfg = getAutoManageConfig();
+  const brokerPositionsBySymbol = new Map<string, any>(
+    (Array.isArray(brokerTruth.positions) ? brokerTruth.positions : []).map((p: any) => [
+      String(p?.symbol || "").toUpperCase(),
+      p,
+    ])
+  );
+  const openOrdersLite = (Array.isArray(brokerTruth.openOrders) ? brokerTruth.openOrders : []).map((o: any) => ({
+    id: String(o?.id || ""),
+    symbol: String(o?.symbol || "").toUpperCase(),
+    side: String(o?.side || ""),
+    type: String(o?.type || ""),
+    status: String(o?.status || ""),
+    order_class: String(o?.order_class || ""),
+    client_order_id: String(o?.client_order_id || ""),
+    legs: [],
+  }));
+  const openOrdersBySymbol = buildOpenOrdersBySymbol(openOrdersLite);
+  const openTradesForReplacement = (Array.isArray(trades) ? trades : []).filter((t: any) => isOperationallyOpenTrade(t));
+
+  const replacementPlan = planConservativeReplacement({
+    incomingTrade: trade,
+    openTrades: openTradesForReplacement,
+    brokerPositionsBySymbol,
+    openOrdersBySymbol,
+    nowIso: nowIso(),
+    marketClosed: !marketOpen,
+    staleAfterEt: autoManageCfg.staleAfterEt,
+    eodFlattenEnabled: autoManageCfg.eodFlatten,
+    maxOpenReached,
+    config: {
+      thresholdScoreDelta: autoManageCfg.replaceScoreDelta,
+      minAgeMin: autoManageCfg.replaceMinAgeMin,
+      protectWinnerAboveR: autoManageCfg.replaceProtectWinnerAboveR,
+      allowUnknownROverride: autoManageCfg.replaceUnknownROverride,
+    },
+  });
+
+  if (replacementPlan.replacementConsidered) counts.replacementConsidered += 1;
+
+  if (maxOpenReached && (!autoManageCfg.replaceEnabled || !replacementPlan.replacementExecuted)) {
+    counts.skipped += 1;
+    const detail = JSON.stringify({
+      brokerPositionsCount: brokerTruth.positionsCount,
+      maxOpenPositions: guardConfig.maxOpenPositions,
+      replacementEnabled: autoManageCfg.replaceEnabled,
+      replacement: replacementPlan,
+    });
+    await recordOutcome({ outcome: "SKIP", reason: "max_open_positions", ticker, tradeId: String(trade?.id || ""), detail });
+    return NextResponse.json(
+      {
+        ok: true,
+        skipped: true,
+        reason: "max_open_positions",
+        detail,
+        replacement: replacementPlan,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
+      { status: 200 }
+    );
+  }
+
+  if (maxOpenReached && replacementPlan.replacementExecuted) {
+    const weakestTradeId = String(replacementPlan.weakestOpenTradeId || "");
+    const weakestIdx = trades.findIndex((t: any) => String(t?.id || "") === weakestTradeId);
+    const weakestTrade = weakestIdx >= 0 ? trades[weakestIdx] : null;
+    const weakestTicker = String(weakestTrade?.ticker || replacementPlan.weakestOpenTicker || "").toUpperCase();
+    const weakestPos = brokerPositionsBySymbol.get(weakestTicker);
+    const weakestQty = Math.abs(Number(weakestPos?.qty ?? weakestTrade?.quantity ?? 0));
+
+    if (!(weakestTrade && weakestTicker && Number.isFinite(weakestQty) && weakestQty > 0)) {
+      counts.skipped += 1;
+      await recordOutcome({
+        outcome: "SKIP",
+        reason: "replacement_close_unavailable",
+        ticker,
+        tradeId: String(trade?.id || ""),
+        detail: JSON.stringify({ replacement: replacementPlan, weakestTradeFound: Boolean(weakestTrade), weakestTicker, weakestQty }),
+      });
+      return NextResponse.json(
+        {
+          ok: true,
+          skipped: true,
+          reason: "replacement_close_unavailable",
+          replacement: replacementPlan,
+          market: { isOpen: marketOpen, timestamp: marketTimestamp },
+          openPositionsCount: brokerTruth.positionsCount,
+          maxOpenPositions: guardConfig.maxOpenPositions,
+          entriesToday: guardState.entriesToday,
+          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+          pendingCount: counts.pendingCount,
+          eligibleCount: counts.eligibleCount,
+          executedCount: counts.executed,
+          counts,
+          notes: notes.slice(0, 40),
+          guardrails: guardSummary,
+        },
+        { status: 200 }
+      );
+    }
+
+    const weakestSide = String(weakestTrade?.side || "LONG").toUpperCase();
+    const replacementCloseSide = weakestSide === "SHORT" ? "buy" : "sell";
+    try {
+      const closeOrder: any = await createOrder({
+        symbol: weakestTicker,
+        qty: weakestQty,
+        side: replacementCloseSide,
+        type: "market",
+        time_in_force: "day",
+      });
+
+      const now = nowIso();
+      trades[weakestIdx] = {
+        ...weakestTrade,
+        closeRequestedAt: now,
+        closeOrderId: String(closeOrder?.id || weakestTrade?.closeOrderId || ""),
+        closeOrderStatus: String(closeOrder?.status || "accepted"),
+        updatedAt: now,
+        autoManage: {
+          ...(weakestTrade?.autoManage || {}),
+          replacementConsidered: true,
+          replacementExecuted: true,
+          replacementReason: replacementPlan.replacementReason,
+          replacementTriggeredByTradeId: String(trade?.id || ""),
+          replacementTriggeredAt: now,
+        },
+      };
+
+      await writeTrades(trades);
+      counts.replacementExecuted += 1;
+      notes.push(`replacement_close_submitted:${weakestTicker}`);
+    } catch (replacementErr: any) {
+      counts.skipped += 1;
+      await recordOutcome({
+        outcome: "FAIL",
+        reason: "replacement_close_submit_failed",
+        ticker,
+        tradeId: String(trade?.id || ""),
+        detail: String(replacementErr?.message || replacementErr || "replacement_close_submit_failed"),
+      });
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "replacement_close_submit_failed",
+          detail: String(replacementErr?.message || replacementErr || "replacement_close_submit_failed"),
+          replacement: replacementPlan,
+          market: { isOpen: marketOpen, timestamp: marketTimestamp },
+          openPositionsCount: brokerTruth.positionsCount,
+          maxOpenPositions: guardConfig.maxOpenPositions,
+          entriesToday: guardState.entriesToday,
+          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+          pendingCount: counts.pendingCount,
+          eligibleCount: counts.eligibleCount,
+          executedCount: counts.executed,
+          counts,
+          notes: notes.slice(0, 40),
+          guardrails: guardSummary,
+        },
+        { status: 500 }
+      );
+    }
+  }
 
   const lastTickerEntry = guardState.tickerEntries[ticker];
   const sinceTicker = minutesSince(lastTickerEntry);
@@ -1471,6 +1623,7 @@ export async function POST(req: Request) {
     riskDollars,
     tier,
     score,
+    replacement: replacementPlan,
   };
 
   const lock = await withRedisLock({

@@ -41,6 +41,25 @@ function isTimestampOnEtDate(value: unknown, etDate: string): boolean {
   return stampEt === etDate;
 }
 
+function isTimestampWithinHours(value: unknown, hours: number): boolean {
+  if (typeof value !== "string" || !value) return false;
+  const ts = Date.parse(value);
+  if (!Number.isFinite(ts)) return false;
+  const cutoff = Date.now() - Math.max(1, hours) * 60 * 60 * 1000;
+  return ts >= cutoff;
+}
+
+function latestIso(a?: string | null, b?: string | null): string | null {
+  const ta = a ? Date.parse(a) : NaN;
+  const tb = b ? Date.parse(b) : NaN;
+  const va = Number.isFinite(ta) ? ta : null;
+  const vb = Number.isFinite(tb) ? tb : null;
+  if (va == null && vb == null) return null;
+  if (va == null) return b || null;
+  if (vb == null) return a || null;
+  return va >= vb ? (a || null) : (b || null);
+}
+
 export async function GET() {
   const startedAt = new Date();
 
@@ -82,6 +101,8 @@ export async function GET() {
 
     // Get auto-manage telemetry
     const amTel = await readAutoManageTelemetry(5);
+    const amLastRun = Array.isArray(amTel?.runs) && amTel.runs.length > 0 ? amTel.runs[0] : null;
+    const amSummary = (amTel?.summary || {}) as Record<string, unknown>;
 
     // Compute: would skip due to max_open_positions?
     const wouldSkipMaxOpenPositions = brokerTruth.error
@@ -148,6 +169,26 @@ export async function GET() {
       marketOpen: alpacaClock?.is_open ?? null,
     };
 
+    const lastScoredAtAny = signals
+      .map((s: any) => (typeof s?.scoredAt === "string" ? s.scoredAt : null))
+      .filter(Boolean)
+      .sort((a: string, b: string) => Date.parse(b) - Date.parse(a))[0] || null;
+    const lastSuccessfulScanAt = latestIso(funnelToday.lastScanAt, funnelToday.updatedAt);
+    const lastScoredAt = latestIso(scoredLast6Hours.lastScoredAt, lastScoredAtAny);
+
+    const summarizeWindow = (hours: number) => {
+      const windowSignals = signals.filter((s: any) => isTimestampWithinHours(s?.createdAt, hours));
+      return {
+        pending: windowSignals.filter((s: any) => s.status === "PENDING").length,
+        scored: windowSignals.filter((s: any) => s.status === "SCORED").length,
+        archivedSkip: windowSignals.filter((s: any) => s.status === "ARCHIVED" && s?.skipReason).length,
+        error: windowSignals.filter((s: any) => s.status === "ERROR").length,
+      };
+    };
+
+    const scoringWindow24h = summarizeWindow(24);
+    const scoringWindow48h = summarizeWindow(48);
+
     const response = {
       ok: true,
       now: startedAt.toISOString(),
@@ -170,6 +211,39 @@ export async function GET() {
       },
       reasons,
       autoManageTelemetry: amTel,
+      autoManageReliability: {
+        flatten: {
+          attempted: Number(amSummary?.eodFlattenAttempted ?? 0),
+          succeeded: Number(amSummary?.eodFlattenSucceeded ?? 0),
+          failed: Number(amSummary?.eodFlattenFailed ?? 0),
+          lastAt: String(amSummary?.lastFlattenAt || "") || null,
+          lastOutcome: String(amSummary?.lastFlattenOutcome || "") || null,
+          lastFailures: Number(amSummary?.lastFlattenFailures ?? 0),
+        },
+        stale: {
+          positionsDetected: Number(amSummary?.staleOpenPositionsCount ?? 0),
+          tradesDetected: Number(amSummary?.staleOpenTradesCount ?? 0),
+          lastPositionsDetected: Number(amSummary?.lastStaleOpenPositionsCount ?? 0),
+          lastTradesDetected: Number(amSummary?.lastStaleOpenTradesCount ?? 0),
+        },
+        replacement: {
+          lastConsidered: Number(amSummary?.lastReplacementConsidered ?? 0) > 0,
+          lastExecuted: Number(amSummary?.lastReplacementExecuted ?? 0) > 0,
+          lastReason: String(amSummary?.lastReplacementReason || "") || null,
+          consideredInRecentRuns: (Array.isArray(amTel?.runs) ? amTel.runs : []).filter((r: any) => r?.replacementConsidered).length,
+          executedInRecentRuns: (Array.isArray(amTel?.runs) ? amTel.runs : []).filter((r: any) => r?.replacementExecuted).length,
+        },
+        lastRun: amLastRun
+          ? {
+              at: amLastRun.ts || null,
+              outcome: amLastRun.outcome || null,
+              reason: amLastRun.reason || null,
+              replacementConsidered: Boolean(amLastRun.replacementConsidered),
+              replacementExecuted: Boolean(amLastRun.replacementExecuted),
+              replacementReason: amLastRun.replacementReason || null,
+            }
+          : null,
+      },
       reconcileTelemetry: reconcileTel,
 
       // New comprehensive diagnostics
@@ -242,6 +316,8 @@ export async function GET() {
 
       // Scoring backlog
       scoring: {
+        lastSuccessfulScanAt,
+        lastScoredAt,
         createdLast6Hours: {
           total: createdLast6Hours.total,
           pending: createdLast6Hours.pending,
@@ -261,6 +337,10 @@ export async function GET() {
           scored: signals.filter((s) => s.status === "SCORED").length,
           error: signals.filter((s) => s.status === "ERROR").length,
           archived: signals.filter((s) => s.status === "ARCHIVED").length,
+        },
+        windows: {
+          h24: scoringWindow24h,
+          h48: scoringWindow48h,
         },
       },
 

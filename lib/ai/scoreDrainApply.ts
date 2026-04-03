@@ -15,8 +15,6 @@ export function applyInsufficientBars(signal: any, reason: string, nowIso: strin
   signal.status = "ARCHIVED";
   signal.skipReason = "insufficient_bars";
   signal.aiSummary = reason || "Insufficient recent bars";
-  signal.aiScore = 0;
-  signal.aiGrade = "F";
   signal.qualified = false;
   signal.shownInApp = false;
   signal.scoredAt = nowIso;
@@ -24,6 +22,8 @@ export function applyInsufficientBars(signal: any, reason: string, nowIso: strin
   signal.scoringLockUntil = undefined;
   signal.scoringStartedAt = undefined;
   // Clear other score fields for consistency
+  delete signal.aiScore;
+  delete signal.aiGrade;
   delete signal.score;
   delete signal.grade;
   delete signal.totalScore;
@@ -53,8 +53,6 @@ export function applyPreGptSkip(
 ) {
   signal.status = "ARCHIVED";
   signal.skipReason = reason;
-  signal.aiScore = 0;
-  signal.aiGrade = "F";
   signal.qualified = false;
   signal.shownInApp = false;
   signal.scoredAt = nowIso;
@@ -77,6 +75,8 @@ export function applyPreGptSkip(
     : summaryMap[reason];
   
   // Clear other score fields
+  delete signal.aiScore;
+  delete signal.aiGrade;
   delete signal.score;
   delete signal.grade;
   delete signal.totalScore;

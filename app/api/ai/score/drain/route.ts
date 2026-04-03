@@ -546,6 +546,7 @@ export async function POST(req: Request) {
     skippedStatus?: number;
     mode?: "live" | "recovery";
     freshHoursUsed?: number;
+    freshHoursSource?: "mode_default" | "query_override";
     // Pre-GPT gating skip counters
     skippedInsufficientBars?: number;
     skippedVolumeTooLow?: number;
@@ -672,7 +673,15 @@ export async function POST(req: Request) {
     const freshHoursUsed = mode === "recovery" ? AI_SCORE_RECOVERY_HOURS : AI_SCORE_FRESH_HOURS;
     const freshWindowStart = new Date(now.getTime() - freshHoursUsed * 60 * 60 * 1000);
     result.mode = mode;
-    result.freshHoursUsed = freshHoursUsed;
+    const recentWindowHoursParam = Number(qp.get("recentWindowHours") ?? "NaN");
+    const hasRecentWindowOverride =
+      Number.isFinite(recentWindowHoursParam) && recentWindowHoursParam > 0;
+    const freshHoursOverride = hasRecentWindowOverride
+      ? Math.max(1, Math.min(168, Math.trunc(recentWindowHoursParam)))
+      : null;
+    const effectiveFreshHours = freshHoursOverride ?? freshHoursUsed;
+    result.freshHoursUsed = effectiveFreshHours;
+    result.freshHoursSource = freshHoursOverride != null ? "query_override" : "mode_default";
     
     // Parse query params (budgetMs and limit already parsed above)
     const backlog = ["1", "true", "yes", "y", "on"].includes(
@@ -686,7 +695,7 @@ export async function POST(req: Request) {
     const releaseLimit = Number(qp.get("releaseLimit") ?? "-1"); // -1 = release all
     
     // Use fresh window for default live mode (no legacy backlog processing in normal drain)
-    const RECENT_WINDOW_HOURS = freshHoursUsed;
+    const RECENT_WINDOW_HOURS = effectiveFreshHours;
 
     // === RECLAIM STALE SCORING SIGNALS ===
     // Before picking new signals, find any stuck SCORING signals older than 10 minutes and revert them to PENDING
