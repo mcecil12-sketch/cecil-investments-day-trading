@@ -32,9 +32,9 @@ const AI_SCORE_FRESH_HOURS = Number(process.env.AI_SCORE_FRESH_HOURS ?? 24); // 
 const AI_SCORE_RECOVERY_HOURS = Number(process.env.AI_SCORE_RECOVERY_HOURS ?? 48); // Window for recovery mode (default 48h)
 
 // Performance tuning: batching
-const AI_SCORE_BATCH_SIZE = Number(process.env.AI_SCORE_BATCH_SIZE ?? 10); // Target number of scorer attempts per run
+const AI_SCORE_BATCH_SIZE = Number(process.env.AI_SCORE_BATCH_SIZE ?? 12); // Target number of scorer attempts per run
 const AI_SCORE_CLAIM_BATCH_SIZE = Number(process.env.AI_SCORE_CLAIM_BATCH_SIZE ?? 0); // 0 means auto sizing
-const AI_SCORE_MAX_CANDIDATE_SCAN = Number(process.env.AI_SCORE_MAX_CANDIDATE_SCAN ?? 60);
+const AI_SCORE_MAX_CANDIDATE_SCAN = Number(process.env.AI_SCORE_MAX_CANDIDATE_SCAN ?? 80);
 const AI_SCORE_DEFAULT_CLAIM_MULTIPLIER = Number(process.env.AI_SCORE_CLAIM_MULTIPLIER ?? 2);
 
 const DRAIN_LOCK_KEY = "ai:score:drain:lock";
@@ -501,9 +501,10 @@ export async function POST(req: Request) {
     maxPerRunComputed,
     configuredClaimBatchSize > 0 ? configuredClaimBatchSize : autoClaimBatchSize
   );
+  // Scan deeper than per-run score limit so pre-GPT skips do not starve scorer throughput.
   const maxCandidateScan = Math.max(
-    runtimeBatchSize,
-    Math.min(maxPerRunComputed, Math.trunc(AI_SCORE_MAX_CANDIDATE_SCAN) || runtimeBatchSize)
+    claimBatchTarget,
+    Math.trunc(AI_SCORE_MAX_CANDIDATE_SCAN) || claimBatchTarget
   );
 
   // Initialize result object (guaranteed to be returned as JSON)
@@ -570,6 +571,8 @@ export async function POST(req: Request) {
     persistedScored?: number;
     persistedError?: number;
     persistedArchived?: number;
+    qualifiedPersisted?: number;
+    shownInAppPersisted?: number;
     pipeline?: {
       pendingScanned: number;
       freshCandidatesScanned: number;
@@ -582,6 +585,8 @@ export async function POST(req: Request) {
       persistedScored: number;
       persistedError: number;
       persistedArchived: number;
+      qualifiedPersisted: number;
+      shownInAppPersisted: number;
     };
   } = {
     ok: true,
@@ -630,6 +635,8 @@ export async function POST(req: Request) {
     persistedScored: 0,
     persistedError: 0,
     persistedArchived: 0,
+    qualifiedPersisted: 0,
+    shownInAppPersisted: 0,
     pipeline: {
       pendingScanned: 0,
       freshCandidatesScanned: 0,
@@ -642,6 +649,8 @@ export async function POST(req: Request) {
       persistedScored: 0,
       persistedError: 0,
       persistedArchived: 0,
+      qualifiedPersisted: 0,
+      shownInAppPersisted: 0,
     },
   };
 
@@ -1197,6 +1206,19 @@ export async function POST(req: Request) {
     result.pipeline!.persistedError = result.persistedError ?? 0;
     result.pipeline!.persistedArchived = result.persistedArchived ?? 0;
 
+    const finalizedPersistedSignals = signals.filter((s) => finalizedIds.includes(s.id));
+    const qualifiedPersistedCount = finalizedPersistedSignals.filter(
+      (s) => s.status === "SCORED" && s.qualified === true
+    ).length;
+    const shownInAppPersistedCount = finalizedPersistedSignals.filter(
+      (s) => s.status === "SCORED" && s.shownInApp === true
+    ).length;
+
+    result.qualifiedPersisted = qualifiedPersistedCount;
+    result.shownInAppPersisted = shownInAppPersistedCount;
+    result.pipeline!.qualifiedPersisted = qualifiedPersistedCount;
+    result.pipeline!.shownInAppPersisted = shownInAppPersistedCount;
+
     if (guardsApplied.length > 0) {
       console.warn("[score/drain] write guard applied corrections", {
         count: guardsApplied.length,
@@ -1235,6 +1257,8 @@ export async function POST(req: Request) {
         drainSkippedDollarVolume: result.skippedDollarVolume ?? 0,
         drainSkippedPriceTooLow: result.skippedPriceTooLow ?? 0,
         drainSkippedSpreadTooWide: result.skippedSpreadTooWide ?? 0,
+        qualified: result.qualifiedPersisted ?? 0,
+        shownInApp: result.shownInAppPersisted ?? 0,
       });
     } catch (err) {
       console.warn("[score/drain] drain metrics update error", err);

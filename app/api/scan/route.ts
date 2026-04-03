@@ -101,7 +101,7 @@ const DEFAULT_MIN_PRICE = 3;
 const DEFAULT_MIN_AVG_VOLUME = 300_000;
 const DEFAULT_LIMIT = 600;
 const MAX_SIGNALS_PER_SCAN = 50;
-const AI_SEED_MIN_BARS = 20;
+const AI_SEED_MIN_BARS = Number(process.env.AI_SEED_MIN_BARS ?? 24);
 
 // Per-mode caps for persisted candidates
 const SCAN_PERSIST_CAP_AI_SEED = Number(process.env.SCAN_PERSIST_CAP_AI_SEED ?? 50);
@@ -126,6 +126,14 @@ const AI_SEED_MAX_VWAP_DISTANCE = 2;
 const AI_SEED_MIN_TREND_DELTA = -0.005;
 const MIN_AVG_VOL_SHARES = Number(process.env.MIN_AVG_VOL_SHARES ?? 600);
 const MIN_AVG_DOLLAR_VOL = Number(process.env.MIN_AVG_DOLLAR_VOL ?? 500_000);
+const AI_SEED_SCAN_MIN_BARS = Math.max(
+  AI_SEED_MIN_BARS,
+  Number(process.env.AI_SEED_SCAN_MIN_BARS ?? 24)
+);
+const AI_SEED_SCAN_MIN_DOLLAR_VOL = Math.max(
+  MIN_AVG_DOLLAR_VOL,
+  Number(process.env.AI_SEED_SCAN_MIN_DOLLAR_VOL ?? 750_000)
+);
 
 const AI_SEED_REQUIRE_SETUP = (process.env.AI_SEED_REQUIRE_SETUP ?? "0") === "1";
 const AI_SEED_REQUIRE_RANGE = (process.env.AI_SEED_REQUIRE_RANGE ?? "0") === "1";
@@ -464,8 +472,12 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
   if (!bars || bars.length === 0) {
     return { ok: false, reason: "missingBars" };
   }
-  if (bars.length < AI_SEED_MIN_BARS) {
-    return { ok: false, reason: "missingBars", note: `bars=${bars.length}` };
+  if (bars.length < AI_SEED_SCAN_MIN_BARS) {
+    return {
+      ok: false,
+      reason: "missingBars",
+      note: `bars=${bars.length} minBars=${AI_SEED_SCAN_MIN_BARS}`,
+    };
   }
 
   const last = bars[bars.length - 1];
@@ -475,7 +487,7 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
       (b) => Number(b.v ?? 0) * Number((b.vw ?? b.c ?? 0) || 0)
     )
   );
-  const failsDollarVol = avgDollarVol < MIN_AVG_DOLLAR_VOL;
+  const failsDollarVol = avgDollarVol < AI_SEED_SCAN_MIN_DOLLAR_VOL;
   const failsSharesVol = avgVolShares < MIN_AVG_VOL_SHARES;
   if (last.c < DEFAULT_MIN_PRICE) {
     return { ok: false, reason: "other", note: `price=${last.c.toFixed(2)}` };
@@ -491,7 +503,7 @@ function evaluateAiSeedGates(bars: AlpacaBar[]): GateResult {
     return {
       ok: false,
       reason: "dollarVolumeTooLow",
-      note: `avgDollarVol=${Math.round(avgDollarVol)} minDollar=${MIN_AVG_DOLLAR_VOL}`,
+      note: `avgDollarVol=${Math.round(avgDollarVol)} minDollar=${AI_SEED_SCAN_MIN_DOLLAR_VOL}`,
     };
   }
 
@@ -965,11 +977,11 @@ const logSummary = () => {
         const lastBar = bars?.[bars.length - 1];
         const barCount = bars?.length ?? 0;
         const barSummary = summarizeBars(bars);
-        if (!bars || barCount < AI_SEED_MIN_BARS) {
+        if (!bars || barCount < AI_SEED_SCAN_MIN_BARS) {
           reject(
             symbol,
             "missingBars",
-            `bars=${barCount} lastBar=${lastBar?.t ?? null}`,
+            `bars=${barCount} minBars=${AI_SEED_SCAN_MIN_BARS} lastBar=${lastBar?.t ?? null}`,
             barSummary
           );
           return null;
@@ -999,7 +1011,7 @@ const logSummary = () => {
         const avgVolPerMin = bars.length ? totalVol / bars.length : 0;
         const avgVolShares = avgVolPerMin;
         const avgDollarVol = avgVolShares * last.c;
-        if (aiSeedMode && avgVolPerMin < 50) {
+        if (aiSeedMode && avgVolPerMin < MIN_AVG_VOL_SHARES) {
           reject(
             symbol,
             "volumeTooLow",

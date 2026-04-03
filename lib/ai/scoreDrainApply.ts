@@ -198,6 +198,7 @@ export function applyScoreSuccess(signal: any, scored: any, nowIso: string) {
           score: scored.aiScore,
           grade: scored.aiGrade,
         });
+  // Only qualified signals should surface in app.
   signal.shownInApp = signal.qualified;
   return signal;
 }
