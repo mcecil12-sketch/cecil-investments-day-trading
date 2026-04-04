@@ -960,6 +960,8 @@ Return ONLY valid JSON:
     });
     
     winnerScore = shortQualityResult.adjustedScore;
+    // Keep valid scored SHORT outcomes above zero after penalty-only adjustments.
+    winnerScore = Math.max(1.0, winnerScore);
     shortDiagnostics = shortQualityResult.diagnostics;
     shortDiagnostics.shortPenaltyReasons = shortQualityResult.penaltyReasons;
     
