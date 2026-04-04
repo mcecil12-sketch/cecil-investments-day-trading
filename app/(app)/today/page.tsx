@@ -3,6 +3,7 @@
 import React, { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { AutoManagePoller } from "@/components/AutoManagePoller";
+import { AgentControlCard } from "@/components/AgentControlCard";
 import { TodayAiHealth } from "@/components/today/TodayAiHealth";
 import { useTrading, TradeSide, Trade } from "@/tradingContext";
 import { computeRiskPerShare } from "@/lib/risk";
@@ -1037,6 +1038,8 @@ export default function TodayPage() {
 
 
         <main className="max-w-6xl mx-auto px-4 pt-6 pb-24 space-y-6">
+          <AgentControlCard />
+
           <section className="space-y-3">
             <div className="flex items-end justify-between gap-3">
               <div>

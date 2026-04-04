@@ -15,6 +15,7 @@ const MACHINE_API_PREFIXES = [
   "/api/auto-manage",
   "/api/ai",
   "/api/ops",
+  "/api/agents",
 ];
 
 const PUBLIC_PATHS = [
