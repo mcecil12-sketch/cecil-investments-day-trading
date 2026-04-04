@@ -1,5 +1,5 @@
 import { appendAgentAction, appendAgentBrief, readAgentState, writeAgentState } from "@/lib/agents/store";
-import { getEtNowIso } from "@/lib/time/etDate";
+import { nowIso } from "@/lib/agents/time";
 import type { AgentBrief, AgentRunnerResult, AgentState, EventRisk, NewsState } from "@/lib/agents/types";
 
 const ET_PARTS = new Intl.DateTimeFormat("en-US", {
@@ -28,7 +28,7 @@ function getEventPosture(now: Date): { eventRisk: EventRisk; newsState: NewsStat
 
 export async function runPolicyNewsAgent(): Promise<AgentRunnerResult> {
   const nowDate = new Date();
-  const now = getEtNowIso(nowDate);
+  const now = nowIso();
   const currentState = await readAgentState();
   const policy = getEventPosture(nowDate);
 

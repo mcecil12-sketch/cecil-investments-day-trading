@@ -7,7 +7,7 @@ import {
   readAgentState,
   writeAgentState,
 } from "@/lib/agents/store";
-import { getEtNowIso } from "@/lib/time/etDate";
+import { nowIso } from "@/lib/agents/time";
 import type {
   AgentBrief,
   AgentIncident,
@@ -102,7 +102,7 @@ function buildTask(incident: AgentIncident, now: string): EngineeringTask {
 }
 
 export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
-  const now = getEtNowIso();
+  const now = nowIso();
   const currentState = await readAgentState();
   const incidents = await listAgentIncidents(50);
   const tasks = await listEngineeringTasks(50);

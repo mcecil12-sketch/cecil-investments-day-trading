@@ -2,7 +2,7 @@ export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
 import { checkAgentReadAuth, unauthorizedAgentResponse } from "@/lib/agents/auth";
-import { listAgentIncidents } from "@/lib/agents/store";
+import { listAgentIncidents, listOpenIncidents } from "@/lib/agents/store";
 
 export async function GET(req: Request) {
   const auth = await checkAgentReadAuth(req);
@@ -17,5 +17,6 @@ export async function GET(req: Request) {
   return NextResponse.json({
     ok: true,
     incidents: await listAgentIncidents(limit),
+    openIncidents: await listOpenIncidents(limit),
   });
 }

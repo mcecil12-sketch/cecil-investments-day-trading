@@ -45,6 +45,17 @@ export interface AgentState {
   freezeWindows: FreezeWindow[];
   activeRestrictions: string[];
   activeIncidentCount: number;
+  telemetry?: {
+    readinessReady?: boolean;
+    readinessReasons?: string[];
+    recentSignalsPending?: number;
+    recentSignalsScored?: number;
+    recentZeroScores?: number;
+    scannerStale?: boolean;
+    scoringStale?: boolean;
+    autoEntryDisabled?: boolean;
+    openTradeMismatch?: boolean;
+  };
   latestBriefId?: string | null;
   latestEngineeringTaskId?: string | null;
   updatedBy: AgentName | "system";
@@ -55,6 +66,7 @@ export interface AgentBrief {
   agent: AgentName;
   briefType: AgentBriefType;
   createdAt: string;
+  etDate?: string;
   title: string;
   summary: string;
   details?: Record<string, unknown>;
@@ -64,6 +76,7 @@ export interface AgentIncident {
   id: string;
   createdAt: string;
   updatedAt: string;
+  etDate?: string;
   severity: AgentIncidentSeverity;
   source: AgentName;
   category: AgentIncidentCategory;
@@ -76,6 +89,7 @@ export interface AgentIncident {
 export interface AgentAction {
   id: string;
   createdAt: string;
+  etDate?: string;
   agent: AgentName;
   actionType: string;
   status: AgentActionStatus;
@@ -87,6 +101,7 @@ export interface EngineeringTask {
   id: string;
   createdAt: string;
   updatedAt: string;
+  etDate?: string;
   status: EngineeringTaskStatus;
   title: string;
   summary: string;

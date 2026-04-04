@@ -1,25 +1,67 @@
-import { createDefaultAgentState, appendAgentAction, appendAgentBrief, readAgentState, writeAgentState } from "@/lib/agents/store";
-import { getEtNowIso } from "@/lib/time/etDate";
-import type { AgentBrief, AgentRunnerResult, AgentState } from "@/lib/agents/types";
+import {
+  createDefaultAgentState,
+  appendAgentAction,
+  appendAgentBrief,
+  listOpenIncidents,
+  readAgentState,
+  writeAgentState,
+} from "@/lib/agents/store";
+import { nowIso } from "@/lib/agents/time";
+import type { AgentBrief, AgentIncident, AgentRunnerResult, AgentState, AllowedGrade } from "@/lib/agents/types";
 
 const RISK_TIGHTEN_RESTRICTION = "Risk tightened to A/B only";
-
-function nextRestrictions(state: AgentState): string[] {
-  const base = state.activeRestrictions.filter((value) => value !== RISK_TIGHTEN_RESTRICTION);
-  if (state.posture !== "DEFENSIVE") return base;
-  return [RISK_TIGHTEN_RESTRICTION, ...base];
-}
+const RISK_HIGH_RESTRICTION = "Risk tightened to A-only due to severe incident";
+const RISK_EVENT_RESTRICTION = "Risk tightened due to elevated event risk";
 
 export async function runRiskAgent(): Promise<AgentRunnerResult> {
-  const now = getEtNowIso();
+  const now = nowIso();
   const currentState = await readAgentState();
+  const openIncidents = await listOpenIncidents(50);
   const defaults = createDefaultAgentState(now);
+
+  const hasCriticalExecutionIncident = openIncidents.some(
+    (incident: AgentIncident) =>
+      incident.severity === "HIGH" &&
+      ["SCORING", "AUTO_ENTRY", "TRADES", "BROKER_SYNC"].includes(incident.category)
+  );
+
+  let allowedGrades: AllowedGrade[] = defaults.allowedGrades;
+  let minScoreAdjustment = 0;
+  const reasons: string[] = [];
+
+  if (hasCriticalExecutionIncident) {
+    allowedGrades = ["A"];
+    minScoreAdjustment = 0.5;
+    reasons.push(RISK_HIGH_RESTRICTION);
+  } else if (currentState.posture === "DEFENSIVE") {
+    allowedGrades = ["A", "B"];
+    minScoreAdjustment = 0.5;
+    reasons.push(RISK_TIGHTEN_RESTRICTION);
+  } else {
+    allowedGrades = defaults.allowedGrades;
+  }
+
+  if (currentState.eventRisk === "HIGH") {
+    if (!reasons.includes(RISK_EVENT_RESTRICTION)) reasons.push(RISK_EVENT_RESTRICTION);
+    if (minScoreAdjustment < 0.5) minScoreAdjustment = 0.5;
+    if (allowedGrades.includes("C")) {
+      allowedGrades = ["A", "B"];
+    }
+  }
+
+  const priorNonRiskRestrictions = currentState.activeRestrictions.filter(
+    (value) =>
+      value !== RISK_TIGHTEN_RESTRICTION &&
+      value !== RISK_HIGH_RESTRICTION &&
+      value !== RISK_EVENT_RESTRICTION
+  );
 
   const nextState: AgentState = {
     ...currentState,
     asOf: now,
-    allowedGrades: currentState.posture === "DEFENSIVE" ? ["A", "B"] : defaults.allowedGrades,
-    activeRestrictions: nextRestrictions(currentState),
+    allowedGrades,
+    minScoreAdjustment,
+    activeRestrictions: [...reasons, ...priorNonRiskRestrictions],
     updatedBy: "risk",
   };
 
@@ -30,12 +72,14 @@ export async function runRiskAgent(): Promise<AgentRunnerResult> {
     createdAt: now,
     title: `Risk guard ${nextState.posture}`,
     summary:
-      nextState.posture === "DEFENSIVE"
-        ? "Risk tightened eligibility to A/B only while the desk is defensive."
-        : `Risk remains aligned with baseline grades ${nextState.allowedGrades.join("/")}.`,
+      reasons.length > 0
+        ? `Risk tightened to ${nextState.allowedGrades.join("/")} with +${nextState.minScoreAdjustment.toFixed(1)} score adjustment. Reasons: ${reasons.join("; ")}.`
+        : `Risk remains aligned with baseline grades ${nextState.allowedGrades.join("/")} with no score adjustment.`,
     details: {
       allowedGrades: nextState.allowedGrades,
       activeRestrictions: nextState.activeRestrictions,
+      minScoreAdjustment: nextState.minScoreAdjustment,
+      openIncidentCount: openIncidents.length,
     },
   };
 
@@ -52,10 +96,11 @@ export async function runRiskAgent(): Promise<AgentRunnerResult> {
     agent: "risk",
     actionType: "RISK_ALIGNMENT",
     status: "APPLIED",
-    summary: `Risk set allowed grades to ${savedState.allowedGrades.join("/")}.`,
+    summary: `Risk set allowed grades to ${savedState.allowedGrades.join("/")} (minScoreAdjustment=${savedState.minScoreAdjustment.toFixed(1)}).`,
     metadata: {
       posture: savedState.posture,
       activeRestrictions: savedState.activeRestrictions,
+      reasons,
     },
   });
 

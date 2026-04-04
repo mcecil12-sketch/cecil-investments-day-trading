@@ -1,4 +1,4 @@
-import { getEtNowIso } from "@/lib/time/etDate";
+import { nowIso } from "@/lib/agents/time";
 import {
   appendAgentAction,
   appendAgentBrief,
@@ -13,15 +13,30 @@ function hasHighSeverityIncident(incidents: AgentIncident[]): boolean {
 }
 
 export async function runPmAgent(): Promise<AgentRunnerResult> {
-  const now = getEtNowIso();
+  const now = nowIso();
   const currentState = await readAgentState();
   const incidents = await listAgentIncidents(50);
   const openIncidents = incidents.filter((incident) => incident.status !== "RESOLVED");
+  const hasHighIncident = hasHighSeverityIncident(openIncidents);
+
+  const reasons: string[] = [];
+  if (hasHighIncident) reasons.push("high-severity incident open");
+  if (currentState.eventRisk === "HIGH") reasons.push("event risk HIGH");
+  if (currentState.telemetry?.readinessReady === false) {
+    reasons.push(...(currentState.telemetry?.readinessReasons ?? ["readiness degraded"]));
+  }
+
+  const shouldDefend = reasons.length > 0;
+  const baseRestrictions = (currentState.activeRestrictions ?? []).filter((value) => !value.startsWith("PM: "));
+  const pmRestrictions = shouldDefend
+    ? Array.from(new Set(reasons.map((reason) => `PM: ${reason}`)))
+    : [];
 
   const nextState: AgentState = {
     ...currentState,
     asOf: now,
-    posture: hasHighSeverityIncident(openIncidents) ? "DEFENSIVE" : "NORMAL",
+    posture: shouldDefend ? "DEFENSIVE" : "NORMAL",
+    activeRestrictions: [...pmRestrictions, ...baseRestrictions],
     activeIncidentCount: openIncidents.length,
     updatedBy: "pm",
   };
@@ -32,13 +47,14 @@ export async function runPmAgent(): Promise<AgentRunnerResult> {
     briefType: "STATUS",
     createdAt: now,
     title: `PM posture ${nextState.posture}`,
-    summary:
-      nextState.posture === "DEFENSIVE"
-        ? `High-severity incidents detected. Posture moved to ${nextState.posture}.`
-        : `No high-severity incidents detected. Posture remains ${nextState.posture}.`,
+    summary: shouldDefend
+      ? `Posture moved to DEFENSIVE due to: ${reasons.join("; ")}.`
+      : "Posture remains NORMAL. No high-risk incidents or readiness degradation detected.",
     details: {
       openIncidentCount: openIncidents.length,
       highSeverityOpenCount: openIncidents.filter((incident) => incident.severity === "HIGH").length,
+      reasons,
+      activeRestrictions: nextState.activeRestrictions,
     },
   };
 
