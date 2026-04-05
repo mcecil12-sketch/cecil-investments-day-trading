@@ -2,17 +2,18 @@ import { describe, expect, it, vi } from "vitest";
 import { executeGithubTask } from "@/lib/agents/githubExecutor";
 
 describe("githubExecutor", () => {
-  it("creates patch file and runs git add/commit/push", async () => {
-    const calls: Array<{ command: string; args: string[] }> = [];
-    const runCommand = vi.fn(async (command: string, args: string[]) => {
-      calls.push({ command, args });
-      return { stdout: "", stderr: "" };
-    });
-    const mkdir = vi.fn(async () => {});
-    const writes: Array<{ path: string; content: string }> = [];
-    const writeFile = vi.fn(async (path: string, content: string) => {
-      writes.push({ path, content });
-    });
+  it("writes patch artifact to repository contents API", async () => {
+    const writeRepoFileImpl = vi.fn(async ({ path }) => ({
+      path,
+      commitSha: "abc123",
+      commitUrl: "https://github.com/org/repo/commit/abc123",
+    }));
+
+    process.env.GITHUB_REPO_OWNER = "org";
+    process.env.GITHUB_REPO_NAME = "repo";
+    process.env.GITHUB_APP_ID = "123";
+    process.env.GITHUB_INSTALLATION_ID = "456";
+    process.env.GITHUB_APP_PRIVATE_KEY = "-----BEGIN RSA PRIVATE KEY-----\\nabc\\n-----END RSA PRIVATE KEY-----";
 
     const result = await executeGithubTask(
       {
@@ -38,26 +39,35 @@ describe("githubExecutor", () => {
         },
       },
       {
-        cwd: "/repo",
-        runCommand: runCommand as any,
-        mkdir,
-        writeFile,
+        writeRepoFileImpl,
       },
     );
 
-    expect(mkdir).toHaveBeenCalledWith("/repo/agent-patches");
-    expect(writes[0].path).toBe("/repo/agent-patches/task-123.md");
-    expect(writes[0].content).toContain("Execute task");
-    expect(writes[0].content).toContain("apply deterministic update");
-    expect(calls).toEqual([
-      { command: "git", args: ["add", "-A"] },
-      { command: "git", args: ["commit", "-m", "agent: task"] },
-      { command: "git", args: ["push"] },
-    ]);
+    expect(writeRepoFileImpl).toHaveBeenCalledTimes(1);
+    expect(writeRepoFileImpl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        owner: "org",
+        repo: "repo",
+        path: "agent-patches/task-123.md",
+        message: "agent: task",
+        branch: "main",
+      }),
+    );
+    const payload = writeRepoFileImpl.mock.calls[0][0];
+    expect(payload.content).toContain("## Summary");
+    expect(payload.content).toContain("summary");
+    expect(payload.content).toContain("## Copilot Prompt");
+    expect(payload.content).toContain("apply deterministic update");
+    expect(payload.content).toContain("## Patch Plan Summary");
+    expect(payload.content).toContain("## Validation Plan");
+    expect(payload.content).toContain("## Commit Plan");
+
     expect(result).toEqual({
       success: true,
       commitMessage: "agent: task",
       filesTouched: ["agent-patches/task-123.md"],
+      commitSha: "abc123",
+      commitUrl: "https://github.com/org/repo/commit/abc123",
     });
   });
 
@@ -74,6 +84,11 @@ describe("githubExecutor", () => {
         copilotPrompt: "apply deterministic update",
         smokeTestBlock: "",
         gitBlock: "",
+        patchPlan: {
+          mode: "GITHUB_COMMIT",
+          targetFiles: ["lib/a.ts"],
+          proposedChangesSummary: "summary",
+        },
       }),
     ).rejects.toThrow("missing_commit_plan");
   });

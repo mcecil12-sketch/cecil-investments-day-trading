@@ -27,6 +27,8 @@ const mocks = vi.hoisted(() => ({
     success: true,
     commitMessage: "agent: execute task",
     filesTouched: ["agent-patches/task-ready.md"],
+    commitSha: "abc123",
+    commitUrl: "https://github.com/org/repo/commit/abc123",
   })),
 }));
 
@@ -266,6 +268,8 @@ describe("POST /api/agents/execute", () => {
       executedTaskId: "task-ready",
       executionStatus: "EXECUTED",
       commitMessage: "agent: execute task",
+      commitSha: "abc123",
+      commitUrl: "https://github.com/org/repo/commit/abc123",
     });
     expect(mocks.updateEngineeringTaskById).toHaveBeenCalledWith(
       "task-ready",
@@ -273,8 +277,54 @@ describe("POST /api/agents/execute", () => {
         status: "DONE",
         executionStatus: "EXECUTED",
         remediationStatus: "completed",
+        remediationResultSummary: expect.stringContaining("Executed via GitHub contents API"),
       }),
     );
+  });
+
+  it("skips READY_FOR_EXECUTION tasks that fail execution guardrails", async () => {
+    mocks.listEngineeringTasks.mockResolvedValueOnce([
+      {
+        id: "task-ready",
+        createdAt: "2026-04-05T09:00:00Z",
+        updatedAt: "2026-04-05T09:00:00Z",
+        status: "READY_FOR_EXECUTION",
+        title: "Ready task",
+        summary: "summary",
+        likelyFiles: ["lib/c.ts"],
+        copilotPrompt: "safe",
+        smokeTestBlock: "",
+        gitBlock: "",
+        patchPlan: {
+          mode: "FILE_WRITE",
+          targetFiles: ["lib/c.ts"],
+          proposedChangesSummary: "summary",
+        },
+        commitPlan: {
+          commitMessage: "agent: ready",
+          targetBranch: "main",
+          pushDirect: true,
+        },
+        executionStatus: "READY",
+      },
+    ]);
+
+    const response = await POST(
+      new Request("http://localhost/api/agents/execute", {
+        method: "POST",
+        headers: { "x-cron-token": "test-cron-token" },
+      }) as any,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      taskId: "task-ready",
+      executionStatus: "READY",
+      skipped: true,
+      reason: "patch_mode_not_github_commit",
+    });
+    expect(mocks.executeGithubTask).not.toHaveBeenCalled();
   });
 
   it("marks task BLOCKED when github execution fails", async () => {

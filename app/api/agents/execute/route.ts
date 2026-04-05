@@ -30,19 +30,16 @@ async function markExecutionFailure(task: EngineeringTask | null, message: strin
 function isEligibleTask(task: EngineeringTask): boolean {
   return (
     task.status === "OPEN" ||
-    task.status === "READY_FOR_EXECUTION" ||
-    task.status === "READY_FOR_PUSH"
+    task.status === "READY_FOR_EXECUTION"
   );
 }
 
 function executionSortRank(task: EngineeringTask): number {
   return task.status === "READY_FOR_EXECUTION"
     ? 0
-    : task.status === "READY_FOR_PUSH"
-      ? 10
-      : task.status === "OPEN"
-        ? 20
-        : 100;
+    : task.status === "OPEN"
+      ? 20
+      : 100;
 }
 
 function validateExecutionGuardrails(task: EngineeringTask): string | null {
@@ -76,7 +73,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, message: "No execution-ready tasks" });
     }
 
-    if (task.status === "READY_FOR_EXECUTION" || task.status === "READY_FOR_PUSH") {
+    if (task.status === "READY_FOR_EXECUTION") {
       const guardrailError = validateExecutionGuardrails(task);
 
       if (guardrailError) {
@@ -102,12 +99,19 @@ export async function POST(req: NextRequest) {
           status: "DONE",
           remediationAttempted: true,
           remediationStatus: "completed",
-          remediationResultSummary: `Executed via GitHub executor (${executionResult.filesTouched.join(", ")}).`,
+          remediationResultSummary: `Executed via GitHub contents API (${executionResult.filesTouched.join(", ")}).`,
           executionStatus: "EXECUTED",
           executionError: null,
+          linkedTelemetrySnapshot: {
+            executionCommitSha: executionResult.commitSha ?? null,
+            executionCommitUrl: executionResult.commitUrl ?? null,
+            executionFilesTouched: executionResult.filesTouched,
+          },
           notes: appendNotes(task.notes, [
-            "Executed via GitHub executor",
+            "Executed via GitHub contents API",
             `Commit message: ${executionResult.commitMessage}`,
+            executionResult.commitSha ? `Commit sha: ${executionResult.commitSha}` : "",
+            executionResult.commitUrl ? `Commit url: ${executionResult.commitUrl}` : "",
           ]),
         });
 
@@ -117,6 +121,8 @@ export async function POST(req: NextRequest) {
           executionStatus: "EXECUTED",
           filesTouched: executionResult.filesTouched,
           commitMessage: executionResult.commitMessage,
+          commitSha: executionResult.commitSha,
+          commitUrl: executionResult.commitUrl,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

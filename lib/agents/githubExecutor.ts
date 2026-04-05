@@ -1,39 +1,25 @@
-import { execFile } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
-import { promisify } from "node:util";
+import { getGithubAppConfig } from "@/lib/agents/github/auth";
+import { writeRepoFile, type WriteRepoFileResult } from "@/lib/agents/github/contents";
 import type { EngineeringTask } from "@/lib/agents/types";
-
-const execFileAsync = promisify(execFile);
-
-type CommandRunner = (
-  command: string,
-  args: string[],
-  options: { cwd: string },
-) => Promise<{ stdout: string; stderr: string }>;
-
-type WriteFileFn = (path: string, content: string) => Promise<void>;
-type MkdirFn = (path: string) => Promise<void>;
 
 export interface GithubExecutionResult {
   success: boolean;
   commitMessage: string;
   filesTouched: string[];
+  commitSha?: string;
+  commitUrl?: string;
 }
 
 export interface GithubExecutorDeps {
-  cwd?: string;
-  runCommand?: CommandRunner;
-  writeFile?: WriteFileFn;
-  mkdir?: MkdirFn;
-}
-
-function defaultRunCommand(
-  command: string,
-  args: string[],
-  options: { cwd: string },
-): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(command, args, options);
+  writeRepoFileImpl?: (input: {
+    owner?: string;
+    repo?: string;
+    path: string;
+    message: string;
+    content: string;
+    branch: string;
+    sha?: string;
+  }) => Promise<WriteRepoFileResult>;
 }
 
 function ensureExecutableTask(task: EngineeringTask): void {
@@ -50,6 +36,20 @@ function ensureExecutableTask(task: EngineeringTask): void {
 
 function buildPatchNote(task: EngineeringTask): string {
   const summary = task.patchPlan?.proposedChangesSummary ?? "No summary provided.";
+  const validationSummary = task.validationPlan
+    ? [
+        `- buildRequired: ${task.validationPlan.buildRequired ? "true" : "false"}`,
+        `- testCommands: ${task.validationPlan.testCommands.length > 0 ? task.validationPlan.testCommands.join(" | ") : "(none)"}`,
+        `- smokeChecks: ${task.validationPlan.smokeChecks.length > 0 ? task.validationPlan.smokeChecks.join(" | ") : "(none)"}`,
+      ].join("\n")
+    : "- (missing validation plan)";
+  const commitSummary = task.commitPlan
+    ? [
+        `- commitMessage: ${task.commitPlan.commitMessage}`,
+        `- targetBranch: ${task.commitPlan.targetBranch}`,
+        `- pushDirect: ${task.commitPlan.pushDirect ? "true" : "false"}`,
+      ].join("\n")
+    : "- (missing commit plan)";
   const targetFiles = (task.patchPlan?.targetFiles ?? []).length > 0
     ? (task.patchPlan?.targetFiles ?? []).map((file) => `- ${file}`).join("\n")
     : "- (none)";
@@ -60,6 +60,9 @@ function buildPatchNote(task: EngineeringTask): string {
     `## Title`,
     task.title,
     "",
+    `## Summary`,
+    task.summary,
+    "",
     `## Copilot Prompt`,
     task.copilotPrompt || "(empty)",
     "",
@@ -68,6 +71,12 @@ function buildPatchNote(task: EngineeringTask): string {
     "",
     `## Patch Targets`,
     targetFiles,
+    "",
+    `## Validation Plan`,
+    validationSummary,
+    "",
+    `## Commit Plan`,
+    commitSummary,
     "",
     `## Generated At`,
     new Date().toISOString(),
@@ -81,28 +90,24 @@ export async function executeGithubTask(
 ): Promise<GithubExecutionResult> {
   ensureExecutableTask(task);
 
-  const cwd = deps.cwd ?? process.cwd();
-  const runCommand = deps.runCommand ?? defaultRunCommand;
-  const writeFileImpl = deps.writeFile ?? (async (path: string, content: string) => {
-    await writeFile(path, content, "utf8");
-  });
-  const mkdirImpl = deps.mkdir ?? (async (path: string) => {
-    await mkdir(path, { recursive: true });
-  });
-
-  const patchDir = join(cwd, "agent-patches");
-  const patchFile = join(patchDir, `${task.id}.md`);
-  await mkdirImpl(patchDir);
-  await writeFileImpl(patchFile, buildPatchNote(task));
-
   const commitMessage = task.commitPlan!.commitMessage.trim();
-  await runCommand("git", ["add", "-A"], { cwd });
-  await runCommand("git", ["commit", "-m", commitMessage], { cwd });
-  await runCommand("git", ["push"], { cwd });
+  const patchPath = `agent-patches/${task.id}.md`;
+  const config = getGithubAppConfig();
+  const writer = deps.writeRepoFileImpl ?? writeRepoFile;
+  const writeResult = await writer({
+    owner: config.repoOwner,
+    repo: config.repoName,
+    path: patchPath,
+    message: commitMessage,
+    content: buildPatchNote(task),
+    branch: task.commitPlan!.targetBranch,
+  });
 
   return {
     success: true,
     commitMessage,
-    filesTouched: [relative(cwd, patchFile)],
+    filesTouched: [writeResult.path || patchPath],
+    commitSha: writeResult.commitSha,
+    commitUrl: writeResult.commitUrl,
   };
 }
