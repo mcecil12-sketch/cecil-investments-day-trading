@@ -49,7 +49,11 @@ export interface AgentState {
     readinessReady?: boolean;
     readinessReasons?: string[];
     brokerPositionsCount?: number;
+    dbOpenTradesCount?: number;
+    dbAutoOpenTradesCount?: number;
+    dbActualOperationalCount?: number;
     dbOperationalOpenCount?: number;
+    mismatchNote?: string | null;
     recentSignalsPending?: number;
     recentSignalsScored?: number;
     recentZeroScores?: number;

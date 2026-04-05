@@ -140,7 +140,22 @@ export function AgentControlCard() {
             Open trade mismatch
           </div>
           <div className="text-sm text-[var(--ci-negative)]">
-            broker={state.telemetry.brokerPositionsCount ?? 0} / db={state.telemetry.dbOperationalOpenCount ?? 0}
+            broker={state.telemetry.brokerPositionsCount ?? 0} / actual-db={state.telemetry.dbActualOperationalCount ?? state.telemetry.dbOperationalOpenCount ?? 0}
+          </div>
+          <div className="text-xs text-[var(--ci-text-muted)]">
+            auto-open (debug)={state.telemetry.dbAutoOpenTradesCount ?? 0}
+          </div>
+        </div>
+      )}
+
+      {state && !state?.telemetry?.openTradeMismatch && (
+        <div className="rounded-xl border border-[var(--ci-border)] bg-black/20 px-4 py-3 space-y-1">
+          <div className="text-[10px] uppercase tracking-wide text-[var(--ci-text-muted)]">
+            Operational mismatch
+          </div>
+          <div className="text-xs text-neutral-200">false</div>
+          <div className="text-xs text-[var(--ci-text-muted)]">
+            broker={state?.telemetry?.brokerPositionsCount ?? 0}; actual-db={state?.telemetry?.dbActualOperationalCount ?? state?.telemetry?.dbOperationalOpenCount ?? 0}; auto-open={state?.telemetry?.dbAutoOpenTradesCount ?? 0}
           </div>
         </div>
       )}

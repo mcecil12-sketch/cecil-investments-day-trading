@@ -199,6 +199,30 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
   const incidents = await listAgentIncidents(50);
   const tasks = await listEngineeringTasks(50);
 
+  // Close stale BROKER_SYNC tasks when their linked incident has already resolved.
+  let resolvedTaskUpdates = 0;
+  for (const task of tasks) {
+    if (
+      task.incidentCategory === "BROKER_SYNC" &&
+      task.incidentId &&
+      (task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW")
+    ) {
+      const linkedIncident = incidents.find((incident) => incident.id === task.incidentId);
+      if (linkedIncident?.status === "RESOLVED") {
+        const updated = await updateEngineeringTaskById(task.id, {
+          status: "DONE",
+          remediationStatus: "succeeded",
+          remediationAttempted: true,
+          remediationResultSummary:
+            linkedIncident.summary || "BROKER_SYNC incident resolved; task closed as no longer actionable.",
+        });
+        if (updated) {
+          resolvedTaskUpdates += 1;
+        }
+      }
+    }
+  }
+
   // Find the highest-priority incident that needs a task: OPEN or MONITORING,
   // HIGH or MEDIUM severity, not yet linked to an open engineering task.
   const candidate = incidents.find(
@@ -253,14 +277,17 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     }
   }
 
-  const openTasks = tasks.filter(
+  const refreshedTasks = await listEngineeringTasks(50);
+  const openTasks = refreshedTasks.filter(
     (task) => task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW",
   );
-  const openTaskCount = openTasks.length + (upsertCreated ? 1 : 0);
+  const openTaskCount = openTasks.length;
 
   const taskSummary = upsertCreated
     ? `Created engineering task "${buildTaskTitle(candidate!)}" for incident ${candidate!.id}.`
-    : "No new engineering task was needed.";
+    : resolvedTaskUpdates > 0
+      ? `Closed ${resolvedTaskUpdates} resolved BROKER_SYNC engineering task${resolvedTaskUpdates === 1 ? "" : "s"}.`
+      : "No new engineering task was needed.";
 
   const latestTask = upsertCreated && candidate
     ? buildTaskTitle(candidate)

@@ -12,9 +12,9 @@ import { readTrades } from "@/lib/tradesStore";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { readReconcileTelemetry } from "@/lib/maintenance/reconcileTelemetry";
 import { computeScoringWindows } from "@/lib/ops/scoringWindows";
+import { computeOperationalDiagnostics } from "@/lib/ops/operationalDiagnostics";
 import { readTodayFunnel } from "@/lib/funnelRedis";
 import { getEtDateString } from "@/lib/time/etDate";
-import { countOperationalOpenAutoTickers, countOperationalOpenTickers } from "@/lib/trades/operational";
 
 export const dynamic = "force-dynamic";
 
@@ -132,13 +132,7 @@ export async function GET() {
     // (assume all open positions count against the gate).
     const brokerTruthFromAutoEntry = brokerPositionsCount;
 
-    // Diagnostics: All operational counts use authoritative broker-truth filter
-    const dbOpenTradesCount = brokerTruthOpenTrades;
-    const dbActualOperationalCount = brokerTruthOpenTrades;
-    const dbAutoOpenTradesCount = countOperationalOpenAutoTickers(trades);
-    
-    // Mismatch detection: compare broker positions count vs actual operational count
-    const openTradesMismatch = brokerPositionsCount !== dbActualOperationalCount;
+    const operationalDiagnostics = computeOperationalDiagnostics(brokerTruth, trades);
 
     // Legacy flags for backward compatibility
     const pause = process.env.PAUSE_AUTOTRADING === "1";
@@ -294,13 +288,11 @@ export async function GET() {
         },
         // Diagnostics: DB state for mismatch detection without blocking automation
         diagnostics: {
-          dbOpenTradesCount,
-          dbAutoOpenTradesCount,
-          dbActualOperationalCount,
-          openTradesMismatch,
-          mismatchNote: openTradesMismatch
-            ? `DB operational count=${dbActualOperationalCount} but broker positions=${brokerPositionsCount}. Run reconcile-open-trades to cleanup stale conflicts.`
-            : null,
+          dbOpenTradesCount: operationalDiagnostics.dbOpenTradesCount,
+          dbAutoOpenTradesCount: operationalDiagnostics.dbAutoOpenTradesCount,
+          dbActualOperationalCount: operationalDiagnostics.dbActualOperationalCount,
+          openTradesMismatch: operationalDiagnostics.openTradesMismatch,
+          mismatchNote: operationalDiagnostics.mismatchNote,
         },
       },
 

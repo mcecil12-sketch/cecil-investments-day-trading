@@ -5,8 +5,8 @@ import { getGuardrailConfig } from "@/lib/autoEntry/guardrails";
 import { getAutoEntryEnabledState, getGuardrailsState } from "@/lib/autoEntry/guardrailsStore";
 import { getEtDateString } from "@/lib/agents/time";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
+import { computeOperationalDiagnostics } from "@/lib/ops/operationalDiagnostics";
 import { readTrades } from "@/lib/tradesStore";
-import { countOperationalOpenTickers } from "@/lib/trades/operational";
 
 type TelemetrySignalsSnapshot = {
   pendingCount: number;
@@ -27,7 +27,11 @@ export type AgentTelemetrySnapshot = {
   autoEntryDisableReason: string | null;
   openTradeMismatch: boolean;
   brokerPositionsCount: number;
+  dbOpenTradesCount: number;
+  dbAutoOpenTradesCount: number;
+  dbActualOperationalCount: number;
   dbOperationalOpenCount: number;
+  mismatchNote: string | null;
   signalsPendingCount: number;
   signalsScoredCount: number;
   zeroScoreCount: number;
@@ -122,15 +126,10 @@ export async function readAgentTelemetrySnapshot(): Promise<AgentTelemetrySnapsh
   const autoEntryDisableReason =
     guardState?.autoDisabledReason ?? (toggleState.enabled ? null : toggleState.reason ?? "auto entry disabled");
 
-  const brokerPositionsCount =
-    typeof brokerTruth?.positionsCount === "number"
-      ? brokerTruth.positionsCount
-      : Array.isArray(brokerTruth?.positions)
-        ? brokerTruth.positions.length
-        : 0;
-
-  const dbOperationalOpenCount = countOperationalOpenTickers(Array.isArray(trades) ? trades : []);
-  const openTradeMismatch = brokerTruth?.error ? false : brokerPositionsCount !== dbOperationalOpenCount;
+  const diagnostics = computeOperationalDiagnostics(brokerTruth, trades);
+  const brokerPositionsCount = diagnostics.brokerPositionsCount;
+  const dbOperationalOpenCount = diagnostics.dbActualOperationalCount;
+  const openTradeMismatch = diagnostics.openTradesMismatch;
 
   const readinessReasons: string[] = [];
   if (staleScanner) readinessReasons.push("scanner stale during market hours");
@@ -154,7 +153,11 @@ export async function readAgentTelemetrySnapshot(): Promise<AgentTelemetrySnapsh
     autoEntryDisableReason,
     openTradeMismatch,
     brokerPositionsCount,
+    dbOpenTradesCount: diagnostics.dbOpenTradesCount,
+    dbAutoOpenTradesCount: diagnostics.dbAutoOpenTradesCount,
+    dbActualOperationalCount: diagnostics.dbActualOperationalCount,
     dbOperationalOpenCount,
+    mismatchNote: diagnostics.mismatchNote,
     signalsPendingCount: signalSummary.pendingCount,
     signalsScoredCount: signalSummary.scoredCount,
     zeroScoreCount: signalSummary.zeroScoreCount,

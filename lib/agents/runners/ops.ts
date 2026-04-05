@@ -26,10 +26,13 @@ function summarizeOps(
   if (snapshot.source === "invalid") {
     return "State storage looked malformed. Logged a low-severity ops incident for follow-up.";
   }
+  if (telemetry.openTradeMismatch) {
+    return `Ops detected operational mismatch: broker positions=${telemetry.brokerPositionsCount}, actual operational DB open=${telemetry.dbActualOperationalCount}.`;
+  }
   if (!telemetry.readinessReady) {
     return `Ops detected issues: ${telemetry.readinessReasons.join("; ")}.`;
   }
-  return `Scoring healthy; ${telemetry.signalsScoredCount} scored / ${telemetry.signalsPendingCount} pending in recent window across ${actionCount} recent control-plane actions.`;
+  return `Ops is healthy. No true broker/db operational mismatch detected. Scoring healthy; ${telemetry.signalsScoredCount} scored / ${telemetry.signalsPendingCount} pending in recent window across ${actionCount} recent control-plane actions.`;
 }
 
 export async function runOpsAgent(): Promise<AgentRunnerResult> {
@@ -111,7 +114,7 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
       source: "ops",
       category: "BROKER_SYNC",
       title: "Open trade mismatch",
-      summary: `Broker positions=${telemetry.brokerPositionsCount}, DB operational open=${telemetry.dbOperationalOpenCount}.`,
+      summary: `Broker positions=${telemetry.brokerPositionsCount}, DB actual operational open=${telemetry.dbActualOperationalCount}. ${telemetry.mismatchNote ?? ""}`.trim(),
       notes: telemetry.readinessReasons,
     });
     brokerSyncIncidentId = result.incident.id;
@@ -119,7 +122,7 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
   } else {
     await resolveIncident(
       { category: "BROKER_SYNC", title: "Open trade mismatch" },
-      "Broker/DB counts aligned.",
+      "No true operational mismatch. Broker/DB counts aligned on operational truth.",
     );
   }
 
@@ -145,12 +148,12 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
         agent: "ops",
         actionType: "REMEDIATION_ATTEMPTED",
         status: "APPLIED",
-        summary: `Attempting broker sync reconcile for incident ${brokerSyncIncidentId}. Before: broker=${telemetry.brokerPositionsCount} db=${telemetry.dbOperationalOpenCount}.`,
+        summary: `Attempting broker sync reconcile for incident ${brokerSyncIncidentId}. Before: broker=${telemetry.brokerPositionsCount} db=${telemetry.dbActualOperationalCount}.`,
         metadata: {
           incidentId: brokerSyncIncidentId,
           category: "BROKER_SYNC",
           beforeBrokerPositionsCount: telemetry.brokerPositionsCount,
-          beforeDbOperationalOpenCount: telemetry.dbOperationalOpenCount,
+          beforeDbOperationalOpenCount: telemetry.dbActualOperationalCount,
         },
       });
 
@@ -162,7 +165,7 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
         const afterTelemetry = await readAgentTelemetrySnapshot();
         const mismatchCleared = !afterTelemetry.openTradeMismatch;
 
-        const beforeAfterSuffix = ` Before: broker=${telemetry.brokerPositionsCount} db=${telemetry.dbOperationalOpenCount}. After: broker=${afterTelemetry.brokerPositionsCount} db=${afterTelemetry.dbOperationalOpenCount}.`;
+        const beforeAfterSuffix = ` Before: broker=${telemetry.brokerPositionsCount} db=${telemetry.dbActualOperationalCount}. After: broker=${afterTelemetry.brokerPositionsCount} db=${afterTelemetry.dbActualOperationalCount}.`;
         remediationSummary =
           remediation.summary + beforeAfterSuffix + (mismatchCleared ? " RESOLVED." : "");
 
@@ -178,7 +181,7 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
               incidentId: brokerSyncIncidentId,
               mismatchCleared,
               afterBrokerPositionsCount: afterTelemetry.brokerPositionsCount,
-              afterDbOperationalOpenCount: afterTelemetry.dbOperationalOpenCount,
+              afterDbOperationalOpenCount: afterTelemetry.dbActualOperationalCount,
               ...remediation.detail,
             },
           });
@@ -186,7 +189,7 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
           if (mismatchCleared) {
             await resolveIncident(
               { category: "BROKER_SYNC", title: "Open trade mismatch" },
-              `Ops reconcile cleared mismatch. broker=${afterTelemetry.brokerPositionsCount} db=${afterTelemetry.dbOperationalOpenCount}.`,
+              `Ops reconcile cleared mismatch. broker=${afterTelemetry.brokerPositionsCount} db=${afterTelemetry.dbActualOperationalCount}.`,
             );
             await appendAgentAction({
               id: crypto.randomUUID(),
@@ -203,9 +206,9 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
               brokerSyncIncidentId,
               {
                 status: "MONITORING",
-                summary: `Broker positions=${afterTelemetry.brokerPositionsCount}, DB operational open=${afterTelemetry.dbOperationalOpenCount}. Reconcile ran; mismatch persists.`,
+                summary: `Broker positions=${afterTelemetry.brokerPositionsCount}, DB actual operational open=${afterTelemetry.dbActualOperationalCount}. Reconcile ran; mismatch persists.`,
               },
-              `Ops reconcile ran but mismatch persists: broker=${afterTelemetry.brokerPositionsCount} db=${afterTelemetry.dbOperationalOpenCount}.`,
+              `Ops reconcile ran but mismatch persists: broker=${afterTelemetry.brokerPositionsCount} db=${afterTelemetry.dbActualOperationalCount}.`,
             );
             await appendAgentAction({
               id: crypto.randomUUID(),
@@ -237,7 +240,7 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
         remediationSummary = remediation.summary;
       }
     } else if (brokerIncident !== null) {
-      remediationSummary = `Broker sync remediation on cooldown for incident ${brokerSyncIncidentId}. broker=${telemetry.brokerPositionsCount} db=${telemetry.dbOperationalOpenCount}.`;
+      remediationSummary = `Broker sync remediation on cooldown for incident ${brokerSyncIncidentId}. broker=${telemetry.brokerPositionsCount} db=${telemetry.dbActualOperationalCount}.`;
     }
   }
 
@@ -283,7 +286,11 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
       readinessReady: telemetry.readinessReady,
       readinessReasons: telemetry.readinessReasons,
       brokerPositionsCount: telemetry.brokerPositionsCount,
+      dbOpenTradesCount: telemetry.dbOpenTradesCount,
+      dbAutoOpenTradesCount: telemetry.dbAutoOpenTradesCount,
+      dbActualOperationalCount: telemetry.dbActualOperationalCount,
       dbOperationalOpenCount: telemetry.dbOperationalOpenCount,
+      mismatchNote: telemetry.mismatchNote,
       recentSignalsPending: telemetry.signalsPendingCount,
       recentSignalsScored: telemetry.signalsScoredCount,
       recentZeroScores: telemetry.zeroScoreCount,
