@@ -1,5 +1,6 @@
 import type { AgentName, AgentRunnerResult } from "@/lib/agents/types";
 import { runEngineeringAgent } from "./engineering";
+import { runEngineeringManagerAgent } from "./engineering-manager";
 import { runOpsAgent } from "./ops";
 import { runPmAgent } from "./pm";
 import { runPolicyNewsAgent } from "./policyNews";
@@ -10,6 +11,7 @@ export const AGENT_RUNNERS: Record<AgentName, () => Promise<AgentRunnerResult>> 
   risk: runRiskAgent,
   ops: runOpsAgent,
   policynews: runPolicyNewsAgent,
+  "engineering-manager": runEngineeringManagerAgent,
   engineering: runEngineeringAgent,
 };
 

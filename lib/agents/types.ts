@@ -1,4 +1,4 @@
-export type AgentName = "pm" | "risk" | "ops" | "policynews" | "engineering";
+export type AgentName = "pm" | "risk" | "ops" | "policynews" | "engineering" | "engineering-manager";
 
 export type AgentPosture = "AGGRESSIVE" | "NORMAL" | "DEFENSIVE";
 
@@ -154,7 +154,7 @@ export interface BacklogItem {
   smokeTestBlock?: string;
   gitBlock?: string;
   linkedIncidentId?: string | null;
-  assignedAgent?: "engineering" | "ops" | "pm" | null;
+  assignedAgent?: "engineering" | "engineering-manager" | "ops" | "pm" | null;
   notes?: string[];
 }
 

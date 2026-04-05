@@ -2,6 +2,7 @@ export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
 import { checkAgentCronAuth, unauthorizedAgentResponse } from "@/lib/agents/auth";
+import { runEngineeringManagerAgent } from "@/lib/agents/runners/engineering-manager";
 import { ALL_AGENT_RUN_ORDER, AGENT_RUNNERS } from "@/lib/agents/runners";
 import { ensureAgentState, readAgentState } from "@/lib/agents/store";
 import type { AgentName } from "@/lib/agents/types";
@@ -42,11 +43,17 @@ export async function POST(req: Request) {
   }
 
   await ensureAgentState();
-  const runList = requested === "all" ? ALL_AGENT_RUN_ORDER : [requested];
+  const runList = requested === "all"
+    ? ALL_AGENT_RUN_ORDER
+    : requested === "engineering-manager"
+      ? []
+      : [requested];
   const results = [];
+  const ran: string[] = [];
 
   for (const agent of runList) {
     const result = await AGENT_RUNNERS[agent]();
+    ran.push(agent);
     results.push({
       agent: result.agent,
       summary: result.summary,
@@ -57,12 +64,34 @@ export async function POST(req: Request) {
     });
   }
 
+  const state = await readAgentState();
+  const noIncidents = state?.activeIncidentCount === 0;
+
+  if ((requested === "all" || requested === "engineering-manager") && noIncidents) {
+    try {
+      const managerResult = await runEngineeringManagerAgent({ state });
+      ran.push("engineering-manager");
+      results.push({
+        agent: "engineering-manager",
+        summary: managerResult.summary,
+        briefId: managerResult.briefId ?? null,
+        actionId: managerResult.actionId ?? null,
+        incidentId: managerResult.incidentId ?? null,
+        engineeringTaskId: managerResult.engineeringTaskId ?? null,
+      });
+    } catch (err) {
+      console.error("engineering-manager error", err);
+    }
+  }
+
+  const finalState = await readAgentState();
+
   return NextResponse.json({
     ok: true,
     authMode: "cron_token",
     requested,
-    ran: runList,
+    ran,
     results,
-    state: await readAgentState(),
+    state: finalState,
   });
 }

@@ -42,6 +42,7 @@ const VALID_UPDATED_BY = new Set<AgentName | "system">([
   "ops",
   "policynews",
   "engineering",
+  "engineering-manager",
   "system",
 ]);
 const VALID_BACKLOG_STATUS = new Set<BacklogItemStatus>(["OPEN", "READY", "IN_PROGRESS", "REVIEW", "DONE"]);
@@ -642,6 +643,14 @@ export async function updateEngineeringTaskById(
 
 export async function listBacklogItems(limit = 100): Promise<BacklogItem[]> {
   return readHistory<BacklogItem>(AGENT_BACKLOG_KEY, limit);
+}
+
+export async function writeBacklog(items: BacklogItem[]): Promise<BacklogItem[]> {
+  const normalized = (Array.isArray(items) ? items : [])
+    .map(normalizeBacklogItem)
+    .slice(0, HISTORY_LIMIT);
+  await writeKey(AGENT_BACKLOG_KEY, normalized);
+  return normalized;
 }
 
 export async function upsertBacklogItem(
