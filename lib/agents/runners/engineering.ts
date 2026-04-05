@@ -1,90 +1,135 @@
 import {
   appendAgentAction,
   appendAgentBrief,
-  appendEngineeringTask,
   listAgentIncidents,
   listEngineeringTasks,
   readAgentState,
+  upsertEngineeringTask,
   writeAgentState,
 } from "@/lib/agents/store";
+import { classifyIncident } from "@/lib/agents/incidents";
 import { nowIso } from "@/lib/agents/time";
 import type {
   AgentBrief,
   AgentIncident,
-  AgentIncidentCategory,
   AgentRunnerResult,
   EngineeringTask,
 } from "@/lib/agents/types";
 
-function likelyFilesForCategory(category: AgentIncidentCategory): string[] {
-  switch (category) {
-    case "SCORING":
-      return [
-        "app/api/ai/score/drain/route.ts",
-        "lib/aiScoring.ts",
-        "lib/ai/scoreDrainApply.ts",
-      ];
-    case "SCANNER":
-      return [
-        "app/api/readiness/route.ts",
-        "app/api/ops/status/route.ts",
-        "lib/funnelRedis.ts",
-      ];
-    case "AUTO_ENTRY":
-      return [
-        "app/api/auto-entry/execute/route.ts",
-        "lib/autoEntry/engine.ts",
-        "lib/autoEntry/guardrails.ts",
-      ];
-    case "TRADES":
-      return [
-        "app/api/trades/approve/route.ts",
-        "lib/tradesStore.ts",
-        "lib/trades/canonical.ts",
-      ];
+// ---------------------------------------------------------------------------
+// Task builders — incident-specific, rich context
+// ---------------------------------------------------------------------------
+
+function buildTaskTitle(incident: AgentIncident): string {
+  switch (incident.category) {
     case "BROKER_SYNC":
-      return [
-        "app/api/maintenance/sync-broker-state/route.ts",
-        "lib/broker/truth.ts",
-        "lib/alpacaClock.ts",
-      ];
-    case "NEWS":
-      return [
-        "lib/agents/runners/policyNews.ts",
-        "lib/agents/store.ts",
-        "app/api/agents/state/route.ts",
-      ];
-    case "ENGINEERING":
-      return [
-        "lib/agents/runners/engineering.ts",
-        "app/api/agents/run/route.ts",
-        "components/AgentControlCard.tsx",
-      ];
-    case "UNKNOWN":
+      return "Investigate open-trade mismatch between broker and DB";
+    case "SCORING":
+      return "Investigate scoring pipeline stall";
+    case "SCANNER":
+      return "Investigate stale scanner during market window";
+    case "AUTO_ENTRY":
+      return "Investigate auto-entry disabled / blocked";
+    case "TRADES":
+      return "Investigate trade lifecycle anomaly";
     default:
-      return [
-        "app/api/ops/status/route.ts",
-        "lib/agents/store.ts",
-        "app/api/agents/run/route.ts",
-      ];
+      return `Investigate ${incident.category.toLowerCase()} incident`;
   }
 }
 
-function openEngineeringTaskForIncident(tasks: EngineeringTask[], incidentId: string): EngineeringTask | null {
+function buildCopilotPrompt(incident: AgentIncident, classification: ReturnType<typeof classifyIncident>): string {
+  if (incident.category === "BROKER_SYNC") {
+    return (
+      `Incident ${incident.id} — BROKER_SYNC mismatch detected in the Cecil Trading App.\n\n` +
+      `Observed: ${incident.summary}\n\n` +
+      `Root cause hypothesis: ${classification.likelyRootCause}\n\n` +
+      `Review these files first:\n` +
+      classification.likelyFiles.map((f) => `  - ${f}`).join("\n") + "\n\n" +
+      `Key questions:\n` +
+      `  1. Are there DB trades with status=OPEN that are not in Alpaca positions?\n` +
+      `  2. Does reconcileOpenTrades correctly close/sync them?\n` +
+      `  3. Does lib/trades/operational.ts countOperationalOpenTickers exclude CLOSED/ARCHIVED trades?\n` +
+      `  4. Does fetchBrokerTruth return accurate positionsCount?\n\n` +
+      `Apply the smallest safe fix. Preserve scan -> signals -> scoring -> auto-entry behavior.`
+    );
+  }
+  if (incident.category === "SCORING") {
+    return (
+      `Incident ${incident.id} — SCORING stall detected in the Cecil Trading App.\n\n` +
+      `Observed: ${incident.summary}\n\n` +
+      `Root cause hypothesis: ${classification.likelyRootCause}\n\n` +
+      `Review these files first:\n` +
+      classification.likelyFiles.map((f) => `  - ${f}`).join("\n") + "\n\n" +
+      `Key questions:\n` +
+      `  1. Is the score drain route being invoked on schedule?\n` +
+      `  2. Is there an AI quota or timeout issue?\n` +
+      `  3. Are signals stuck in PENDING/SCORING status?\n\n` +
+      `Apply the smallest safe fix. Do not modify broker execution logic.`
+    );
+  }
+  if (incident.category === "AUTO_ENTRY") {
+    return (
+      `Incident ${incident.id} — AUTO_ENTRY disabled in the Cecil Trading App.\n\n` +
+      `Observed: ${incident.summary}\n\n` +
+      `Root cause hypothesis: ${classification.likelyRootCause}\n\n` +
+      `Review these files first:\n` +
+      classification.likelyFiles.map((f) => `  - ${f}`).join("\n") + "\n\n" +
+      `Key questions:\n` +
+      `  1. What guardrail or toggle caused the disable?\n` +
+      `  2. Is there a daily loss limit active?\n` +
+      `  3. What are the safe reset conditions?\n\n` +
+      `Do not auto-reset without verifying root cause. Preserve all execution guards.`
+    );
+  }
+  const likelyFilesText = classification.likelyFiles.map((f) => `  - ${f}`).join("\n");
   return (
-    tasks.find(
-      (task) =>
-        task.incidentId === incidentId &&
-        (task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW")
-    ) ?? null
+    `Incident ${incident.id} (${incident.category}) in the Cecil Trading App.\n\n` +
+    `Observed: ${incident.summary}\n\n` +
+    `Root cause hypothesis: ${classification.likelyRootCause}\n\n` +
+    `Review these files first:\n${likelyFilesText}\n\n` +
+    `Apply the smallest safe fix. Preserve scan -> signals -> scoring -> auto-entry behavior.`
+  );
+}
+
+function buildSmokeTestBlock(incident: AgentIncident): string {
+  const common = `npm run build\nnpm run test -- --runInBand`;
+  if (incident.category === "BROKER_SYNC") {
+    return (
+      `${common}\n` +
+      `# Then verify:\n` +
+      `# GET /api/agents/run?agent=ops\n` +
+      `# GET /api/agents/incidents\n` +
+      `# GET /api/ops/status   (check broker.positionsCount vs trades.operationalOpen)\n` +
+      `# GET /api/readiness    (verify open-trade mismatch cleared)\n` +
+      `# POST /api/maintenance/reconcile-open-trades  (dry-run first)`
+    );
+  }
+  if (incident.category === "SCORING") {
+    return (
+      `${common}\n` +
+      `# Then verify:\n` +
+      `# GET /api/agents/run?agent=ops\n` +
+      `# GET /api/readiness\n` +
+      `# GET /api/ops/status   (check scoring.age, signals pipeline)`
+    );
+  }
+  return (
+    `${common}\n` +
+    `# Then verify:\n` +
+    `# GET /api/agents/run?agent=ops\n` +
+    `# GET /api/agents/incidents\n` +
+    `# GET /api/readiness`
   );
 }
 
 function buildTask(incident: AgentIncident, now: string): EngineeringTask {
-  const likelyFiles = likelyFilesForCategory(incident.category);
-  const title = `Investigate ${incident.category.toLowerCase()} incident`;
-  const summary = `${incident.severity} incident from ${incident.source}: ${incident.title}. ${incident.summary}`;
-  const commitSummary = `agent: address ${incident.category.toLowerCase()} incident`;
+  const classification = classifyIncident(incident);
+  const title = buildTaskTitle(incident);
+  const summary =
+    `[${incident.severity}][${incident.category}] ${incident.title}. ` +
+    `${incident.summary} ` +
+    `Recommended next action: ${classification.recommendedNextAction}`;
+  const commitSummary = `agent: investigate ${incident.category.toLowerCase()} incident`;
 
   return {
     id: crypto.randomUUID(),
@@ -93,13 +138,22 @@ function buildTask(incident: AgentIncident, now: string): EngineeringTask {
     status: "OPEN",
     title,
     summary,
-    likelyFiles,
-    copilotPrompt: `Investigate incident ${incident.id} (${incident.category}) in the Cecil Trading App. Review ${likelyFiles.join(", ")} first, explain the likely fault, apply the smallest safe fix, and preserve existing scan -> signals -> scoring -> auto-entry behavior.`,
-    smokeTestBlock: `npm run build\nnpm run test -- --runInBand`,
+    likelyFiles: classification.likelyFiles,
+    copilotPrompt: buildCopilotPrompt(incident, classification),
+    smokeTestBlock: buildSmokeTestBlock(incident),
     gitBlock: `git add -A && git commit -m "${commitSummary}" && git push`,
     incidentId: incident.id,
+    incidentCategory: incident.category,
+    likelyRootCause: classification.likelyRootCause,
+    recommendedNextAction: classification.recommendedNextAction,
+    remediationAttempted: false,
+    remediationStatus: "none",
   };
 }
+
+// ---------------------------------------------------------------------------
+// Runner
+// ---------------------------------------------------------------------------
 
 export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
   const now = nowIso();
@@ -107,30 +161,52 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
   const incidents = await listAgentIncidents(50);
   const tasks = await listEngineeringTasks(50);
 
+  // Find the highest-priority incident that needs a task: OPEN or MONITORING,
+  // HIGH or MEDIUM severity, not yet linked to an open engineering task.
   const candidate = incidents.find(
     (incident) =>
-      incident.status === "OPEN" &&
+      (incident.status === "OPEN" || incident.status === "MONITORING") &&
       (incident.severity === "HIGH" || incident.severity === "MEDIUM") &&
-      !openEngineeringTaskForIncident(tasks, incident.id)
+      !tasks.find(
+        (task) =>
+          task.incidentId === incident.id &&
+          (task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW"),
+      ),
   );
 
-  const createdTask = candidate ? await appendEngineeringTask(buildTask(candidate, now)) : null;
-  const openTasks = tasks.filter((task) => task.status !== "DONE");
-  const taskSummary = createdTask
-    ? `Created engineering task for incident ${candidate?.id}.`
+  let createdTaskId: string | null = null;
+  let upsertCreated = false;
+
+  if (candidate) {
+    const upsertResult = await upsertEngineeringTask(buildTask(candidate, now));
+    createdTaskId = upsertResult.created ? upsertResult.task.id : null;
+    upsertCreated = upsertResult.created;
+  }
+
+  const openTasks = tasks.filter(
+    (task) => task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW",
+  );
+  const openTaskCount = openTasks.length + (upsertCreated ? 1 : 0);
+
+  const taskSummary = upsertCreated
+    ? `Created engineering task "${buildTaskTitle(candidate!)}" for incident ${candidate!.id}.`
     : "No new engineering task was needed.";
+
+  const latestTask = upsertCreated && candidate
+    ? buildTaskTitle(candidate)
+    : (openTasks[0]?.title ?? currentState.latestEngineeringTaskTitle ?? null);
 
   const brief: AgentBrief = {
     id: crypto.randomUUID(),
     agent: "engineering",
     briefType: "STATUS",
     createdAt: now,
-    title: createdTask ? "Engineering task queued" : "Engineering backlog unchanged",
-    summary: `${taskSummary} Open tasks: ${createdTask ? openTasks.length + 1 : openTasks.length}.`,
+    title: upsertCreated ? "Engineering task queued" : "Engineering backlog unchanged",
+    summary: `${taskSummary} Open tasks: ${openTaskCount}.`,
     details: {
-      createdTaskId: createdTask?.id ?? null,
+      createdTaskId,
       candidateIncidentId: candidate?.id ?? null,
-      openTaskCount: createdTask ? openTasks.length + 1 : openTasks.length,
+      openTaskCount,
     },
   };
 
@@ -140,7 +216,9 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     ...currentState,
     asOf: now,
     latestBriefId: brief.id,
-    latestEngineeringTaskId: createdTask?.id ?? currentState.latestEngineeringTaskId ?? null,
+    latestEngineeringTaskId: createdTaskId ?? currentState.latestEngineeringTaskId ?? null,
+    latestEngineeringTaskTitle: latestTask,
+    openEngineeringTaskCount: openTaskCount,
     updatedBy: "engineering",
   });
 
@@ -152,7 +230,7 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     status: "APPLIED",
     summary: taskSummary,
     metadata: {
-      createdTaskId: createdTask?.id ?? null,
+      createdTaskId,
       incidentId: candidate?.id ?? null,
     },
   });
@@ -162,7 +240,7 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     state: savedState,
     briefId: brief.id,
     actionId: action.id,
-    engineeringTaskId: createdTask?.id ?? null,
+    engineeringTaskId: createdTaskId,
     summary: brief.summary,
   };
 }

@@ -33,6 +33,7 @@ import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { buildAutoEntryFunnelFields } from "./funnel";
 import { isOperationallyOpenTrade } from "@/lib/trades/operational";
 import { buildOpenOrdersBySymbol, planConservativeReplacement } from "@/lib/autoManage/reliability";
+import { readExecutionOverlays, type ExecutionOverlays } from "@/lib/agents/overlays";
 
 async function bumpAutoEntryFunnelSafe(fields: Record<string, number | undefined>) {
   if (!fields || Object.keys(fields).length === 0) return;
@@ -693,10 +694,11 @@ export async function POST(req: Request) {
     } catch {}
     return String(process.env.VERCEL_URL || "unknown-host");
   })();
-  const [guardState, toggleState, brokerTruth] = await Promise.all([
+  const [guardState, toggleState, brokerTruth, overlay] = await Promise.all([
     guardrailsStore.getGuardrailsState(etDate),
     guardrailsStore.getAutoEntryEnabledState(guardConfig),
     fetchBrokerTruth(),
+    readExecutionOverlays(),
   ]);
 
   let marketOpen = true;
@@ -1182,6 +1184,37 @@ export async function POST(req: Request) {
     );
   }
 
+  // Overlay: maxEntriesOverride tightens (never loosens) the per-day entry cap
+  if (overlay.maxEntriesOverride != null && guardState.entriesToday >= overlay.maxEntriesOverride) {
+    counts.skipped += 1;
+    await recordOutcome({ outcome: "SKIP", reason: "overlay_max_entries_override" });
+    return NextResponse.json(
+      {
+        ok: true,
+        skipped: true,
+        reason: "overlay_max_entries_override",
+        detail: `overlay cap is ${overlay.maxEntriesOverride}, entries today: ${guardState.entriesToday}`,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        openPositionsCount: brokerTruth.positionsCount,
+        maxOpenPositions: guardConfig.maxOpenPositions,
+        entriesToday: guardState.entriesToday,
+        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+        pendingCount: counts.pendingCount,
+        eligibleCount: counts.eligibleCount,
+        executedCount: counts.executed,
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+        overlay: {
+          posture: overlay.posture,
+          maxEntriesOverride: overlay.maxEntriesOverride,
+          stateAvailable: overlay.stateAvailable,
+        },
+      },
+      { status: 200 }
+    );
+  }
+
   const sinceLoss = minutesSince(guardState.lastLossAt);
   if (sinceLoss != null && sinceLoss < guardConfig.cooldownAfterLossMin) {
     const minsRemaining = Math.ceil(guardConfig.cooldownAfterLossMin - sinceLoss);
@@ -1238,6 +1271,97 @@ export async function POST(req: Request) {
   const trade = trades[idx];
   const ticker = String(trade.ticker || "").toUpperCase();
   const side = String(trade.side || "LONG").toUpperCase();
+
+  // Overlay: grade and score checks against the selected trade
+  {
+    const tradeScore = typeof trade?.aiScore === "number" && Number.isFinite(trade.aiScore) ? trade.aiScore : null;
+    const tradeTier = (tierForScore(tradeScore ?? 0) || trade?.tier || "C") as string;
+    const gradeAllowed = overlay.allowedGrades.includes(tradeTier as "A" | "B" | "C");
+
+    if (!gradeAllowed) {
+      counts.skipped += 1;
+      await recordOutcome({
+        outcome: "SKIP",
+        reason: "overlay_grade_excluded",
+        ticker,
+        tradeId: String(trade?.id || ""),
+        detail: `grade ${tradeTier} not in overlay allowedGrades [${overlay.allowedGrades.join(",")}]`,
+      });
+      return NextResponse.json(
+        {
+          ok: true,
+          skipped: true,
+          reason: "overlay_grade_excluded",
+          detail: `grade ${tradeTier} not in overlay allowedGrades [${overlay.allowedGrades.join(",")}]`,
+          market: { isOpen: marketOpen, timestamp: marketTimestamp },
+          openPositionsCount: brokerTruth.positionsCount,
+          maxOpenPositions: guardConfig.maxOpenPositions,
+          entriesToday: guardState.entriesToday,
+          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+          pendingCount: counts.pendingCount,
+          eligibleCount: counts.eligibleCount,
+          executedCount: counts.executed,
+          counts,
+          notes: notes.slice(0, 40),
+          guardrails: guardSummary,
+          overlay: {
+            posture: overlay.posture,
+            allowedGrades: overlay.allowedGrades,
+            minScoreAdjustment: overlay.minScoreAdjustment,
+            stateAvailable: overlay.stateAvailable,
+          },
+        },
+        { status: 200 }
+      );
+    }
+
+    if (overlay.minScoreAdjustment !== 0 && tradeScore != null) {
+      // Determine the base threshold for this tier
+      const autoConfig = getAutoConfig();
+      const baseTierMin =
+        tradeTier === "A" ? autoConfig.tierAmin :
+        tradeTier === "B" ? autoConfig.tierBmin :
+        autoConfig.tierCmin;
+      const effectiveTierMin = baseTierMin + overlay.minScoreAdjustment;
+
+      if (tradeScore < effectiveTierMin) {
+        counts.skipped += 1;
+        await recordOutcome({
+          outcome: "SKIP",
+          reason: "overlay_score_below_adjusted_threshold",
+          ticker,
+          tradeId: String(trade?.id || ""),
+          detail: `score ${tradeScore} < adjusted threshold ${effectiveTierMin} (base ${baseTierMin} + adj ${overlay.minScoreAdjustment})`,
+        });
+        return NextResponse.json(
+          {
+            ok: true,
+            skipped: true,
+            reason: "overlay_score_below_adjusted_threshold",
+            detail: `score ${tradeScore} < adjusted threshold ${effectiveTierMin}`,
+            market: { isOpen: marketOpen, timestamp: marketTimestamp },
+            openPositionsCount: brokerTruth.positionsCount,
+            maxOpenPositions: guardConfig.maxOpenPositions,
+            entriesToday: guardState.entriesToday,
+            maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+            pendingCount: counts.pendingCount,
+            eligibleCount: counts.eligibleCount,
+            executedCount: counts.executed,
+            counts,
+            notes: notes.slice(0, 40),
+            guardrails: guardSummary,
+            overlay: {
+              posture: overlay.posture,
+              allowedGrades: overlay.allowedGrades,
+              minScoreAdjustment: overlay.minScoreAdjustment,
+              stateAvailable: overlay.stateAvailable,
+            },
+          },
+          { status: 200 }
+        );
+      }
+    }
+  }
 
   const autoManageCfg = getAutoManageConfig();
   const brokerPositionsBySymbol = new Map<string, any>(

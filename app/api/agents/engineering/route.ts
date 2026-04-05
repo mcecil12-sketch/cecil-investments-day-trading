@@ -14,8 +14,15 @@ export async function GET(req: Request) {
   const limitParam = Number(url.searchParams.get("limit") ?? "25");
   const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(100, Math.floor(limitParam)) : 25;
 
+  const tasks = await listEngineeringTasks(limit);
+  const openTasks = tasks.filter(
+    (task) =>
+      task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW",
+  );
+
   return NextResponse.json({
     ok: true,
-    tasks: await listEngineeringTasks(limit),
+    tasks,
+    openTasks,
   });
 }

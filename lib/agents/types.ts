@@ -58,6 +58,11 @@ export interface AgentState {
   };
   latestBriefId?: string | null;
   latestEngineeringTaskId?: string | null;
+  latestEngineeringTaskTitle?: string | null;
+  remediationSummary?: string;
+  lastRemediationAt?: string | null;
+  openIncidentCategories?: AgentIncidentCategory[];
+  openEngineeringTaskCount?: number;
   updatedBy: AgentName | "system";
 }
 
@@ -110,6 +115,11 @@ export interface EngineeringTask {
   smokeTestBlock: string;
   gitBlock: string;
   incidentId?: string | null;
+  incidentCategory?: AgentIncidentCategory;
+  likelyRootCause?: string;
+  recommendedNextAction?: string;
+  remediationAttempted?: boolean;
+  remediationStatus?: "none" | "attempted" | "succeeded" | "failed";
 }
 
 export interface AgentRunnerResult {

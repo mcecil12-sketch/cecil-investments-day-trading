@@ -3,6 +3,7 @@ import { readTrades, upsertTrade } from "@/lib/tradesStore";
 import { getAutoConfig, tierForScore } from "@/lib/autoEntry/config";
 import { deriveSessionMeta } from "@/lib/autoEntry/eligibility";
 import { getEtDateString } from "@/lib/time/etDate";
+import { readExecutionOverlays } from "@/lib/agents/overlays";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -102,10 +103,17 @@ export async function POST(req: NextRequest) {
 
   const today = getEtDateString();
 
-  const [signals, trades] = await Promise.all([
+  const [signals, trades, overlay] = await Promise.all([
     fetchScoredSignalsFromInternalApi(),
     readTrades<any>(),
+    readExecutionOverlays(),
   ]);
+
+  // Effective limit: honor maxEntriesOverride when it tightens the requested limit
+  const effectiveLimit =
+    overlay.maxEntriesOverride != null && overlay.maxEntriesOverride >= 0
+      ? Math.min(limit, overlay.maxEntriesOverride)
+      : limit;
 
   const existingBySignalId = new Set<string>();
   const existingPendingBySymbolSide = new Set<string>();
@@ -156,8 +164,12 @@ export async function POST(req: NextRequest) {
     }
 
     const aiScore = getNum(s, ["aiScore", "score"]);
-    if (aiScore == null || aiScore < minScore) {
-      skipped.push({ symbol, reason: "below_minScore" });
+    const effectiveMinScore = minScore + overlay.minScoreAdjustment;
+    if (aiScore == null || aiScore < effectiveMinScore) {
+      skipped.push({
+        symbol,
+        reason: overlay.minScoreAdjustment !== 0 ? "below_overlay_adjusted_minScore" : "below_minScore",
+      });
       continue;
     }
 
@@ -178,7 +190,7 @@ export async function POST(req: NextRequest) {
     seenCandidateSymbolSide.add(symbolSide);
     totalCandidates += 1;
 
-    if (created.length >= limit) {
+    if (created.length >= effectiveLimit) {
       skipped.push({ symbol, reason: "limit_reached" });
       continue;
     }
@@ -198,6 +210,12 @@ export async function POST(req: NextRequest) {
     const tier = tierForScore(aiScore) || "C";
     if (tier === "C" && !cfg.allowedTiers.includes("C")) {
       skipped.push({ symbol, reason: "tier_c_disabled" });
+      continue;
+    }
+
+    // Overlay grade filter: PM/Risk may restrict to A-only or A/B-only
+    if (!overlay.allowedGrades.includes(tier as "A" | "B" | "C")) {
+      skipped.push({ symbol, reason: "overlay_grade_excluded", grade: tier, allowedGrades: overlay.allowedGrades });
       continue;
     }
 
@@ -246,13 +264,22 @@ export async function POST(req: NextRequest) {
       ok: true,
       today,
       limit,
+      effectiveLimit,
       minScore,
       totalSignals: (signals || []).length,
       totalCandidates,
       createdCount: created.length,
       skippedCount: skipped.length,
+      skippedByOverlayCount: skipped.filter((s) => s.reason === "overlay_grade_excluded" || s.reason === "below_overlay_adjusted_minScore").length,
       created,
       skipped: skipped.slice(0, 50),
+      overlay: {
+        posture: overlay.posture,
+        allowedGrades: overlay.allowedGrades,
+        minScoreAdjustment: overlay.minScoreAdjustment,
+        maxEntriesOverride: overlay.maxEntriesOverride,
+        stateAvailable: overlay.stateAvailable,
+      },
     },
     { status: 200 }
   );

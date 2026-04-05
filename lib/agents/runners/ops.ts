@@ -6,22 +6,29 @@ import {
   listOpenIncidents,
   readAgentStateSnapshot,
   resolveIncident,
+  updateIncidentById,
   upsertIncident,
   writeAgentState,
 } from "@/lib/agents/store";
 import { readAgentTelemetrySnapshot } from "@/lib/agents/sources";
-import type { AgentBrief, AgentRunnerResult } from "@/lib/agents/types";
+import {
+  executeRemediationForIncident,
+  isRemediationOnCooldown,
+} from "@/lib/agents/remediation";
+import type { AgentBrief, AgentIncidentCategory, AgentRunnerResult } from "@/lib/agents/types";
 import { nowIso } from "@/lib/agents/time";
 
-function summarizeOps(snapshot: AgentStateSnapshot, actionCount: number, telemetry: Awaited<ReturnType<typeof readAgentTelemetrySnapshot>>): string {
+function summarizeOps(
+  snapshot: AgentStateSnapshot,
+  actionCount: number,
+  telemetry: Awaited<ReturnType<typeof readAgentTelemetrySnapshot>>,
+): string {
   if (snapshot.source === "invalid") {
     return "State storage looked malformed. Logged a low-severity ops incident for follow-up.";
   }
-
   if (!telemetry.readinessReady) {
     return `Ops detected issues: ${telemetry.readinessReasons.join("; ")}.`;
   }
-
   return `Scoring healthy; ${telemetry.signalsScoredCount} scored / ${telemetry.signalsPendingCount} pending in recent window across ${actionCount} recent control-plane actions.`;
 }
 
@@ -31,6 +38,8 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
   const telemetry = await readAgentTelemetrySnapshot();
   const actions = await listAgentActions(50);
   let createdIncidentId: string | null = null;
+
+  // ------- Incident upsert / resolve cycle -------
 
   if (snapshot.source === "invalid") {
     const { incident } = await upsertIncident({
@@ -57,7 +66,7 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
   } else {
     await resolveIncident(
       { category: "SCORING", title: "Scoring stale while pending backlog exists" },
-      "Scoring returned to healthy cadence."
+      "Scoring returned to healthy cadence.",
     );
   }
 
@@ -74,7 +83,7 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
   } else {
     await resolveIncident(
       { category: "SCANNER", title: "Scanner stale during market window" },
-      "Scanner freshness recovered."
+      "Scanner freshness recovered.",
     );
   }
 
@@ -89,9 +98,13 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
     });
     if (result.created && !createdIncidentId) createdIncidentId = result.incident.id;
   } else {
-    await resolveIncident({ category: "AUTO_ENTRY", title: "Auto-entry disabled" }, "Auto-entry enabled again.");
+    await resolveIncident(
+      { category: "AUTO_ENTRY", title: "Auto-entry disabled" },
+      "Auto-entry enabled again.",
+    );
   }
 
+  let brokerSyncIncidentId: string | null = null;
   if (telemetry.openTradeMismatch) {
     const result = await upsertIncident({
       severity: "MEDIUM",
@@ -101,24 +114,116 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
       summary: `Broker positions=${telemetry.brokerPositionsCount}, DB operational open=${telemetry.dbOperationalOpenCount}.`,
       notes: telemetry.readinessReasons,
     });
+    brokerSyncIncidentId = result.incident.id;
     if (result.created && !createdIncidentId) createdIncidentId = result.incident.id;
   } else {
-    await resolveIncident({ category: "BROKER_SYNC", title: "Open trade mismatch" }, "Broker/DB counts aligned.");
+    await resolveIncident(
+      { category: "BROKER_SYNC", title: "Open trade mismatch" },
+      "Broker/DB counts aligned.",
+    );
   }
+
+  // ------- Bounded remediation: BROKER_SYNC only -------
+
+  let remediationSummary: string | undefined;
+  let lastRemediationAt: string | null = null;
+
+  if (
+    brokerSyncIncidentId !== null &&
+    telemetry.openTradeMismatch
+  ) {
+    const openIncidentsSnapshot = await listOpenIncidents(50);
+    const brokerIncident = openIncidentsSnapshot.find((inc) => inc.id === brokerSyncIncidentId);
+
+    // Only attempt for OPEN incidents — MONITORING means we already tried
+    if (brokerIncident && brokerIncident.status === "OPEN") {
+      if (!isRemediationOnCooldown(brokerSyncIncidentId, actions)) {
+        // Record attempt
+        await appendAgentAction({
+          id: crypto.randomUUID(),
+          createdAt: now,
+          agent: "ops",
+          actionType: "REMEDIATION_ATTEMPTED",
+          status: "APPLIED",
+          summary: `Attempting broker sync reconcile for incident ${brokerSyncIncidentId}.`,
+          metadata: { incidentId: brokerSyncIncidentId, category: "BROKER_SYNC" },
+        });
+
+        const remediation = await executeRemediationForIncident(brokerIncident, telemetry);
+        remediationSummary = remediation.summary;
+        lastRemediationAt = now;
+
+        if (remediation.attempted && remediation.success) {
+          await appendAgentAction({
+            id: crypto.randomUUID(),
+            createdAt: now,
+            agent: "ops",
+            actionType: "REMEDIATION_SUCCEEDED",
+            status: "APPLIED",
+            summary: remediation.summary,
+            metadata: { incidentId: brokerSyncIncidentId, ...remediation.detail },
+          });
+          // Transition incident to MONITORING — let the next run confirm resolution
+          await updateIncidentById(
+            brokerSyncIncidentId,
+            { status: "MONITORING" },
+            `Ops agent applied reconcile: ${remediation.summary}`,
+          );
+          await appendAgentAction({
+            id: crypto.randomUUID(),
+            createdAt: now,
+            agent: "ops",
+            actionType: "INCIDENT_MONITORING",
+            status: "APPLIED",
+            summary: `Incident ${brokerSyncIncidentId} transitioned to MONITORING after remediation.`,
+            metadata: { incidentId: brokerSyncIncidentId },
+          });
+        } else if (remediation.attempted && !remediation.success) {
+          await appendAgentAction({
+            id: crypto.randomUUID(),
+            createdAt: now,
+            agent: "ops",
+            actionType: "REMEDIATION_FAILED",
+            status: "FAILED",
+            summary: remediation.summary,
+            metadata: {
+              incidentId: brokerSyncIncidentId,
+              error: remediation.error,
+              ...remediation.detail,
+            },
+          });
+        }
+      } else {
+        remediationSummary = `Broker sync remediation on cooldown for incident ${brokerSyncIncidentId}.`;
+      }
+    }
+  }
+
+  // ------- Compile open incident categories for state -------
 
   const openIncidents = await listOpenIncidents(50);
   const activeIncidentCount = openIncidents.length;
+  const openIncidentCategories = Array.from(
+    new Set(openIncidents.map((inc) => inc.category)),
+  ) as AgentIncidentCategory[];
+
+  // ------- Brief -------
+
   const brief: AgentBrief = {
     id: crypto.randomUUID(),
     agent: "ops",
     briefType: "STATUS",
     createdAt: now,
-    title: activeIncidentCount === 0 ? "Ops healthy" : `Ops tracking ${activeIncidentCount} incident${activeIncidentCount === 1 ? "" : "s"}`,
+    title:
+      activeIncidentCount === 0
+        ? "Ops healthy"
+        : `Ops tracking ${activeIncidentCount} incident${activeIncidentCount === 1 ? "" : "s"}`,
     summary: summarizeOps(snapshot, actions.length, telemetry),
     details: {
       stateSource: snapshot.source,
       activeIncidentCount,
       recentActionCount: actions.length,
+      remediationSummary: remediationSummary ?? null,
       telemetry,
     },
   };
@@ -129,6 +234,9 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
     ...snapshot.state,
     asOf: now,
     activeIncidentCount,
+    openIncidentCategories,
+    remediationSummary,
+    lastRemediationAt,
     telemetry: {
       readinessReady: telemetry.readinessReady,
       readinessReasons: telemetry.readinessReasons,
@@ -156,6 +264,7 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
     metadata: {
       stateSource: snapshot.source,
       createdIncidentId,
+      remediationSummary: remediationSummary ?? null,
       telemetry,
     },
   });

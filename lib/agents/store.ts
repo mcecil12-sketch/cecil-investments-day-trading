@@ -165,6 +165,24 @@ function normalizeState(raw: unknown): AgentState | null {
     latestBriefId: typeof candidate.latestBriefId === "string" ? candidate.latestBriefId : null,
     latestEngineeringTaskId:
       typeof candidate.latestEngineeringTaskId === "string" ? candidate.latestEngineeringTaskId : null,
+    latestEngineeringTaskTitle:
+      typeof candidate.latestEngineeringTaskTitle === "string"
+        ? candidate.latestEngineeringTaskTitle
+        : null,
+    remediationSummary:
+      typeof candidate.remediationSummary === "string" ? candidate.remediationSummary : undefined,
+    lastRemediationAt:
+      typeof candidate.lastRemediationAt === "string" ? candidate.lastRemediationAt : null,
+    openIncidentCategories: Array.isArray(candidate.openIncidentCategories)
+      ? (candidate.openIncidentCategories.filter(
+          (c): c is AgentIncidentCategory => typeof c === "string",
+        ) as AgentIncidentCategory[])
+      : undefined,
+    openEngineeringTaskCount:
+      typeof candidate.openEngineeringTaskCount === "number" &&
+      Number.isFinite(candidate.openEngineeringTaskCount)
+        ? Math.max(0, Math.floor(candidate.openEngineeringTaskCount))
+        : undefined,
     updatedBy,
   };
 }
@@ -414,7 +432,8 @@ export async function upsertIncident(
           : current.severity,
       summary: incident.summary,
       notes: mergeNotes(current.notes, incident.notes),
-      status: incident.status ?? "OPEN",
+      // Preserve MONITORING status unless an explicit override is provided
+      status: incident.status ?? (current.status === "MONITORING" ? "MONITORING" : "OPEN"),
     };
     const withoutCurrent = history.filter((_, rowIndex) => rowIndex !== idx);
     const next = [merged, ...withoutCurrent];
@@ -474,4 +493,56 @@ export async function listEngineeringTasks(limit = 25): Promise<EngineeringTask[
 
 export async function appendEngineeringTask(task: EngineeringTask): Promise<EngineeringTask> {
   return appendHistory(AGENT_ENGINEERING_KEY, normalizeEngineeringTask(task), HISTORY_LIMIT);
+}
+
+export async function findOpenEngineeringTaskByIncident(
+  incidentId: string,
+): Promise<EngineeringTask | null> {
+  const tasks = await listEngineeringTasks(HISTORY_LIMIT);
+  return (
+    tasks.find(
+      (task) =>
+        task.incidentId === incidentId &&
+        (task.status === "OPEN" ||
+          task.status === "IN_PROGRESS" ||
+          task.status === "READY_FOR_REVIEW"),
+    ) ?? null
+  );
+}
+
+export async function upsertEngineeringTask(
+  task: EngineeringTask,
+): Promise<{ task: EngineeringTask; created: boolean }> {
+  if (task.incidentId) {
+    const existing = await findOpenEngineeringTaskByIncident(task.incidentId);
+    if (existing) {
+      return { task: existing, created: false };
+    }
+  }
+  const created = await appendEngineeringTask(task);
+  return { task: created, created: true };
+}
+
+export async function updateIncidentById(
+  id: string,
+  updates: Partial<Pick<AgentIncident, "status" | "severity" | "summary">>,
+  note?: string,
+): Promise<AgentIncident | null> {
+  const now = nowIso();
+  const history = await listAgentIncidents(HISTORY_LIMIT);
+  const idx = history.findIndex((inc) => inc.id === id);
+  if (idx < 0) return null;
+
+  const current = history[idx];
+  const updated: AgentIncident = {
+    ...current,
+    ...updates,
+    updatedAt: now,
+    notes: mergeNotes(current.notes, note ? [note] : undefined),
+  };
+
+  const next = [...history];
+  next[idx] = normalizeIncidentRecord(updated);
+  await writeIncidentHistory(next);
+  return updated;
 }

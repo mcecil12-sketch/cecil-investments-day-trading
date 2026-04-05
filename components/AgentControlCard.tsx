@@ -134,6 +134,34 @@ export function AgentControlCard() {
         />
       </div>
 
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+        <DetailRow
+          label="Open incident categories"
+          value={
+            state?.openIncidentCategories?.length
+              ? state.openIncidentCategories.join(" / ")
+              : "None"
+          }
+        />
+        <DetailRow
+          label="Open engineering tasks"
+          value={String(state?.openEngineeringTaskCount ?? 0)}
+        />
+        <DetailRow
+          label="Latest engineering task"
+          value={state?.latestEngineeringTaskTitle ?? "None"}
+        />
+      </div>
+
+      {state?.remediationSummary && (
+        <div className="rounded-xl border border-[var(--ci-border)] bg-black/20 px-4 py-3 space-y-1">
+          <div className="text-[10px] uppercase tracking-wide text-[var(--ci-text-muted)]">
+            Latest remediation
+          </div>
+          <div className="text-xs text-neutral-200">{state.remediationSummary}</div>
+        </div>
+      )}
+
       <div className="rounded-xl border border-[var(--ci-border)] bg-black/20 px-4 py-3 space-y-1">
         <div className="text-[10px] uppercase tracking-wide text-[var(--ci-text-muted)]">
           Latest brief
