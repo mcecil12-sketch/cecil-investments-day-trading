@@ -2,11 +2,15 @@ import {
   appendAgentAction,
   appendAgentBrief,
   getOpenBacklogItems,
+  listEngineeringTasks,
   listBacklogItems,
   readAgentState,
+  updateEngineeringTaskById,
   writeAgentState,
   writeBacklog,
 } from "@/lib/agents/store";
+import { prepareExecutionPlan } from "@/lib/agents/execution/engine";
+import { approveExecution } from "@/lib/agents/governance/manager";
 import { nowIso } from "@/lib/agents/time";
 import type { AgentBrief, AgentRunnerResult, BacklogItem } from "@/lib/agents/types";
 
@@ -72,6 +76,60 @@ export async function runEngineeringManagerAgent(_context?: unknown): Promise<Ag
     await writeBacklog([...backlog, ...newItems]);
   }
 
+  const engineeringTasks = await listEngineeringTasks(200);
+  let newlyReadyCount = 0;
+  let newlyBlockedCount = 0;
+  let latestExecutionReadyTitle: string | null = null;
+  let latestExecutionStatus: "READY_FOR_EXECUTION" | "READY_FOR_PUSH" | "BLOCKED" | null = null;
+
+  for (const task of engineeringTasks) {
+    if (task.status !== "OPEN" && task.status !== "IN_PROGRESS") continue;
+
+    const approval = approveExecution(task);
+    if (!approval.ok) {
+      if (task.executionStatus !== "BLOCKED" || task.executionError !== approval.reason) {
+        await updateEngineeringTaskById(task.id, {
+          status: "BLOCKED",
+          executionStatus: "BLOCKED",
+          executionError: approval.reason,
+          notes: [...(task.notes ?? []), `Execution blocked: ${approval.reason}`].slice(-20),
+        });
+      }
+      newlyBlockedCount += 1;
+      if (!latestExecutionStatus) {
+        latestExecutionStatus = "BLOCKED";
+        latestExecutionReadyTitle = task.title;
+      }
+      continue;
+    }
+
+    const prepared = prepareExecutionPlan(task);
+    const needsUpdate =
+      task.executionStatus !== prepared.executionStatus ||
+      task.executionError != null ||
+      !task.patchPlan ||
+      !task.validationPlan ||
+      !task.commitPlan;
+
+    if (needsUpdate) {
+      await updateEngineeringTaskById(task.id, {
+        status: prepared.nextTaskStatus,
+        patchPlan: prepared.patchPlan,
+        validationPlan: prepared.validationPlan,
+        commitPlan: prepared.commitPlan,
+        executionStatus: prepared.executionStatus,
+        executionError: null,
+        notes: [...(task.notes ?? []), `Execution readiness prepared: ${prepared.nextTaskStatus}`].slice(-20),
+      });
+    }
+
+    newlyReadyCount += 1;
+    if (!latestExecutionStatus) {
+      latestExecutionStatus = prepared.nextTaskStatus;
+      latestExecutionReadyTitle = task.title;
+    }
+  }
+
   const refreshedBacklog = await listBacklogItems(200);
   const openBacklogCount = refreshedBacklog.filter((item) => item.status === "OPEN" || item.status === "READY").length;
   const inProgressBacklogCount = refreshedBacklog.filter((item) => item.status === "IN_PROGRESS").length;
@@ -93,6 +151,10 @@ export async function runEngineeringManagerAgent(_context?: unknown): Promise<Ag
     details: {
       created: newItems.length,
       ensured: tasksToEnsure.length,
+      openExecutionReadyCount: newlyReadyCount,
+      blockedTaskCount: newlyBlockedCount,
+      latestExecutionTaskTitle: latestExecutionReadyTitle,
+      latestExecutionStatus,
       openBacklogCount,
       inProgressBacklogCount,
       nextBacklogTitles,
@@ -105,9 +167,13 @@ export async function runEngineeringManagerAgent(_context?: unknown): Promise<Ag
     ...currentState,
     asOf: now,
     latestBriefId: brief.id,
+    openExecutionReadyCount: newlyReadyCount,
+    blockedTaskCount: newlyBlockedCount,
     openBacklogCount,
     inProgressBacklogCount,
     nextBacklogTitles,
+    latestExecutionTaskTitle: latestExecutionReadyTitle,
+    latestExecutionStatus,
     updatedBy: "engineering-manager",
   });
 
@@ -124,6 +190,10 @@ export async function runEngineeringManagerAgent(_context?: unknown): Promise<Ag
     metadata: {
       created: newItems.length,
       ensured: tasksToEnsure.length,
+      executionReadyCount: newlyReadyCount,
+      blockedTaskCount: newlyBlockedCount,
+      latestExecutionTaskTitle: latestExecutionReadyTitle,
+      latestExecutionStatus,
       titles: tasksToEnsure.map((task) => task.title),
     },
   });

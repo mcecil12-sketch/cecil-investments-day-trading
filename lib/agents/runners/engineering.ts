@@ -18,9 +18,77 @@ import { nowIso } from "@/lib/agents/time";
 import type {
   AgentBrief,
   AgentIncident,
+  CommitPlan,
   AgentRunnerResult,
   EngineeringTask,
+  PatchPlan,
+  ValidationPlan,
 } from "@/lib/agents/types";
+
+function uniqueFiles(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+function inferBacklogLikelyFiles(title: string, summary: string): string[] {
+  const text = `${title} ${summary}`.toLowerCase();
+  if (text.includes("zero-score") || text.includes("zero score")) {
+    return [
+      "app/api/ai/score/drain/route.ts",
+      "lib/aiScoring.ts",
+      "lib/aiQualify.ts",
+      "lib/funnelMetrics.ts",
+    ];
+  }
+  if (text.includes("determinism") || text.includes("deterministic") || text.includes("score")) {
+    return [
+      "app/api/ai/score/drain/route.ts",
+      "lib/aiScoring.ts",
+      "lib/aiMetrics.ts",
+      "lib/activity.ts",
+    ];
+  }
+  if (text.includes("qualification") || text.includes("qualify") || text.includes("threshold")) {
+    return [
+      "lib/aiQualify.ts",
+      "app/api/signals/route.ts",
+      "lib/funnelMetrics.ts",
+      "lib/activity.ts",
+    ];
+  }
+  return ["lib/agents/runners/engineering.ts", "lib/agents/store.ts"];
+}
+
+function buildPatchPlan(title: string, summary: string, likelyFiles: string[]): PatchPlan {
+  return {
+    mode: likelyFiles.length > 0 ? "GITHUB_COMMIT" : "PLACEHOLDER",
+    targetFiles: uniqueFiles(likelyFiles),
+    proposedChangesSummary: `${title}: ${summary}`,
+  };
+}
+
+function buildValidationPlan(likelyFiles: string[], smokeTestBlock: string): ValidationPlan {
+  const testCommands = [
+    "npm run test",
+  ];
+  const smokeChecks = smokeTestBlock
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("GET ") || line.startsWith("POST ") || line.startsWith("/api/"));
+
+  return {
+    buildRequired: likelyFiles.some((file) => file.startsWith("app/") || file.startsWith("components/")),
+    testCommands,
+    smokeChecks,
+  };
+}
+
+function buildCommitPlan(title: string): CommitPlan {
+  return {
+    commitMessage: `agent: ${title}`,
+    targetBranch: "main",
+    pushDirect: true,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Task builders — incident-specific, rich context
@@ -156,6 +224,8 @@ function buildTask(incident: AgentIncident, now: string): EngineeringTask {
     `${incident.summary} ` +
     `Recommended next action: ${classification.recommendedNextAction}`;
   const commitSummary = `agent: investigate ${incident.category.toLowerCase()} incident`;
+  const likelyFiles = uniqueFiles(classification.likelyFiles);
+  const smokeTestBlock = buildSmokeTestBlock(incident);
 
   return {
     id: crypto.randomUUID(),
@@ -164,9 +234,9 @@ function buildTask(incident: AgentIncident, now: string): EngineeringTask {
     status: "OPEN",
     title,
     summary,
-    likelyFiles: classification.likelyFiles,
+    likelyFiles,
     copilotPrompt: buildCopilotPrompt(incident, classification),
-    smokeTestBlock: buildSmokeTestBlock(incident),
+    smokeTestBlock,
     gitBlock: `git add -A && git commit -m "${commitSummary}" && git push`,
     incidentId: incident.id,
     incidentCategory: incident.category,
@@ -192,6 +262,11 @@ function buildTask(incident: AgentIncident, now: string): EngineeringTask {
         ? incident.summary
         : undefined,
     backlogItemId: null,
+    patchPlan: buildPatchPlan(title, summary, likelyFiles),
+    validationPlan: buildValidationPlan(likelyFiles, smokeTestBlock),
+    commitPlan: buildCommitPlan(title),
+    executionStatus: "PENDING",
+    executionError: null,
   };
 }
 
@@ -202,6 +277,7 @@ const STARTER_BACKLOG_ITEMS = [
     title: "Improve scoring determinism",
     summary: "Reduce non-deterministic score variance across repeated evaluations of the same signal batch.",
     assignedAgent: "engineering" as const,
+    likelyFiles: ["app/api/ai/score/drain/route.ts", "lib/aiScoring.ts", "lib/aiMetrics.ts"],
   },
   {
     type: "OPTIMIZATION" as const,
@@ -209,6 +285,7 @@ const STARTER_BACKLOG_ITEMS = [
     title: "Reduce zero-score fallbacks",
     summary: "Audit zero-score paths and add deterministic fallback handling where model scoring returns ambiguous output.",
     assignedAgent: "engineering" as const,
+    likelyFiles: ["app/api/ai/score/drain/route.ts", "lib/aiScoring.ts", "lib/aiQualify.ts"],
   },
   {
     type: "FEATURE" as const,
@@ -216,6 +293,7 @@ const STARTER_BACKLOG_ITEMS = [
     title: "Optimize signal qualification rate",
     summary: "Review qualification filters and telemetry to improve passing signal quality without increasing risk.",
     assignedAgent: "engineering" as const,
+    likelyFiles: ["lib/aiQualify.ts", "app/api/signals/route.ts", "lib/funnelMetrics.ts"],
   },
 ];
 
@@ -244,6 +322,8 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
       task.incidentCategory === "BROKER_SYNC" &&
       task.incidentId &&
       (task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW")
+      || task.status === "READY_FOR_EXECUTION"
+      || task.status === "READY_FOR_PUSH"
     ) {
       const linkedIncident = incidents.find((incident) => incident.id === task.incidentId);
       if (linkedIncident?.status === "RESOLVED") {
@@ -282,7 +362,13 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
       !tasks.find(
         (task) =>
           task.incidentId === incident.id &&
-          (task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW"),
+          (
+            task.status === "OPEN" ||
+            task.status === "IN_PROGRESS" ||
+            task.status === "READY_FOR_EXECUTION" ||
+            task.status === "READY_FOR_PUSH" ||
+            task.status === "READY_FOR_REVIEW"
+          ),
       ),
   );
 
@@ -300,7 +386,12 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
   // Backlog-driven work when we have spare capacity and no HIGH incidents.
   tasks = await listEngineeringTasks(100);
   const activeTasks = tasks.filter(
-    (task) => task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW",
+    (task) =>
+      task.status === "OPEN" ||
+      task.status === "IN_PROGRESS" ||
+      task.status === "READY_FOR_EXECUTION" ||
+      task.status === "READY_FOR_PUSH" ||
+      task.status === "READY_FOR_REVIEW",
   );
   const hasHighOpenIncident = incidents.some(
     (incident) => incident.status !== "RESOLVED" && incident.severity === "HIGH",
@@ -320,6 +411,10 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
         continue;
       }
 
+      const likelyFiles = uniqueFiles(backlogItem.likelyFiles ?? inferBacklogLikelyFiles(backlogItem.title, backlogItem.summary));
+      const smokeTestBlock =
+        backlogItem.smokeTestBlock ??
+        "npm run build\nnpm run test\nGET /api/agents/engineering\nGET /api/readiness";
       const task: EngineeringTask = {
         id: crypto.randomUUID(),
         createdAt: now,
@@ -327,13 +422,11 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
         status: "OPEN",
         title: backlogItem.title,
         summary: backlogItem.summary,
-        likelyFiles: backlogItem.likelyFiles ?? [],
+        likelyFiles,
         copilotPrompt:
           backlogItem.copilotPrompt ??
           `Backlog item ${backlogItem.id}: ${backlogItem.title}\n\n${backlogItem.summary}\n\nApply a minimal safe implementation and preserve existing trading flow.`,
-        smokeTestBlock:
-          backlogItem.smokeTestBlock ??
-          "npm run build\nnpm run test -- --runInBand",
+        smokeTestBlock,
         gitBlock: backlogItem.gitBlock ?? "git add -A && git commit -m \"agent: backlog task\" && git push",
         incidentId: backlogItem.linkedIncidentId ?? null,
         likelyRootCause: undefined,
@@ -341,6 +434,11 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
         remediationAttempted: false,
         remediationStatus: "none",
         backlogItemId: backlogItem.id,
+        patchPlan: buildPatchPlan(backlogItem.title, backlogItem.summary, likelyFiles),
+        validationPlan: buildValidationPlan(likelyFiles, smokeTestBlock),
+        commitPlan: buildCommitPlan(backlogItem.title),
+        executionStatus: "PENDING",
+        executionError: null,
         notes: ["Created from backlog queue"],
       };
 
@@ -368,7 +466,13 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     const existingTask = tasks.find(
       (task) =>
         task.incidentId === monitoringBrokerIncident.id &&
-        (task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW"),
+        (
+          task.status === "OPEN" ||
+          task.status === "IN_PROGRESS" ||
+          task.status === "READY_FOR_EXECUTION" ||
+          task.status === "READY_FOR_PUSH" ||
+          task.status === "READY_FOR_REVIEW"
+        ),
     );
     if (existingTask) {
       const { brokerPositionsCount, dbOperationalOpenCount } = parseBrokerDbCounts(monitoringBrokerIncident.summary);
@@ -405,9 +509,18 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
 
   const refreshedTasks = await listEngineeringTasks(100);
   const openTasks = refreshedTasks.filter(
-    (task) => task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW",
+    (task) =>
+      task.status === "OPEN" ||
+      task.status === "IN_PROGRESS" ||
+      task.status === "READY_FOR_EXECUTION" ||
+      task.status === "READY_FOR_PUSH" ||
+      task.status === "READY_FOR_REVIEW",
   );
   const openTaskCount = openTasks.length;
+  const openExecutionReadyCount = refreshedTasks.filter(
+    (task) => task.status === "READY_FOR_EXECUTION" || task.status === "READY_FOR_PUSH",
+  ).length;
+  const blockedTaskCount = refreshedTasks.filter((task) => task.status === "BLOCKED").length;
 
   const refreshedBacklog = await listBacklogItems(200);
   const openBacklogCount = refreshedBacklog.filter((item) => item.status === "OPEN" || item.status === "READY").length;
@@ -454,9 +567,19 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     latestEngineeringTaskId: selectedTaskId ?? currentState.latestEngineeringTaskId ?? null,
     latestEngineeringTaskTitle: latestTask,
     openEngineeringTaskCount: openTaskCount,
+    openExecutionReadyCount,
+    blockedTaskCount,
     openBacklogCount,
     inProgressBacklogCount,
     nextBacklogTitles,
+    latestExecutionTaskTitle:
+      refreshedTasks.find((task) => task.status === "READY_FOR_EXECUTION" || task.status === "READY_FOR_PUSH")?.title ??
+      currentState.latestExecutionTaskTitle ??
+      null,
+    latestExecutionStatus:
+      refreshedTasks.find((task) => task.status === "READY_FOR_EXECUTION" || task.status === "READY_FOR_PUSH")?.status ??
+      currentState.latestExecutionStatus ??
+      null,
     updatedBy: "engineering",
   });
 
@@ -472,6 +595,8 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
       updatedTaskId,
       incidentId: candidate?.id ?? null,
       backlogTaskIds: createdBacklogTaskIds,
+      openExecutionReadyCount,
+      blockedTaskCount,
       openBacklogCount,
       inProgressBacklogCount,
     },

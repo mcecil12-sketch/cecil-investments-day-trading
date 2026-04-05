@@ -23,10 +23,15 @@ import type {
   AgentIncidentCategory,
   AgentState,
   AllowedGrade,
+  CommitPlan,
+  EngineeringExecutionStatus,
   EngineeringTask,
+  EngineeringTaskStatus,
   EventRisk,
   FreezeWindow,
   NewsState,
+  PatchPlan,
+  ValidationPlan,
 } from "./types";
 
 const STORE_TTL_SECONDS = getTtlSeconds("TELEMETRY_DAYS");
@@ -48,6 +53,71 @@ const VALID_UPDATED_BY = new Set<AgentName | "system">([
 const VALID_BACKLOG_STATUS = new Set<BacklogItemStatus>(["OPEN", "READY", "IN_PROGRESS", "REVIEW", "DONE"]);
 const VALID_BACKLOG_TYPE = new Set<BacklogItemType>(["BUG", "FEATURE", "OPTIMIZATION", "TECH_DEBT"]);
 const VALID_BACKLOG_PRIORITY = new Set<BacklogItemPriority>(["HIGH", "MEDIUM", "LOW"]);
+const VALID_ENGINEERING_STATUS = new Set<EngineeringTaskStatus>([
+  "OPEN",
+  "IN_PROGRESS",
+  "READY_FOR_EXECUTION",
+  "READY_FOR_PUSH",
+  "READY_FOR_REVIEW",
+  "DONE",
+  "BLOCKED",
+  "FAILED",
+]);
+const VALID_EXECUTION_STATUS = new Set<EngineeringExecutionStatus>([
+  "PENDING",
+  "READY",
+  "BLOCKED",
+  "EXECUTED",
+  "FAILED",
+]);
+
+function normalizePatchPlan(input: unknown): PatchPlan | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const candidate = input as Partial<PatchPlan>;
+  const mode = candidate.mode;
+  if (mode !== "PLACEHOLDER" && mode !== "FILE_WRITE" && mode !== "GITHUB_COMMIT") {
+    return undefined;
+  }
+  return {
+    mode,
+    targetFiles: Array.isArray(candidate.targetFiles)
+      ? uniqueStrings(candidate.targetFiles.filter((value): value is string => typeof value === "string"))
+      : [],
+    proposedChangesSummary:
+      typeof candidate.proposedChangesSummary === "string"
+        ? candidate.proposedChangesSummary.trim()
+        : "",
+  };
+}
+
+function normalizeValidationPlan(input: unknown): ValidationPlan | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const candidate = input as Partial<ValidationPlan>;
+  return {
+    buildRequired: Boolean(candidate.buildRequired),
+    testCommands: Array.isArray(candidate.testCommands)
+      ? uniqueStrings(candidate.testCommands.filter((value): value is string => typeof value === "string"))
+      : [],
+    smokeChecks: Array.isArray(candidate.smokeChecks)
+      ? uniqueStrings(candidate.smokeChecks.filter((value): value is string => typeof value === "string"))
+      : [],
+  };
+}
+
+function normalizeCommitPlan(input: unknown): CommitPlan | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const candidate = input as Partial<CommitPlan>;
+  const targetBranch = candidate.targetBranch === "main" ? "main" : null;
+  if (!targetBranch) return undefined;
+  return {
+    commitMessage:
+      typeof candidate.commitMessage === "string" && candidate.commitMessage.trim()
+        ? candidate.commitMessage.trim()
+        : "agent: update engineering task",
+    targetBranch,
+    pushDirect: Boolean(candidate.pushDirect),
+  };
+}
 
 export type AgentStateSource = "stored" | "missing" | "invalid" | "unavailable";
 
@@ -221,6 +291,16 @@ function normalizeState(raw: unknown): AgentState | null {
       Number.isFinite(candidate.openEngineeringTaskCount)
         ? Math.max(0, Math.floor(candidate.openEngineeringTaskCount))
         : undefined,
+    openExecutionReadyCount:
+      typeof candidate.openExecutionReadyCount === "number" &&
+      Number.isFinite(candidate.openExecutionReadyCount)
+        ? Math.max(0, Math.floor(candidate.openExecutionReadyCount))
+        : undefined,
+    blockedTaskCount:
+      typeof candidate.blockedTaskCount === "number" &&
+      Number.isFinite(candidate.blockedTaskCount)
+        ? Math.max(0, Math.floor(candidate.blockedTaskCount))
+        : undefined,
     openBacklogCount:
       typeof candidate.openBacklogCount === "number" &&
       Number.isFinite(candidate.openBacklogCount)
@@ -234,6 +314,12 @@ function normalizeState(raw: unknown): AgentState | null {
     nextBacklogTitles: Array.isArray(candidate.nextBacklogTitles)
       ? uniqueStrings(candidate.nextBacklogTitles.filter((value): value is string => typeof value === "string")).slice(0, 10)
       : undefined,
+    latestExecutionTaskTitle:
+      typeof candidate.latestExecutionTaskTitle === "string" ? candidate.latestExecutionTaskTitle : null,
+    latestExecutionStatus:
+      typeof candidate.latestExecutionStatus === "string" && VALID_ENGINEERING_STATUS.has(candidate.latestExecutionStatus as EngineeringTaskStatus)
+        ? (candidate.latestExecutionStatus as EngineeringTaskStatus)
+        : null,
     updatedBy,
   };
 }
@@ -287,11 +373,27 @@ function normalizeAction(action: AgentAction): AgentAction {
 function normalizeEngineeringTask(task: EngineeringTask): EngineeringTask {
   const createdAt = toStrictIso(task.createdAt);
   const updatedAt = toStrictIso(task.updatedAt, createdAt);
+  const status = VALID_ENGINEERING_STATUS.has(task.status) ? task.status : "OPEN";
+  const patchPlan = normalizePatchPlan(task.patchPlan);
+  const validationPlan = normalizeValidationPlan(task.validationPlan);
+  const commitPlan = normalizeCommitPlan(task.commitPlan);
   return {
     ...task,
     createdAt,
     updatedAt,
+    status,
     etDate: task.etDate ?? timestampEtDate(task.createdAt, createdAt),
+    likelyFiles: Array.isArray(task.likelyFiles) ? uniqueStrings(task.likelyFiles) : [],
+    patchPlan,
+    validationPlan,
+    commitPlan,
+    executionStatus:
+      typeof task.executionStatus === "string" && VALID_EXECUTION_STATUS.has(task.executionStatus)
+        ? task.executionStatus
+        : undefined,
+    executionError:
+      typeof task.executionError === "string" || task.executionError === null ? task.executionError : undefined,
+    notes: Array.isArray(task.notes) ? uniqueStrings(task.notes).slice(-20) : undefined,
   };
 }
 
@@ -367,11 +469,15 @@ export function createDefaultAgentState(now: string = nowIso()): AgentState {
     freezeWindows: [],
     activeRestrictions: [],
     activeIncidentCount: 0,
+    openExecutionReadyCount: 0,
+    blockedTaskCount: 0,
     openBacklogCount: 0,
     inProgressBacklogCount: 0,
     nextBacklogTitles: [],
     latestBriefId: null,
     latestEngineeringTaskId: null,
+    latestExecutionTaskTitle: null,
+    latestExecutionStatus: null,
     updatedBy: "system",
   };
 }
@@ -577,7 +683,16 @@ export async function closeTasksByIncident(incidentId: string): Promise<number> 
   let updatedCount = 0;
 
   const next = history.map((task) => {
-    if (task.incidentId !== incidentId || task.status !== "OPEN") {
+    if (
+      task.incidentId !== incidentId ||
+      !(
+        task.status === "OPEN" ||
+        task.status === "IN_PROGRESS" ||
+        task.status === "READY_FOR_EXECUTION" ||
+        task.status === "READY_FOR_PUSH" ||
+        task.status === "READY_FOR_REVIEW"
+      )
+    ) {
       return task;
     }
     updatedCount += 1;
@@ -585,6 +700,8 @@ export async function closeTasksByIncident(incidentId: string): Promise<number> 
     return normalizeEngineeringTask({
       ...task,
       status: "DONE",
+      executionStatus: task.executionStatus === "BLOCKED" || task.executionStatus === "FAILED" ? task.executionStatus : "EXECUTED",
+      executionError: null,
       updatedAt: now,
       notes: mergeNotes(notes, ["Auto-closed: incident resolved"]),
     });
@@ -607,6 +724,8 @@ export async function findOpenEngineeringTaskByIncident(
         task.incidentId === incidentId &&
         (task.status === "OPEN" ||
           task.status === "IN_PROGRESS" ||
+          task.status === "READY_FOR_EXECUTION" ||
+          task.status === "READY_FOR_PUSH" ||
           task.status === "READY_FOR_REVIEW"),
     ) ?? null
   );
@@ -627,7 +746,7 @@ export async function upsertEngineeringTask(
 
 export async function updateEngineeringTaskById(
   id: string,
-  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot" | "notes" | "backlogItemId">>,
+  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot" | "notes" | "backlogItemId" | "patchPlan" | "validationPlan" | "commitPlan" | "executionStatus" | "executionError">>,
 ): Promise<EngineeringTask | null> {
   const now = nowIso();
   const history = await listEngineeringTasks(HISTORY_LIMIT);

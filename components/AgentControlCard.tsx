@@ -213,6 +213,25 @@ export function AgentControlCard() {
         />
       </div>
 
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+        <DetailRow
+          label="Execution-ready tasks"
+          value={String(state?.openExecutionReadyCount ?? 0)}
+        />
+        <DetailRow
+          label="Blocked tasks"
+          value={String(state?.blockedTaskCount ?? 0)}
+        />
+        <DetailRow
+          label="Latest execution"
+          value={
+            state?.latestExecutionTaskTitle
+              ? `${state.latestExecutionTaskTitle} (${state.latestExecutionStatus ?? "OPEN"})`
+              : "None"
+          }
+        />
+      </div>
+
       <div className="rounded-xl border border-[var(--ci-border)] bg-black/20 px-4 py-3 space-y-2">
         <div className="text-[10px] uppercase tracking-wide text-[var(--ci-text-muted)]">
           Backlog

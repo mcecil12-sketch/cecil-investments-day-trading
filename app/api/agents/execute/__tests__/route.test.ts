@@ -3,9 +3,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   listEngineeringTasks: vi.fn(),
   updateEngineeringTaskById: vi.fn(async () => undefined),
-  runPatchExecution: vi.fn(async () => ({ ok: true, skipped: true, reason: "empty_patch" })),
-  runBuildAndTests: vi.fn(async () => ({ ok: true })),
-  commitAndPush: vi.fn(async () => ({ ok: true })),
+  prepareExecutionPlan: vi.fn(() => ({
+    patchPlan: {
+      mode: "GITHUB_COMMIT",
+      targetFiles: ["app/api/agents/execute/route.ts"],
+      proposedChangesSummary: "Enable orchestrated execution",
+    },
+    validationPlan: {
+      buildRequired: true,
+      testCommands: ["npm run test"],
+      smokeChecks: ["GET /api/agents/engineering"],
+    },
+    commitPlan: {
+      commitMessage: "agent: Enable GitHub API write access",
+      targetBranch: "main",
+      pushDirect: true,
+    },
+    executionStatus: "READY",
+    nextTaskStatus: "READY_FOR_EXECUTION",
+  })),
   approveExecution: vi.fn(() => ({ ok: true })),
 }));
 
@@ -15,9 +31,7 @@ vi.mock("@/lib/agents/store", () => ({
 }));
 
 vi.mock("@/lib/agents/execution/engine", () => ({
-  runPatchExecution: mocks.runPatchExecution,
-  runBuildAndTests: mocks.runBuildAndTests,
-  commitAndPush: mocks.commitAndPush,
+  prepareExecutionPlan: mocks.prepareExecutionPlan,
 }));
 
 vi.mock("@/lib/agents/governance/manager", () => ({
@@ -93,10 +107,10 @@ describe("POST /api/agents/execute", () => {
       reason: "blocked_pattern_detected",
       taskId: "task-1",
     });
-    expect(mocks.runBuildAndTests).not.toHaveBeenCalled();
+    expect(mocks.prepareExecutionPlan).not.toHaveBeenCalled();
   });
 
-  it("completes safe mode execution and marks the task done", async () => {
+  it("prepares execution readiness and does not shell out", async () => {
     mocks.listEngineeringTasks.mockResolvedValueOnce([
       {
         id: "task-1",
@@ -123,20 +137,20 @@ describe("POST /api/agents/execute", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
       ok: true,
-      executedTaskId: "task-1",
-      apply: { ok: true, skipped: true, reason: "empty_patch" },
-      test: { ok: true },
-      commit: { ok: true, skipped: true, reason: "safe_mode_no_patch" },
+      taskId: "task-1",
+      executionStatus: "READY_FOR_EXECUTION",
+      commitPlan: { targetBranch: "main", pushDirect: true },
+      validationPlan: { buildRequired: true },
     });
-    expect(mocks.runPatchExecution).toHaveBeenCalledWith("");
-    expect(mocks.runBuildAndTests).toHaveBeenCalledTimes(1);
-    expect(mocks.commitAndPush).not.toHaveBeenCalled();
-    expect(mocks.updateEngineeringTaskById).toHaveBeenCalledTimes(2);
-    expect(mocks.updateEngineeringTaskById).toHaveBeenLastCalledWith(
+    expect(mocks.prepareExecutionPlan).toHaveBeenCalledTimes(1);
+    expect(mocks.prepareExecutionPlan).toHaveBeenCalledWith(expect.objectContaining({ id: "task-1" }));
+    expect(mocks.updateEngineeringTaskById).toHaveBeenCalledTimes(1);
+    expect(mocks.updateEngineeringTaskById).toHaveBeenCalledWith(
       "task-1",
       expect.objectContaining({
-        status: "DONE",
-        remediationStatus: "succeeded",
+        status: "READY_FOR_EXECUTION",
+        executionStatus: "READY",
+        executionError: null,
       }),
     );
   });

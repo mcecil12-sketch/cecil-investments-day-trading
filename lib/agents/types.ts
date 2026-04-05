@@ -26,7 +26,17 @@ export type AgentIncidentStatus = "OPEN" | "MONITORING" | "RESOLVED";
 
 export type AgentActionStatus = "PROPOSED" | "APPLIED" | "SKIPPED" | "FAILED";
 
-export type EngineeringTaskStatus = "OPEN" | "IN_PROGRESS" | "READY_FOR_REVIEW" | "DONE";
+export type EngineeringTaskStatus =
+  | "OPEN"
+  | "IN_PROGRESS"
+  | "READY_FOR_EXECUTION"
+  | "READY_FOR_PUSH"
+  | "READY_FOR_REVIEW"
+  | "DONE"
+  | "BLOCKED"
+  | "FAILED";
+
+export type EngineeringExecutionStatus = "PENDING" | "READY" | "BLOCKED" | "EXECUTED" | "FAILED";
 
 export type BacklogItemStatus = "OPEN" | "READY" | "IN_PROGRESS" | "REVIEW" | "DONE";
 export type BacklogItemType = "BUG" | "FEATURE" | "OPTIMIZATION" | "TECH_DEBT";
@@ -73,10 +83,32 @@ export interface AgentState {
   lastRemediationAt?: string | null;
   openIncidentCategories?: AgentIncidentCategory[];
   openEngineeringTaskCount?: number;
+  openExecutionReadyCount?: number;
+  blockedTaskCount?: number;
   openBacklogCount?: number;
   inProgressBacklogCount?: number;
   nextBacklogTitles?: string[];
+  latestExecutionTaskTitle?: string | null;
+  latestExecutionStatus?: EngineeringTaskStatus | null;
   updatedBy: AgentName | "system";
+}
+
+export interface PatchPlan {
+  mode: "PLACEHOLDER" | "FILE_WRITE" | "GITHUB_COMMIT";
+  targetFiles: string[];
+  proposedChangesSummary: string;
+}
+
+export interface ValidationPlan {
+  buildRequired: boolean;
+  testCommands: string[];
+  smokeChecks: string[];
+}
+
+export interface CommitPlan {
+  commitMessage: string;
+  targetBranch: "main";
+  pushDirect: boolean;
 }
 
 export interface AgentBrief {
@@ -137,6 +169,11 @@ export interface EngineeringTask {
   linkedTelemetrySnapshot?: Record<string, unknown>;
   remediationResultSummary?: string;
   backlogItemId?: string | null;
+  patchPlan?: PatchPlan;
+  validationPlan?: ValidationPlan;
+  commitPlan?: CommitPlan;
+  executionStatus?: EngineeringExecutionStatus;
+  executionError?: string | null;
   notes?: string[];
 }
 

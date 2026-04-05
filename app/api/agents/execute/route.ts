@@ -3,11 +3,7 @@ export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
 import { checkAgentCronAuth, unauthorizedAgentResponse } from "@/lib/agents/auth";
-import {
-  runPatchExecution,
-  runBuildAndTests,
-  commitAndPush,
-} from "@/lib/agents/execution/engine";
+import { prepareExecutionPlan } from "@/lib/agents/execution/engine";
 import { approveExecution } from "@/lib/agents/governance/manager";
 import { listEngineeringTasks, updateEngineeringTaskById } from "@/lib/agents/store";
 import type { EngineeringTask } from "@/lib/agents/types";
@@ -20,11 +16,18 @@ async function markExecutionFailure(task: EngineeringTask | null, message: strin
   if (!task) return;
 
   await updateEngineeringTaskById(task.id, {
+    status: task.status === "DONE" ? "DONE" : "FAILED",
     remediationAttempted: true,
     remediationStatus: "failed",
     remediationResultSummary: message,
+    executionStatus: "FAILED",
+    executionError: message,
     notes: appendNotes(task.notes, [`Execution failed: ${message}`]),
   });
+}
+
+function isEligibleTask(task: EngineeringTask): boolean {
+  return task.status === "OPEN" || task.status === "IN_PROGRESS";
 }
 
 export async function POST(req: NextRequest) {
@@ -37,7 +40,7 @@ export async function POST(req: NextRequest) {
 
   try {
     const tasks = await listEngineeringTasks(100);
-    task = tasks.find((candidate) => candidate.status === "OPEN") ?? null;
+    task = tasks.find((candidate) => isEligibleTask(candidate)) ?? null;
 
     if (!task) {
       return NextResponse.json({ ok: true, message: "No tasks to execute" });
@@ -49,9 +52,12 @@ export async function POST(req: NextRequest) {
       const blockedNotes = appendNotes(task.notes, [`Execution blocked: ${approval.reason}`]);
 
       await updateEngineeringTaskById(task.id, {
+        status: "BLOCKED",
         remediationAttempted: true,
         remediationStatus: "failed",
         remediationResultSummary: `Execution blocked: ${approval.reason}`,
+        executionStatus: "BLOCKED",
+        executionError: approval.reason,
         notes: blockedNotes,
       });
 
@@ -60,72 +66,38 @@ export async function POST(req: NextRequest) {
           ok: false,
           reason: approval.reason,
           taskId: task.id,
+          executionStatus: "BLOCKED",
         },
         { status: 403 },
       );
     }
 
-    const approvedNotes = appendNotes(task.notes, ["Execution approved by governance manager"]);
-
-    await updateEngineeringTaskById(task.id, {
-      status: "IN_PROGRESS",
-      remediationAttempted: true,
-      remediationStatus: "attempted",
-      remediationResultSummary: "Execution approved; build and test gate started.",
-      notes: approvedNotes,
-    });
-
-    task = {
-      ...task,
-      status: "IN_PROGRESS",
-      remediationAttempted: true,
-      remediationStatus: "attempted",
-      remediationResultSummary: "Execution approved; build and test gate started.",
-      notes: approvedNotes,
-    };
-
-    const patch = "";
-    const apply = await runPatchExecution(patch);
-    if (!apply.ok) {
-      throw new Error(apply.error);
-    }
-
-    const test = await runBuildAndTests();
-    if (!test.ok) {
-      throw new Error(test.error);
-    }
-
-    const shouldCommit = patch.trim().length > 0;
-    const commit = shouldCommit
-      ? await commitAndPush(`agent: ${task.title}`)
-      : { ok: true as const, skipped: true, reason: "safe_mode_no_patch" };
-
-    if (!commit.ok) {
-      throw new Error(commit.error);
-    }
-
-    const notes = appendNotes(task.notes, [
-      apply.skipped ? `Patch skipped: ${apply.reason ?? "unspecified"}` : "Patch applied",
-      "Build and tests passed",
-      commit.skipped ? `Commit skipped: ${commit.reason ?? "unspecified"}` : "Commit pushed to main",
+    const prepared = prepareExecutionPlan(task);
+    const approvedNotes = appendNotes(task.notes, [
+      "Execution approved by governance manager",
+      `Execution plan prepared for ${prepared.nextTaskStatus}`,
     ]);
 
     await updateEngineeringTaskById(task.id, {
-      status: "DONE",
+      status: prepared.nextTaskStatus,
       remediationAttempted: true,
-      remediationStatus: "succeeded",
-      remediationResultSummary: commit.skipped
-        ? "Safe mode execution completed. Build and tests passed; commit skipped."
-        : "Execution completed. Patch applied, validation passed, and changes pushed to main.",
-      notes,
+      remediationStatus: "attempted",
+      remediationResultSummary: "Execution plan prepared and queued for external executor.",
+      patchPlan: prepared.patchPlan,
+      validationPlan: prepared.validationPlan,
+      commitPlan: prepared.commitPlan,
+      executionStatus: prepared.executionStatus,
+      executionError: null,
+      notes: approvedNotes,
     });
 
     return NextResponse.json({
       ok: true,
-      executedTaskId: task.id,
-      apply,
-      test,
-      commit,
+      taskId: task.id,
+      executionStatus: prepared.nextTaskStatus,
+      patchPlan: prepared.patchPlan,
+      validationPlan: prepared.validationPlan,
+      commitPlan: prepared.commitPlan,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

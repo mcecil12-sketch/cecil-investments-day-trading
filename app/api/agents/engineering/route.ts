@@ -17,12 +17,22 @@ export async function GET(req: Request) {
   const tasks = await listEngineeringTasks(limit);
   const openTasks = tasks.filter(
     (task) =>
-      task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW",
+      task.status === "OPEN" ||
+      task.status === "IN_PROGRESS" ||
+      task.status === "READY_FOR_EXECUTION" ||
+      task.status === "READY_FOR_PUSH" ||
+      task.status === "READY_FOR_REVIEW",
   );
+  const executionReadyTasks = tasks.filter(
+    (task) => task.status === "READY_FOR_EXECUTION" || task.status === "READY_FOR_PUSH",
+  );
+  const blockedTasks = tasks.filter((task) => task.status === "BLOCKED" || task.executionStatus === "BLOCKED");
 
   return NextResponse.json({
     ok: true,
     tasks,
     openTasks,
+    executionReadyTasks,
+    blockedTasks,
   });
 }

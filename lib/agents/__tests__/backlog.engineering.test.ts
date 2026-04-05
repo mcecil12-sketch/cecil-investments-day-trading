@@ -113,6 +113,11 @@ describe("backlog + engineering runner", () => {
     const tasks = await listEngineeringTasks(50);
     const linkedTask = tasks.find((task) => task.backlogItemId === seeded.item.id);
     expect(linkedTask).toBeTruthy();
+    expect(linkedTask?.patchPlan?.proposedChangesSummary).toContain("Backlog candidate");
+    expect(linkedTask?.validationPlan?.testCommands).toContain("npm run test");
+    expect(linkedTask?.commitPlan?.targetBranch).toBe("main");
+    expect(linkedTask?.executionStatus).toBe("PENDING");
+    expect(linkedTask?.likelyFiles.length).toBeGreaterThan(0);
 
     const backlog = await listBacklogItems(50);
     expect(backlog.find((item) => item.id === seeded.item.id)?.status).toBe("IN_PROGRESS");
