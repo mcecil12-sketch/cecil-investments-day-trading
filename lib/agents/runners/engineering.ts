@@ -455,9 +455,9 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
 
   // Force-refresh known backlog tasks in place so legacy placeholder plans become executable.
   const backlogForRefresh = await listBacklogItems(200);
-  const backlogById = new Map(backlogForRefresh.map((item) => [item.id, { title: item.title }]));
+  const backlogTitleById = new Map(backlogForRefresh.map((item) => [item.id, { title: item.title }]));
   for (const task of tasks) {
-    const known = resolveKnownBacklogSpec(task, backlogById);
+    const known = resolveKnownBacklogSpec(task, backlogTitleById);
     if (!known) continue;
 
     const likelyFiles = uniqueFiles(known.targetFiles);
