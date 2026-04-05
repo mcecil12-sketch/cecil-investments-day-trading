@@ -27,7 +27,24 @@ async function markExecutionFailure(task: EngineeringTask | null, message: strin
 }
 
 function isEligibleTask(task: EngineeringTask): boolean {
-  return task.status === "OPEN" || task.status === "IN_PROGRESS";
+  return (
+    task.status === "OPEN" ||
+    task.status === "READY_FOR_EXECUTION" ||
+    task.status === "READY_FOR_PUSH"
+  );
+}
+
+function executionSortRank(task: EngineeringTask): number {
+  const incidentRank = task.incidentId ? 0 : 100;
+  const statusRank =
+    task.status === "READY_FOR_EXECUTION"
+      ? 0
+      : task.status === "READY_FOR_PUSH"
+        ? 10
+        : task.status === "OPEN"
+          ? 20
+          : 100;
+  return incidentRank + statusRank;
 }
 
 export async function POST(req: NextRequest) {
@@ -40,13 +57,18 @@ export async function POST(req: NextRequest) {
 
   try {
     const tasks = await listEngineeringTasks(100);
-    task = tasks.find((candidate) => isEligibleTask(candidate)) ?? null;
+    task = tasks
+      .filter((candidate) => isEligibleTask(candidate))
+      .sort((a, b) => executionSortRank(a) - executionSortRank(b))[0] ?? null;
 
     if (!task) {
-      return NextResponse.json({ ok: true, message: "No tasks to execute" });
+      return NextResponse.json({ ok: true, message: "No execution-ready tasks" });
     }
 
-    const approval = approveExecution(task);
+    const approval =
+      task.status === "OPEN"
+        ? approveExecution(task)
+        : { ok: true as const };
 
     if (!approval.ok) {
       const blockedNotes = appendNotes(task.notes, [`Execution blocked: ${approval.reason}`]);

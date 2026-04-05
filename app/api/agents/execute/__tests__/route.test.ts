@@ -73,7 +73,49 @@ describe("POST /api/agents/execute", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, message: "No tasks to execute" });
+    expect(await response.json()).toEqual({ ok: true, message: "No execution-ready tasks" });
+    expect(mocks.updateEngineeringTaskById).not.toHaveBeenCalled();
+  });
+
+  it("returns no execution-ready tasks when only blocked or done tasks exist", async () => {
+    mocks.listEngineeringTasks.mockResolvedValueOnce([
+      {
+        id: "task-blocked",
+        createdAt: "2026-04-05T10:00:00Z",
+        updatedAt: "2026-04-05T10:00:00Z",
+        status: "BLOCKED",
+        title: "Blocked task",
+        summary: "summary",
+        likelyFiles: [],
+        copilotPrompt: "",
+        smokeTestBlock: "",
+        gitBlock: "",
+      },
+      {
+        id: "task-done",
+        createdAt: "2026-04-05T09:00:00Z",
+        updatedAt: "2026-04-05T09:00:00Z",
+        status: "DONE",
+        title: "Done task",
+        summary: "summary",
+        likelyFiles: [],
+        copilotPrompt: "",
+        smokeTestBlock: "",
+        gitBlock: "",
+      },
+    ]);
+
+    const response = await POST(
+      new Request("http://localhost/api/agents/execute", {
+        method: "POST",
+        headers: { "x-cron-token": "test-cron-token" },
+      }) as any,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, message: "No execution-ready tasks" });
+    expect(mocks.approveExecution).not.toHaveBeenCalled();
+    expect(mocks.prepareExecutionPlan).not.toHaveBeenCalled();
     expect(mocks.updateEngineeringTaskById).not.toHaveBeenCalled();
   });
 
@@ -106,8 +148,62 @@ describe("POST /api/agents/execute", () => {
       ok: false,
       reason: "blocked_pattern_detected",
       taskId: "task-1",
+      executionStatus: "BLOCKED",
     });
     expect(mocks.prepareExecutionPlan).not.toHaveBeenCalled();
+  });
+
+  it("prefers READY_FOR_EXECUTION over OPEN and ignores blocked tasks", async () => {
+    mocks.listEngineeringTasks.mockResolvedValueOnce([
+      {
+        id: "task-blocked",
+        createdAt: "2026-04-05T11:00:00Z",
+        updatedAt: "2026-04-05T11:00:00Z",
+        status: "BLOCKED",
+        title: "Blocked task",
+        summary: "summary",
+        likelyFiles: ["lib/a.ts"],
+        copilotPrompt: "blocked",
+        smokeTestBlock: "",
+        gitBlock: "",
+      },
+      {
+        id: "task-open",
+        createdAt: "2026-04-05T10:00:00Z",
+        updatedAt: "2026-04-05T10:00:00Z",
+        status: "OPEN",
+        title: "Open task",
+        summary: "summary",
+        likelyFiles: ["lib/b.ts"],
+        copilotPrompt: "safe",
+        smokeTestBlock: "",
+        gitBlock: "",
+      },
+      {
+        id: "task-ready",
+        createdAt: "2026-04-05T09:00:00Z",
+        updatedAt: "2026-04-05T09:00:00Z",
+        status: "READY_FOR_EXECUTION",
+        title: "Ready task",
+        summary: "summary",
+        likelyFiles: ["lib/c.ts"],
+        copilotPrompt: "safe",
+        smokeTestBlock: "",
+        gitBlock: "",
+      },
+    ]);
+
+    const response = await POST(
+      new Request("http://localhost/api/agents/execute", {
+        method: "POST",
+        headers: { "x-cron-token": "test-cron-token" },
+      }) as any,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, taskId: "task-ready" });
+    expect(mocks.approveExecution).not.toHaveBeenCalled();
+    expect(mocks.prepareExecutionPlan).toHaveBeenCalledWith(expect.objectContaining({ id: "task-ready" }));
   });
 
   it("prepares execution readiness and does not shell out", async () => {

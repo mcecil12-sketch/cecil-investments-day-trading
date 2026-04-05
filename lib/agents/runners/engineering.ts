@@ -90,6 +90,43 @@ function buildCommitPlan(title: string): CommitPlan {
   };
 }
 
+function isActiveTask(task: EngineeringTask): boolean {
+  return (
+    task.status === "OPEN" ||
+    task.status === "IN_PROGRESS" ||
+    task.status === "READY_FOR_EXECUTION" ||
+    task.status === "READY_FOR_PUSH" ||
+    task.status === "READY_FOR_REVIEW"
+  );
+}
+
+function isUnresolvedBacklogGateTask(task: EngineeringTask): boolean {
+  return (
+    task.status === "OPEN" ||
+    task.status === "IN_PROGRESS" ||
+    task.status === "READY_FOR_EXECUTION" ||
+    task.status === "READY_FOR_PUSH" ||
+    task.status === "BLOCKED"
+  );
+}
+
+function executionVisibilityRank(task: EngineeringTask): number {
+  const incidentRank = task.incidentId ? 0 : 100;
+  const statusRank =
+    task.status === "READY_FOR_EXECUTION"
+      ? 0
+      : task.status === "READY_FOR_PUSH"
+        ? 10
+        : task.status === "OPEN"
+          ? 20
+          : task.status === "IN_PROGRESS"
+            ? 20
+            : task.status === "BLOCKED"
+              ? 30
+              : 100;
+  return incidentRank + statusRank;
+}
+
 // ---------------------------------------------------------------------------
 // Task builders — incident-specific, rich context
 // ---------------------------------------------------------------------------
@@ -321,9 +358,12 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     if (
       task.incidentCategory === "BROKER_SYNC" &&
       task.incidentId &&
-      (task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW")
-      || task.status === "READY_FOR_EXECUTION"
-      || task.status === "READY_FOR_PUSH"
+      (
+        task.status === "IN_PROGRESS" ||
+        task.status === "READY_FOR_REVIEW" ||
+        task.status === "READY_FOR_EXECUTION" ||
+        task.status === "READY_FOR_PUSH"
+      )
     ) {
       const linkedIncident = incidents.find((incident) => incident.id === task.incidentId);
       if (linkedIncident?.status === "RESOLVED") {
@@ -385,22 +425,15 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
 
   // Backlog-driven work when we have spare capacity and no HIGH incidents.
   tasks = await listEngineeringTasks(100);
-  const activeTasks = tasks.filter(
-    (task) =>
-      task.status === "OPEN" ||
-      task.status === "IN_PROGRESS" ||
-      task.status === "READY_FOR_EXECUTION" ||
-      task.status === "READY_FOR_PUSH" ||
-      task.status === "READY_FOR_REVIEW",
-  );
+  const activeTasks = tasks.filter((task) => isActiveTask(task));
+  const unresolvedBacklogGateCount = tasks.filter((task) => isUnresolvedBacklogGateTask(task)).length;
   const hasHighOpenIncident = incidents.some(
     (incident) => incident.status !== "RESOLVED" && incident.severity === "HIGH",
   );
 
   const createdBacklogTaskIds: string[] = [];
-  if (activeTasks.length < 3 && !hasHighOpenIncident) {
-    const targetCount = Math.min(2, 3 - activeTasks.length);
-    const nextBacklog = await getNextBacklogItems(Math.max(1, targetCount));
+  if (unresolvedBacklogGateCount === 0 && !hasHighOpenIncident) {
+    const nextBacklog = await getNextBacklogItems(1);
 
     for (const backlogItem of nextBacklog) {
       const exists = activeTasks.find((task) => task.backlogItemId === backlogItem.id);
@@ -508,19 +541,22 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
   }
 
   const refreshedTasks = await listEngineeringTasks(100);
-  const openTasks = refreshedTasks.filter(
-    (task) =>
-      task.status === "OPEN" ||
-      task.status === "IN_PROGRESS" ||
-      task.status === "READY_FOR_EXECUTION" ||
-      task.status === "READY_FOR_PUSH" ||
-      task.status === "READY_FOR_REVIEW",
-  );
+  const openTasks = refreshedTasks.filter((task) => isActiveTask(task));
   const openTaskCount = openTasks.length;
   const openExecutionReadyCount = refreshedTasks.filter(
     (task) => task.status === "READY_FOR_EXECUTION" || task.status === "READY_FOR_PUSH",
   ).length;
   const blockedTaskCount = refreshedTasks.filter((task) => task.status === "BLOCKED").length;
+  const latestExecutionTask = refreshedTasks
+    .filter(
+      (task) =>
+        task.status === "READY_FOR_EXECUTION" ||
+        task.status === "READY_FOR_PUSH" ||
+        task.status === "OPEN" ||
+        task.status === "IN_PROGRESS" ||
+        task.status === "BLOCKED",
+    )
+    .sort((a, b) => executionVisibilityRank(a) - executionVisibilityRank(b))[0] ?? null;
 
   const refreshedBacklog = await listBacklogItems(200);
   const openBacklogCount = refreshedBacklog.filter((item) => item.status === "OPEN" || item.status === "READY").length;
@@ -572,14 +608,8 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     openBacklogCount,
     inProgressBacklogCount,
     nextBacklogTitles,
-    latestExecutionTaskTitle:
-      refreshedTasks.find((task) => task.status === "READY_FOR_EXECUTION" || task.status === "READY_FOR_PUSH")?.title ??
-      currentState.latestExecutionTaskTitle ??
-      null,
-    latestExecutionStatus:
-      refreshedTasks.find((task) => task.status === "READY_FOR_EXECUTION" || task.status === "READY_FOR_PUSH")?.status ??
-      currentState.latestExecutionStatus ??
-      null,
+    latestExecutionTaskTitle: latestExecutionTask?.title ?? null,
+    latestExecutionStatus: latestExecutionTask?.status ?? null,
     updatedBy: "engineering",
   });
 

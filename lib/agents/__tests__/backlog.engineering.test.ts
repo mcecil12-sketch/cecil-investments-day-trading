@@ -32,6 +32,7 @@ import {
   appendEngineeringTask,
   listBacklogItems,
   listEngineeringTasks,
+  readAgentState,
   updateBacklogStatus,
   upsertBacklogItem,
   upsertIncident,
@@ -139,5 +140,84 @@ describe("backlog + engineering runner", () => {
     const tasks = await listEngineeringTasks(100);
     const linkedTasks = tasks.filter((task) => task.backlogItemId === seeded.item.id);
     expect(linkedTasks.length).toBe(1);
+  });
+
+  it("does not create backlog-driven tasks when unresolved tasks already exist", async () => {
+    const now = new Date().toISOString();
+    await appendEngineeringTask({
+      id: crypto.randomUUID(),
+      createdAt: now,
+      updatedAt: now,
+      status: "OPEN",
+      title: "Existing unresolved",
+      summary: "Should block backlog pull",
+      likelyFiles: ["lib/agents/runners/engineering.ts"],
+      copilotPrompt: "prompt",
+      smokeTestBlock: "npm run test",
+      gitBlock: "git add -A",
+      remediationStatus: "none",
+    });
+
+    const seeded = await upsertBacklogItem({
+      status: "OPEN",
+      type: "OPTIMIZATION",
+      priority: "HIGH",
+      title: "Backlog must wait",
+      summary: "Must not become task while unresolved exists",
+      assignedAgent: "engineering",
+    });
+
+    await runEngineeringAgent();
+
+    const tasks = await listEngineeringTasks(100);
+    const linkedTask = tasks.find((task) => task.backlogItemId === seeded.item.id);
+    expect(linkedTask).toBeUndefined();
+
+    const backlog = await listBacklogItems(100);
+    expect(backlog.find((item) => item.id === seeded.item.id)?.status).toBe("OPEN");
+  });
+
+  it("updates execution visibility counts and latest execution fields", async () => {
+    const now = new Date().toISOString();
+
+    await appendEngineeringTask({
+      id: crypto.randomUUID(),
+      createdAt: now,
+      updatedAt: now,
+      status: "BLOCKED",
+      title: "Blocked task",
+      summary: "blocked",
+      likelyFiles: ["lib/agents/governance/manager.ts"],
+      copilotPrompt: "blocked",
+      smokeTestBlock: "",
+      gitBlock: "",
+      remediationStatus: "failed",
+      executionStatus: "BLOCKED",
+      executionError: "blocked_pattern_detected",
+    });
+
+    await appendEngineeringTask({
+      id: crypto.randomUUID(),
+      createdAt: now,
+      updatedAt: now,
+      status: "READY_FOR_EXECUTION",
+      title: "Ready task",
+      summary: "ready",
+      likelyFiles: ["app/api/agents/execute/route.ts"],
+      copilotPrompt: "safe",
+      smokeTestBlock: "GET /api/agents/engineering",
+      gitBlock: "git add -A",
+      remediationStatus: "attempted",
+      executionStatus: "READY",
+      executionError: null,
+    });
+
+    await runEngineeringAgent();
+
+    const state = await readAgentState();
+    expect(state.openExecutionReadyCount).toBe(1);
+    expect(state.blockedTaskCount).toBe(1);
+    expect(state.latestExecutionTaskTitle).toBe("Ready task");
+    expect(state.latestExecutionStatus).toBe("READY_FOR_EXECUTION");
   });
 });
