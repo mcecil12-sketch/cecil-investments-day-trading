@@ -4,6 +4,7 @@ import { getTradingConfig } from "@/lib/tradingConfig";
 import { getEtDateString, nowIso, parseAgentTimestamp, toStrictIso } from "@/lib/agents/time";
 import {
   AGENT_ACTIONS_KEY,
+  AGENT_BACKLOG_KEY,
   AGENT_BRIEFS_KEY,
   AGENT_ENGINEERING_KEY,
   AGENT_INCIDENTS_KEY,
@@ -15,6 +16,10 @@ import type {
   AgentIncident,
   AgentName,
   AgentPosture,
+  BacklogItem,
+  BacklogItemPriority,
+  BacklogItemStatus,
+  BacklogItemType,
   AgentIncidentCategory,
   AgentState,
   AllowedGrade,
@@ -39,6 +44,9 @@ const VALID_UPDATED_BY = new Set<AgentName | "system">([
   "engineering",
   "system",
 ]);
+const VALID_BACKLOG_STATUS = new Set<BacklogItemStatus>(["OPEN", "READY", "IN_PROGRESS", "REVIEW", "DONE"]);
+const VALID_BACKLOG_TYPE = new Set<BacklogItemType>(["BUG", "FEATURE", "OPTIMIZATION", "TECH_DEBT"]);
+const VALID_BACKLOG_PRIORITY = new Set<BacklogItemPriority>(["HIGH", "MEDIUM", "LOW"]);
 
 export type AgentStateSource = "stored" | "missing" | "invalid" | "unavailable";
 
@@ -129,6 +137,35 @@ function normalizeState(raw: unknown): AgentState | null {
                   )
                 )
               : undefined,
+            brokerPositionsCount:
+              typeof candidate.telemetry.brokerPositionsCount === "number" &&
+              Number.isFinite(candidate.telemetry.brokerPositionsCount)
+                ? Math.max(0, Math.floor(candidate.telemetry.brokerPositionsCount))
+                : undefined,
+            dbOpenTradesCount:
+              typeof candidate.telemetry.dbOpenTradesCount === "number" &&
+              Number.isFinite(candidate.telemetry.dbOpenTradesCount)
+                ? Math.max(0, Math.floor(candidate.telemetry.dbOpenTradesCount))
+                : undefined,
+            dbAutoOpenTradesCount:
+              typeof candidate.telemetry.dbAutoOpenTradesCount === "number" &&
+              Number.isFinite(candidate.telemetry.dbAutoOpenTradesCount)
+                ? Math.max(0, Math.floor(candidate.telemetry.dbAutoOpenTradesCount))
+                : undefined,
+            dbActualOperationalCount:
+              typeof candidate.telemetry.dbActualOperationalCount === "number" &&
+              Number.isFinite(candidate.telemetry.dbActualOperationalCount)
+                ? Math.max(0, Math.floor(candidate.telemetry.dbActualOperationalCount))
+                : undefined,
+            dbOperationalOpenCount:
+              typeof candidate.telemetry.dbOperationalOpenCount === "number" &&
+              Number.isFinite(candidate.telemetry.dbOperationalOpenCount)
+                ? Math.max(0, Math.floor(candidate.telemetry.dbOperationalOpenCount))
+                : undefined,
+            mismatchNote:
+              typeof candidate.telemetry.mismatchNote === "string" || candidate.telemetry.mismatchNote === null
+                ? candidate.telemetry.mismatchNote
+                : undefined,
             recentSignalsPending:
               typeof candidate.telemetry.recentSignalsPending === "number" &&
               Number.isFinite(candidate.telemetry.recentSignalsPending)
@@ -183,6 +220,19 @@ function normalizeState(raw: unknown): AgentState | null {
       Number.isFinite(candidate.openEngineeringTaskCount)
         ? Math.max(0, Math.floor(candidate.openEngineeringTaskCount))
         : undefined,
+    openBacklogCount:
+      typeof candidate.openBacklogCount === "number" &&
+      Number.isFinite(candidate.openBacklogCount)
+        ? Math.max(0, Math.floor(candidate.openBacklogCount))
+        : undefined,
+    inProgressBacklogCount:
+      typeof candidate.inProgressBacklogCount === "number" &&
+      Number.isFinite(candidate.inProgressBacklogCount)
+        ? Math.max(0, Math.floor(candidate.inProgressBacklogCount))
+        : undefined,
+    nextBacklogTitles: Array.isArray(candidate.nextBacklogTitles)
+      ? uniqueStrings(candidate.nextBacklogTitles.filter((value): value is string => typeof value === "string")).slice(0, 10)
+      : undefined,
     updatedBy,
   };
 }
@@ -244,6 +294,28 @@ function normalizeEngineeringTask(task: EngineeringTask): EngineeringTask {
   };
 }
 
+function normalizeBacklogItem(item: BacklogItem): BacklogItem {
+  const createdAt = toStrictIso(item.createdAt);
+  const updatedAt = toStrictIso(item.updatedAt, createdAt);
+
+  const status = VALID_BACKLOG_STATUS.has(item.status) ? item.status : "OPEN";
+  const type = VALID_BACKLOG_TYPE.has(item.type) ? item.type : "TECH_DEBT";
+  const priority = VALID_BACKLOG_PRIORITY.has(item.priority) ? item.priority : "MEDIUM";
+
+  return {
+    ...item,
+    createdAt,
+    updatedAt,
+    status,
+    type,
+    priority,
+    title: item.title.trim(),
+    summary: item.summary.trim(),
+    likelyFiles: Array.isArray(item.likelyFiles) ? uniqueStrings(item.likelyFiles) : undefined,
+    notes: Array.isArray(item.notes) ? uniqueStrings(item.notes).slice(-20) : undefined,
+  };
+}
+
 async function readKey<T>(key: string): Promise<T | null> {
   if (!redis) return null;
   try {
@@ -294,6 +366,9 @@ export function createDefaultAgentState(now: string = nowIso()): AgentState {
     freezeWindows: [],
     activeRestrictions: [],
     activeIncidentCount: 0,
+    openBacklogCount: 0,
+    inProgressBacklogCount: 0,
+    nextBacklogTitles: [],
     latestBriefId: null,
     latestEngineeringTaskId: null,
     updatedBy: "system",
@@ -495,6 +570,32 @@ export async function appendEngineeringTask(task: EngineeringTask): Promise<Engi
   return appendHistory(AGENT_ENGINEERING_KEY, normalizeEngineeringTask(task), HISTORY_LIMIT);
 }
 
+export async function closeTasksByIncident(incidentId: string): Promise<number> {
+  const now = nowIso();
+  const history = await listEngineeringTasks(HISTORY_LIMIT);
+  let updatedCount = 0;
+
+  const next = history.map((task) => {
+    if (task.incidentId !== incidentId || task.status !== "OPEN") {
+      return task;
+    }
+    updatedCount += 1;
+    const notes = Array.isArray(task.notes) ? task.notes : [];
+    return normalizeEngineeringTask({
+      ...task,
+      status: "DONE",
+      updatedAt: now,
+      notes: mergeNotes(notes, ["Auto-closed: incident resolved"]),
+    });
+  });
+
+  if (updatedCount > 0) {
+    await writeKey(AGENT_ENGINEERING_KEY, next);
+  }
+
+  return updatedCount;
+}
+
 export async function findOpenEngineeringTaskByIncident(
   incidentId: string,
 ): Promise<EngineeringTask | null> {
@@ -525,7 +626,7 @@ export async function upsertEngineeringTask(
 
 export async function updateEngineeringTaskById(
   id: string,
-  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot">>,
+  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot" | "notes" | "backlogItemId">>,
 ): Promise<EngineeringTask | null> {
   const now = nowIso();
   const history = await listEngineeringTasks(HISTORY_LIMIT);
@@ -537,6 +638,88 @@ export async function updateEngineeringTaskById(
   next[idx] = updated;
   await writeKey(AGENT_ENGINEERING_KEY, next);
   return updated;
+}
+
+export async function listBacklogItems(limit = 100): Promise<BacklogItem[]> {
+  return readHistory<BacklogItem>(AGENT_BACKLOG_KEY, limit);
+}
+
+export async function upsertBacklogItem(
+  item: Omit<BacklogItem, "id" | "createdAt" | "updatedAt"> & { id?: string; createdAt?: string; updatedAt?: string },
+): Promise<{ item: BacklogItem; created: boolean }> {
+  const now = nowIso();
+  const history = await listBacklogItems(HISTORY_LIMIT);
+  const normalizedTitle = item.title.trim().toUpperCase();
+
+  const idx = history.findIndex((candidate) => {
+    if (item.id && candidate.id === item.id) return true;
+    return candidate.title.trim().toUpperCase() === normalizedTitle && candidate.status !== "DONE";
+  });
+
+  if (idx >= 0) {
+    const current = history[idx];
+    const merged = normalizeBacklogItem({
+      ...current,
+      ...item,
+      id: current.id,
+      createdAt: current.createdAt,
+      updatedAt: now,
+      notes: mergeNotes(current.notes, item.notes),
+    });
+    const next = [...history];
+    next[idx] = merged;
+    await writeKey(AGENT_BACKLOG_KEY, next);
+    return { item: merged, created: false };
+  }
+
+  const created = normalizeBacklogItem({
+    ...item,
+    id: item.id ?? crypto.randomUUID(),
+    createdAt: item.createdAt ?? now,
+    updatedAt: item.updatedAt ?? now,
+  } as BacklogItem);
+
+  await writeKey(AGENT_BACKLOG_KEY, [created, ...history].slice(0, HISTORY_LIMIT));
+  return { item: created, created: true };
+}
+
+export async function updateBacklogStatus(id: string, status: BacklogItemStatus): Promise<BacklogItem | null> {
+  const now = nowIso();
+  const history = await listBacklogItems(HISTORY_LIMIT);
+  const idx = history.findIndex((item) => item.id === id);
+  if (idx < 0) return null;
+
+  const updated = normalizeBacklogItem({
+    ...history[idx],
+    status,
+    updatedAt: now,
+  });
+
+  const next = [...history];
+  next[idx] = updated;
+  await writeKey(AGENT_BACKLOG_KEY, next);
+  return updated;
+}
+
+export async function getOpenBacklogItems(limit = 100): Promise<BacklogItem[]> {
+  const items = await listBacklogItems(Math.max(limit, HISTORY_LIMIT));
+  return items
+    .filter((item) => item.status === "OPEN" || item.status === "READY" || item.status === "IN_PROGRESS" || item.status === "REVIEW")
+    .slice(0, limit);
+}
+
+export async function getNextBacklogItems(limit = 3): Promise<BacklogItem[]> {
+  const priorityRank: Record<BacklogItemPriority, number> = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+  const items = await listBacklogItems(HISTORY_LIMIT);
+
+  return items
+    .filter((item) => item.status === "OPEN" || item.status === "READY")
+    .sort((a, b) => {
+      const byPriority = priorityRank[b.priority] - priorityRank[a.priority];
+      if (byPriority !== 0) return byPriority;
+      return Date.parse(a.createdAt) - Date.parse(b.createdAt);
+    })
+    .slice(0, Math.max(1, limit));
 }
 
 export async function updateIncidentById(

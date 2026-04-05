@@ -28,6 +28,10 @@ export type AgentActionStatus = "PROPOSED" | "APPLIED" | "SKIPPED" | "FAILED";
 
 export type EngineeringTaskStatus = "OPEN" | "IN_PROGRESS" | "READY_FOR_REVIEW" | "DONE";
 
+export type BacklogItemStatus = "OPEN" | "READY" | "IN_PROGRESS" | "REVIEW" | "DONE";
+export type BacklogItemType = "BUG" | "FEATURE" | "OPTIMIZATION" | "TECH_DEBT";
+export type BacklogItemPriority = "HIGH" | "MEDIUM" | "LOW";
+
 export interface FreezeWindow {
   start: string;
   end: string;
@@ -69,6 +73,9 @@ export interface AgentState {
   lastRemediationAt?: string | null;
   openIncidentCategories?: AgentIncidentCategory[];
   openEngineeringTaskCount?: number;
+  openBacklogCount?: number;
+  inProgressBacklogCount?: number;
+  nextBacklogTitles?: string[];
   updatedBy: AgentName | "system";
 }
 
@@ -129,6 +136,26 @@ export interface EngineeringTask {
   successCriteria?: string;
   linkedTelemetrySnapshot?: Record<string, unknown>;
   remediationResultSummary?: string;
+  backlogItemId?: string | null;
+  notes?: string[];
+}
+
+export interface BacklogItem {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  status: BacklogItemStatus;
+  type: BacklogItemType;
+  priority: BacklogItemPriority;
+  title: string;
+  summary: string;
+  likelyFiles?: string[];
+  copilotPrompt?: string;
+  smokeTestBlock?: string;
+  gitBlock?: string;
+  linkedIncidentId?: string | null;
+  assignedAgent?: "engineering" | "ops" | "pm" | null;
+  notes?: string[];
 }
 
 export interface AgentRunnerResult {

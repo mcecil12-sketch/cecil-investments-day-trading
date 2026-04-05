@@ -1,10 +1,15 @@
 import {
   appendAgentAction,
   appendAgentBrief,
+  closeTasksByIncident,
+  getNextBacklogItems,
   listAgentIncidents,
+  listBacklogItems,
   listEngineeringTasks,
   readAgentState,
+  updateBacklogStatus,
   updateEngineeringTaskById,
+  upsertBacklogItem,
   upsertEngineeringTask,
   writeAgentState,
 } from "@/lib/agents/store";
@@ -40,7 +45,7 @@ function buildTaskTitle(incident: AgentIncident): string {
 
 function parseBrokerDbCounts(summary: string): { brokerPositionsCount: number | null; dbOperationalOpenCount: number | null } {
   const brokerMatch = summary.match(/Broker positions=(\d+)/i);
-  const dbMatch = summary.match(/DB operational open=(\d+)/i);
+  const dbMatch = summary.match(/DB (?:actual )?operational open=(\d+)/i);
   return {
     brokerPositionsCount: brokerMatch ? Number(brokerMatch[1]) : null,
     dbOperationalOpenCount: dbMatch ? Number(dbMatch[1]) : null,
@@ -186,8 +191,33 @@ function buildTask(incident: AgentIncident, now: string): EngineeringTask {
       incident.category === "BROKER_SYNC" && incident.status === "MONITORING"
         ? incident.summary
         : undefined,
+    backlogItemId: null,
   };
 }
+
+const STARTER_BACKLOG_ITEMS = [
+  {
+    type: "OPTIMIZATION" as const,
+    priority: "MEDIUM" as const,
+    title: "Improve scoring determinism",
+    summary: "Reduce non-deterministic score variance across repeated evaluations of the same signal batch.",
+    assignedAgent: "engineering" as const,
+  },
+  {
+    type: "OPTIMIZATION" as const,
+    priority: "MEDIUM" as const,
+    title: "Reduce zero-score fallbacks",
+    summary: "Audit zero-score paths and add deterministic fallback handling where model scoring returns ambiguous output.",
+    assignedAgent: "engineering" as const,
+  },
+  {
+    type: "FEATURE" as const,
+    priority: "LOW" as const,
+    title: "Optimize signal qualification rate",
+    summary: "Review qualification filters and telemetry to improve passing signal quality without increasing risk.",
+    assignedAgent: "engineering" as const,
+  },
+];
 
 // ---------------------------------------------------------------------------
 // Runner
@@ -197,15 +227,23 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
   const now = nowIso();
   const currentState = await readAgentState();
   const incidents = await listAgentIncidents(50);
-  const tasks = await listEngineeringTasks(50);
+  let tasks = await listEngineeringTasks(100);
 
-  // Close stale BROKER_SYNC tasks when their linked incident has already resolved.
+  // 2C.2: close linked OPEN tasks whenever the incident is resolved.
+  let closedByIncident = 0;
+  for (const incident of incidents) {
+    if (incident.status === "RESOLVED") {
+      closedByIncident += await closeTasksByIncident(incident.id);
+    }
+  }
+
+  // Keep prior BROKER_SYNC cleanup for non-OPEN active tasks.
   let resolvedTaskUpdates = 0;
   for (const task of tasks) {
     if (
       task.incidentCategory === "BROKER_SYNC" &&
       task.incidentId &&
-      (task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW")
+      (task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW")
     ) {
       const linkedIncident = incidents.find((incident) => incident.id === task.incidentId);
       if (linkedIncident?.status === "RESOLVED") {
@@ -215,13 +253,25 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
           remediationAttempted: true,
           remediationResultSummary:
             linkedIncident.summary || "BROKER_SYNC incident resolved; task closed as no longer actionable.",
+          notes: ["Auto-closed: incident resolved"],
         });
-        if (updated) {
-          resolvedTaskUpdates += 1;
-        }
+        if (updated) resolvedTaskUpdates += 1;
       }
     }
   }
+
+  // Seed starter backlog once when backlog is empty.
+  const existingBacklog = await listBacklogItems(100);
+  if (existingBacklog.length === 0) {
+    for (const seed of STARTER_BACKLOG_ITEMS) {
+      await upsertBacklogItem({
+        status: "OPEN",
+        ...seed,
+      });
+    }
+  }
+
+  tasks = await listEngineeringTasks(100);
 
   // Find the highest-priority incident that needs a task: OPEN or MONITORING,
   // HIGH or MEDIUM severity, not yet linked to an open engineering task.
@@ -245,6 +295,70 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     const upsertResult = await upsertEngineeringTask(nextTask);
     createdTaskId = upsertResult.created ? upsertResult.task.id : null;
     upsertCreated = upsertResult.created;
+  }
+
+  // Backlog-driven work when we have spare capacity and no HIGH incidents.
+  tasks = await listEngineeringTasks(100);
+  const activeTasks = tasks.filter(
+    (task) => task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW",
+  );
+  const hasHighOpenIncident = incidents.some(
+    (incident) => incident.status !== "RESOLVED" && incident.severity === "HIGH",
+  );
+
+  const createdBacklogTaskIds: string[] = [];
+  if (activeTasks.length < 3 && !hasHighOpenIncident) {
+    const targetCount = Math.min(2, 3 - activeTasks.length);
+    const nextBacklog = await getNextBacklogItems(Math.max(1, targetCount));
+
+    for (const backlogItem of nextBacklog) {
+      const exists = activeTasks.find((task) => task.backlogItemId === backlogItem.id);
+      if (exists) {
+        if (backlogItem.status !== "IN_PROGRESS") {
+          await updateBacklogStatus(backlogItem.id, "IN_PROGRESS");
+        }
+        continue;
+      }
+
+      const task: EngineeringTask = {
+        id: crypto.randomUUID(),
+        createdAt: now,
+        updatedAt: now,
+        status: "OPEN",
+        title: backlogItem.title,
+        summary: backlogItem.summary,
+        likelyFiles: backlogItem.likelyFiles ?? [],
+        copilotPrompt:
+          backlogItem.copilotPrompt ??
+          `Backlog item ${backlogItem.id}: ${backlogItem.title}\n\n${backlogItem.summary}\n\nApply a minimal safe implementation and preserve existing trading flow.`,
+        smokeTestBlock:
+          backlogItem.smokeTestBlock ??
+          "npm run build\nnpm run test -- --runInBand",
+        gitBlock: backlogItem.gitBlock ?? "git add -A && git commit -m \"agent: backlog task\" && git push",
+        incidentId: backlogItem.linkedIncidentId ?? null,
+        likelyRootCause: undefined,
+        recommendedNextAction: undefined,
+        remediationAttempted: false,
+        remediationStatus: "none",
+        backlogItemId: backlogItem.id,
+        notes: ["Created from backlog queue"],
+      };
+
+      await appendAgentAction({
+        id: crypto.randomUUID(),
+        createdAt: now,
+        agent: "engineering",
+        actionType: "BACKLOG_TASK_SELECTED",
+        status: "APPLIED",
+        summary: `Selected backlog item ${backlogItem.id} (${backlogItem.priority}) for engineering execution.`,
+        metadata: { backlogItemId: backlogItem.id, priority: backlogItem.priority },
+      });
+
+      await upsertEngineeringTask(task);
+      await updateBacklogStatus(backlogItem.id, "IN_PROGRESS");
+      createdBacklogTaskIds.push(task.id);
+      activeTasks.push(task);
+    }
   }
 
   const monitoringBrokerIncident = incidents.find(
@@ -277,17 +391,38 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     }
   }
 
-  const refreshedTasks = await listEngineeringTasks(50);
+  // When a backlog-linked task is DONE, move item to REVIEW (or keep DONE).
+  const backlogItems = await listBacklogItems(200);
+  const backlogById = new Map(backlogItems.map((item) => [item.id, item]));
+  for (const task of tasks) {
+    if (task.status !== "DONE" || !task.backlogItemId) continue;
+    const linked = backlogById.get(task.backlogItemId);
+    if (!linked) continue;
+    if (linked.status !== "REVIEW" && linked.status !== "DONE") {
+      await updateBacklogStatus(linked.id, "REVIEW");
+    }
+  }
+
+  const refreshedTasks = await listEngineeringTasks(100);
   const openTasks = refreshedTasks.filter(
     (task) => task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW",
   );
   const openTaskCount = openTasks.length;
 
+  const refreshedBacklog = await listBacklogItems(200);
+  const openBacklogCount = refreshedBacklog.filter((item) => item.status === "OPEN" || item.status === "READY").length;
+  const inProgressBacklogCount = refreshedBacklog.filter((item) => item.status === "IN_PROGRESS").length;
+  const nextBacklogTitles = (await getNextBacklogItems(2)).map((item) => item.title);
+
   const taskSummary = upsertCreated
     ? `Created engineering task "${buildTaskTitle(candidate!)}" for incident ${candidate!.id}.`
-    : resolvedTaskUpdates > 0
-      ? `Closed ${resolvedTaskUpdates} resolved BROKER_SYNC engineering task${resolvedTaskUpdates === 1 ? "" : "s"}.`
-      : "No new engineering task was needed.";
+    : createdBacklogTaskIds.length > 0
+      ? `Created ${createdBacklogTaskIds.length} backlog task${createdBacklogTaskIds.length === 1 ? "" : "s"} for proactive engineering work.`
+      : resolvedTaskUpdates > 0 || closedByIncident > 0
+        ? `Closed ${resolvedTaskUpdates + closedByIncident} resolved incident-linked engineering task${resolvedTaskUpdates + closedByIncident === 1 ? "" : "s"}.`
+        : "No new engineering task was needed.";
+
+  const selectedTaskId = createdTaskId ?? createdBacklogTaskIds[0] ?? null;
 
   const latestTask = upsertCreated && candidate
     ? buildTaskTitle(candidate)
@@ -298,12 +433,15 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     agent: "engineering",
     briefType: "STATUS",
     createdAt: now,
-    title: upsertCreated ? "Engineering task queued" : "Engineering backlog unchanged",
+    title: upsertCreated || createdBacklogTaskIds.length > 0 ? "Engineering task queued" : "Engineering backlog unchanged",
     summary: `${taskSummary} Open tasks: ${openTaskCount}.`,
     details: {
       createdTaskId,
       candidateIncidentId: candidate?.id ?? null,
       openTaskCount,
+      openBacklogCount,
+      inProgressBacklogCount,
+      nextBacklogTitles,
     },
   };
 
@@ -313,9 +451,12 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     ...currentState,
     asOf: now,
     latestBriefId: brief.id,
-    latestEngineeringTaskId: createdTaskId ?? currentState.latestEngineeringTaskId ?? null,
+    latestEngineeringTaskId: selectedTaskId ?? currentState.latestEngineeringTaskId ?? null,
     latestEngineeringTaskTitle: latestTask,
     openEngineeringTaskCount: openTaskCount,
+    openBacklogCount,
+    inProgressBacklogCount,
+    nextBacklogTitles,
     updatedBy: "engineering",
   });
 
@@ -330,6 +471,9 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
       createdTaskId,
       updatedTaskId,
       incidentId: candidate?.id ?? null,
+      backlogTaskIds: createdBacklogTaskIds,
+      openBacklogCount,
+      inProgressBacklogCount,
     },
   });
 
@@ -338,7 +482,7 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     state: savedState,
     briefId: brief.id,
     actionId: action.id,
-    engineeringTaskId: createdTaskId,
+    engineeringTaskId: selectedTaskId,
     summary: brief.summary,
   };
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import type { AgentBrief, AgentState } from "@/lib/agents/types";
+import type { AgentBrief, AgentState, BacklogItem } from "@/lib/agents/types";
 
 type AgentStateResponse = {
   ok?: boolean;
@@ -11,6 +11,11 @@ type AgentStateResponse = {
 type AgentBriefResponse = {
   ok?: boolean;
   brief?: AgentBrief | null;
+};
+
+type BacklogResponse = {
+  ok?: boolean;
+  items?: BacklogItem[];
 };
 
 function DetailRow({
@@ -37,14 +42,16 @@ function formatMaxEntries(value: number | null | undefined): string {
 export function AgentControlCard() {
   const [state, setState] = useState<AgentState | null>(null);
   const [brief, setBrief] = useState<AgentBrief | null>(null);
+  const [backlogTop, setBacklogTop] = useState<BacklogItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [stateResult, briefResult] = await Promise.allSettled([
+      const [stateResult, briefResult, backlogResult] = await Promise.allSettled([
         fetch("/api/agents/state", { cache: "no-store" }),
         fetch("/api/agents/brief/latest", { cache: "no-store" }),
+        fetch("/api/agents/backlog", { cache: "no-store" }),
       ]);
 
       if (stateResult.status === "fulfilled" && stateResult.value.ok) {
@@ -57,11 +64,27 @@ export function AgentControlCard() {
         setBrief(payload.brief ?? null);
       }
 
+      if (backlogResult.status === "fulfilled" && backlogResult.value.ok) {
+        const payload = (await backlogResult.value.json().catch(() => ({}))) as BacklogResponse;
+        const top = (payload.items ?? [])
+          .filter((item) => item.status !== "DONE")
+          .sort((a, b) => {
+            const rank = { HIGH: 3, MEDIUM: 2, LOW: 1 } as const;
+            const byPriority = rank[b.priority] - rank[a.priority];
+            if (byPriority !== 0) return byPriority;
+            return Date.parse(a.createdAt) - Date.parse(b.createdAt);
+          })
+          .slice(0, 2);
+        setBacklogTop(top);
+      }
+
       const failed =
         (stateResult.status === "rejected" ||
           (stateResult.status === "fulfilled" && !stateResult.value.ok)) &&
         (briefResult.status === "rejected" ||
-          (briefResult.status === "fulfilled" && !briefResult.value.ok));
+          (briefResult.status === "fulfilled" && !briefResult.value.ok)) &&
+        (backlogResult.status === "rejected" ||
+          (backlogResult.status === "fulfilled" && !backlogResult.value.ok));
 
       setError(failed ? "Agent control unavailable" : null);
     } catch {
@@ -188,6 +211,26 @@ export function AgentControlCard() {
           label="Latest engineering task"
           value={state?.latestEngineeringTaskTitle ?? "None"}
         />
+      </div>
+
+      <div className="rounded-xl border border-[var(--ci-border)] bg-black/20 px-4 py-3 space-y-2">
+        <div className="text-[10px] uppercase tracking-wide text-[var(--ci-text-muted)]">
+          Backlog
+        </div>
+        <div className="text-xs text-neutral-200">
+          open={state?.openBacklogCount ?? 0}; in-progress={state?.inProgressBacklogCount ?? 0}
+        </div>
+        <div className="space-y-1">
+          {backlogTop.length > 0 ? (
+            backlogTop.map((item) => (
+              <div key={item.id} className="text-xs text-neutral-200">
+                {item.title} ({item.priority})
+              </div>
+            ))
+          ) : (
+            <div className="text-xs text-[var(--ci-text-muted)]">No backlog items queued.</div>
+          )}
+        </div>
       </div>
 
       {state?.remediationSummary && (
