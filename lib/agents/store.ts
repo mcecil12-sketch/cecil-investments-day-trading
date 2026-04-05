@@ -523,6 +523,22 @@ export async function upsertEngineeringTask(
   return { task: created, created: true };
 }
 
+export async function updateEngineeringTaskById(
+  id: string,
+  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot">>,
+): Promise<EngineeringTask | null> {
+  const now = nowIso();
+  const history = await listEngineeringTasks(HISTORY_LIMIT);
+  const idx = history.findIndex((t) => t.id === id);
+  if (idx < 0) return null;
+  const current = history[idx];
+  const updated: EngineeringTask = { ...current, ...updates, updatedAt: now };
+  const next = [...history];
+  next[idx] = updated;
+  await writeKey(AGENT_ENGINEERING_KEY, next);
+  return updated;
+}
+
 export async function updateIncidentById(
   id: string,
   updates: Partial<Pick<AgentIncident, "status" | "severity" | "summary">>,

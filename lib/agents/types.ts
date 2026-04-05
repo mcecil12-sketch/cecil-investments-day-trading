@@ -48,6 +48,8 @@ export interface AgentState {
   telemetry?: {
     readinessReady?: boolean;
     readinessReasons?: string[];
+    brokerPositionsCount?: number;
+    dbOperationalOpenCount?: number;
     recentSignalsPending?: number;
     recentSignalsScored?: number;
     recentZeroScores?: number;
@@ -120,6 +122,9 @@ export interface EngineeringTask {
   recommendedNextAction?: string;
   remediationAttempted?: boolean;
   remediationStatus?: "none" | "attempted" | "succeeded" | "failed";
+  successCriteria?: string;
+  linkedTelemetrySnapshot?: Record<string, unknown>;
+  remediationResultSummary?: string;
 }
 
 export interface AgentRunnerResult {

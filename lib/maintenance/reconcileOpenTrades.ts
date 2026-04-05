@@ -2,6 +2,7 @@ import { alpacaRequest } from "@/lib/alpaca";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { recordReconcile } from "@/lib/maintenance/reconcileTelemetry";
+import { isOperationallyOpenTrade } from "@/lib/trades/operational";
 
 const POSITION_OPEN_OVERRIDES_CANCELED_v1 = true;
 
@@ -349,8 +350,12 @@ export async function reconcileOpenTrades(
     const openStopBySymbol = await fetchOpenStopBySymbol();
 
     const trades: any[] = await readTrades();
+    // Use the same operational-open definition as countOperationalOpenTickers so
+    // reconcile covers exactly the trades that register as "open" in telemetry.
+    // Includes: status=OPEN trades AND trades with alpacaStatus/brokerStatus=="position_open"
+    // Excludes: ARCHIVED and CLOSED trades.
     const openTrades = trades
-      .filter((t) => (t?.status || "").toUpperCase() === "OPEN")
+      .filter((t) => isOperationallyOpenTrade(t))
       .slice(0, max);
 
     const results: any[] = [];

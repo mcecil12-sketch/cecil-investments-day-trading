@@ -15,7 +15,7 @@ import {
   executeRemediationForIncident,
   isRemediationOnCooldown,
 } from "@/lib/agents/remediation";
-import type { AgentBrief, AgentIncidentCategory, AgentRunnerResult } from "@/lib/agents/types";
+import type { AgentBrief, AgentIncident, AgentIncidentCategory, AgentRunnerResult } from "@/lib/agents/types";
 import { nowIso } from "@/lib/agents/time";
 
 function summarizeOps(
@@ -128,64 +128,104 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
   let remediationSummary: string | undefined;
   let lastRemediationAt: string | null = null;
 
-  if (
-    brokerSyncIncidentId !== null &&
-    telemetry.openTradeMismatch
-  ) {
+  if (brokerSyncIncidentId !== null && telemetry.openTradeMismatch) {
     const openIncidentsSnapshot = await listOpenIncidents(50);
-    const brokerIncident = openIncidentsSnapshot.find((inc) => inc.id === brokerSyncIncidentId);
+    const brokerIncident: AgentIncident | null =
+      openIncidentsSnapshot.find((inc) => inc.id === brokerSyncIncidentId) ?? null;
 
-    // Only attempt for OPEN incidents — MONITORING means we already tried
-    if (brokerIncident && brokerIncident.status === "OPEN") {
-      if (!isRemediationOnCooldown(brokerSyncIncidentId, actions)) {
-        // Record attempt
-        await appendAgentAction({
-          id: crypto.randomUUID(),
-          createdAt: now,
-          agent: "ops",
-          actionType: "REMEDIATION_ATTEMPTED",
-          status: "APPLIED",
-          summary: `Attempting broker sync reconcile for incident ${brokerSyncIncidentId}.`,
-          metadata: { incidentId: brokerSyncIncidentId, category: "BROKER_SYNC" },
-        });
+    const canAttempt =
+      brokerIncident !== null &&
+      (brokerIncident.status === "OPEN" || brokerIncident.status === "MONITORING") &&
+      !isRemediationOnCooldown(brokerSyncIncidentId, actions);
 
-        const remediation = await executeRemediationForIncident(brokerIncident, telemetry);
-        remediationSummary = remediation.summary;
-        lastRemediationAt = now;
+    if (canAttempt && brokerIncident !== null) {
+      await appendAgentAction({
+        id: crypto.randomUUID(),
+        createdAt: now,
+        agent: "ops",
+        actionType: "REMEDIATION_ATTEMPTED",
+        status: "APPLIED",
+        summary: `Attempting broker sync reconcile for incident ${brokerSyncIncidentId}. Before: broker=${telemetry.brokerPositionsCount} db=${telemetry.dbOperationalOpenCount}.`,
+        metadata: {
+          incidentId: brokerSyncIncidentId,
+          category: "BROKER_SYNC",
+          beforeBrokerPositionsCount: telemetry.brokerPositionsCount,
+          beforeDbOperationalOpenCount: telemetry.dbOperationalOpenCount,
+        },
+      });
 
-        if (remediation.attempted && remediation.success) {
+      const remediation = await executeRemediationForIncident(brokerIncident, telemetry);
+      lastRemediationAt = now;
+
+      if (remediation.attempted) {
+        // Re-read telemetry immediately after reconcile to verify if mismatch cleared
+        const afterTelemetry = await readAgentTelemetrySnapshot();
+        const mismatchCleared = !afterTelemetry.openTradeMismatch;
+
+        const beforeAfterSuffix = ` Before: broker=${telemetry.brokerPositionsCount} db=${telemetry.dbOperationalOpenCount}. After: broker=${afterTelemetry.brokerPositionsCount} db=${afterTelemetry.dbOperationalOpenCount}.`;
+        remediationSummary =
+          remediation.summary + beforeAfterSuffix + (mismatchCleared ? " RESOLVED." : "");
+
+        if (remediation.success || mismatchCleared) {
           await appendAgentAction({
             id: crypto.randomUUID(),
             createdAt: now,
             agent: "ops",
             actionType: "REMEDIATION_SUCCEEDED",
             status: "APPLIED",
-            summary: remediation.summary,
-            metadata: { incidentId: brokerSyncIncidentId, ...remediation.detail },
+            summary: remediationSummary,
+            metadata: {
+              incidentId: brokerSyncIncidentId,
+              mismatchCleared,
+              afterBrokerPositionsCount: afterTelemetry.brokerPositionsCount,
+              afterDbOperationalOpenCount: afterTelemetry.dbOperationalOpenCount,
+              ...remediation.detail,
+            },
           });
-          // Transition incident to MONITORING — let the next run confirm resolution
-          await updateIncidentById(
-            brokerSyncIncidentId,
-            { status: "MONITORING" },
-            `Ops agent applied reconcile: ${remediation.summary}`,
-          );
-          await appendAgentAction({
-            id: crypto.randomUUID(),
-            createdAt: now,
-            agent: "ops",
-            actionType: "INCIDENT_MONITORING",
-            status: "APPLIED",
-            summary: `Incident ${brokerSyncIncidentId} transitioned to MONITORING after remediation.`,
-            metadata: { incidentId: brokerSyncIncidentId },
-          });
-        } else if (remediation.attempted && !remediation.success) {
+
+          if (mismatchCleared) {
+            await resolveIncident(
+              { category: "BROKER_SYNC", title: "Open trade mismatch" },
+              `Ops reconcile cleared mismatch. broker=${afterTelemetry.brokerPositionsCount} db=${afterTelemetry.dbOperationalOpenCount}.`,
+            );
+            await appendAgentAction({
+              id: crypto.randomUUID(),
+              createdAt: now,
+              agent: "ops",
+              actionType: "INCIDENT_RESOLVED",
+              status: "APPLIED",
+              summary: `Incident ${brokerSyncIncidentId} resolved: broker/DB counts now aligned.`,
+              metadata: { incidentId: brokerSyncIncidentId },
+            });
+            brokerSyncIncidentId = null;
+          } else {
+            await updateIncidentById(
+              brokerSyncIncidentId,
+              {
+                status: "MONITORING",
+                summary: `Broker positions=${afterTelemetry.brokerPositionsCount}, DB operational open=${afterTelemetry.dbOperationalOpenCount}. Reconcile ran; mismatch persists.`,
+              },
+              `Ops reconcile ran but mismatch persists: broker=${afterTelemetry.brokerPositionsCount} db=${afterTelemetry.dbOperationalOpenCount}.`,
+            );
+            await appendAgentAction({
+              id: crypto.randomUUID(),
+              createdAt: now,
+              agent: "ops",
+              actionType: "INCIDENT_MONITORING",
+              status: "APPLIED",
+              summary: `Incident ${brokerSyncIncidentId} MONITORING: reconcile ran but mismatch persists.`,
+              metadata: { incidentId: brokerSyncIncidentId },
+            });
+          }
+        } else {
+          remediationSummary = remediation.summary + beforeAfterSuffix;
           await appendAgentAction({
             id: crypto.randomUUID(),
             createdAt: now,
             agent: "ops",
             actionType: "REMEDIATION_FAILED",
             status: "FAILED",
-            summary: remediation.summary,
+            summary: remediationSummary,
             metadata: {
               incidentId: brokerSyncIncidentId,
               error: remediation.error,
@@ -194,8 +234,10 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
           });
         }
       } else {
-        remediationSummary = `Broker sync remediation on cooldown for incident ${brokerSyncIncidentId}.`;
+        remediationSummary = remediation.summary;
       }
+    } else if (brokerIncident !== null) {
+      remediationSummary = `Broker sync remediation on cooldown for incident ${brokerSyncIncidentId}. broker=${telemetry.brokerPositionsCount} db=${telemetry.dbOperationalOpenCount}.`;
     }
   }
 
@@ -240,6 +282,8 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
     telemetry: {
       readinessReady: telemetry.readinessReady,
       readinessReasons: telemetry.readinessReasons,
+      brokerPositionsCount: telemetry.brokerPositionsCount,
+      dbOperationalOpenCount: telemetry.dbOperationalOpenCount,
       recentSignalsPending: telemetry.signalsPendingCount,
       recentSignalsScored: telemetry.signalsScoredCount,
       recentZeroScores: telemetry.zeroScoreCount,

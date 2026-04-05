@@ -4,6 +4,7 @@ import {
   listAgentIncidents,
   listEngineeringTasks,
   readAgentState,
+  updateEngineeringTaskById,
   upsertEngineeringTask,
   writeAgentState,
 } from "@/lib/agents/store";
@@ -23,7 +24,7 @@ import type {
 function buildTaskTitle(incident: AgentIncident): string {
   switch (incident.category) {
     case "BROKER_SYNC":
-      return "Investigate open-trade mismatch between broker and DB";
+      return "Resolve broker/DB open-trade mismatch for stale OPEN trades";
     case "SCORING":
       return "Investigate scoring pipeline stall";
     case "SCANNER":
@@ -37,19 +38,36 @@ function buildTaskTitle(incident: AgentIncident): string {
   }
 }
 
+function parseBrokerDbCounts(summary: string): { brokerPositionsCount: number | null; dbOperationalOpenCount: number | null } {
+  const brokerMatch = summary.match(/Broker positions=(\d+)/i);
+  const dbMatch = summary.match(/DB operational open=(\d+)/i);
+  return {
+    brokerPositionsCount: brokerMatch ? Number(brokerMatch[1]) : null,
+    dbOperationalOpenCount: dbMatch ? Number(dbMatch[1]) : null,
+  };
+}
+
 function buildCopilotPrompt(incident: AgentIncident, classification: ReturnType<typeof classifyIncident>): string {
   if (incident.category === "BROKER_SYNC") {
+    const { brokerPositionsCount, dbOperationalOpenCount } = parseBrokerDbCounts(incident.summary);
+    const observedCounts =
+      brokerPositionsCount !== null || dbOperationalOpenCount !== null
+        ? `Broker positions=${brokerPositionsCount ?? "unknown"}, DB operational open=${dbOperationalOpenCount ?? "unknown"}.`
+        : "Broker/DB counts unavailable in incident summary.";
     return (
       `Incident ${incident.id} — BROKER_SYNC mismatch detected in the Cecil Trading App.\n\n` +
       `Observed: ${incident.summary}\n\n` +
+      `Counts snapshot: ${observedCounts}\n\n` +
       `Root cause hypothesis: ${classification.likelyRootCause}\n\n` +
       `Review these files first:\n` +
-      classification.likelyFiles.map((f) => `  - ${f}`).join("\n") + "\n\n" +
+      [...classification.likelyFiles, "lib/maintenance/reconcileOpenTrades.ts", "app/api/maintenance/sync-broker-state/route.ts", "app/api/maintenance/finalize-closes/route.ts"]
+        .map((f) => `  - ${f}`)
+        .join("\n") + "\n\n" +
       `Key questions:\n` +
-      `  1. Are there DB trades with status=OPEN that are not in Alpaca positions?\n` +
-      `  2. Does reconcileOpenTrades correctly close/sync them?\n` +
-      `  3. Does lib/trades/operational.ts countOperationalOpenTickers exclude CLOSED/ARCHIVED trades?\n` +
-      `  4. Does fetchBrokerTruth return accurate positionsCount?\n\n` +
+      `  1. Are there operationally-open DB trades (including broker/alpaca position_open markers) that are missing at the broker?\n` +
+      `  2. Does reconcileOpenTrades use the same open-trade definition as countOperationalOpenTickers?\n` +
+      `  3. Does sync-broker-state handle stale/ghost positions without re-opening already-closed trades?\n` +
+      `  4. Does fetchBrokerTruth return accurate positionsCount and cache behavior under retries?\n\n` +
       `Apply the smallest safe fix. Preserve scan -> signals -> scoring -> auto-entry behavior.`
     );
   }
@@ -101,7 +119,9 @@ function buildSmokeTestBlock(incident: AgentIncident): string {
       `# GET /api/agents/incidents\n` +
       `# GET /api/ops/status   (check broker.positionsCount vs trades.operationalOpen)\n` +
       `# GET /api/readiness    (verify open-trade mismatch cleared)\n` +
-      `# POST /api/maintenance/reconcile-open-trades  (dry-run first)`
+      `# POST /api/maintenance/reconcile-open-trades  (dry-run first)\n` +
+      `# POST /api/maintenance/sync-broker-state\n` +
+      `# POST /api/maintenance/finalize-closes`
     );
   }
   if (incident.category === "SCORING") {
@@ -125,6 +145,7 @@ function buildSmokeTestBlock(incident: AgentIncident): string {
 function buildTask(incident: AgentIncident, now: string): EngineeringTask {
   const classification = classifyIncident(incident);
   const title = buildTaskTitle(incident);
+  const { brokerPositionsCount, dbOperationalOpenCount } = parseBrokerDbCounts(incident.summary);
   const summary =
     `[${incident.severity}][${incident.category}] ${incident.title}. ` +
     `${incident.summary} ` +
@@ -148,6 +169,23 @@ function buildTask(incident: AgentIncident, now: string): EngineeringTask {
     recommendedNextAction: classification.recommendedNextAction,
     remediationAttempted: false,
     remediationStatus: "none",
+    successCriteria:
+      incident.category === "BROKER_SYNC"
+        ? "Broker positions count and DB operational open count reconcile with no mismatch. Stale open-position markers are cleaned up, incident resolves, and readiness no longer reports an open-trade mismatch."
+        : undefined,
+    linkedTelemetrySnapshot:
+      incident.category === "BROKER_SYNC" &&
+      (brokerPositionsCount !== null || dbOperationalOpenCount !== null)
+        ? {
+          brokerPositionsCount,
+          dbOperationalOpenCount,
+          incidentSeverity: incident.severity,
+        }
+        : undefined,
+    remediationResultSummary:
+      incident.category === "BROKER_SYNC" && incident.status === "MONITORING"
+        ? incident.summary
+        : undefined,
   };
 }
 
@@ -176,11 +214,43 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
 
   let createdTaskId: string | null = null;
   let upsertCreated = false;
+  let updatedTaskId: string | null = null;
 
   if (candidate) {
-    const upsertResult = await upsertEngineeringTask(buildTask(candidate, now));
+    const nextTask = buildTask(candidate, now);
+    const upsertResult = await upsertEngineeringTask(nextTask);
     createdTaskId = upsertResult.created ? upsertResult.task.id : null;
     upsertCreated = upsertResult.created;
+  }
+
+  const monitoringBrokerIncident = incidents.find(
+    (incident) => incident.category === "BROKER_SYNC" && incident.status === "MONITORING",
+  );
+  if (monitoringBrokerIncident) {
+    const existingTask = tasks.find(
+      (task) =>
+        task.incidentId === monitoringBrokerIncident.id &&
+        (task.status === "OPEN" || task.status === "IN_PROGRESS" || task.status === "READY_FOR_REVIEW"),
+    );
+    if (existingTask) {
+      const { brokerPositionsCount, dbOperationalOpenCount } = parseBrokerDbCounts(monitoringBrokerIncident.summary);
+      const updated = await updateEngineeringTaskById(existingTask.id, {
+        remediationAttempted: true,
+        remediationStatus: "attempted",
+        remediationResultSummary: monitoringBrokerIncident.summary,
+        linkedTelemetrySnapshot:
+          brokerPositionsCount !== null || dbOperationalOpenCount !== null
+            ? {
+              brokerPositionsCount,
+              dbOperationalOpenCount,
+              incidentSeverity: monitoringBrokerIncident.severity,
+            }
+            : undefined,
+      });
+      if (updated) {
+        updatedTaskId = updated.id;
+      }
+    }
   }
 
   const openTasks = tasks.filter(
@@ -231,6 +301,7 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     summary: taskSummary,
     metadata: {
       createdTaskId,
+      updatedTaskId,
       incidentId: candidate?.id ?? null,
     },
   });
