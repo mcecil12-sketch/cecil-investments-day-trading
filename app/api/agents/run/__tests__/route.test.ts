@@ -38,6 +38,12 @@ const mocks = vi.hoisted(() => {
       summary: "Manager ensured 5 system tasks. Created 2.",
       briefId: "brief-manager",
     })),
+    fetchExecution: vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    ),
   };
 });
 
@@ -64,6 +70,7 @@ import { POST } from "../route";
 describe("POST /api/agents/run", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal("fetch", mocks.fetchExecution);
     process.env.CRON_TOKEN = "test-cron-token";
     delete process.env.CRON_SECRET;
   });
@@ -84,6 +91,7 @@ describe("POST /api/agents/run", () => {
       message: "Missing or invalid x-cron-token",
     });
     expect(mocks.ensureAgentState).not.toHaveBeenCalled();
+    expect(mocks.fetchExecution).not.toHaveBeenCalled();
   });
 
   it("accepts a valid x-cron-token and runs all agents in order", async () => {
@@ -104,6 +112,14 @@ describe("POST /api/agents/run", () => {
     expect(mocks.runPolicyNewsAgent).toHaveBeenCalledTimes(1);
     expect(mocks.runOpsAgent).toHaveBeenCalledTimes(1);
     expect(mocks.runEngineeringManagerAgent).toHaveBeenCalledTimes(1);
+    expect(mocks.fetchExecution).toHaveBeenCalledTimes(1);
+    expect(mocks.fetchExecution).toHaveBeenCalledWith(
+      new URL("http://localhost/api/agents/execute"),
+      expect.objectContaining({
+        method: "POST",
+        headers: { "x-cron-token": "test-cron-token" },
+      })
+    );
     expect(body.results).toEqual([
       {
         agent: "policynews",
@@ -177,6 +193,7 @@ describe("POST /api/agents/run", () => {
     expect(response.status).toBe(200);
     expect(body.ran).toEqual(["policynews", "ops"]);
     expect(mocks.runEngineeringManagerAgent).not.toHaveBeenCalled();
+    expect(mocks.fetchExecution).not.toHaveBeenCalled();
   });
 
   it("supports direct engineering-manager requests when there are no active incidents", async () => {
@@ -194,6 +211,7 @@ describe("POST /api/agents/run", () => {
     expect(mocks.runPolicyNewsAgent).not.toHaveBeenCalled();
     expect(mocks.runOpsAgent).not.toHaveBeenCalled();
     expect(mocks.runEngineeringManagerAgent).toHaveBeenCalledTimes(1);
+    expect(mocks.fetchExecution).toHaveBeenCalledTimes(1);
   });
 
   it("returns 400 for an invalid agent selector", async () => {
@@ -209,5 +227,6 @@ describe("POST /api/agents/run", () => {
     expect(response.status).toBe(400);
     expect(body.ok).toBe(false);
     expect(body.error).toBe("invalid_agent");
+    expect(mocks.fetchExecution).not.toHaveBeenCalled();
   });
 });

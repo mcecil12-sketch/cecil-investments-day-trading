@@ -86,6 +86,20 @@ export async function POST(req: Request) {
 
   const finalState = await readAgentState();
 
+  if (ran.includes("engineering-manager")) {
+    try {
+      await fetch(new URL("/api/agents/execute", req.url), {
+        method: "POST",
+        headers: {
+          "x-cron-token": process.env.CRON_TOKEN || process.env.CRON_SECRET || "",
+        },
+        cache: "no-store",
+      });
+    } catch (e) {
+      console.warn("Execution trigger failed", e);
+    }
+  }
+
   return NextResponse.json({
     ok: true,
     authMode: "cron_token",
