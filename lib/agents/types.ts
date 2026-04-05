@@ -164,7 +164,7 @@ export interface EngineeringTask {
   likelyRootCause?: string;
   recommendedNextAction?: string;
   remediationAttempted?: boolean;
-  remediationStatus?: "none" | "attempted" | "succeeded" | "failed";
+  remediationStatus?: "none" | "attempted" | "succeeded" | "failed" | "completed";
   successCriteria?: string;
   linkedTelemetrySnapshot?: Record<string, unknown>;
   remediationResultSummary?: string;

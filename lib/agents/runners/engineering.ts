@@ -105,7 +105,6 @@ function isUnresolvedBacklogGateTask(task: EngineeringTask): boolean {
     task.status === "OPEN" ||
     task.status === "IN_PROGRESS" ||
     task.status === "READY_FOR_EXECUTION" ||
-    task.status === "READY_FOR_PUSH" ||
     task.status === "BLOCKED"
   );
 }

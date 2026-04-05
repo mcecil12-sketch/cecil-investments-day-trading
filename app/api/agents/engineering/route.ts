@@ -32,29 +32,24 @@ export async function GET(req: Request) {
   const limitParam = Number(url.searchParams.get("limit") ?? "25");
   const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(100, Math.floor(limitParam)) : 25;
 
-  const tasks = (await listEngineeringTasks(limit)).sort(
+  const allTasks = (await listEngineeringTasks(200)).sort(
     (a, b) => executionVisibilityRank(a) - executionVisibilityRank(b),
   );
-  const openTasks = tasks.filter(
+  const tasks = allTasks.slice(0, limit);
+  const openTasks = allTasks.filter(
     (task) =>
       task.status === "OPEN" ||
       task.status === "IN_PROGRESS" ||
       task.status === "READY_FOR_EXECUTION" ||
-      task.status === "READY_FOR_PUSH" ||
-      task.status === "READY_FOR_REVIEW",
+      task.status === "READY_FOR_PUSH",
   );
-  const executionReadyTasks = tasks.filter(
-    (task) => task.status === "READY_FOR_EXECUTION" || task.status === "READY_FOR_PUSH",
+  const executionReadyTasks = allTasks.filter(
+    (task) => task.status === "READY_FOR_EXECUTION" || task.executionStatus === "READY",
   );
-  const blockedTasks = tasks.filter((task) => task.status === "BLOCKED" || task.executionStatus === "BLOCKED");
-  const latestExecutionTask = tasks.find(
-    (task) =>
-      task.status === "READY_FOR_EXECUTION" ||
-      task.status === "READY_FOR_PUSH" ||
-      task.status === "OPEN" ||
-      task.status === "IN_PROGRESS" ||
-      task.status === "BLOCKED",
-  );
+  const blockedTasks = allTasks.filter((task) => task.status === "BLOCKED");
+  const latestReadyForExecution = allTasks
+    .filter((task) => task.status === "READY_FOR_EXECUTION")
+    .at(-1) ?? null;
 
   return NextResponse.json({
     ok: true,
@@ -62,9 +57,10 @@ export async function GET(req: Request) {
     openTasks,
     executionReadyTasks,
     blockedTasks,
+    openEngineeringTaskCount: openTasks.length + blockedTasks.length,
     openExecutionReadyCount: executionReadyTasks.length,
     blockedTaskCount: blockedTasks.length,
-    latestExecutionTaskTitle: latestExecutionTask?.title ?? null,
-    latestExecutionStatus: latestExecutionTask?.status ?? null,
+    latestExecutionTaskTitle: latestReadyForExecution?.title ?? null,
+    latestExecutionStatus: latestReadyForExecution?.executionStatus ?? null,
   });
 }

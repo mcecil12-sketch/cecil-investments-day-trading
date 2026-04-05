@@ -4,6 +4,7 @@ export const dynamic = "force-dynamic";
 import { NextRequest, NextResponse } from "next/server";
 import { checkAgentCronAuth, unauthorizedAgentResponse } from "@/lib/agents/auth";
 import { prepareExecutionPlan } from "@/lib/agents/execution/engine";
+import { executeGithubTask } from "@/lib/agents/githubExecutor";
 import { approveExecution } from "@/lib/agents/governance/manager";
 import { listEngineeringTasks, updateEngineeringTaskById } from "@/lib/agents/store";
 import type { EngineeringTask } from "@/lib/agents/types";
@@ -35,16 +36,26 @@ function isEligibleTask(task: EngineeringTask): boolean {
 }
 
 function executionSortRank(task: EngineeringTask): number {
-  const incidentRank = task.incidentId ? 0 : 100;
-  const statusRank =
-    task.status === "READY_FOR_EXECUTION"
-      ? 0
-      : task.status === "READY_FOR_PUSH"
-        ? 10
-        : task.status === "OPEN"
-          ? 20
-          : 100;
-  return incidentRank + statusRank;
+  return task.status === "READY_FOR_EXECUTION"
+    ? 0
+    : task.status === "READY_FOR_PUSH"
+      ? 10
+      : task.status === "OPEN"
+        ? 20
+        : 100;
+}
+
+function validateExecutionGuardrails(task: EngineeringTask): string | null {
+  if (task.patchPlan?.mode !== "GITHUB_COMMIT") {
+    return "patch_mode_not_github_commit";
+  }
+  if (task.commitPlan?.pushDirect !== true) {
+    return "push_direct_not_enabled";
+  }
+  if (!task.commitPlan?.commitMessage?.trim()) {
+    return "missing_commit_message";
+  }
+  return null;
 }
 
 export async function POST(req: NextRequest) {
@@ -65,10 +76,73 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, message: "No execution-ready tasks" });
     }
 
-    const approval =
-      task.status === "OPEN"
-        ? approveExecution(task)
-        : { ok: true as const };
+    if (task.status === "READY_FOR_EXECUTION" || task.status === "READY_FOR_PUSH") {
+      const guardrailError = validateExecutionGuardrails(task);
+
+      if (guardrailError) {
+        const skippedNotes = appendNotes(task.notes, [`Execution skipped: ${guardrailError}`]);
+        await updateEngineeringTaskById(task.id, {
+          notes: skippedNotes,
+          executionError: guardrailError,
+        });
+
+        return NextResponse.json({
+          ok: true,
+          taskId: task.id,
+          executionStatus: task.executionStatus ?? "READY",
+          skipped: true,
+          reason: guardrailError,
+        });
+      }
+
+      try {
+        const executionResult = await executeGithubTask(task);
+
+        await updateEngineeringTaskById(task.id, {
+          status: "DONE",
+          remediationAttempted: true,
+          remediationStatus: "completed",
+          remediationResultSummary: `Executed via GitHub executor (${executionResult.filesTouched.join(", ")}).`,
+          executionStatus: "EXECUTED",
+          executionError: null,
+          notes: appendNotes(task.notes, [
+            "Executed via GitHub executor",
+            `Commit message: ${executionResult.commitMessage}`,
+          ]),
+        });
+
+        return NextResponse.json({
+          ok: true,
+          executedTaskId: task.id,
+          executionStatus: "EXECUTED",
+          filesTouched: executionResult.filesTouched,
+          commitMessage: executionResult.commitMessage,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await updateEngineeringTaskById(task.id, {
+          status: "BLOCKED",
+          remediationAttempted: true,
+          remediationStatus: "failed",
+          remediationResultSummary: `Execution failed: ${message}`,
+          executionStatus: "FAILED",
+          executionError: message,
+          notes: appendNotes(task.notes, [`Execution failed: ${message}`]),
+        });
+
+        return NextResponse.json(
+          {
+            ok: false,
+            error: message,
+            taskId: task.id,
+            executionStatus: "FAILED",
+          },
+          { status: 500 },
+        );
+      }
+    }
+
+    const approval = task.status === "OPEN" ? approveExecution(task) : { ok: true as const };
 
     if (!approval.ok) {
       const blockedNotes = appendNotes(task.notes, [`Execution blocked: ${approval.reason}`]);

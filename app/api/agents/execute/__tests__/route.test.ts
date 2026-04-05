@@ -23,6 +23,11 @@ const mocks = vi.hoisted(() => ({
     nextTaskStatus: "READY_FOR_EXECUTION",
   })),
   approveExecution: vi.fn(() => ({ ok: true })),
+  executeGithubTask: vi.fn(async () => ({
+    success: true,
+    commitMessage: "agent: execute task",
+    filesTouched: ["agent-patches/task-ready.md"],
+  })),
 }));
 
 vi.mock("@/lib/agents/store", () => ({
@@ -36,6 +41,10 @@ vi.mock("@/lib/agents/execution/engine", () => ({
 
 vi.mock("@/lib/agents/governance/manager", () => ({
   approveExecution: mocks.approveExecution,
+}));
+
+vi.mock("@/lib/agents/githubExecutor", () => ({
+  executeGithubTask: mocks.executeGithubTask,
 }));
 
 import { POST } from "../route";
@@ -190,6 +199,17 @@ describe("POST /api/agents/execute", () => {
         copilotPrompt: "safe",
         smokeTestBlock: "",
         gitBlock: "",
+        patchPlan: {
+          mode: "GITHUB_COMMIT",
+          targetFiles: ["lib/c.ts"],
+          proposedChangesSummary: "summary",
+        },
+        commitPlan: {
+          commitMessage: "agent: ready",
+          targetBranch: "main",
+          pushDirect: true,
+        },
+        executionStatus: "READY",
       },
     ]);
 
@@ -201,9 +221,111 @@ describe("POST /api/agents/execute", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, taskId: "task-ready" });
+    expect(await response.json()).toMatchObject({ ok: true, executedTaskId: "task-ready", executionStatus: "EXECUTED" });
     expect(mocks.approveExecution).not.toHaveBeenCalled();
-    expect(mocks.prepareExecutionPlan).toHaveBeenCalledWith(expect.objectContaining({ id: "task-ready" }));
+    expect(mocks.executeGithubTask).toHaveBeenCalledWith(expect.objectContaining({ id: "task-ready" }));
+  });
+
+  it("executes READY_FOR_EXECUTION tasks and marks them DONE", async () => {
+    mocks.listEngineeringTasks.mockResolvedValueOnce([
+      {
+        id: "task-ready",
+        createdAt: "2026-04-05T09:00:00Z",
+        updatedAt: "2026-04-05T09:00:00Z",
+        status: "READY_FOR_EXECUTION",
+        title: "Ready task",
+        summary: "summary",
+        likelyFiles: ["lib/c.ts"],
+        copilotPrompt: "safe",
+        smokeTestBlock: "",
+        gitBlock: "",
+        patchPlan: {
+          mode: "GITHUB_COMMIT",
+          targetFiles: ["lib/c.ts"],
+          proposedChangesSummary: "summary",
+        },
+        commitPlan: {
+          commitMessage: "agent: ready",
+          targetBranch: "main",
+          pushDirect: true,
+        },
+        executionStatus: "READY",
+      },
+    ]);
+
+    const response = await POST(
+      new Request("http://localhost/api/agents/execute", {
+        method: "POST",
+        headers: { "x-cron-token": "test-cron-token" },
+      }) as any,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      executedTaskId: "task-ready",
+      executionStatus: "EXECUTED",
+      commitMessage: "agent: execute task",
+    });
+    expect(mocks.updateEngineeringTaskById).toHaveBeenCalledWith(
+      "task-ready",
+      expect.objectContaining({
+        status: "DONE",
+        executionStatus: "EXECUTED",
+        remediationStatus: "completed",
+      }),
+    );
+  });
+
+  it("marks task BLOCKED when github execution fails", async () => {
+    mocks.listEngineeringTasks.mockResolvedValueOnce([
+      {
+        id: "task-ready",
+        createdAt: "2026-04-05T09:00:00Z",
+        updatedAt: "2026-04-05T09:00:00Z",
+        status: "READY_FOR_EXECUTION",
+        title: "Ready task",
+        summary: "summary",
+        likelyFiles: ["lib/c.ts"],
+        copilotPrompt: "safe",
+        smokeTestBlock: "",
+        gitBlock: "",
+        patchPlan: {
+          mode: "GITHUB_COMMIT",
+          targetFiles: ["lib/c.ts"],
+          proposedChangesSummary: "summary",
+        },
+        commitPlan: {
+          commitMessage: "agent: ready",
+          targetBranch: "main",
+          pushDirect: true,
+        },
+        executionStatus: "READY",
+      },
+    ]);
+    mocks.executeGithubTask.mockRejectedValueOnce(new Error("push_failed"));
+
+    const response = await POST(
+      new Request("http://localhost/api/agents/execute", {
+        method: "POST",
+        headers: { "x-cron-token": "test-cron-token" },
+      }) as any,
+    );
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      taskId: "task-ready",
+      executionStatus: "FAILED",
+    });
+    expect(mocks.updateEngineeringTaskById).toHaveBeenCalledWith(
+      "task-ready",
+      expect.objectContaining({
+        status: "BLOCKED",
+        executionStatus: "FAILED",
+        executionError: "push_failed",
+      }),
+    );
   });
 
   it("prepares execution readiness and does not shell out", async () => {

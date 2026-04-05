@@ -61,6 +61,7 @@ describe("GET /api/agents/engineering", () => {
         copilotPrompt: "",
         smokeTestBlock: "",
         gitBlock: "",
+        executionStatus: "READY",
       },
     ]);
 
@@ -69,9 +70,10 @@ describe("GET /api/agents/engineering", () => {
 
     const body = await response.json();
     expect(body.openExecutionReadyCount).toBe(1);
+    expect(body.openEngineeringTaskCount).toBe(3);
     expect(body.blockedTaskCount).toBe(1);
     expect(body.latestExecutionTaskTitle).toBe("Ready task");
-    expect(body.latestExecutionStatus).toBe("READY_FOR_EXECUTION");
+    expect(body.latestExecutionStatus).toBe("READY");
     expect(body.tasks[0].id).toBe("ready-1");
     expect(body.tasks.at(-1).id).toBe("blocked-1");
   });

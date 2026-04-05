@@ -220,4 +220,37 @@ describe("backlog + engineering runner", () => {
     expect(state.latestExecutionTaskTitle).toBe("Ready task");
     expect(state.latestExecutionStatus).toBe("READY_FOR_EXECUTION");
   });
+
+  it("does not create backlog-driven tasks when unresolved task is BLOCKED", async () => {
+    const now = new Date().toISOString();
+    await appendEngineeringTask({
+      id: crypto.randomUUID(),
+      createdAt: now,
+      updatedAt: now,
+      status: "BLOCKED",
+      title: "Blocked unresolved",
+      summary: "Should still gate backlog creation",
+      likelyFiles: ["lib/agents/runners/engineering.ts"],
+      copilotPrompt: "prompt",
+      smokeTestBlock: "npm run test",
+      gitBlock: "git add -A",
+      remediationStatus: "failed",
+      executionStatus: "BLOCKED",
+      executionError: "blocked_pattern_detected",
+    });
+
+    const seeded = await upsertBacklogItem({
+      status: "OPEN",
+      type: "TECH_DEBT",
+      priority: "HIGH",
+      title: "Blocked gate candidate",
+      summary: "Must remain backlog-only",
+      assignedAgent: "engineering",
+    });
+
+    await runEngineeringAgent();
+
+    const tasks = await listEngineeringTasks(100);
+    expect(tasks.find((task) => task.backlogItemId === seeded.item.id)).toBeUndefined();
+  });
 });
