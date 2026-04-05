@@ -70,6 +70,11 @@ const VALID_EXECUTION_STATUS = new Set<EngineeringExecutionStatus>([
   "EXECUTED",
   "FAILED",
 ]);
+const LEGACY_BLOCKED_ERROR_MARKERS = [
+  "next: command not found",
+  "task_not_open",
+  "/var/task/agent-patches",
+];
 
 function normalizePatchPlan(input: unknown): PatchPlan | undefined {
   if (!input || typeof input !== "object") return undefined;
@@ -419,6 +424,61 @@ function normalizeBacklogItem(item: BacklogItem): BacklogItem {
   };
 }
 
+function normalizeTaskTitle(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toUpperCase();
+}
+
+function hasLegacyBlockedExecutionError(error: string | null | undefined): boolean {
+  if (!error) return false;
+  const normalized = error.toLowerCase();
+  return LEGACY_BLOCKED_ERROR_MARKERS.some((marker) => normalized.includes(marker));
+}
+
+function appendEngineeringNote(notes: string[] | undefined, note: string): string[] {
+  return Array.from(new Set([...(notes ?? []), note].map((value) => value.trim()).filter(Boolean))).slice(-20);
+}
+
+function sanitizeEngineeringHistory(tasks: EngineeringTask[]): { tasks: EngineeringTask[]; changed: boolean } {
+  const now = nowIso();
+  const normalized = tasks.map((task) => normalizeEngineeringTask(task));
+  let changed = false;
+
+  const next = normalized.map((task, index) => {
+    if (task.status !== "BLOCKED" || !hasLegacyBlockedExecutionError(task.executionError)) {
+      return task;
+    }
+
+    const duplicateExists = normalized.some((candidate, candidateIndex) => {
+      if (candidateIndex === index) return false;
+      if (candidate.status === "DONE") return false;
+      if (task.backlogItemId && candidate.backlogItemId === task.backlogItemId) return true;
+      return normalizeTaskTitle(candidate.title) === normalizeTaskTitle(task.title);
+    });
+
+    changed = true;
+
+    if (duplicateExists) {
+      return normalizeEngineeringTask({
+        ...task,
+        status: "DONE",
+        updatedAt: now,
+        notes: appendEngineeringNote(task.notes, "Reset after executor architecture upgrade"),
+      });
+    }
+
+    return normalizeEngineeringTask({
+      ...task,
+      status: "OPEN",
+      executionStatus: "PENDING",
+      executionError: null,
+      updatedAt: now,
+      notes: appendEngineeringNote(task.notes, "Reset after executor architecture upgrade"),
+    });
+  });
+
+  return { tasks: next, changed };
+}
+
 async function readKey<T>(key: string): Promise<T | null> {
   if (!redis) return null;
   try {
@@ -670,7 +730,12 @@ export async function appendAgentAction(action: AgentAction): Promise<AgentActio
 }
 
 export async function listEngineeringTasks(limit = 25): Promise<EngineeringTask[]> {
-  return readHistory<EngineeringTask>(AGENT_ENGINEERING_KEY, limit);
+  const history = await readHistory<EngineeringTask>(AGENT_ENGINEERING_KEY, HISTORY_LIMIT);
+  const { tasks, changed } = sanitizeEngineeringHistory(history);
+  if (changed) {
+    await writeKey(AGENT_ENGINEERING_KEY, tasks.slice(0, HISTORY_LIMIT));
+  }
+  return tasks.slice(0, Math.max(0, limit));
 }
 
 export async function appendEngineeringTask(task: EngineeringTask): Promise<EngineeringTask> {
@@ -734,19 +799,59 @@ export async function findOpenEngineeringTaskByIncident(
 export async function upsertEngineeringTask(
   task: EngineeringTask,
 ): Promise<{ task: EngineeringTask; created: boolean }> {
-  if (task.incidentId) {
-    const existing = await findOpenEngineeringTaskByIncident(task.incidentId);
-    if (existing) {
-      return { task: existing, created: false };
-    }
+  const now = nowIso();
+  const history = await listEngineeringTasks(HISTORY_LIMIT);
+
+  const existingByIncidentIdx = task.incidentId
+    ? history.findIndex(
+      (candidate) =>
+        candidate.incidentId === task.incidentId &&
+        (candidate.status === "OPEN" ||
+          candidate.status === "IN_PROGRESS" ||
+          candidate.status === "READY_FOR_EXECUTION" ||
+          candidate.status === "READY_FOR_PUSH" ||
+          candidate.status === "READY_FOR_REVIEW"),
+    )
+    : -1;
+
+  const incomingTitle = normalizeTaskTitle(task.title);
+  const existingByBacklogOrTitleIdx = history.findIndex((candidate) => {
+    if (candidate.status === "DONE") return false;
+    if (task.backlogItemId && candidate.backlogItemId === task.backlogItemId) return true;
+    return normalizeTaskTitle(candidate.title) === incomingTitle;
+  });
+
+  const existingIdx = existingByIncidentIdx >= 0 ? existingByIncidentIdx : existingByBacklogOrTitleIdx;
+  if (existingIdx >= 0) {
+    const current = history[existingIdx];
+    const updated = normalizeEngineeringTask({
+      ...current,
+      updatedAt: now,
+      summary: task.summary || current.summary,
+      likelyFiles: task.likelyFiles?.length > 0 ? task.likelyFiles : current.likelyFiles,
+      copilotPrompt: task.copilotPrompt || current.copilotPrompt,
+      smokeTestBlock: task.smokeTestBlock || current.smokeTestBlock,
+      gitBlock: task.gitBlock || current.gitBlock,
+      backlogItemId: current.backlogItemId ?? task.backlogItemId ?? null,
+      patchPlan: task.patchPlan ?? current.patchPlan,
+      validationPlan: task.validationPlan ?? current.validationPlan,
+      commitPlan: task.commitPlan ?? current.commitPlan,
+      notes: mergeNotes(current.notes, task.notes),
+    });
+
+    const next = [...history];
+    next[existingIdx] = updated;
+    await writeKey(AGENT_ENGINEERING_KEY, next);
+    return { task: updated, created: false };
   }
+
   const created = await appendEngineeringTask(task);
   return { task: created, created: true };
 }
 
 export async function updateEngineeringTaskById(
   id: string,
-  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot" | "notes" | "backlogItemId" | "patchPlan" | "validationPlan" | "commitPlan" | "executionStatus" | "executionError">>,
+  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot" | "notes" | "backlogItemId" | "likelyFiles" | "patchPlan" | "validationPlan" | "commitPlan" | "executionStatus" | "executionError">>,
 ): Promise<EngineeringTask | null> {
   const now = nowIso();
   const history = await listEngineeringTasks(HISTORY_LIMIT);

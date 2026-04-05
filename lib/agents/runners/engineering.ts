@@ -29,7 +29,56 @@ function uniqueFiles(values: string[]): string[] {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
 }
 
+function normalizeTitle(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toUpperCase();
+}
+
+function appendTaskNote(notes: string[] | undefined, note: string): string[] {
+  return Array.from(new Set([...(notes ?? []), note].map((value) => value.trim()).filter(Boolean))).slice(-20);
+}
+
+function getKnownBacklogSpec(title: string): { targetFiles: string[]; proposedChangesSummary: string } | null {
+  switch (normalizeTitle(title)) {
+    case "IMPROVE SCORING DETERMINISM":
+      return {
+        targetFiles: ["app/api/ai/score/drain/route.ts", "app/api/signals/route.ts"],
+        proposedChangesSummary:
+          "Tighten deterministic scoring flow and remove order-sensitive behavior between drain and signal endpoints.",
+      };
+    case "REDUCE ZERO-SCORE FALLBACKS":
+      return {
+        targetFiles: ["app/api/ai/score/drain/route.ts", "app/api/signals/route.ts"],
+        proposedChangesSummary:
+          "Reduce ambiguous zero-score fallbacks by making retry/fallback paths deterministic in scoring and signal routing.",
+      };
+    case "OPTIMIZE SIGNAL QUALIFICATION RATE":
+      return {
+        targetFiles: ["app/api/signals/route.ts"],
+        proposedChangesSummary:
+          "Tune qualification gates to improve pass quality and consistency without widening risk exposure.",
+      };
+    default:
+      return null;
+  }
+}
+
+function buildBacklogPatchPlan(title: string, summary: string, likelyFiles: string[]): PatchPlan {
+  const known = getKnownBacklogSpec(title);
+  if (known) {
+    return {
+      mode: "GITHUB_COMMIT",
+      targetFiles: uniqueFiles(known.targetFiles),
+      proposedChangesSummary: known.proposedChangesSummary,
+    };
+  }
+  return buildPatchPlan(title, summary, likelyFiles);
+}
+
 function inferBacklogLikelyFiles(title: string, summary: string): string[] {
+  const known = getKnownBacklogSpec(title);
+  if (known) {
+    return known.targetFiles;
+  }
   const text = `${title} ${summary}`.toLowerCase();
   if (text.includes("zero-score") || text.includes("zero score")) {
     return [
@@ -392,6 +441,28 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
 
   tasks = await listEngineeringTasks(100);
 
+  // Upgrade legacy placeholder plans for known backlog work in-place.
+  for (const task of tasks) {
+    const known = getKnownBacklogSpec(task.title);
+    if (!known) continue;
+    if (task.patchPlan?.mode !== "PLACEHOLDER") continue;
+
+    const likelyFiles = uniqueFiles(known.targetFiles);
+    await updateEngineeringTaskById(task.id, {
+      likelyFiles,
+      patchPlan: {
+        mode: "GITHUB_COMMIT",
+        targetFiles: likelyFiles,
+        proposedChangesSummary: known.proposedChangesSummary,
+      },
+      validationPlan: buildValidationPlan(likelyFiles, task.smokeTestBlock),
+      commitPlan: task.commitPlan ?? buildCommitPlan(task.title),
+      notes: appendTaskNote(task.notes, "Upgraded placeholder patch plan to executable GitHub commit plan."),
+    });
+  }
+
+  tasks = await listEngineeringTasks(100);
+
   // Find the highest-priority incident that needs a task: OPEN or MONITORING,
   // HIGH or MEDIUM severity, not yet linked to an open engineering task.
   const candidate = incidents.find(
@@ -435,15 +506,35 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     const nextBacklog = await getNextBacklogItems(1);
 
     for (const backlogItem of nextBacklog) {
-      const exists = activeTasks.find((task) => task.backlogItemId === backlogItem.id);
+      const exists = tasks.find((task) => {
+        if (task.status === "DONE") return false;
+        if (task.backlogItemId && task.backlogItemId === backlogItem.id) return true;
+        return normalizeTitle(task.title) === normalizeTitle(backlogItem.title);
+      });
       if (exists) {
+        const known = getKnownBacklogSpec(backlogItem.title);
+        if (known && exists.patchPlan?.mode === "PLACEHOLDER") {
+          const likelyFiles = uniqueFiles(known.targetFiles);
+          await updateEngineeringTaskById(exists.id, {
+            likelyFiles,
+            patchPlan: {
+              mode: "GITHUB_COMMIT",
+              targetFiles: likelyFiles,
+              proposedChangesSummary: known.proposedChangesSummary,
+            },
+            validationPlan: buildValidationPlan(likelyFiles, exists.smokeTestBlock),
+            commitPlan: exists.commitPlan ?? buildCommitPlan(exists.title),
+            notes: appendTaskNote(exists.notes, "Upgraded placeholder patch plan to executable GitHub commit plan."),
+          });
+        }
         if (backlogItem.status !== "IN_PROGRESS") {
           await updateBacklogStatus(backlogItem.id, "IN_PROGRESS");
         }
         continue;
       }
 
-      const likelyFiles = uniqueFiles(backlogItem.likelyFiles ?? inferBacklogLikelyFiles(backlogItem.title, backlogItem.summary));
+      const known = getKnownBacklogSpec(backlogItem.title);
+      const likelyFiles = uniqueFiles(known?.targetFiles ?? backlogItem.likelyFiles ?? inferBacklogLikelyFiles(backlogItem.title, backlogItem.summary));
       const smokeTestBlock =
         backlogItem.smokeTestBlock ??
         "npm run build\nnpm run test\nGET /api/agents/engineering\nGET /api/readiness";
@@ -466,7 +557,7 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
         remediationAttempted: false,
         remediationStatus: "none",
         backlogItemId: backlogItem.id,
-        patchPlan: buildPatchPlan(backlogItem.title, backlogItem.summary, likelyFiles),
+        patchPlan: buildBacklogPatchPlan(backlogItem.title, backlogItem.summary, likelyFiles),
         validationPlan: buildValidationPlan(likelyFiles, smokeTestBlock),
         commitPlan: buildCommitPlan(backlogItem.title),
         executionStatus: "PENDING",
@@ -536,6 +627,33 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     if (!linked) continue;
     if (linked.status !== "REVIEW" && linked.status !== "DONE") {
       await updateBacklogStatus(linked.id, "REVIEW");
+    }
+  }
+
+  // Keep at least one execution-ready task in queue when we have a safe candidate.
+  tasks = await listEngineeringTasks(100);
+  const hasExecutionReady = tasks.some(
+    (task) =>
+      task.status === "READY_FOR_EXECUTION" &&
+      task.patchPlan?.mode === "GITHUB_COMMIT" &&
+      (task.patchPlan.targetFiles?.length ?? 0) > 0,
+  );
+  if (!hasExecutionReady) {
+    const candidateForExecution = tasks.find(
+      (task) =>
+        task.status === "OPEN" &&
+        task.patchPlan?.mode === "GITHUB_COMMIT" &&
+        (task.patchPlan.targetFiles?.length ?? 0) > 0 &&
+        task.commitPlan?.pushDirect === true &&
+        Boolean(task.commitPlan?.commitMessage?.trim()),
+    );
+    if (candidateForExecution) {
+      await updateEngineeringTaskById(candidateForExecution.id, {
+        status: "READY_FOR_EXECUTION",
+        executionStatus: "READY",
+        executionError: null,
+        notes: appendTaskNote(candidateForExecution.notes, "Queued for execution after executor architecture upgrade."),
+      });
     }
   }
 
