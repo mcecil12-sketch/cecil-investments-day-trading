@@ -382,6 +382,14 @@ function normalizeEngineeringTask(task: EngineeringTask): EngineeringTask {
   const patchPlan = normalizePatchPlan(task.patchPlan);
   const validationPlan = normalizeValidationPlan(task.validationPlan);
   const commitPlan = normalizeCommitPlan(task.commitPlan);
+  const normalizedExecutionStatus =
+    typeof task.executionStatus === "string" && VALID_EXECUTION_STATUS.has(task.executionStatus)
+      ? task.executionStatus
+      : undefined;
+  const executionStatus =
+    status === "BLOCKED" && normalizedExecutionStatus === "READY"
+      ? (typeof task.executionError === "string" && task.executionError.trim() ? "FAILED" : undefined)
+      : normalizedExecutionStatus;
   return {
     ...task,
     createdAt,
@@ -392,10 +400,7 @@ function normalizeEngineeringTask(task: EngineeringTask): EngineeringTask {
     patchPlan,
     validationPlan,
     commitPlan,
-    executionStatus:
-      typeof task.executionStatus === "string" && VALID_EXECUTION_STATUS.has(task.executionStatus)
-        ? task.executionStatus
-        : undefined,
+    executionStatus,
     executionError:
       typeof task.executionError === "string" || task.executionError === null ? task.executionError : undefined,
     commitSha:

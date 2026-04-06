@@ -77,4 +77,44 @@ describe("GET /api/agents/engineering", () => {
     expect(body.tasks[0].id).toBe("ready-1");
     expect(body.tasks.at(-1).id).toBe("blocked-1");
   });
+
+  it("does not classify BLOCKED tasks as execution-ready even if executionStatus is READY", async () => {
+    mocks.listEngineeringTasks.mockResolvedValueOnce([
+      {
+        id: "blocked-ready",
+        createdAt: "2026-04-05T10:00:00Z",
+        updatedAt: "2026-04-05T10:00:00Z",
+        status: "BLOCKED",
+        title: "Blocked but stale-ready",
+        summary: "",
+        likelyFiles: [],
+        copilotPrompt: "",
+        smokeTestBlock: "",
+        gitBlock: "",
+        executionStatus: "READY",
+      },
+      {
+        id: "ready-true",
+        createdAt: "2026-04-05T11:00:00Z",
+        updatedAt: "2026-04-05T11:00:00Z",
+        status: "READY_FOR_EXECUTION",
+        title: "True ready task",
+        summary: "",
+        likelyFiles: [],
+        copilotPrompt: "",
+        smokeTestBlock: "",
+        gitBlock: "",
+        executionStatus: "READY",
+      },
+    ]);
+
+    const response = await GET(new Request("http://localhost/api/agents/engineering?limit=25"));
+    expect(response.status).toBe(200);
+
+    const body = await response.json();
+    expect(body.executionReadyTasks).toHaveLength(1);
+    expect(body.executionReadyTasks[0].id).toBe("ready-true");
+    expect(body.blockedTasks).toHaveLength(1);
+    expect(body.blockedTasks[0].id).toBe("blocked-ready");
+  });
 });

@@ -475,8 +475,8 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
       },
       validationPlan: buildValidationPlan(likelyFiles, task.smokeTestBlock),
       commitPlan: task.commitPlan ?? buildCommitPlan(task.title),
-      executionStatus: "READY",
-      executionError: null,
+      executionStatus: shouldPromote ? "READY" : task.executionStatus,
+      executionError: shouldPromote ? null : task.executionError,
       notes: appendTaskNote(
         appendTaskNote(task.notes, "Upgraded placeholder patch plan to executable GitHub commit plan."),
         shouldPromote ? "Execution readiness refreshed after plan upgrade" : "",
@@ -551,8 +551,8 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
             },
             validationPlan: buildValidationPlan(likelyFiles, exists.smokeTestBlock),
             commitPlan: exists.commitPlan ?? buildCommitPlan(exists.title),
-            executionStatus: "READY",
-            executionError: null,
+            executionStatus: shouldPromote ? "READY" : exists.executionStatus,
+            executionError: shouldPromote ? null : exists.executionError,
             notes: appendTaskNote(
               appendTaskNote(exists.notes, "Upgraded placeholder patch plan to executable GitHub commit plan."),
               shouldPromote ? "Execution readiness refreshed after plan upgrade" : "",

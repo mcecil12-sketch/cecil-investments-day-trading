@@ -44,11 +44,11 @@ export async function GET(req: Request) {
       task.status === "READY_FOR_PUSH",
   );
   const executionReadyTasks = allTasks.filter(
-    (task) => task.status === "READY_FOR_EXECUTION" || task.executionStatus === "READY",
+    (task) => task.status === "READY_FOR_EXECUTION" && task.executionStatus === "READY",
   );
   const blockedTasks = allTasks.filter((task) => task.status === "BLOCKED");
   const latestReadyForExecution = allTasks
-    .filter((task) => task.status === "READY_FOR_EXECUTION")
+    .filter((task) => task.status === "READY_FOR_EXECUTION" && task.executionStatus === "READY")
     .at(-1) ?? null;
 
   return NextResponse.json({

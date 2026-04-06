@@ -228,14 +228,14 @@ describe("backlog + engineering runner", () => {
       createdAt: now,
       updatedAt: now,
       status: "BLOCKED",
-      title: "Blocked unresolved",
+      title: "Improve scoring determinism",
       summary: "Should still gate backlog creation",
       likelyFiles: ["lib/agents/runners/engineering.ts"],
       copilotPrompt: "prompt",
       smokeTestBlock: "npm run test",
       gitBlock: "git add -A",
       remediationStatus: "failed",
-      executionStatus: "BLOCKED",
+      executionStatus: "READY",
       executionError: "blocked_pattern_detected",
     });
 
@@ -252,5 +252,9 @@ describe("backlog + engineering runner", () => {
 
     const tasks = await listEngineeringTasks(100);
     expect(tasks.find((task) => task.backlogItemId === seeded.item.id)).toBeUndefined();
+
+    const blockedTask = tasks.find((task) => task.title === "Improve scoring determinism");
+    expect(blockedTask?.status).toBe("BLOCKED");
+    expect(blockedTask?.executionStatus).not.toBe("READY");
   });
 });
