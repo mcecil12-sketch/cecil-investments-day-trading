@@ -70,7 +70,10 @@ const VALID_EXECUTION_STATUS = new Set<EngineeringExecutionStatus>([
   "EXECUTED",
   "FAILED",
 ]);
-const LEGACY_BLOCKED_ERROR_MARKERS = [
+const TRANSIENT_SETUP_FAILURE_MARKERS = [
+  "missing_env_github_app_id",
+  "missing_env_github_app_private_key",
+  "decoder routines::unsupported",
   "next: command not found",
   "task_not_open",
   "/var/task/agent-patches",
@@ -437,10 +440,25 @@ function normalizeTaskTitle(value: string): string {
   return value.trim().replace(/\s+/g, " ").toUpperCase();
 }
 
-function hasLegacyBlockedExecutionError(error: string | null | undefined): boolean {
-  if (!error) return false;
-  const normalized = error.toLowerCase();
-  return LEGACY_BLOCKED_ERROR_MARKERS.some((marker) => normalized.includes(marker));
+function hasTransientSetupFailureMarker(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.toLowerCase();
+  return TRANSIENT_SETUP_FAILURE_MARKERS.some((marker) => normalized.includes(marker));
+}
+
+function hasRecoverableExecutorFailure(task: EngineeringTask): boolean {
+  return (
+    hasTransientSetupFailureMarker(task.executionError) ||
+    hasTransientSetupFailureMarker(task.remediationResultSummary)
+  );
+}
+
+function hasValidDirectGithubCommitPlan(task: EngineeringTask): boolean {
+  if (task.patchPlan?.mode !== "GITHUB_COMMIT") return false;
+  if ((task.patchPlan.targetFiles?.length ?? 0) === 0) return false;
+  if (task.commitPlan?.pushDirect !== true) return false;
+  if (!task.commitPlan?.commitMessage?.trim()) return false;
+  return true;
 }
 
 function appendEngineeringNote(notes: string[] | undefined, note: string): string[] {
@@ -452,36 +470,24 @@ function sanitizeEngineeringHistory(tasks: EngineeringTask[]): { tasks: Engineer
   const normalized = tasks.map((task) => normalizeEngineeringTask(task));
   let changed = false;
 
-  const next = normalized.map((task, index) => {
-    if (task.status !== "BLOCKED" || !hasLegacyBlockedExecutionError(task.executionError)) {
+  const next = normalized.map((task) => {
+    if (
+      task.status !== "BLOCKED" ||
+      !hasRecoverableExecutorFailure(task) ||
+      !hasValidDirectGithubCommitPlan(task)
+    ) {
       return task;
     }
 
-    const duplicateExists = normalized.some((candidate, candidateIndex) => {
-      if (candidateIndex === index) return false;
-      if (candidate.status === "DONE") return false;
-      if (task.backlogItemId && candidate.backlogItemId === task.backlogItemId) return true;
-      return normalizeTaskTitle(candidate.title) === normalizeTaskTitle(task.title);
-    });
-
     changed = true;
-
-    if (duplicateExists) {
-      return normalizeEngineeringTask({
-        ...task,
-        status: "DONE",
-        updatedAt: now,
-        notes: appendEngineeringNote(task.notes, "Reset after executor architecture upgrade"),
-      });
-    }
 
     return normalizeEngineeringTask({
       ...task,
-      status: "OPEN",
-      executionStatus: "PENDING",
+      status: "READY_FOR_EXECUTION",
+      executionStatus: "READY",
       executionError: null,
       updatedAt: now,
-      notes: appendEngineeringNote(task.notes, "Reset after executor architecture upgrade"),
+      notes: appendEngineeringNote(task.notes, "Re-queued after transient executor/env recovery"),
     });
   });
 
