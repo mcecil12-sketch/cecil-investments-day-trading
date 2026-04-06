@@ -55,6 +55,62 @@ function validateExecutionGuardrails(task: EngineeringTask): string | null {
   return null;
 }
 
+function buildReadyExecutionTask(task: EngineeringTask, updates?: Partial<EngineeringTask>): EngineeringTask {
+  return {
+    ...task,
+    ...updates,
+    status: "READY_FOR_EXECUTION",
+  };
+}
+
+async function executeReadyForGithubCommit(task: EngineeringTask) {
+  const executionResult = await executeGithubTask(task);
+
+  await updateEngineeringTaskById(task.id, {
+    status: "DONE",
+    remediationAttempted: true,
+    remediationStatus: "completed",
+    remediationResultSummary: `Executed via GitHub contents API (${executionResult.filesTouched.join(", ")}).`,
+    executionStatus: "EXECUTED",
+    executionError: null,
+    commitSha: executionResult.commitSha ?? null,
+    commitUrl: executionResult.commitUrl ?? null,
+    linkedTelemetrySnapshot: {
+      executionCommitSha: executionResult.commitSha ?? null,
+      executionCommitUrl: executionResult.commitUrl ?? null,
+      executionFilesTouched: executionResult.filesTouched,
+    },
+    notes: appendNotes(task.notes, [
+      "Executed via GitHub contents API",
+      `Commit message: ${executionResult.commitMessage}`,
+      executionResult.commitSha ? `Commit sha: ${executionResult.commitSha}` : "",
+      executionResult.commitUrl ? `Commit url: ${executionResult.commitUrl}` : "",
+    ]),
+  });
+
+  return NextResponse.json({
+    ok: true,
+    executedTaskId: task.id,
+    executionStatus: "EXECUTED",
+    filesTouched: executionResult.filesTouched,
+    commitMessage: executionResult.commitMessage,
+    commitSha: executionResult.commitSha,
+    commitUrl: executionResult.commitUrl,
+  });
+}
+
+async function blockExecution(task: EngineeringTask, message: string) {
+  await updateEngineeringTaskById(task.id, {
+    status: "BLOCKED",
+    remediationAttempted: true,
+    remediationStatus: "failed",
+    remediationResultSummary: `Execution failed: ${message}`,
+    executionStatus: "FAILED",
+    executionError: message,
+    notes: appendNotes(task.notes, [`Execution failed: ${message}`]),
+  });
+}
+
 export async function POST(req: NextRequest) {
   const auth = checkAgentCronAuth(req);
   if (!auth.ok) {
@@ -93,48 +149,10 @@ export async function POST(req: NextRequest) {
       }
 
       try {
-        const executionResult = await executeGithubTask(task);
-
-        await updateEngineeringTaskById(task.id, {
-          status: "DONE",
-          remediationAttempted: true,
-          remediationStatus: "completed",
-          remediationResultSummary: `Executed via GitHub contents API (${executionResult.filesTouched.join(", ")}).`,
-          executionStatus: "EXECUTED",
-          executionError: null,
-          linkedTelemetrySnapshot: {
-            executionCommitSha: executionResult.commitSha ?? null,
-            executionCommitUrl: executionResult.commitUrl ?? null,
-            executionFilesTouched: executionResult.filesTouched,
-          },
-          notes: appendNotes(task.notes, [
-            "Executed via GitHub contents API",
-            `Commit message: ${executionResult.commitMessage}`,
-            executionResult.commitSha ? `Commit sha: ${executionResult.commitSha}` : "",
-            executionResult.commitUrl ? `Commit url: ${executionResult.commitUrl}` : "",
-          ]),
-        });
-
-        return NextResponse.json({
-          ok: true,
-          executedTaskId: task.id,
-          executionStatus: "EXECUTED",
-          filesTouched: executionResult.filesTouched,
-          commitMessage: executionResult.commitMessage,
-          commitSha: executionResult.commitSha,
-          commitUrl: executionResult.commitUrl,
-        });
+        return await executeReadyForGithubCommit(task);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        await updateEngineeringTaskById(task.id, {
-          status: "BLOCKED",
-          remediationAttempted: true,
-          remediationStatus: "failed",
-          remediationResultSummary: `Execution failed: ${message}`,
-          executionStatus: "FAILED",
-          executionError: message,
-          notes: appendNotes(task.notes, [`Execution failed: ${message}`]),
-        });
+        await blockExecution(task, message);
 
         return NextResponse.json(
           {
@@ -180,6 +198,16 @@ export async function POST(req: NextRequest) {
       `Execution plan prepared for ${prepared.nextTaskStatus}`,
     ]);
 
+    const preparedTask = buildReadyExecutionTask(task, {
+      status: prepared.nextTaskStatus,
+      patchPlan: prepared.patchPlan,
+      validationPlan: prepared.validationPlan,
+      commitPlan: prepared.commitPlan,
+      executionStatus: prepared.executionStatus,
+      executionError: null,
+      notes: approvedNotes,
+    });
+
     await updateEngineeringTaskById(task.id, {
       status: prepared.nextTaskStatus,
       remediationAttempted: true,
@@ -192,6 +220,41 @@ export async function POST(req: NextRequest) {
       executionError: null,
       notes: approvedNotes,
     });
+
+    if (preparedTask.status === "READY_FOR_EXECUTION") {
+      const guardrailError = validateExecutionGuardrails(preparedTask);
+
+      if (guardrailError) {
+        await updateEngineeringTaskById(task.id, {
+          notes: appendNotes(preparedTask.notes, [`Execution skipped: ${guardrailError}`]),
+          executionError: guardrailError,
+        });
+
+        return NextResponse.json({
+          ok: true,
+          taskId: task.id,
+          executionStatus: preparedTask.executionStatus ?? "READY",
+          skipped: true,
+          reason: guardrailError,
+        });
+      }
+
+      try {
+        return await executeReadyForGithubCommit(preparedTask);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await blockExecution(preparedTask, message);
+        return NextResponse.json(
+          {
+            ok: false,
+            error: message,
+            taskId: task.id,
+            executionStatus: "FAILED",
+          },
+          { status: 500 },
+        );
+      }
+    }
 
     return NextResponse.json({
       ok: true,

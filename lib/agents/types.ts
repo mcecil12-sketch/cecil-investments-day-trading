@@ -174,6 +174,8 @@ export interface EngineeringTask {
   commitPlan?: CommitPlan;
   executionStatus?: EngineeringExecutionStatus;
   executionError?: string | null;
+  commitSha?: string | null;
+  commitUrl?: string | null;
   notes?: string[];
 }
 

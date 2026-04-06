@@ -378,7 +378,7 @@ describe("POST /api/agents/execute", () => {
     );
   });
 
-  it("prepares execution readiness and does not shell out", async () => {
+  it("prepares execution readiness and executes immediately when guardrails pass", async () => {
     mocks.listEngineeringTasks.mockResolvedValueOnce([
       {
         id: "task-1",
@@ -405,20 +405,26 @@ describe("POST /api/agents/execute", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
       ok: true,
-      taskId: "task-1",
-      executionStatus: "READY_FOR_EXECUTION",
-      commitPlan: { targetBranch: "main", pushDirect: true },
-      validationPlan: { buildRequired: true },
+      executedTaskId: "task-1",
+      executionStatus: "EXECUTED",
+      commitSha: "abc123",
+      commitUrl: "https://github.com/org/repo/commit/abc123",
     });
     expect(mocks.prepareExecutionPlan).toHaveBeenCalledTimes(1);
     expect(mocks.prepareExecutionPlan).toHaveBeenCalledWith(expect.objectContaining({ id: "task-1" }));
-    expect(mocks.updateEngineeringTaskById).toHaveBeenCalledTimes(1);
+    expect(mocks.executeGithubTask).toHaveBeenCalledTimes(1);
+    expect(mocks.updateEngineeringTaskById).toHaveBeenCalledWith(
+      "task-1",
+      expect.objectContaining({ status: "READY_FOR_EXECUTION", executionStatus: "READY", executionError: null }),
+    );
     expect(mocks.updateEngineeringTaskById).toHaveBeenCalledWith(
       "task-1",
       expect.objectContaining({
-        status: "READY_FOR_EXECUTION",
-        executionStatus: "READY",
+        status: "DONE",
+        executionStatus: "EXECUTED",
         executionError: null,
+        commitSha: "abc123",
+        commitUrl: "https://github.com/org/repo/commit/abc123",
       }),
     );
   });

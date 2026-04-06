@@ -398,6 +398,10 @@ function normalizeEngineeringTask(task: EngineeringTask): EngineeringTask {
         : undefined,
     executionError:
       typeof task.executionError === "string" || task.executionError === null ? task.executionError : undefined,
+    commitSha:
+      typeof task.commitSha === "string" || task.commitSha === null ? task.commitSha : undefined,
+    commitUrl:
+      typeof task.commitUrl === "string" || task.commitUrl === null ? task.commitUrl : undefined,
     notes: Array.isArray(task.notes) ? uniqueStrings(task.notes).slice(-20) : undefined,
   };
 }
@@ -851,7 +855,7 @@ export async function upsertEngineeringTask(
 
 export async function updateEngineeringTaskById(
   id: string,
-  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot" | "notes" | "backlogItemId" | "likelyFiles" | "patchPlan" | "validationPlan" | "commitPlan" | "executionStatus" | "executionError">>,
+  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot" | "notes" | "backlogItemId" | "likelyFiles" | "patchPlan" | "validationPlan" | "commitPlan" | "executionStatus" | "executionError" | "commitSha" | "commitUrl">>,
 ): Promise<EngineeringTask | null> {
   const now = nowIso();
   const history = await listEngineeringTasks(HISTORY_LIMIT);
