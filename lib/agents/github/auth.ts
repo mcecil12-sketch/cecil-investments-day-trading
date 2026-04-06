@@ -1,4 +1,4 @@
-import { createSign } from "node:crypto";
+import { createPrivateKey, createSign, type KeyObject } from "node:crypto";
 
 export interface GithubAppConfig {
   appId: string;
@@ -31,7 +31,31 @@ function readRequiredEnv(name: string): string {
 }
 
 function normalizePrivateKey(rawKey: string): string {
-  return rawKey.includes("\\n") ? rawKey.replace(/\\n/g, "\n") : rawKey;
+  let normalized = rawKey.trim();
+
+  const hasDoubleQuotes = normalized.startsWith('"') && normalized.endsWith('"');
+  const hasSingleQuotes = normalized.startsWith("'") && normalized.endsWith("'");
+  if (hasDoubleQuotes || hasSingleQuotes) {
+    normalized = normalized.slice(1, -1).trim();
+  }
+
+  normalized = normalized
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\r\n/g, "\n");
+
+  return normalized;
+}
+
+function toPrivateKeyObject(privateKey: string): KeyObject {
+  try {
+    return createPrivateKey({
+      key: normalizePrivateKey(privateKey),
+      format: "pem",
+    });
+  } catch {
+    throw new Error("invalid_github_app_private_key");
+  }
 }
 
 export function getGithubAppConfig(): GithubAppConfig {
@@ -58,11 +82,12 @@ export function buildGithubAppJwt(config: Pick<GithubAppConfig, "appId" | "priva
   const encodedHeader = base64UrlEncode(JSON.stringify(header));
   const encodedPayload = base64UrlEncode(JSON.stringify(payload));
   const unsignedToken = `${encodedHeader}.${encodedPayload}`;
+  const keyObject = toPrivateKeyObject(config.privateKey);
 
   const signer = createSign("RSA-SHA256");
   signer.update(unsignedToken);
   signer.end();
-  const signature = signer.sign(config.privateKey).toString("base64url");
+  const signature = signer.sign(keyObject).toString("base64url");
 
   return `${unsignedToken}.${signature}`;
 }
