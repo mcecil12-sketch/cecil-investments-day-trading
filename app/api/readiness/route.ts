@@ -6,6 +6,8 @@ import { getGuardrailConfig, minutesSince } from "@/lib/autoEntry/guardrails";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { getEtDateString } from "@/lib/time/etDate";
+import { readTrades } from "@/lib/tradesStore";
+import { isOpenTradeStatus, ProtectionStatus } from "@/lib/trades/protection";
 
 type Check = {
   name: string;
@@ -117,6 +119,20 @@ export async function GET(req: Request) {
     fetchBrokerTruth(),
   ]);
 
+  const trades = await readTrades<any>().catch(() => []);
+  const openTrades = (Array.isArray(trades) ? trades : []).filter((t) => isOpenTradeStatus(t?.status));
+  const criticalProtectionStatuses = new Set<ProtectionStatus>([
+    "MISSING_STOP",
+    "STOP_EXPIRED",
+    "STOP_CANCELED",
+    "REPAIRING",
+    "REPAIR_FAILED",
+  ]);
+  const unprotectedOpenTrades = openTrades.filter((t) =>
+    criticalProtectionStatuses.has((t?.protectionStatus || "") as ProtectionStatus)
+  );
+  const protectionCritical = unprotectedOpenTrades.length > 0;
+
   const signals: any[] = Array.isArray(signalsPayload)
     ? signalsPayload
     : signalsPayload?.signals ?? [];
@@ -227,6 +243,16 @@ export async function GET(req: Request) {
       detail: brokerTruth.error
         ? `broker_error: ${brokerTruth.error}`
         : `broker positions: ${brokerPositionsCount} / max: ${guardConfig.maxOpenPositions}`,
+    },
+    {
+      name: "protection_integrity",
+      ok: publicMode ? true : !protectionCritical,
+      detail: protectionCritical
+        ? `CRITICAL: ${unprotectedOpenTrades.length} open trade(s) without verified stop [${unprotectedOpenTrades
+            .map((t: any) => `${String(t?.ticker || "?")}:${String(t?.protectionStatus || "UNKNOWN")}`)
+            .slice(0, 8)
+            .join(",")}]`
+        : `protected_open_trades=${openTrades.length}`,
     },
   ];
 

@@ -2,7 +2,7 @@ import { getAutoManageConfig } from "@/lib/autoManage/config";
 import { getRuleForGrade, shouldMoveToBreakEven, shouldEnableTrailing } from "@/lib/autoManage/gradeRules";
 import { recordAutoManage } from "@/lib/autoManage/telemetry";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
-import { getLatestQuote, alpacaRequest, getPositions, createOrder } from "@/lib/alpaca";
+import { getLatestQuote, alpacaRequest, getPositions, createOrder, getOrder } from "@/lib/alpaca";
 import { syncStopForTrade, rescueStop } from "@/lib/autoManage/stopSync";
 import { reconcileOpenTrades } from "@/lib/maintenance/reconcileOpenTrades";
 import { sendNotification } from "@/lib/notifications/notify";
@@ -10,6 +10,15 @@ import { selectCanonicalOpenTrade } from "@/lib/trades/canonical";
 import { evaluateCutLoss } from "@/lib/autoManage/cutLoss";
 import { computeUnrealizedR } from "@/lib/autoManage/risk";
 import { hydrateOpenTradeFromBroker } from "@/lib/autoManage/hydration";
+import { appendActivity } from "@/lib/activity";
+import {
+  classifyOrderTerminalStatus,
+  findProtectiveStopOrder,
+  isOpenOrderStatus,
+  normalizeTradeSide,
+  ProtectionClassification,
+  ProtectionIssueCode,
+} from "@/lib/trades/protection";
 import {
   applyFlattenDiagnosticsToTrade,
   attemptFlattenPosition,
@@ -19,6 +28,13 @@ import {
   finalizeTradeWithoutBroker,
   isEtAtOrAfter,
 } from "@/lib/autoManage/reliability";
+
+type ProtectionEventType =
+  | "STOP_REPAIRED"
+  | "STOP_EXPIRED"
+  | "STOP_MISSING"
+  | "STOP_REPAIR_FAILED"
+  | "TRADE_FLATTENED_PROTECTION";
 
 export type AutoManageResult = {
   ok: true;
@@ -323,57 +339,170 @@ async function submitMarketCloseForTrade(trade: any, ticker: string): Promise<
   }
 }
 
-/**
- * Stop Rescue Failsafe: ensure there's always an active protective stop when trade is OPEN and broker position exists.
- * - Check if stopOrderId exists and is active
- * - Check if broker position exists
- * - If both missing or stop not active, create new standalone GTC stop
- * - Persist stopOrderId only after Alpaca confirms acceptance
- * - Non-fatal: record telemetry and continue if rescue fails
- */
-async function ensureStopRescued(trade: any, now: string, ticker: string): Promise<{ rescueAttempted: boolean; rescueOk?: boolean; rescueNote?: string }> {
-  const stopOrderId = trade.stopOrderId;
-  
-  // Quick check: if stopOrderId exists, we assume it's active (detailed check in sync)
-  if (stopOrderId) {
-    return { rescueAttempted: false };
+async function emitProtectionEvent(args: {
+  type: ProtectionEventType;
+  tradeId: string;
+  ticker: string;
+  message: string;
+  meta?: Record<string, any>;
+}) {
+  console.log(`[risk] ${args.type}`, {
+    tradeId: args.tradeId,
+    ticker: args.ticker,
+    message: args.message,
+    meta: args.meta,
+  });
+  try {
+    await appendActivity({
+      type: args.type,
+      tradeId: args.tradeId,
+      ticker: args.ticker,
+      message: args.message,
+      meta: args.meta,
+    });
+  } catch {}
+}
+
+async function classifyProtectionFromBroker(args: {
+  trade: any;
+  ticker: string;
+  side: "LONG" | "SHORT";
+  brokerPosition: any;
+  symbolOpenOrders: any[];
+}): Promise<ProtectionClassification> {
+  const brokerQty = Math.abs(Number(args.brokerPosition?.qty ?? 0));
+  if (!(brokerQty > 0)) {
+    return { status: "VERIFIED", issue: "missing_broker_position" };
   }
 
-  // No stop order ID - check if broker position exists
-  try {
-    const positions = await getPositions(ticker);
-    const brokerPos = Array.isArray(positions)
-      ? positions.find((p: any) => p?.symbol?.toUpperCase() === ticker)
-      : null;
-
-    const brokerQty = Number((brokerPos as any)?.qty ?? 0);
-    if (brokerQty <= 0) {
-      // No position, no rescue needed
-      return { rescueAttempted: false };
-    }
-
-    // Broker position exists but no stop - attempt rescue
-    const rescueRes = await rescueStop(trade);
-    if (rescueRes.ok) {
-      return {
-        rescueAttempted: true,
-        rescueOk: true,
-        rescueNote: `stop_rescued: ${rescueRes.stopOrderId}`,
-      };
-    } else {
-      return {
-        rescueAttempted: true,
-        rescueOk: false,
-        rescueNote: `stop_rescue_failed: ${rescueRes.error}${rescueRes.detail ? ": " + rescueRes.detail : ""}`,
-      };
-    }
-  } catch (err: any) {
+  const protective = findProtectiveStopOrder({
+    ticker: args.ticker,
+    tradeSide: args.side,
+    openOrders: args.symbolOpenOrders,
+  });
+  if (protective) {
     return {
-      rescueAttempted: true,
-      rescueOk: false,
-      rescueNote: `stop_rescue_error: ${String(err?.message || err)}`,
+      status: "VERIFIED",
+      activeStopOrderId: protective.id,
+      activeStopPrice: protective.stopPrice ?? undefined,
     };
   }
+
+  const trackedStopOrderId = String(args.trade?.stopOrderId || "");
+  if (!trackedStopOrderId) {
+    return {
+      status: "MISSING_STOP",
+      issue: "missing_protective_stop_order",
+      issueDetail: "no_open_stop_detected",
+    };
+  }
+
+  try {
+    const tracked = await getOrder(trackedStopOrderId);
+    const status = String((tracked as any)?.status || "").toLowerCase();
+    if (isOpenOrderStatus(status)) {
+      return {
+        status: "MISSING_STOP",
+        issue: "tracked_stop_not_found_open",
+        issueDetail: `tracked_stop_open_but_not_present_in_open_book:${trackedStopOrderId}`,
+      };
+    }
+    const terminal = classifyOrderTerminalStatus(status);
+    if (terminal === "EXPIRED") {
+      return {
+        status: "STOP_EXPIRED",
+        issue: "stop_expired",
+        issueDetail: `tracked_stop_status=${status}`,
+      };
+    }
+    if (terminal === "CANCELED") {
+      return {
+        status: "STOP_CANCELED",
+        issue: "stop_canceled",
+        issueDetail: `tracked_stop_status=${status}`,
+      };
+    }
+    if (status === "rejected") {
+      return {
+        status: "MISSING_STOP",
+        issue: "stop_rejected",
+        issueDetail: `tracked_stop_status=${status}`,
+      };
+    }
+    return {
+      status: "MISSING_STOP",
+      issue: "stop_invalid_status",
+      issueDetail: `tracked_stop_status=${status || "unknown"}`,
+    };
+  } catch (err: any) {
+    return {
+      status: "MISSING_STOP",
+      issue: "broker_order_lookup_failed",
+      issueDetail: String(err?.message || err),
+    };
+  }
+}
+
+async function flattenForProtectionFailure(args: {
+  next: any[];
+  idx: number;
+  now: string;
+  ticker: string;
+  tradeId: string;
+  issue: ProtectionIssueCode;
+  issueDetail: string;
+}) {
+  const closeRes = await submitMarketCloseForTrade(args.next[args.idx], args.ticker);
+  if (!closeRes.ok) {
+    const flattenIssue = `flatten_submit_failed:${closeRes.error}${closeRes.detail ? ":" + closeRes.detail : ""}`;
+    args.next[args.idx] = {
+      ...args.next[args.idx],
+      protectionStatus: "REPAIR_FAILED",
+      protectionIssue: `${args.issue}:${args.issueDetail}:${flattenIssue}`,
+      lastProtectionCheckAt: args.now,
+      updatedAt: args.now,
+    };
+    await emitProtectionEvent({
+      type: "STOP_REPAIR_FAILED",
+      tradeId: args.tradeId,
+      ticker: args.ticker,
+      message: "Stop repair failed and flatten submission failed",
+      meta: {
+        issue: args.issue,
+        issueDetail: args.issueDetail,
+        flattenError: flattenIssue,
+      },
+    });
+    return { ok: false };
+  }
+
+  args.next[args.idx] = {
+    ...args.next[args.idx],
+    status: "CLOSED",
+    autoEntryStatus: "CLOSED",
+    closedAt: args.now,
+    closeReason: "protection_flatten",
+    closeOrderId: closeRes.orderId,
+    closeOrderStatus: closeRes.status,
+    protectionStatus: "FLATTENED",
+    protectionIssue: `${args.issue}:${args.issueDetail}`,
+    protectionVerifiedAt: args.now,
+    lastProtectionCheckAt: args.now,
+    updatedAt: args.now,
+  };
+  await emitProtectionEvent({
+    type: "TRADE_FLATTENED_PROTECTION",
+    tradeId: args.tradeId,
+    ticker: args.ticker,
+    message: "Trade flattened after stop protection repair failure",
+    meta: {
+      issue: args.issue,
+      issueDetail: args.issueDetail,
+      closeOrderId: closeRes.orderId,
+      qty: closeRes.qty,
+    },
+  });
+  return { ok: true };
 }
 
 export async function runAutoManage(opts: { source?: string; runId?: string; force?: boolean }): Promise<AutoManageResult> {
@@ -689,19 +818,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     }
 
     if (!(stop != null && stop > 0)) {
-      if (idx >= 0) {
-        next[idx] = {
-          ...next[idx],
-          status: "ERROR",
-          autoEntryStatus: "INVALID",
-          error: "missing_stop_price",
-          reason: "missing_stop_price",
-          updatedAt: now,
-        };
-        updated++;
-      }
-      pushNote(`mark_invalid_missing_stop:${ticker}`);
-      continue;
+      pushNote(`missing_trade_stop_price:${ticker}`);
     }
 
     if (cfg.eodFlatten && flattenAllowed) {
@@ -787,7 +904,16 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     const unrealizedR = metrics.unrealizedR;
     const px = metrics.px;
     const entryForCalc = metrics.entry;
-    const rps = riskPerShare(entryForCalc, stop)!;
+    const stopForCalc = typeof stop === "number" && Number.isFinite(stop) ? stop : null;
+    if (stopForCalc == null || stopForCalc <= 0) {
+      pushNote(`r_compute_failed_missing_stop_after_metrics:${ticker}`);
+      continue;
+    }
+    const rps = riskPerShare(entryForCalc, stopForCalc);
+    if (rps == null) {
+      pushNote(`r_compute_failed_invalid_risk:${ticker}`);
+      continue;
+    }
 
     const cutLossEvaluation = evaluateCutLoss({
       enabled: cfg.cutLossEnabled,
@@ -882,14 +1008,15 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     }
 
     // === GRADE-BASED STOP MANAGEMENT ===
-    let nextStop = stop;
+    let effectiveStop = stopForCalc;
+    let nextStop = effectiveStop;
     const tradeGrade = (t.grade ?? t.ai?.grade ?? t.signalGrade ?? "C") as string;
     const gradeRule = getRuleForGrade(tradeGrade);
     
     // Check if already at break-even or better
     const alreadyAtBreakEven = side === "SHORT" 
-      ? (stop <= entryForCalc + 0.001) // SHORT: stop at or below entry
-      : (stop >= entryForCalc - 0.001); // LONG: stop at or above entry
+      ? (effectiveStop <= entryForCalc + 0.001) // SHORT: stop at or below entry
+      : (effectiveStop >= entryForCalc - 0.001); // LONG: stop at or above entry
     
     // Move to break-even based on grade rule
     if (shouldMoveToBreakEven(unrealizedR, tradeGrade, alreadyAtBreakEven)) {
@@ -909,55 +1036,164 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     }
 
     if (idx >= 0) {
-      // STOP RESCUE FAILSAFE: ensure there's always an active protective stop
-      let rescueAttemptedLocal = false;
-      let rescueOkLocal = false;
-      let rescueNote: string = "";
-      try {
-        const rescueResult = await ensureStopRescued(next[idx], now, ticker);
-        rescueAttemptedLocal = rescueResult.rescueAttempted;
-        rescueOkLocal = rescueResult.rescueOk ?? false;
-        rescueNote = rescueResult.rescueNote || "";
-
-        if (rescueAttemptedLocal) {
-          rescueAttempted++;
-          if (rescueOkLocal) {
-            rescueOk++;
-            // Stop was rescued - update trade with new stopOrderId
-            next[idx] = {
-              ...next[idx],
-              stopOrderId: rescueNote.split(": ")[1], // Extract stopOrderId from note
-              autoManage: {
-                ...(next[idx].autoManage || {}),
-                lastStopRescueAt: now,
-                lastStopRescueStatus: "OK",
-              },
-              updatedAt: now,
-            };
-            pushNote(`stop_rescue_ok:${ticker}:${rescueNote}`);
-            updated++;
-          } else {
-            rescueFailed++;
-            // Rescue attempt failed - log but don't fail the run
-            next[idx] = {
-              ...next[idx],
-              autoManage: {
-                ...(next[idx].autoManage || {}),
-                lastStopRescueAt: now,
-                lastStopRescueStatus: "FAIL",
-                lastStopRescueError: rescueNote,
-              },
-              updatedAt: now,
-            };
-            pushNote(`stop_rescue_fail:${ticker}:${rescueNote}`);
-            hadFailures = true;
-          }
-        }
-      } catch (rescueErr: any) {
-        pushNote(`stop_rescue_exception:${ticker}:${String(rescueErr?.message || rescueErr)}`);
+      const normalizedSide = normalizeTradeSide(side);
+      if (!normalizedSide) {
+        pushNote(`stop_protection_skip_invalid_side:${ticker}`);
+        continue;
       }
 
-      const changedStop = Math.abs(nextStop - stop) > 1e-6;
+      const protection = await classifyProtectionFromBroker({
+        trade: next[idx],
+        ticker,
+        side: normalizedSide,
+        brokerPosition: brokerPos,
+        symbolOpenOrders,
+      });
+
+      next[idx] = {
+        ...next[idx],
+        protectionStatus: protection.status,
+        protectionIssue: protection.issue
+          ? `${protection.issue}${protection.issueDetail ? `:${protection.issueDetail}` : ""}`
+          : undefined,
+        lastProtectionCheckAt: now,
+        protectionVerifiedAt: protection.status === "VERIFIED" ? now : next[idx]?.protectionVerifiedAt,
+        stopOrderId: protection.activeStopOrderId || next[idx]?.stopOrderId,
+        stopPrice:
+          protection.activeStopPrice != null && protection.activeStopPrice > 0
+            ? protection.activeStopPrice
+            : next[idx]?.stopPrice,
+        updatedAt: now,
+      };
+      updated++;
+
+      if (protection.activeStopPrice != null && protection.activeStopPrice > 0) {
+        effectiveStop = protection.activeStopPrice;
+      }
+
+      if (protection.status !== "VERIFIED") {
+        const eventType =
+          protection.status === "STOP_EXPIRED"
+            ? "STOP_EXPIRED"
+            : protection.status === "STOP_CANCELED"
+              ? "STOP_MISSING"
+              : "STOP_MISSING";
+
+        await emitProtectionEvent({
+          type: eventType,
+          tradeId: id,
+          ticker,
+          message: `Protection issue detected: ${protection.status}`,
+          meta: {
+            issue: protection.issue,
+            issueDetail: protection.issueDetail,
+          },
+        });
+
+        rescueAttempted++;
+        next[idx] = {
+          ...next[idx],
+          protectionStatus: "REPAIRING",
+          protectionIssue: protection.issue
+            ? `${protection.issue}${protection.issueDetail ? `:${protection.issueDetail}` : ""}`
+            : "repair_submit_failed",
+          lastProtectionCheckAt: now,
+          updatedAt: now,
+        };
+        updated++;
+
+        const rescueResult = await rescueStop(next[idx]);
+        if (rescueResult.ok) {
+          rescueOk++;
+          next[idx] = {
+            ...next[idx],
+            stopOrderId: rescueResult.stopOrderId,
+            protectionStatus: "REPAIRED",
+            protectionIssue: undefined,
+            protectionVerifiedAt: now,
+            lastProtectionCheckAt: now,
+            autoManage: {
+              ...(next[idx].autoManage || {}),
+              lastStopRescueAt: now,
+              lastStopRescueStatus: "OK",
+            },
+            updatedAt: now,
+          };
+          updated++;
+          await emitProtectionEvent({
+            type: "STOP_REPAIRED",
+            tradeId: id,
+            ticker,
+            message: `Stop repaired successfully via broker order ${rescueResult.stopOrderId}`,
+            meta: {
+              previousStatus: protection.status,
+              repairedStopOrderId: rescueResult.stopOrderId,
+            },
+          });
+          pushNote(`stop_repair_ok:${ticker}:${protection.status}`);
+        } else {
+          rescueFailed++;
+          hadFailures = true;
+          next[idx] = {
+            ...next[idx],
+            protectionStatus: "REPAIR_FAILED",
+            protectionIssue: `${rescueResult.error}${rescueResult.detail ? `:${rescueResult.detail}` : ""}`,
+            lastProtectionCheckAt: now,
+            autoManage: {
+              ...(next[idx].autoManage || {}),
+              lastStopRescueAt: now,
+              lastStopRescueStatus: "FAIL",
+              lastStopRescueError: `${rescueResult.error}${rescueResult.detail ? `:${rescueResult.detail}` : ""}`,
+            },
+            updatedAt: now,
+          };
+          updated++;
+          await emitProtectionEvent({
+            type: "STOP_REPAIR_FAILED",
+            tradeId: id,
+            ticker,
+            message: "Stop repair failed; attempting immediate protection flatten",
+            meta: {
+              issue: rescueResult.error,
+              detail: rescueResult.detail,
+              previousStatus: protection.status,
+            },
+          });
+          const flattenedProtection = await flattenForProtectionFailure({
+            next,
+            idx,
+            now,
+            ticker,
+            tradeId: id,
+            issue: (protection.issue || "repair_submit_failed") as ProtectionIssueCode,
+            issueDetail: `${rescueResult.error}${rescueResult.detail ? `:${rescueResult.detail}` : ""}`,
+          });
+          if (flattenedProtection.ok) {
+            flattened++;
+          } else {
+            flattenFailures += 1;
+          }
+          updated++;
+          continue;
+        }
+      } else {
+        next[idx] = {
+          ...next[idx],
+          protectionStatus: "VERIFIED",
+          protectionIssue: undefined,
+          protectionVerifiedAt: now,
+          lastProtectionCheckAt: now,
+          updatedAt: now,
+        };
+        updated++;
+      }
+
+      if (!(effectiveStop > 0)) {
+        pushNote(`r_compute_failed_missing_stop_after_repair:${ticker}`);
+        continue;
+      }
+
+      const changedStop = Math.abs(nextStop - effectiveStop) > 1e-6;
       let stopSyncOk = true;
       let stopSyncNote = "";
 
@@ -1001,7 +1237,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
       }
 
       const noteRule = unrealizedR >= 2 ? `LOCK_2R_${tradeGrade}` : unrealizedR >= gradeRule.breakEvenAtR ? `BE_${gradeRule.breakEvenAtR}R_${tradeGrade}` : `NONE_${tradeGrade}`;
-      const stopFrom = r2(stop);
+      const stopFrom = r2(effectiveStop);
       const stopTo = r2(nextStop);
       const px2 = r2(px);
       let syncTag = "";

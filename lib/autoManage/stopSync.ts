@@ -1,5 +1,6 @@
 import { alpacaRequest, createOrder, getOrder, getPositions } from "@/lib/alpaca";
 import { normalizeStopPrice, tickForEquityPrice } from "@/lib/tickSize";
+import { classifyOrderTerminalStatus, isOpenOrderStatus } from "@/lib/trades/protection";
 
 type Side = "LONG" | "SHORT";
 
@@ -69,6 +70,26 @@ async function isStopOrderActive(orderId: string): Promise<boolean> {
 export type StopRescueResult =
   | { ok: true; stopOrderId: string; reason: string }
   | { ok: false; error: string; detail?: string };
+
+async function verifyOrderIsLive(orderId: string): Promise<{ ok: true } | { ok: false; error: string; detail?: string }> {
+  try {
+    const order = await getOrder(orderId);
+    const status = String((order as any)?.status || "").toLowerCase();
+    if (isOpenOrderStatus(status)) {
+      return { ok: true };
+    }
+    const terminal = classifyOrderTerminalStatus(status);
+    if (terminal === "EXPIRED") {
+      return { ok: false, error: "repair_verify_failed", detail: `expired:${orderId}` };
+    }
+    if (terminal === "CANCELED") {
+      return { ok: false, error: "repair_verify_failed", detail: `canceled:${orderId}` };
+    }
+    return { ok: false, error: "repair_verify_failed", detail: `status:${status || "unknown"}:${orderId}` };
+  } catch (err: any) {
+    return { ok: false, error: "repair_verify_failed", detail: String(err?.message || err) };
+  }
+}
 
 /**
  * Rescue stop: create a standalone GTC stop order when trade is OPEN and broker position exists
@@ -140,6 +161,11 @@ export async function rescueStop(trade: TradeLike): Promise<StopRescueResult> {
     const stopOrderId = String((stopOrder as any)?.id || "");
     if (!stopOrderId) {
       return { ok: false, error: "stop_order_missing_id" };
+    }
+
+    const verify = await verifyOrderIsLive(stopOrderId);
+    if (!verify.ok) {
+      return { ok: false, error: verify.error, detail: verify.detail };
     }
 
     return {
@@ -243,15 +269,25 @@ export async function syncStopForTrade(trade: TradeLike, nextStopPrice: number):
       qty,
       side: stopSide,
       type: "stop",
-      time_in_force: "day",
+      time_in_force: "gtc",
       stop_price: normResult.stop,
       extended_hours: false,
     });
 
+    const stopOrderId = String((stopOrder as any)?.id || "");
+    if (!stopOrderId) {
+      return { ok: false, error: "stop_order_missing_id" };
+    }
+
+    const verify = await verifyOrderIsLive(stopOrderId);
+    if (!verify.ok) {
+      return { ok: false, error: verify.error, detail: verify.detail, quantizationNote };
+    }
+
     return { 
       ok: true, 
       qty, 
-      stopOrderId: String((stopOrder as any)?.id || ""), 
+      stopOrderId,
       cancelled,
       quantizationNote,
     };

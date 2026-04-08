@@ -15,6 +15,7 @@ import { computeScoringWindows } from "@/lib/ops/scoringWindows";
 import { computeOperationalDiagnostics } from "@/lib/ops/operationalDiagnostics";
 import { readTodayFunnel } from "@/lib/funnelRedis";
 import { getEtDateString } from "@/lib/time/etDate";
+import { isOpenTradeStatus, ProtectionStatus } from "@/lib/trades/protection";
 
 export const dynamic = "force-dynamic";
 
@@ -133,6 +134,18 @@ export async function GET() {
     const brokerTruthFromAutoEntry = brokerPositionsCount;
 
     const operationalDiagnostics = computeOperationalDiagnostics(brokerTruth, trades);
+    const openTrades = (Array.isArray(trades) ? trades : []).filter((t: any) => isOpenTradeStatus(t?.status));
+    const criticalProtectionStatuses = new Set<ProtectionStatus>([
+      "MISSING_STOP",
+      "STOP_EXPIRED",
+      "STOP_CANCELED",
+      "REPAIRING",
+      "REPAIR_FAILED",
+    ]);
+    const unprotectedOpenTrades = openTrades.filter((t: any) =>
+      criticalProtectionStatuses.has((t?.protectionStatus || "") as ProtectionStatus)
+    );
+    const protectionCritical = unprotectedOpenTrades.length > 0;
 
     // Legacy flags for backward compatibility
     const pause = process.env.PAUSE_AUTOTRADING === "1";
@@ -157,10 +170,13 @@ export async function GET() {
         !brokerTruth.error &&
         !wouldSkipMaxOpenPositions &&
         !guardState.autoDisabledReason &&
-        (alpacaClock?.is_open ?? true),
+        (alpacaClock?.is_open ?? true) &&
+        !protectionCritical,
       brokerConnected: !brokerTruth.error,
       scoringHealthy: createdLast6Hours.pending + createdLast6Hours.error < 50,
       marketOpen: alpacaClock?.is_open ?? null,
+      protectionCritical,
+      unprotectedOpenTrades: unprotectedOpenTrades.length,
     };
 
     const lastScoredAtAny = signals

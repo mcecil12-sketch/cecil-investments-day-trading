@@ -8,6 +8,7 @@ import {
   isOperationallyActiveTrade,
   normalizedOperationalStatus,
 } from "@/lib/trades/operational";
+import { ProtectionStatus } from "@/lib/trades/protection";
 
 export const runtime = "nodejs";
 
@@ -71,6 +72,12 @@ export interface TradeRecord extends IncomingTrade {
   stopOrderId?: string;
   takeProfitOrderId?: string;
   error?: string;
+
+  // Protection integrity model
+  protectionStatus?: ProtectionStatus;
+  protectionVerifiedAt?: string;
+  protectionIssue?: string;
+  lastProtectionCheckAt?: string;
 
   // Closure fields (should only be set when status is CLOSED/ERROR, not when position exists)
   closedAt?: string;

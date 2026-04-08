@@ -10,6 +10,7 @@ import { NotificationEvent } from "@/lib/notifications/types";
 import { sendNotification } from "@/lib/notifications/notify";
 import { getAllSignals } from "@/lib/signalsStore";
 import { normalizeStopPrice, tickForEquityPrice } from "@/lib/tickSize";
+import { ProtectionStatus } from "@/lib/trades/protection";
 
 async function fireNotification(event: NotificationEvent) {
   try {
@@ -92,6 +93,10 @@ type Trade = {
   signalTier?: string;
   signalGrade?: string;
   signalId?: string;
+  protectionStatus?: ProtectionStatus;
+  protectionVerifiedAt?: string;
+  protectionIssue?: string;
+  lastProtectionCheckAt?: string;
 };
 
 async function readSettings(): Promise<{ autoManagementEnabled?: boolean }> {
