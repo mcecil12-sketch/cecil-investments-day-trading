@@ -7,6 +7,8 @@ import { prepareExecutionPlan } from "@/lib/agents/execution/engine";
 import { executeGithubTask } from "@/lib/agents/githubExecutor";
 import { approveExecution } from "@/lib/agents/governance/manager";
 import { listEngineeringTasks, updateEngineeringTaskById } from "@/lib/agents/store";
+import { openImpactEnvelope, closeImpactEnvelope } from "@/lib/agents/executionImpact";
+import { runSmokeValidation } from "@/lib/agents/preCommitValidation";
 import type { EngineeringTask } from "@/lib/agents/types";
 
 function appendNotes(current: string[] | undefined, additions: string[]): string[] {
@@ -64,6 +66,38 @@ function buildReadyExecutionTask(task: EngineeringTask, updates?: Partial<Engine
 }
 
 async function executeReadyForGithubCommit(task: EngineeringTask) {
+  // Phase 3: open impact envelope before execution
+  let envelopeId: string | null = null;
+  try {
+    const envelope = await openImpactEnvelope(task.id, "engineering");
+    envelopeId = envelope.envelopeId;
+  } catch {
+    // non-fatal — impact tracking is best-effort
+  }
+
+  // Phase 3: run smoke validation before committing
+  let validationPassed = true;
+  let validationFailureReason: string | null = null;
+  try {
+    const validation = await runSmokeValidation(task);
+    validationPassed = validation.passed;
+    validationFailureReason = validation.failureReason;
+    if (!validationPassed) {
+      console.warn(`[execute] Pre-commit smoke validation failed for task ${task.id}: ${validationFailureReason}`);
+    }
+  } catch {
+    // non-fatal — validation errors don't block execution
+  }
+
+  if (!validationPassed && validationFailureReason) {
+    // Queue a narrower remediation instead of blocking entirely; mark as noted
+    const blockedNotes = appendNotes(task.notes, [
+      `Pre-commit validation failed: ${validationFailureReason}`,
+      "Proceeding with execution — smoke check failure is advisory in Phase 3.",
+    ]);
+    await updateEngineeringTaskById(task.id, { notes: blockedNotes });
+  }
+
   const executionResult = await executeGithubTask(task);
 
   await updateEngineeringTaskById(task.id, {
@@ -87,6 +121,15 @@ async function executeReadyForGithubCommit(task: EngineeringTask) {
       executionResult.commitUrl ? `Commit url: ${executionResult.commitUrl}` : "",
     ]),
   });
+
+  // Phase 3: close impact envelope after execution
+  if (envelopeId) {
+    try {
+      await closeImpactEnvelope(envelopeId, executionResult.commitSha ?? null);
+    } catch {
+      // non-fatal
+    }
+  }
 
   return NextResponse.json({
     ok: true,

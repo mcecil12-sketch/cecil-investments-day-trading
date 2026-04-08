@@ -5,6 +5,7 @@ import { checkAgentCronAuth, unauthorizedAgentResponse } from "@/lib/agents/auth
 import { runEngineeringManagerAgent } from "@/lib/agents/runners/engineering-manager";
 import { ALL_AGENT_RUN_ORDER, AGENT_RUNNERS } from "@/lib/agents/runners";
 import { ensureAgentState, readAgentState } from "@/lib/agents/store";
+import { runEmOrchestration } from "@/lib/agents/engineeringManager";
 import type { AgentName } from "@/lib/agents/types";
 
 type AgentRunRequest = AgentName | "all";
@@ -81,6 +82,13 @@ export async function POST(req: Request) {
       });
     } catch (err) {
       console.error("engineering-manager error", err);
+    }
+
+    // Phase 3: run EM orchestration (scoring + strategist + learning signals)
+    try {
+      await runEmOrchestration();
+    } catch (err) {
+      console.warn("EM orchestration error (non-fatal)", err);
     }
   }
 
