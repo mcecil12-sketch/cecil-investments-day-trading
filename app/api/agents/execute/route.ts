@@ -9,6 +9,7 @@ import { approveExecution } from "@/lib/agents/governance/manager";
 import { listEngineeringTasks, updateEngineeringTaskById } from "@/lib/agents/store";
 import { openImpactEnvelope, closeImpactEnvelope } from "@/lib/agents/executionImpact";
 import { runSmokeValidation } from "@/lib/agents/preCommitValidation";
+import { getCriticalTasks } from "@/lib/redis";
 import type { EngineeringTask } from "@/lib/agents/types";
 
 function appendNotes(current: string[] | undefined, additions: string[]): string[] {
@@ -163,6 +164,22 @@ export async function POST(req: NextRequest) {
   let task: EngineeringTask | null = null;
 
   try {
+    // ─── Critical Task Bypass ─────────────────────────────────────────
+    // Block engineering execution when unresolved protection incidents exist.
+    const criticalTasks = await getCriticalTasks().catch(() => []);
+    if (criticalTasks.length > 0) {
+      const selected = criticalTasks[0];
+      return NextResponse.json({
+        ok: true,
+        message: "Execution blocked: unresolved critical protection incidents",
+        criticalBypassApplied: true,
+        selectedSource: "critical-task-queue",
+        criticalTaskCount: criticalTasks.length,
+        selectedCriticalTask: selected,
+        executionStatus: "BYPASSED_CRITICAL",
+      });
+    }
+
     const tasks = await listEngineeringTasks(100);
     task = tasks
       .filter((candidate) => isEligibleTask(candidate))

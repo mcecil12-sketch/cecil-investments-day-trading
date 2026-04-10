@@ -16,6 +16,11 @@ import { NotificationEvent } from "@/lib/notifications/types";
 import { normalizeStopPrice, normalizeLimitPrice, tickForEquityPrice } from "@/lib/tickSize";
 import { fetchBrokerTruth, type BrokerTruth } from "@/lib/broker/truth";
 import {
+  auditProtectionIntegrity,
+  type BrokerPosition,
+  type BrokerOrder,
+} from "@/lib/risk/protection-integrity";
+import {
   deriveSessionMeta,
   evaluatePendingEligibility,
   getTradeTimestamp,
@@ -1156,6 +1161,66 @@ export async function POST(req: Request) {
       },
       { status: 200 }
     );
+  }
+
+  // ─── Protection Integrity Gate ──────────────────────────────────────
+  // Block new entries when existing open positions have critical protection gaps.
+  {
+    const openTradesForAudit = trades
+      .filter((t: any) => isOperationallyOpenTrade(t))
+      .map((t: any) => ({
+        id: String(t?.id || ""),
+        ticker: String(t?.ticker || "").toUpperCase(),
+        side: String(t?.side || "LONG").toUpperCase(),
+        status: String(t?.status || ""),
+        qty: Number(t?.size || t?.qty || 0),
+        stopOrderId: t?.stopOrderId || t?.alpacaStopOrderId,
+        protectionStatus: t?.protectionStatus,
+      }));
+    if (openTradesForAudit.length > 0) {
+      const positions: BrokerPosition[] = Array.isArray(brokerTruth.positions) ? brokerTruth.positions : [];
+      const orders: BrokerOrder[] = Array.isArray(brokerTruth.openOrders) ? brokerTruth.openOrders : [];
+      const audit = auditProtectionIntegrity({
+        openTrades: openTradesForAudit,
+        brokerPositions: positions,
+        brokerOrders: orders,
+        marketOpen,
+      });
+      if (audit.criticalCount > 0) {
+        const criticalIncidents = audit.incidents.filter((i) => i.severity === "CRITICAL");
+        counts.skipped += 1;
+        await recordOutcome({
+          outcome: "SKIP",
+          reason: "PROTECTION_INTEGRITY_FAILED",
+          detail: `${audit.criticalCount} critical: ${criticalIncidents.map((i) => `${i.code}:${i.symbol}`).join(", ")}`,
+        });
+        return NextResponse.json(
+          {
+            ok: true,
+            skipped: true,
+            reason: "PROTECTION_INTEGRITY_FAILED",
+            detail: `${audit.criticalCount} critical protection incidents on existing positions`,
+            protectionAudit: {
+              criticalCount: audit.criticalCount,
+              incidentCount: audit.incidentCount,
+              incidents: criticalIncidents.slice(0, 10),
+            },
+            market: { isOpen: marketOpen, timestamp: marketTimestamp },
+            openPositionsCount: brokerTruth.positionsCount,
+            maxOpenPositions: guardConfig.maxOpenPositions,
+            entriesToday: guardState.entriesToday,
+            maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+            pendingCount: counts.pendingCount,
+            eligibleCount: counts.eligibleCount,
+            executedCount: counts.executed,
+            counts,
+            notes: notes.slice(0, 40),
+            guardrails: guardSummary,
+          },
+          { status: 200 },
+        );
+      }
+    }
   }
 
   const maxOpenReached = brokerTruth.positionsCount >= guardConfig.maxOpenPositions;
