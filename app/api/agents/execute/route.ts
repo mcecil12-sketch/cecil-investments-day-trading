@@ -166,18 +166,20 @@ export async function POST(req: NextRequest) {
   let task: EngineeringTask | null = null;
 
   try {
-    // ─── Critical Task Bypass ─────────────────────────────────────────
-    // When unresolved protection incidents exist, select the oldest critical
-    // task first so the self-heal loop addresses it before normal work.
+    // ─── Critical Task Batch Drain ────────────────────────────────────
+    // When unresolved protection incidents exist, attempt to resolve all
+    // eligible critical tasks in one run (capped for safety).
     const criticalTasks = await getCriticalTasks().catch(() => []);
     if (criticalTasks.length > 0) {
-      // getCriticalTasks() returns newest-first; select the oldest unresolved
-      const selected = criticalTasks[criticalTasks.length - 1];
+      const MAX_PER_RUN = Math.max(1, Math.min(20, Number(process.env.MAX_CRITICAL_RESOLUTIONS_PER_RUN) || 5));
+      const batch = criticalTasks.slice(0, MAX_PER_RUN);
 
-      // Run safe execution gate (build + smoke validation)
+      console.log(`[execute] Critical batch start: ${batch.length}/${criticalTasks.length} tasks, cap=${MAX_PER_RUN}`);
+
+      // Run safe execution gate once for the batch (build + smoke validation)
       let gateResult: GateResult | null = null;
       try {
-        gateResult = await runSafeExecutionGate(selected);
+        gateResult = await runSafeExecutionGate(batch[0]);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         gateResult = {
@@ -193,54 +195,90 @@ export async function POST(req: NextRequest) {
         };
       }
 
-      // If gate passes, attempt verified resolution
-      let resolutionResult: { resolved: boolean; verification: any; task: any } | null = null;
-      if (gateResult.passed) {
-        try {
-          resolutionResult = await resolveWithVerification(selected.id);
-        } catch (err) {
-          resolutionResult = {
-            resolved: false,
-            verification: {
-              passed: false,
-              source: "exception",
-              reason: err instanceof Error ? err.message : String(err),
-              checkedAt: new Date().toISOString(),
-            },
-            task: selected,
-          };
+      // If gate fails, block the entire batch
+      if (!gateResult.passed) {
+        // Record attempt metadata for each task
+        for (const ct of batch) {
+          await setAttemptMetadata(ct.id, {
+            lastAttemptAt: new Date().toISOString(),
+            lastAttemptResult: "failure",
+            lastVerificationResult: "skipped",
+            lastVerificationReason: gateResult.failureReason ?? "gate_failed",
+          }).catch(() => {});
         }
-      } else {
-        // Gate failed — record attempt metadata
-        await setAttemptMetadata(selected.id, {
-          lastAttemptAt: new Date().toISOString(),
-          lastAttemptResult: "failure",
-          lastVerificationResult: "skipped",
-          lastVerificationReason: gateResult.failureReason ?? "gate_failed",
-        }).catch(() => {});
+
+        return NextResponse.json({
+          ok: true,
+          message: "Execution blocked: safe execution gate failed",
+          criticalBypassApplied: true,
+          selectedSource: "critical-task-queue",
+          executionStatus: "BYPASSED_CRITICAL",
+          criticalTaskCount: criticalTasks.length,
+          attemptedCriticalCount: 0,
+          resolvedCriticalCount: 0,
+          failedCriticalCount: 0,
+          skippedCriticalCount: batch.length,
+          remainingCriticalCount: criticalTasks.length,
+          criticalResolutionResults: batch.map((ct) => ({
+            id: ct.id,
+            incidentCode: ct.incidentCode,
+            symbol: ct.symbol,
+            status: "skipped" as const,
+            reason: gateResult!.failureReason ?? "gate_failed",
+          })),
+          safeExecutionGate: gateResult,
+        });
       }
+
+      // Gate passed — attempt resolution for each task
+      type ItemResult = {
+        id: string;
+        incidentCode: string;
+        symbol: string;
+        status: "resolved" | "failed" | "skipped";
+        reason: string | null;
+      };
+      const results: ItemResult[] = [];
+      let resolvedCount = 0;
+      let failedCount = 0;
+
+      for (const ct of batch) {
+        try {
+          const res = await resolveWithVerification(ct.id);
+          if (res.resolved) {
+            resolvedCount++;
+            results.push({ id: ct.id, incidentCode: ct.incidentCode, symbol: ct.symbol, status: "resolved", reason: null });
+          } else {
+            failedCount++;
+            results.push({ id: ct.id, incidentCode: ct.incidentCode, symbol: ct.symbol, status: "failed", reason: res.verification.reason });
+          }
+        } catch (err) {
+          failedCount++;
+          results.push({ id: ct.id, incidentCode: ct.incidentCode, symbol: ct.symbol, status: "failed", reason: err instanceof Error ? err.message : String(err) });
+        }
+      }
+
+      const remainingCount = criticalTasks.length - resolvedCount;
+      const allResolved = remainingCount === 0;
+
+      console.log(`[execute] Critical batch done: resolved=${resolvedCount} failed=${failedCount} remaining=${remainingCount}`);
 
       return NextResponse.json({
         ok: true,
-        message: resolutionResult?.resolved
-          ? "Critical incident resolved after verification"
-          : "Execution blocked: unresolved critical protection incidents",
+        message: allResolved
+          ? "All critical incidents resolved after verification"
+          : `Resolved ${resolvedCount}/${batch.length} critical incidents`,
         criticalBypassApplied: true,
         selectedSource: "critical-task-queue",
-        selectedCriticalTaskId: selected.id,
-        selectedCriticalIncidentCode: selected.incidentCode,
+        executionStatus: allResolved ? "CRITICAL_BATCH_RESOLVED" : resolvedCount > 0 ? "CRITICAL_BATCH_PARTIAL" : "BYPASSED_CRITICAL",
         criticalTaskCount: criticalTasks.length,
-        selectedCriticalTask: selected,
-        executionStatus: resolutionResult?.resolved
-          ? "CRITICAL_RESOLVED"
-          : "BYPASSED_CRITICAL",
+        attemptedCriticalCount: batch.length,
+        resolvedCriticalCount: resolvedCount,
+        failedCriticalCount: failedCount,
+        skippedCriticalCount: 0,
+        remainingCriticalCount: remainingCount,
+        criticalResolutionResults: results,
         safeExecutionGate: gateResult,
-        resolution: resolutionResult
-          ? {
-              resolved: resolutionResult.resolved,
-              verification: resolutionResult.verification,
-            }
-          : null,
       });
     }
 
