@@ -57,15 +57,21 @@ export async function runPostFixVerification(
   task: CriticalTask,
 ): Promise<VerificationResult> {
   const now = new Date().toISOString();
-  const base = process.env.VERCEL_URL
-    ? `https://${process.env.VERCEL_URL}`
-    : process.env.NEXTAUTH_URL ?? "http://localhost:3000";
+  // Prefer explicit production URL over VERCEL_URL (may be behind Vercel Deployment Protection)
+  const base = (
+    process.env.APP_URL?.replace(/\/$/, "") ||
+    process.env.NEXTAUTH_URL?.replace(/\/$/, "") ||
+    (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null) ||
+    "http://localhost:3000"
+  );
   const cronToken = process.env.CRON_TOKEN ?? process.env.CRON_SECRET ?? "";
+  const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
 
   const headers: Record<string, string> = {
-    "x-cron-token": cronToken,
     "cache-control": "no-store",
   };
+  if (cronToken) headers["x-cron-token"] = cronToken;
+  if (bypassSecret) headers["x-vercel-protection-bypass"] = bypassSecret;
 
   // 1. Check protection-audit
   try {

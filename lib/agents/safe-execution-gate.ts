@@ -3,52 +3,108 @@
  * before it can be marked as resolved.
  *
  * Contract:
- *   1. Local build probe must pass
- *   2. Targeted smoke tests must pass
+ *   1. Local build probe must pass (ping /api/agents/state)
+ *   2. Targeted smoke probes must pass (readiness + protection-audit)
  *   3. On failure, task remains unresolved with remediation metadata
+ *
+ * Auth: forwards x-cron-token and x-vercel-protection-bypass headers
+ * so probes succeed both through Vercel Deployment Protection and
+ * through route-level auth.
  */
 
-import { runBuildValidation, runSmokeValidation } from "@/lib/agents/preCommitValidation";
 import type { CriticalTask } from "@/lib/redis";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
+export interface ProbeResult {
+  route: string;
+  ok: boolean;
+  status: number | null;
+  reason: string | null;
+}
+
 export interface GateResult {
   passed: boolean;
   buildOk: boolean;
-  buildReason: string | null;
+  buildProbe: ProbeResult;
   smokeOk: boolean;
-  smokeFailedKeys: string[];
-  smokeResults: Record<string, "pass" | "fail" | "skip">;
+  smokeProbes: ProbeResult[];
   validatedAt: string;
   failureReason: string | null;
+  baseUrl: string;
+  authMode: string;
 }
 
-// ─── Smoke check selection for critical tasks ───────────────────────
+// ─── Internal helpers ───────────────────────────────────────────────
 
-function smokeKeysForIncident(incidentCode: string): string[] {
-  switch (incidentCode) {
-    case "MISSING_STOP":
-    case "STOP_EXPIRED":
-    case "STOP_CANCELED":
-    case "STOP_DAY_TIF":
-    case "STOP_REPAIR_FAILED":
-    case "FLATTEN_FAILED":
-    case "BROKER_DB_MISMATCH":
-      return ["readiness", "protection-audit"];
-    default:
-      return ["readiness", "protection-audit"];
+/**
+ * Resolve the base URL for internal self-probes.
+ * Prefer explicit production URL over VERCEL_URL which may be a
+ * deployment-specific URL behind Vercel Deployment Protection.
+ */
+function resolveBaseUrl(): string {
+  if (process.env.APP_URL) return process.env.APP_URL.replace(/\/$/, "");
+  if (process.env.NEXTAUTH_URL) return process.env.NEXTAUTH_URL.replace(/\/$/, "");
+  if (process.env.NEXT_PUBLIC_APP_URL) return process.env.NEXT_PUBLIC_APP_URL.replace(/\/$/, "");
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  return "http://localhost:3000";
+}
+
+function buildProbeHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    "cache-control": "no-store",
+  };
+  const cronToken = process.env.CRON_TOKEN ?? process.env.CRON_SECRET ?? "";
+  if (cronToken) headers["x-cron-token"] = cronToken;
+  const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
+  if (bypassSecret) headers["x-vercel-protection-bypass"] = bypassSecret;
+  return headers;
+}
+
+function authModeLabel(): string {
+  if (process.env.CRON_TOKEN || process.env.CRON_SECRET) return "cron_token";
+  return "none";
+}
+
+const SMOKE_ROUTES_FOR_INCIDENT: Record<string, string[]> = {
+  MISSING_STOP: ["/api/readiness", "/api/trades/protection-audit"],
+  STOP_EXPIRED: ["/api/readiness", "/api/trades/protection-audit"],
+  STOP_CANCELED: ["/api/readiness", "/api/trades/protection-audit"],
+  STOP_DAY_TIF: ["/api/readiness", "/api/trades/protection-audit"],
+  STOP_REPAIR_FAILED: ["/api/readiness", "/api/trades/protection-audit"],
+  FLATTEN_FAILED: ["/api/readiness", "/api/trades/protection-audit"],
+  BROKER_DB_MISMATCH: ["/api/readiness", "/api/trades/protection-audit"],
+};
+
+const DEFAULT_SMOKE_ROUTES = ["/api/readiness", "/api/trades/protection-audit"];
+
+// ─── Probe runner ───────────────────────────────────────────────────
+
+async function probeRoute(
+  base: string,
+  route: string,
+  headers: Record<string, string>,
+): Promise<ProbeResult> {
+  try {
+    const res = await fetch(`${base}${route}`, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(10_000),
+    });
+    return {
+      route,
+      ok: res.ok,
+      status: res.status,
+      reason: res.ok ? null : `HTTP ${res.status}`,
+    };
+  } catch (err) {
+    return {
+      route,
+      ok: false,
+      status: null,
+      reason: err instanceof Error ? err.message : String(err),
+    };
   }
-}
-
-// Minimal synthetic task shape for runSmokeValidation
-function syntheticTaskForSmoke(task: CriticalTask) {
-  return {
-    id: task.id,
-    title: `Self-heal: ${task.incidentCode} on ${task.symbol}`,
-    summary: `Critical incident resolution for ${task.incidentCode}`,
-    status: "OPEN" as const,
-  } as any; // EngineeringTask shape — only title/summary/id used by classifier
 }
 
 // ─── Gate runner ────────────────────────────────────────────────────
@@ -57,49 +113,38 @@ export async function runSafeExecutionGate(
   task: CriticalTask,
 ): Promise<GateResult> {
   const now = new Date().toISOString();
+  const base = resolveBaseUrl();
+  const headers = buildProbeHeaders();
+  const authMode = authModeLabel();
 
-  // 1. Build probe
-  let buildOk = false;
-  let buildReason: string | null = null;
-  try {
-    const buildResult = await runBuildValidation();
-    buildOk = buildResult.ok;
-    buildReason = buildResult.reason;
-  } catch (err) {
-    buildReason = err instanceof Error ? err.message : String(err);
+  // 1. Build probe — confirm runtime is operational
+  const buildProbe = await probeRoute(base, "/api/agents/state", headers);
+
+  // 2. Targeted smoke probes for this incident type
+  const smokeRoutes =
+    SMOKE_ROUTES_FOR_INCIDENT[task.incidentCode] ?? DEFAULT_SMOKE_ROUTES;
+  const smokeProbes: ProbeResult[] = [];
+  for (const route of smokeRoutes) {
+    smokeProbes.push(await probeRoute(base, route, headers));
   }
+  const smokeOk = smokeProbes.every((p) => p.ok);
 
-  // 2. Targeted smoke tests
-  let smokeOk = false;
-  const smokeResults: Record<string, "pass" | "fail" | "skip"> = {};
-  const smokeFailedKeys: string[] = [];
-
-  try {
-    const syntheticTask = syntheticTaskForSmoke(task);
-    const smokeOutcome = await runSmokeValidation(syntheticTask);
-    smokeOk = smokeOutcome.passed;
-    Object.assign(smokeResults, smokeOutcome.smokeCheckResults);
-    for (const [key, val] of Object.entries(smokeOutcome.smokeCheckResults)) {
-      if (val === "fail") smokeFailedKeys.push(key);
-    }
-  } catch (err) {
-    // Smoke network failure is non-fatal in serverless
-    smokeOk = true;
-  }
-
-  const passed = buildOk && smokeOk;
+  const passed = buildProbe.ok && smokeOk;
   const reasons: string[] = [];
-  if (!buildOk) reasons.push(`build: ${buildReason || "failed"}`);
-  if (!smokeOk) reasons.push(`smoke: ${smokeFailedKeys.join(", ")}`);
+  if (!buildProbe.ok) reasons.push(`build(${buildProbe.route}): ${buildProbe.reason}`);
+  for (const p of smokeProbes) {
+    if (!p.ok) reasons.push(`smoke(${p.route}): ${p.reason}`);
+  }
 
   return {
     passed,
-    buildOk,
-    buildReason,
+    buildOk: buildProbe.ok,
+    buildProbe,
     smokeOk,
-    smokeFailedKeys,
-    smokeResults,
+    smokeProbes,
     validatedAt: now,
     failureReason: passed ? null : reasons.join("; "),
+    baseUrl: base,
+    authMode,
   };
 }

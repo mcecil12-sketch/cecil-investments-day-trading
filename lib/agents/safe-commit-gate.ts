@@ -25,8 +25,10 @@ const SMOKE_ROUTES: Record<SafeGateTaskType, string[]> = {
 };
 
 function resolveBaseUrl(): string {
+  if (process.env.APP_URL) return process.env.APP_URL.replace(/\/$/, "");
+  if (process.env.NEXTAUTH_URL) return process.env.NEXTAUTH_URL.replace(/\/$/, "");
+  if (process.env.NEXT_PUBLIC_APP_URL) return process.env.NEXT_PUBLIC_APP_URL.replace(/\/$/, "");
   if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
-  if (process.env.NEXT_PUBLIC_APP_URL) return process.env.NEXT_PUBLIC_APP_URL;
   return "http://localhost:3000";
 }
 
@@ -48,14 +50,18 @@ export async function runSafeGate(
   }
 
   const baseUrl = resolveBaseUrl();
+  const probeHeaders: Record<string, string> = {};
   const cronToken = process.env.CRON_TOKEN || "";
+  if (cronToken) probeHeaders["x-cron-token"] = cronToken;
+  const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
+  if (bypassSecret) probeHeaders["x-vercel-protection-bypass"] = bypassSecret;
   const smokeResults: SmokeResult[] = [];
 
   for (const route of routes) {
     try {
       const resp = await fetch(`${baseUrl}${route}`, {
         method: "GET",
-        headers: { "x-cron-token": cronToken },
+        headers: probeHeaders,
         signal: AbortSignal.timeout(10_000),
       });
       smokeResults.push({ route, ok: resp.ok, status: resp.status });

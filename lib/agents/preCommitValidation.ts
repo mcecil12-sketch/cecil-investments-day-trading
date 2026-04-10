@@ -83,15 +83,22 @@ export async function runBuildValidation(): Promise<{ ok: boolean; reason: strin
   // Instead we confirm that the runtime is functional by pinging the internal
   // agents state endpoint. A 200 response means the build is operational.
   try {
-    const base = process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : process.env.NEXTAUTH_URL ?? "http://localhost:3000";
+    // Prefer explicit production URL over VERCEL_URL (may be behind Vercel Deployment Protection)
+    const base =
+      process.env.APP_URL?.replace(/\/$/, "") ||
+      process.env.NEXTAUTH_URL?.replace(/\/$/, "") ||
+      (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null) ||
+      "http://localhost:3000";
+
+    const headers: Record<string, string> = {};
+    const cronToken = process.env.CRON_TOKEN ?? process.env.CRON_SECRET ?? "";
+    if (cronToken) headers["x-cron-token"] = cronToken;
+    const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
+    if (bypassSecret) headers["x-vercel-protection-bypass"] = bypassSecret;
 
     const res = await fetch(`${base}/api/agents/state`, {
       method: "GET",
-      headers: {
-        "x-cron-token": process.env.CRON_TOKEN ?? process.env.CRON_SECRET ?? "",
-      },
+      headers,
       signal: AbortSignal.timeout(8000),
     });
 
@@ -118,13 +125,19 @@ export async function runSmokeValidation(
   const plan = getValidationPlan(task);
   const results: Record<string, "pass" | "fail" | "skip"> = {};
 
+  // Prefer explicit production URL over VERCEL_URL (may be behind Vercel Deployment Protection)
   const base =
     baseUrl ??
-    (process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : process.env.NEXTAUTH_URL ?? "http://localhost:3000");
+    (process.env.APP_URL?.replace(/\/$/, "") ||
+     process.env.NEXTAUTH_URL?.replace(/\/$/, "") ||
+     (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null) ||
+     "http://localhost:3000");
 
+  const probeHeaders: Record<string, string> = { "cache-control": "no-store" };
   const cronToken = process.env.CRON_TOKEN ?? process.env.CRON_SECRET ?? "";
+  if (cronToken) probeHeaders["x-cron-token"] = cronToken;
+  const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
+  if (bypassSecret) probeHeaders["x-vercel-protection-bypass"] = bypassSecret;
 
   for (const key of plan.smokeCheckKeys) {
     const checkDef = SMOKE_CHECKS[key];
@@ -136,10 +149,7 @@ export async function runSmokeValidation(
     try {
       const res = await fetch(`${base}${checkDef.path}`, {
         method: checkDef.method,
-        headers: {
-          "x-cron-token": cronToken,
-          "cache-control": "no-store",
-        },
+        headers: probeHeaders,
         signal: AbortSignal.timeout(10000),
       });
 

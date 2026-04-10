@@ -179,15 +179,17 @@ export async function POST(req: NextRequest) {
       try {
         gateResult = await runSafeExecutionGate(selected);
       } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
         gateResult = {
           passed: false,
           buildOk: false,
-          buildReason: err instanceof Error ? err.message : String(err),
+          buildProbe: { route: "/api/agents/state", ok: false, status: null, reason: errMsg },
           smokeOk: false,
-          smokeFailedKeys: [],
-          smokeResults: {},
+          smokeProbes: [],
           validatedAt: new Date().toISOString(),
-          failureReason: `gate_exception: ${err instanceof Error ? err.message : String(err)}`,
+          failureReason: `gate_exception: ${errMsg}`,
+          baseUrl: "unknown",
+          authMode: "unknown",
         };
       }
 
