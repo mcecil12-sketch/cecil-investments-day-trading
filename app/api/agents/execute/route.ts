@@ -12,6 +12,7 @@ import { runSmokeValidation } from "@/lib/agents/preCommitValidation";
 import { getCriticalTasks } from "@/lib/redis";
 import { runSafeExecutionGate, type GateResult } from "@/lib/agents/safe-execution-gate";
 import { resolveWithVerification, setAttemptMetadata } from "@/lib/agents/incident-resolution";
+import { runIncidentResolver, type ActionResult } from "@/lib/agents/resolvers";
 import type { EngineeringTask } from "@/lib/agents/types";
 
 function appendNotes(current: string[] | undefined, additions: string[]): string[] {
@@ -237,6 +238,7 @@ export async function POST(req: NextRequest) {
         symbol: string;
         status: "resolved" | "failed" | "skipped";
         reason: string | null;
+        action?: ActionResult;
       };
       const results: ItemResult[] = [];
       let resolvedCount = 0;
@@ -244,13 +246,56 @@ export async function POST(req: NextRequest) {
 
       for (const ct of batch) {
         try {
+          // 1. Run real corrective action
+          const actionResult = await runIncidentResolver(ct);
+          console.log(`[execute] resolver result for ${ct.id}:`, {
+            action: actionResult.action,
+            ok: actionResult.ok,
+            attempted: actionResult.attempted,
+          });
+
+          // 2. If action failed, record and continue (don't verify)
+          if (actionResult.attempted && !actionResult.ok) {
+            failedCount++;
+            await setAttemptMetadata(ct.id, {
+              lastAttemptAt: new Date().toISOString(),
+              lastAttemptResult: "failure",
+              lastVerificationResult: "skipped",
+              lastVerificationReason: actionResult.detail,
+            }).catch(() => {});
+            results.push({
+              id: ct.id,
+              incidentCode: ct.incidentCode,
+              symbol: ct.symbol,
+              status: "failed",
+              reason: actionResult.detail,
+              action: actionResult,
+            });
+            continue;
+          }
+
+          // 3. Action succeeded (or was not needed) — run verification
           const res = await resolveWithVerification(ct.id);
           if (res.resolved) {
             resolvedCount++;
-            results.push({ id: ct.id, incidentCode: ct.incidentCode, symbol: ct.symbol, status: "resolved", reason: null });
+            results.push({
+              id: ct.id,
+              incidentCode: ct.incidentCode,
+              symbol: ct.symbol,
+              status: "resolved",
+              reason: null,
+              action: actionResult,
+            });
           } else {
             failedCount++;
-            results.push({ id: ct.id, incidentCode: ct.incidentCode, symbol: ct.symbol, status: "failed", reason: res.verification.reason });
+            results.push({
+              id: ct.id,
+              incidentCode: ct.incidentCode,
+              symbol: ct.symbol,
+              status: "failed",
+              reason: res.verification.reason,
+              action: actionResult,
+            });
           }
         } catch (err) {
           failedCount++;
