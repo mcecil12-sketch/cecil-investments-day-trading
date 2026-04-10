@@ -10,6 +10,8 @@ import { listEngineeringTasks, updateEngineeringTaskById } from "@/lib/agents/st
 import { openImpactEnvelope, closeImpactEnvelope } from "@/lib/agents/executionImpact";
 import { runSmokeValidation } from "@/lib/agents/preCommitValidation";
 import { getCriticalTasks } from "@/lib/redis";
+import { runSafeExecutionGate, type GateResult } from "@/lib/agents/safe-execution-gate";
+import { resolveWithVerification, setAttemptMetadata } from "@/lib/agents/incident-resolution";
 import type { EngineeringTask } from "@/lib/agents/types";
 
 function appendNotes(current: string[] | undefined, additions: string[]): string[] {
@@ -165,18 +167,78 @@ export async function POST(req: NextRequest) {
 
   try {
     // ─── Critical Task Bypass ─────────────────────────────────────────
-    // Block engineering execution when unresolved protection incidents exist.
+    // When unresolved protection incidents exist, select the oldest critical
+    // task first so the self-heal loop addresses it before normal work.
     const criticalTasks = await getCriticalTasks().catch(() => []);
     if (criticalTasks.length > 0) {
-      const selected = criticalTasks[0];
+      // getCriticalTasks() returns newest-first; select the oldest unresolved
+      const selected = criticalTasks[criticalTasks.length - 1];
+
+      // Run safe execution gate (build + smoke validation)
+      let gateResult: GateResult | null = null;
+      try {
+        gateResult = await runSafeExecutionGate(selected);
+      } catch (err) {
+        gateResult = {
+          passed: false,
+          buildOk: false,
+          buildReason: err instanceof Error ? err.message : String(err),
+          smokeOk: false,
+          smokeFailedKeys: [],
+          smokeResults: {},
+          validatedAt: new Date().toISOString(),
+          failureReason: `gate_exception: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+
+      // If gate passes, attempt verified resolution
+      let resolutionResult: { resolved: boolean; verification: any; task: any } | null = null;
+      if (gateResult.passed) {
+        try {
+          resolutionResult = await resolveWithVerification(selected.id);
+        } catch (err) {
+          resolutionResult = {
+            resolved: false,
+            verification: {
+              passed: false,
+              source: "exception",
+              reason: err instanceof Error ? err.message : String(err),
+              checkedAt: new Date().toISOString(),
+            },
+            task: selected,
+          };
+        }
+      } else {
+        // Gate failed — record attempt metadata
+        await setAttemptMetadata(selected.id, {
+          lastAttemptAt: new Date().toISOString(),
+          lastAttemptResult: "failure",
+          lastVerificationResult: "skipped",
+          lastVerificationReason: gateResult.failureReason ?? "gate_failed",
+        }).catch(() => {});
+      }
+
       return NextResponse.json({
         ok: true,
-        message: "Execution blocked: unresolved critical protection incidents",
+        message: resolutionResult?.resolved
+          ? "Critical incident resolved after verification"
+          : "Execution blocked: unresolved critical protection incidents",
         criticalBypassApplied: true,
         selectedSource: "critical-task-queue",
+        selectedCriticalTaskId: selected.id,
+        selectedCriticalIncidentCode: selected.incidentCode,
         criticalTaskCount: criticalTasks.length,
         selectedCriticalTask: selected,
-        executionStatus: "BYPASSED_CRITICAL",
+        executionStatus: resolutionResult?.resolved
+          ? "CRITICAL_RESOLVED"
+          : "BYPASSED_CRITICAL",
+        safeExecutionGate: gateResult,
+        resolution: resolutionResult
+          ? {
+              resolved: resolutionResult.resolved,
+              verification: resolutionResult.verification,
+            }
+          : null,
       });
     }
 

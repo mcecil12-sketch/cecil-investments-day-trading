@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { alpacaRequest, createOrder } from "@/lib/alpaca";
 import { redis } from "@/lib/redis";
+import { getCriticalTasks } from "@/lib/redis";
 import { recordAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
 import { requireAuth } from "@/lib/auth";
 import { getGuardrailConfig, minutesSince } from "@/lib/autoEntry/guardrails";
@@ -1164,6 +1165,46 @@ export async function POST(req: Request) {
   }
 
   // ─── Protection Integrity Gate ──────────────────────────────────────
+  // Fail-closed: block new entries when unresolved critical incidents exist in Redis.
+  {
+    const unresolvedCritical = await getCriticalTasks().catch(() => []);
+    if (unresolvedCritical.length > 0) {
+      counts.skipped += 1;
+      const incidentSummary = unresolvedCritical
+        .slice(0, 5)
+        .map((t) => `${t.incidentCode}:${t.symbol}`)
+        .join(", ");
+      await recordOutcome({
+        outcome: "SKIP",
+        reason: "PROTECTION_INTEGRITY_FAILED",
+        detail: `${unresolvedCritical.length} unresolved critical task(s): ${incidentSummary}`,
+      });
+      return NextResponse.json(
+        {
+          ok: true,
+          skipped: true,
+          reason: "PROTECTION_INTEGRITY_FAILED",
+          detail: `${unresolvedCritical.length} unresolved critical incident(s) in self-heal queue`,
+          unresolvedCriticalCount: unresolvedCritical.length,
+          unresolvedCriticalSummary: incidentSummary,
+          market: { isOpen: marketOpen, timestamp: marketTimestamp },
+          openPositionsCount: brokerTruth.positionsCount,
+          maxOpenPositions: guardConfig.maxOpenPositions,
+          entriesToday: guardState.entriesToday,
+          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+          pendingCount: counts.pendingCount,
+          eligibleCount: counts.eligibleCount,
+          executedCount: counts.executed,
+          counts,
+          notes: notes.slice(0, 40),
+          guardrails: guardSummary,
+        },
+        { status: 200 },
+      );
+    }
+  }
+
+  // ─── Protection Integrity Audit Gate ────────────────────────────────
   // Block new entries when existing open positions have critical protection gaps.
   {
     const openTradesForAudit = trades

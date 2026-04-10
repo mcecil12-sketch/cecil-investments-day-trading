@@ -53,16 +53,21 @@ export async function GET(req: Request) {
     createdAt: t.createdAt,
   }));
 
+  // CRITICAL tasks override normal priority — surface at top
+  const selfHealPending = criticalTasks.length > 0;
+
   return NextResponse.json({
     ok: true,
     fresh: false,
     id: brief.id,
     createdAt: brief.createdAt,
-    selectedTaskId: brief.selectedTaskId,
-    selectedTaskTitle: brief.selectedTaskTitle,
+    selectedTaskId: selfHealPending ? criticalEntries[0]?.taskId ?? brief.selectedTaskId : brief.selectedTaskId,
+    selectedTaskTitle: selfHealPending ? criticalEntries[0]?.title ?? brief.selectedTaskTitle : brief.selectedTaskTitle,
     strategistBias: brief.strategistBias,
     learningSignalsSummary: brief.learningSignalsSummary,
     critical: criticalEntries.length,
+    unresolvedCriticalCount: criticalEntries.length,
+    selfHealPending,
     criticalTasks: criticalEntries,
     scoredTasks: brief.scoredTasks,
   });
