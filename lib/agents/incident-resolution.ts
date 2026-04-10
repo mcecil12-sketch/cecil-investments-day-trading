@@ -57,10 +57,11 @@ export async function runPostFixVerification(
   task: CriticalTask,
 ): Promise<VerificationResult> {
   const now = new Date().toISOString();
-  // Prefer explicit production URL over VERCEL_URL (may be behind Vercel Deployment Protection)
+  // Prefer NEXT_PUBLIC_BASE_URL (project convention for trusted production URL)
   const base = (
-    process.env.APP_URL?.replace(/\/$/, "") ||
-    process.env.NEXTAUTH_URL?.replace(/\/$/, "") ||
+    process.env.NEXT_PUBLIC_BASE_URL?.replace(/\/+$/, "") ||
+    process.env.APP_URL?.replace(/\/+$/, "") ||
+    process.env.NEXTAUTH_URL?.replace(/\/+$/, "") ||
     (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null) ||
     "http://localhost:3000"
   );

@@ -83,10 +83,11 @@ export async function runBuildValidation(): Promise<{ ok: boolean; reason: strin
   // Instead we confirm that the runtime is functional by pinging the internal
   // agents state endpoint. A 200 response means the build is operational.
   try {
-    // Prefer explicit production URL over VERCEL_URL (may be behind Vercel Deployment Protection)
+    // Prefer NEXT_PUBLIC_BASE_URL (project convention for trusted production URL)
     const base =
-      process.env.APP_URL?.replace(/\/$/, "") ||
-      process.env.NEXTAUTH_URL?.replace(/\/$/, "") ||
+      process.env.NEXT_PUBLIC_BASE_URL?.replace(/\/+$/, "") ||
+      process.env.APP_URL?.replace(/\/+$/, "") ||
+      process.env.NEXTAUTH_URL?.replace(/\/+$/, "") ||
       (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null) ||
       "http://localhost:3000";
 
@@ -125,11 +126,12 @@ export async function runSmokeValidation(
   const plan = getValidationPlan(task);
   const results: Record<string, "pass" | "fail" | "skip"> = {};
 
-  // Prefer explicit production URL over VERCEL_URL (may be behind Vercel Deployment Protection)
+  // Prefer NEXT_PUBLIC_BASE_URL (project convention for trusted production URL)
   const base =
     baseUrl ??
-    (process.env.APP_URL?.replace(/\/$/, "") ||
-     process.env.NEXTAUTH_URL?.replace(/\/$/, "") ||
+    (process.env.NEXT_PUBLIC_BASE_URL?.replace(/\/+$/, "") ||
+     process.env.APP_URL?.replace(/\/+$/, "") ||
+     process.env.NEXTAUTH_URL?.replace(/\/+$/, "") ||
      (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null) ||
      "http://localhost:3000");
 
