@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { promises as fs } from "fs";
 import path from "path";
-import { getPositions, getOrder, replaceOrder } from "@/lib/alpaca";
+import { getPositions, getOrder, replaceOrder, createOrder, alpacaRequest } from "@/lib/alpaca";
 import { appendActivity } from "@/lib/activity";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { etDateString } from "@/lib/autoEntry/guardrails";
@@ -11,6 +11,8 @@ import { sendNotification } from "@/lib/notifications/notify";
 import { getAllSignals } from "@/lib/signalsStore";
 import { normalizeStopPrice, tickForEquityPrice } from "@/lib/tickSize";
 import { ProtectionStatus } from "@/lib/trades/protection";
+import { saveCriticalTask } from "@/lib/redis";
+import { auditProtectionIntegrity, envFlag, parseQty } from "@/lib/risk/protection-integrity";
 
 async function fireNotification(event: NotificationEvent) {
   try {
@@ -515,4 +517,293 @@ export async function GET() {
       { status: 500 }
     );
   }
+}
+
+// ─── POST: Trade actions (repair / close / update) ──────────────────
+
+export async function POST(req: Request) {
+  const body = await req.json().catch(() => ({}));
+  const action = String(body?.action || "").toLowerCase();
+  const tradeId = String(body?.tradeId || "");
+
+  if (!action || !tradeId) {
+    return NextResponse.json(
+      { ok: false, error: "action and tradeId required" },
+      { status: 400 },
+    );
+  }
+
+  const trades = await readTrades<Trade>();
+  const trade = trades.find((t) => t.id === tradeId);
+  if (!trade) {
+    return NextResponse.json(
+      { ok: false, error: "trade not found" },
+      { status: 404 },
+    );
+  }
+
+  const nowIso = new Date().toISOString();
+
+  switch (action) {
+    case "repair":
+      return handleRepair(trade, trades, nowIso);
+    case "close":
+      return handleClose(trade, trades, nowIso);
+    case "update":
+      return handleUpdate(trade, trades, nowIso, body.updates || {});
+    default:
+      return NextResponse.json(
+        { ok: false, error: `unknown action: ${action}` },
+        { status: 400 },
+      );
+  }
+}
+
+// ─── Repair: broker-authoritative qty, GTC TIF, flatten on fail ─────
+
+async function handleRepair(trade: Trade, allTrades: Trade[], nowIso: string) {
+  const symbol = trade.ticker.toUpperCase();
+
+  // Get broker-authoritative qty
+  let brokerPos: any = null;
+  try {
+    brokerPos = await getPositions(symbol);
+  } catch {}
+  const brokerQty = Math.abs(Number(brokerPos?.qty ?? 0));
+
+  if (!brokerPos || brokerQty <= 0) {
+    return NextResponse.json(
+      { ok: false, error: "no_broker_position", symbol },
+      { status: 422 },
+    );
+  }
+
+  const side = (trade.side || "").toUpperCase();
+  const stopSide = side === "SHORT" ? "buy" : "sell";
+  const entryPrice = Number(trade.entryPrice ?? brokerPos?.avg_entry_price ?? 0);
+
+  let stopPrice = trade.suggestedStopPrice;
+  if (!stopPrice || !Number.isFinite(stopPrice)) {
+    stopPrice =
+      side === "LONG"
+        ? Math.round(entryPrice * 0.98 * 100) / 100
+        : Math.round(entryPrice * 1.02 * 100) / 100;
+  }
+
+  // Normalize stop price
+  const tick = tickForEquityPrice(entryPrice);
+  const normResult = normalizeStopPrice({
+    side: (side as "LONG" | "SHORT") || "LONG",
+    entryPrice,
+    stopPrice,
+    tick,
+  });
+  if (normResult.ok) stopPrice = normResult.stop;
+
+  try {
+    const order = await createOrder({
+      symbol,
+      qty: String(brokerQty),
+      side: stopSide,
+      type: "stop",
+      stop_price: String(stopPrice),
+      time_in_force: "gtc",
+    });
+
+    // Update trade in DB
+    const idx = allTrades.findIndex((t) => t.id === trade.id);
+    if (idx >= 0) {
+      allTrades[idx] = {
+        ...allTrades[idx],
+        protectionStatus: "REPAIRED" as ProtectionStatus,
+        protectionVerifiedAt: nowIso,
+        protectionIssue: undefined,
+        updatedAt: nowIso,
+      };
+      await writeTrades(allTrades);
+    }
+
+    console.log("[manage] repair stop submitted", {
+      symbol,
+      qty: brokerQty,
+      stopPrice,
+      orderId: order.id,
+      timeInForce: "gtc",
+    });
+
+    return NextResponse.json({
+      ok: true,
+      action: "repair",
+      symbol,
+      orderId: order.id,
+      qty: brokerQty,
+      stopPrice,
+      timeInForce: "gtc",
+    });
+  } catch (repairErr: any) {
+    console.error("[manage] repair failed", {
+      symbol,
+      error: repairErr?.message,
+    });
+
+    // Flatten on repair fail (gated by env flag)
+    if (envFlag("RISK_FLATTEN_ON_REPAIR_FAIL")) {
+      try {
+        await alpacaRequest({
+          method: "DELETE",
+          path: `/v2/positions/${encodeURIComponent(symbol)}`,
+        });
+
+        await saveCriticalTask({
+          incidentCode: "STOP_REPAIR_FAILED",
+          symbol,
+          severity: "CRITICAL",
+          detail: `Repair failed: ${repairErr?.message}; position flattened`,
+        }).catch(() => {});
+
+        const idx = allTrades.findIndex((t) => t.id === trade.id);
+        if (idx >= 0) {
+          allTrades[idx] = {
+            ...allTrades[idx],
+            status: "CLOSED",
+            closedAt: nowIso,
+            closeReason: "flatten_repair_fail",
+            protectionStatus: "FLATTENED" as ProtectionStatus,
+            updatedAt: nowIso,
+          };
+          await writeTrades(allTrades);
+        }
+
+        return NextResponse.json({
+          ok: false,
+          action: "repair",
+          symbol,
+          repairError: repairErr?.message,
+          flattened: true,
+        });
+      } catch (flatErr: any) {
+        await saveCriticalTask({
+          incidentCode: "FLATTEN_FAILED",
+          symbol,
+          severity: "CRITICAL",
+          detail: `Repair AND flatten failed: ${flatErr?.message}`,
+        }).catch(() => {});
+
+        return NextResponse.json(
+          {
+            ok: false,
+            action: "repair",
+            symbol,
+            repairError: repairErr?.message,
+            flattenError: flatErr?.message,
+          },
+          { status: 500 },
+        );
+      }
+    } else {
+      // Flatten disabled — emit task and return error
+      await saveCriticalTask({
+        incidentCode: "STOP_REPAIR_FAILED",
+        symbol,
+        severity: "CRITICAL",
+        detail: `Repair failed: ${repairErr?.message}; flatten disabled`,
+      }).catch(() => {});
+
+      return NextResponse.json(
+        {
+          ok: false,
+          action: "repair",
+          symbol,
+          repairError: repairErr?.message,
+          flattened: false,
+        },
+        { status: 500 },
+      );
+    }
+  }
+}
+
+// ─── Close: cancel orders + DELETE position ─────────────────────────
+
+async function handleClose(trade: Trade, allTrades: Trade[], nowIso: string) {
+  const symbol = trade.ticker.toUpperCase();
+
+  // Cancel all open orders for this symbol first
+  try {
+    await alpacaRequest({
+      method: "DELETE",
+      path: `/v2/orders?symbols=${encodeURIComponent(symbol)}`,
+    });
+  } catch (err) {
+    console.warn("[manage] cancel orders failed (proceeding)", { symbol, err });
+  }
+
+  // Close position
+  try {
+    await alpacaRequest({
+      method: "DELETE",
+      path: `/v2/positions/${encodeURIComponent(symbol)}`,
+    });
+  } catch (err: any) {
+    return NextResponse.json(
+      { ok: false, action: "close", symbol, error: err?.message },
+      { status: 500 },
+    );
+  }
+
+  const idx = allTrades.findIndex((t) => t.id === trade.id);
+  if (idx >= 0) {
+    allTrades[idx] = {
+      ...allTrades[idx],
+      status: "CLOSED",
+      closedAt: nowIso,
+      closeReason: "manual_close",
+      updatedAt: nowIso,
+    };
+    await writeTrades(allTrades);
+  }
+
+  return NextResponse.json({ ok: true, action: "close", symbol });
+}
+
+// ─── Update: DB-only field update ───────────────────────────────────
+
+async function handleUpdate(
+  trade: Trade,
+  allTrades: Trade[],
+  nowIso: string,
+  updates: Record<string, any>,
+) {
+  const idx = allTrades.findIndex((t) => t.id === trade.id);
+  if (idx < 0) {
+    return NextResponse.json(
+      { ok: false, error: "trade not found" },
+      { status: 404 },
+    );
+  }
+
+  // Only allow safe field updates
+  const allowed = [
+    "suggestedStopPrice",
+    "stopSuggestionReason",
+    "protectionStatus",
+    "protectionIssue",
+    "tier",
+    "grade",
+    "score",
+  ];
+  const safeUpdates: Record<string, any> = {};
+  for (const key of allowed) {
+    if (key in updates) safeUpdates[key] = updates[key];
+  }
+
+  allTrades[idx] = { ...allTrades[idx], ...safeUpdates, updatedAt: nowIso };
+  await writeTrades(allTrades);
+
+  return NextResponse.json({
+    ok: true,
+    action: "update",
+    tradeId: trade.id,
+    updated: Object.keys(safeUpdates),
+  });
 }

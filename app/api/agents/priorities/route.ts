@@ -8,6 +8,7 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { checkAgentCronAuth, unauthorizedAgentResponse } from "@/lib/agents/auth";
 import { readEmBrief, runEmOrchestration } from "@/lib/agents/engineeringManager";
+import { getCriticalTasks } from "@/lib/redis";
 
 export async function GET(req: Request) {
   const auth = checkAgentCronAuth(req);
@@ -18,9 +19,19 @@ export async function GET(req: Request) {
 
   if (refresh) {
     const result = await runEmOrchestration();
+    const criticalTasks = await getCriticalTasks().catch(() => []);
+    const criticalEntries = criticalTasks.map((t) => ({
+      taskId: t.id,
+      title: `[CRITICAL] ${t.incidentCode}: ${t.symbol} — ${t.detail}`,
+      priority: "CRITICAL" as const,
+      source: "protection-integrity",
+      createdAt: t.createdAt,
+    }));
     return NextResponse.json({
       ok: true,
       fresh: true,
+      critical: criticalEntries.length,
+      criticalTasks: criticalEntries,
       selectedTaskId: result.selectedTaskId,
       selectedTaskTitle: result.selectedTaskTitle,
       strategistBias: result.strategist.marketBias,
@@ -33,6 +44,15 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: true, fresh: false, scoredTasks: [], message: "No priorities computed yet. POST /api/agents/run to initialize." });
   }
 
+  const criticalTasks = await getCriticalTasks().catch(() => []);
+  const criticalEntries = criticalTasks.map((t) => ({
+    taskId: t.id,
+    title: `[CRITICAL] ${t.incidentCode}: ${t.symbol} — ${t.detail}`,
+    priority: "CRITICAL" as const,
+    source: "protection-integrity",
+    createdAt: t.createdAt,
+  }));
+
   return NextResponse.json({
     ok: true,
     fresh: false,
@@ -42,6 +62,8 @@ export async function GET(req: Request) {
     selectedTaskTitle: brief.selectedTaskTitle,
     strategistBias: brief.strategistBias,
     learningSignalsSummary: brief.learningSignalsSummary,
+    critical: criticalEntries.length,
+    criticalTasks: criticalEntries,
     scoredTasks: brief.scoredTasks,
   });
 }

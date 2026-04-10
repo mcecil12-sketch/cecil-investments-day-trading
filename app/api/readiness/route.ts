@@ -7,7 +7,11 @@ import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { getEtDateString } from "@/lib/time/etDate";
 import { readTrades } from "@/lib/tradesStore";
-import { isOpenTradeStatus, ProtectionStatus } from "@/lib/trades/protection";
+import { isOpenTradeStatus } from "@/lib/trades/protection";
+import {
+  auditProtectionIntegrity,
+  type AuditResult,
+} from "@/lib/risk/protection-integrity";
 
 type Check = {
   name: string;
@@ -121,17 +125,28 @@ export async function GET(req: Request) {
 
   const trades = await readTrades<any>().catch(() => []);
   const openTrades = (Array.isArray(trades) ? trades : []).filter((t) => isOpenTradeStatus(t?.status));
-  const criticalProtectionStatuses = new Set<ProtectionStatus>([
-    "MISSING_STOP",
-    "STOP_EXPIRED",
-    "STOP_CANCELED",
-    "REPAIRING",
-    "REPAIR_FAILED",
-  ]);
-  const unprotectedOpenTrades = openTrades.filter((t) =>
-    criticalProtectionStatuses.has((t?.protectionStatus || "") as ProtectionStatus)
-  );
-  const protectionCritical = unprotectedOpenTrades.length > 0;
+
+  // Broker-truth protection audit (fail-closed on broker error)
+  let protectionAudit: AuditResult | null = null;
+  let protectionCritical = false;
+  if (!brokerTruth.error) {
+    const auditTrades = openTrades.map((t: any) => ({
+      id: String(t.id || ""),
+      ticker: String(t.ticker || ""),
+      side: String(t.side || ""),
+      status: String(t.status || ""),
+      stopOrderId: t.stopOrderId || t.alpacaStopOrderId,
+    }));
+    protectionAudit = auditProtectionIntegrity({
+      openTrades: auditTrades,
+      brokerPositions: brokerTruth.positions || [],
+      brokerOrders: brokerTruth.openOrders || [],
+    });
+    protectionCritical = !protectionAudit.ok;
+  } else {
+    // Fail-closed: if broker unavailable, assume critical when trades exist
+    protectionCritical = openTrades.length > 0;
+  }
 
   const signals: any[] = Array.isArray(signalsPayload)
     ? signalsPayload
@@ -248,10 +263,15 @@ export async function GET(req: Request) {
       name: "protection_integrity",
       ok: publicMode ? true : !protectionCritical,
       detail: protectionCritical
-        ? `CRITICAL: ${unprotectedOpenTrades.length} open trade(s) without verified stop [${unprotectedOpenTrades
-            .map((t: any) => `${String(t?.ticker || "?")}:${String(t?.protectionStatus || "UNKNOWN")}`)
-            .slice(0, 8)
-            .join(",")}]`
+        ? protectionAudit
+          ? `CRITICAL: ${protectionAudit.criticalCount} incident(s) [${protectionAudit.incidents
+              .filter((i) => i.severity === "CRITICAL")
+              .map((i) => `${i.symbol}:${i.code}`)
+              .slice(0, 8)
+              .join(",")}]`
+          : brokerTruth.error
+            ? `broker_error: ${brokerTruth.error}; ${openTrades.length} open trade(s) unverifiable`
+            : `CRITICAL: ${openTrades.length} open trade(s) without verified stop`
         : `protected_open_trades=${openTrades.length}`,
     },
   ];

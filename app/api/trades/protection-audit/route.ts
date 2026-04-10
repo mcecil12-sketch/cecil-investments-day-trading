@@ -1,211 +1,266 @@
 /**
  * GET /api/trades/protection-audit
  * Audits open trades for broker-truth stop protection integrity.
- * Flags missing, expired, or canceled protective stops with detailed issues.
+ * ?enforce=1 → attempt self-heal (repair missing stops, flatten on failure).
  */
 export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
 import { readTrades } from "@/lib/tradesStore";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
-import { getOrder } from "@/lib/alpaca";
+import { saveCriticalTask } from "@/lib/redis";
 import {
-  classifyOrderTerminalStatus,
-  findProtectiveStopOrder,
+  auditProtectionIntegrity,
+  envFlag,
+  parseQty,
+  type AuditResult,
+  type BrokerPosition,
+  type BrokerOrder,
+} from "@/lib/risk/protection-integrity";
+import {
   isOpenTradeStatus,
   normalizeTicker,
-  normalizeTradeSide,
-  ProtectionStatus,
 } from "@/lib/trades/protection";
+import { alpacaHeaders, tradingUrl } from "@/lib/alpaca";
 
-type AnyTrade = Record<string, any>;
+// ─── Enforce helpers ────────────────────────────────────────────────
 
-type AuditIssue = {
-  id: string;
-  ticker: string;
-  side: string;
-  status: string;
-  protectionStatus: ProtectionStatus;
-  issue: string;
-  detail?: string;
-  trackedStopOrderId?: string;
-  lastProtectionCheckAt?: string;
-};
-
-async function classifyTradeProtection(args: {
-  trade: AnyTrade;
-  symbolOpenOrders: any[];
-  brokerQty: number;
-}): Promise<AuditIssue | null> {
-  const trade = args.trade;
-  const ticker = normalizeTicker(trade.ticker);
-  const side = normalizeTradeSide(trade.side);
-  const status = String(trade.status || "");
-  const trackedStopOrderId = String(trade.stopOrderId || "") || undefined;
-
-  if (!(args.brokerQty > 0)) {
-    return null;
-  }
-
-  if (!side) {
-    return {
-      id: String(trade.id || ""),
-      ticker,
-      side: String(trade.side || ""),
-      status,
-      protectionStatus: "MISSING_STOP",
-      issue: "invalid_trade_side",
-      detail: "trade side is not LONG/SHORT",
-      trackedStopOrderId,
-      lastProtectionCheckAt: trade.lastProtectionCheckAt,
-    };
-  }
-
-  const protective = findProtectiveStopOrder({
-    ticker,
-    tradeSide: side,
-    openOrders: args.symbolOpenOrders,
-  });
-  if (protective) {
-    return null;
-  }
-
-  if (!trackedStopOrderId) {
-    return {
-      id: String(trade.id || ""),
-      ticker,
-      side,
-      status,
-      protectionStatus: "MISSING_STOP",
-      issue: "missing_stop",
-      detail: "no open protective stop found at broker",
-      lastProtectionCheckAt: trade.lastProtectionCheckAt,
-    };
-  }
-
+async function submitRepairStop(opts: {
+  symbol: string;
+  qty: number;
+  side: "buy" | "sell";
+  stopPrice: number;
+}): Promise<{ ok: boolean; orderId?: string; error?: string }> {
   try {
-    const tracked = await getOrder(trackedStopOrderId);
-    const orderStatus = String((tracked as any)?.status || "").toLowerCase();
-    const terminal = classifyOrderTerminalStatus(orderStatus);
-    if (terminal === "EXPIRED") {
-      return {
-        id: String(trade.id || ""),
-        ticker,
-        side,
-        status,
-        protectionStatus: "STOP_EXPIRED",
-        issue: "stop_expired",
-        detail: `tracked stop status=${orderStatus}`,
-        trackedStopOrderId,
-        lastProtectionCheckAt: trade.lastProtectionCheckAt,
-      };
+    const resp = await fetch(tradingUrl("/v2/orders"), {
+      method: "POST",
+      headers: { ...alpacaHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: opts.symbol,
+        qty: String(opts.qty),
+        side: opts.side,
+        type: "stop",
+        stop_price: String(opts.stopPrice),
+        time_in_force: "gtc",
+      }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      return { ok: false, error: `${resp.status}: ${text}` };
     }
-    if (terminal === "CANCELED") {
-      return {
-        id: String(trade.id || ""),
-        ticker,
-        side,
-        status,
-        protectionStatus: "STOP_CANCELED",
-        issue: "stop_canceled",
-        detail: `tracked stop status=${orderStatus}`,
-        trackedStopOrderId,
-        lastProtectionCheckAt: trade.lastProtectionCheckAt,
-      };
-    }
-    return {
-      id: String(trade.id || ""),
-      ticker,
-      side,
-      status,
-      protectionStatus: "MISSING_STOP",
-      issue: "missing_stop",
-      detail: `no open protective stop found; tracked status=${orderStatus || "unknown"}`,
-      trackedStopOrderId,
-      lastProtectionCheckAt: trade.lastProtectionCheckAt,
-    };
+    const order = await resp.json();
+    return { ok: true, orderId: order.id };
   } catch (err: any) {
-    return {
-      id: String(trade.id || ""),
-      ticker,
-      side,
-      status,
-      protectionStatus: "MISSING_STOP",
-      issue: "tracked_stop_lookup_failed",
-      detail: String(err?.message || err),
-      trackedStopOrderId,
-      lastProtectionCheckAt: trade.lastProtectionCheckAt,
-    };
+    return { ok: false, error: err?.message || String(err) };
   }
 }
 
-export async function GET() {
+async function flattenPosition(
+  symbol: string,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const resp = await fetch(
+      tradingUrl(`/v2/positions/${encodeURIComponent(symbol)}`),
+      { method: "DELETE", headers: alpacaHeaders() },
+    );
+    if (!resp.ok) {
+      const text = await resp.text();
+      return { ok: false, error: `${resp.status}: ${text}` };
+    }
+    return { ok: true };
+  } catch (err: any) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+// ─── Enforce logic ──────────────────────────────────────────────────
+
+async function enforceProtection(
+  audit: AuditResult,
+  brokerPositions: BrokerPosition[],
+): Promise<{ repaired: string[]; flattened: string[]; failed: string[] }> {
+  const repaired: string[] = [];
+  const flattened: string[] = [];
+  const failed: string[] = [];
+
+  const posBySymbol = new Map<string, BrokerPosition>();
+  for (const p of brokerPositions) {
+    const sym = normalizeTicker(p.symbol);
+    if (sym) posBySymbol.set(sym, p);
+  }
+
+  for (const detail of audit.details) {
+    const needsRepair = detail.incidents.some(
+      (i) =>
+        i.code === "MISSING_STOP" ||
+        i.code === "STOP_EXPIRED" ||
+        i.code === "STOP_CANCELED" ||
+        i.code === "STOP_DAY_TIF",
+    );
+    if (!needsRepair) continue;
+
+    const pos = posBySymbol.get(detail.symbol);
+    if (!pos) {
+      failed.push(detail.symbol);
+      continue;
+    }
+    const brokerQty = parseQty(pos.qty);
+    if (brokerQty <= 0) {
+      failed.push(detail.symbol);
+      continue;
+    }
+
+    const posSide =
+      String(pos.side || "").toLowerCase() === "short" ? "short" : "long";
+    const stopSide: "buy" | "sell" = posSide === "long" ? "sell" : "buy";
+    const entryPrice = Number(pos.avg_entry_price ?? 0);
+    if (!entryPrice) {
+      failed.push(detail.symbol);
+      continue;
+    }
+
+    // Emergency stop at 2% from entry
+    const stopPrice =
+      posSide === "long"
+        ? Math.round(entryPrice * 0.98 * 100) / 100
+        : Math.round(entryPrice * 1.02 * 100) / 100;
+
+    const result = await submitRepairStop({
+      symbol: detail.symbol,
+      qty: brokerQty,
+      side: stopSide,
+      stopPrice,
+    });
+
+    if (result.ok) {
+      repaired.push(detail.symbol);
+      console.log("[protection-audit] repaired stop", {
+        symbol: detail.symbol,
+        qty: brokerQty,
+        stopPrice,
+        orderId: result.orderId,
+      });
+    } else {
+      // Flatten on repair fail (gated by env flag)
+      if (envFlag("RISK_FLATTEN_ON_REPAIR_FAIL")) {
+        console.error("[protection-audit] repair failed, flattening", {
+          symbol: detail.symbol,
+          error: result.error,
+        });
+        const flatResult = await flattenPosition(detail.symbol);
+        if (flatResult.ok) {
+          flattened.push(detail.symbol);
+          console.log("[protection-audit] flattened", { symbol: detail.symbol });
+          await saveCriticalTask({
+            incidentCode: "STOP_REPAIR_FAILED",
+            symbol: detail.symbol,
+            severity: "CRITICAL",
+            detail: `Repair failed: ${result.error}; position flattened`,
+          }).catch(() => {});
+        } else {
+          failed.push(detail.symbol);
+          console.error("[protection-audit] flatten failed", {
+            symbol: detail.symbol,
+            error: flatResult.error,
+          });
+          await saveCriticalTask({
+            incidentCode: "FLATTEN_FAILED",
+            symbol: detail.symbol,
+            severity: "CRITICAL",
+            detail: `Repair failed: ${result.error}; flatten also failed: ${flatResult.error}`,
+          }).catch(() => {});
+        }
+      } else {
+        failed.push(detail.symbol);
+        console.error("[protection-audit] repair failed (flatten disabled)", {
+          symbol: detail.symbol,
+          error: result.error,
+        });
+        await saveCriticalTask({
+          incidentCode: "STOP_REPAIR_FAILED",
+          symbol: detail.symbol,
+          severity: "CRITICAL",
+          detail: `Repair failed: ${result.error}; flatten disabled`,
+        }).catch(() => {});
+      }
+    }
+  }
+
+  return { repaired, flattened, failed };
+}
+
+// ─── Route handler ──────────────────────────────────────────────────
+
+export async function GET(req: Request) {
+  const url = new URL(req.url);
+  const enforce = url.searchParams.get("enforce") === "1";
+
   const [allTrades, brokerTruth] = await Promise.all([
-    readTrades<AnyTrade>().catch(() => []),
+    readTrades<Record<string, any>>().catch(() => []),
     fetchBrokerTruth(),
   ]);
 
   if (brokerTruth.error) {
     return NextResponse.json(
-      {
-        ok: false,
-        error: "broker_truth_unavailable",
-        detail: brokerTruth.error,
-      },
-      { status: 502 }
+      { ok: false, error: "broker_truth_unavailable", detail: brokerTruth.error },
+      { status: 502 },
     );
   }
 
-  const openTrades = (Array.isArray(allTrades) ? allTrades : []).filter((t) => isOpenTradeStatus(t?.status));
+  const openTrades = (Array.isArray(allTrades) ? allTrades : [])
+    .filter((t) => isOpenTradeStatus(t?.status))
+    .map((t) => ({
+      id: String(t.id || ""),
+      ticker: String(t.ticker || ""),
+      side: String(t.side || ""),
+      status: String(t.status || ""),
+      qty: Number(t.size || t.qty || 0),
+      stopOrderId: t.stopOrderId || t.alpacaStopOrderId,
+      protectionStatus: t.protectionStatus,
+    }));
 
-  const positionsBySymbol = new Map<string, any>();
-  for (const pos of brokerTruth.positions || []) {
-    const symbol = normalizeTicker((pos as any)?.symbol);
-    if (!symbol) continue;
-    positionsBySymbol.set(symbol, pos);
-  }
+  const positions: BrokerPosition[] = brokerTruth.positions || [];
+  const orders: BrokerOrder[] = brokerTruth.openOrders || [];
 
-  const openOrdersBySymbol = new Map<string, any[]>();
-  for (const order of brokerTruth.openOrders || []) {
-    const symbol = normalizeTicker((order as any)?.symbol);
-    if (!symbol) continue;
-    const bucket = openOrdersBySymbol.get(symbol) || [];
-    bucket.push(order);
-    openOrdersBySymbol.set(symbol, bucket);
-  }
+  const audit = auditProtectionIntegrity({
+    openTrades,
+    brokerPositions: positions,
+    brokerOrders: orders,
+  });
 
-  const issues: AuditIssue[] = [];
-  let protectedTrades = 0;
-
-  for (const trade of openTrades) {
-    const ticker = normalizeTicker(trade?.ticker);
-    const brokerPos = positionsBySymbol.get(ticker);
-    const brokerQty = Math.abs(Number((brokerPos as any)?.qty ?? 0));
-    const classified = await classifyTradeProtection({
-      trade,
-      symbolOpenOrders: openOrdersBySymbol.get(ticker) || [],
-      brokerQty,
-    });
-    if (classified) {
-      issues.push(classified);
-    } else {
-      protectedTrades += 1;
+  // Emit critical tasks
+  for (const incident of audit.incidents) {
+    if (incident.severity === "CRITICAL") {
+      await saveCriticalTask({
+        incidentCode: incident.code,
+        symbol: incident.symbol,
+        severity: incident.severity,
+        detail: incident.detail,
+      }).catch((err) => {
+        console.error("[protection-audit] saveCriticalTask failed", err);
+      });
     }
   }
 
-  const unprotectedTrades = issues.length;
-  const protectionRate = openTrades.length > 0 ? Math.round((protectedTrades / openTrades.length) * 10000) / 100 : null;
+  let enforcement:
+    | { repaired: string[]; flattened: string[]; failed: string[] }
+    | undefined;
+  if (enforce && !audit.ok) {
+    enforcement = await enforceProtection(audit, positions);
+  }
 
   return NextResponse.json({
-    ok: true,
+    ok: audit.ok,
+    source: "broker-truth",
     brokerFetchedAt: brokerTruth.fetchedAt,
-    openTrades: openTrades.length,
-    protectedTrades,
-    unprotectedTrades,
-    expiredStopCount: issues.filter((x) => x.protectionStatus === "STOP_EXPIRED").length,
-    canceledStopCount: issues.filter((x) => x.protectionStatus === "STOP_CANCELED").length,
-    missingStopCount: issues.filter((x) => x.protectionStatus === "MISSING_STOP").length,
-    protectionRate,
-    issues,
+    auditedAt: audit.auditedAt,
+    openTrades: audit.tradeCount,
+    protectedTrades: audit.protectedCount,
+    unprotectedTrades: audit.tradeCount - audit.protectedCount,
+    criticalCount: audit.criticalCount,
+    incidentCount: audit.incidentCount,
+    incidents: audit.incidents,
+    details: audit.details,
+    enforcement: enforcement || undefined,
   });
 }
