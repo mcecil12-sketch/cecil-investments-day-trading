@@ -33,6 +33,8 @@ export type ActionResult = {
   ok: boolean;
   detail: string;
   orderId?: string;
+  /** Structured reason code for stale/non-actionable classification. */
+  reasonCode?: string;
 };
 
 // ─── Broker primitives ──────────────────────────────────────────────
@@ -130,6 +132,7 @@ async function resolveStopNeeded(
       action: "repair_stop",
       ok: false,
       detail: `No broker position found for ${symbol}; cannot place stop`,
+      reasonCode: "no_broker_position",
     };
   }
 
@@ -140,6 +143,7 @@ async function resolveStopNeeded(
       action: "repair_stop",
       ok: false,
       detail: `Broker position qty is 0 for ${symbol}`,
+      reasonCode: "no_broker_position",
     };
   }
 

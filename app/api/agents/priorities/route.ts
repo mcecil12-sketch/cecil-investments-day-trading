@@ -87,14 +87,16 @@ export async function GET(req: Request) {
   // CRITICAL tasks override normal priority — surface at top
   // Only BLOCKING (real) incidents should trigger self-heal pending
   const selfHealPending = blockingCritical.length > 0;
+  // Selected task should prefer blocking (live) incidents over synthetic
+  const blockingEntries = criticalEntries.filter((e) => !e.synthetic);
 
   return NextResponse.json({
     ok: true,
     fresh: false,
     id: brief.id,
     createdAt: brief.createdAt,
-    selectedTaskId: selfHealPending ? criticalEntries[0]?.taskId ?? brief.selectedTaskId : brief.selectedTaskId,
-    selectedTaskTitle: selfHealPending ? criticalEntries[0]?.title ?? brief.selectedTaskTitle : brief.selectedTaskTitle,
+    selectedTaskId: selfHealPending ? blockingEntries[0]?.taskId ?? brief.selectedTaskId : brief.selectedTaskId,
+    selectedTaskTitle: selfHealPending ? blockingEntries[0]?.title ?? brief.selectedTaskTitle : brief.selectedTaskTitle,
     strategistBias: brief.strategistBias,
     learningSignalsSummary: brief.learningSignalsSummary,
     critical: blockingCritical.length,

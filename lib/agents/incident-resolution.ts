@@ -8,6 +8,8 @@
  */
 
 import { redis, getCriticalTasks, type CriticalTask } from "@/lib/redis";
+import { readTrades } from "@/lib/tradesStore";
+import { normalizeTicker, isOpenTradeStatus } from "@/lib/trades/protection";
 
 const CRITICAL_TASKS_KEY = "critical_tasks";
 
@@ -237,4 +239,60 @@ export async function resolveWithVerification(
   await redis.hset(CRITICAL_TASKS_KEY, { [taskId]: task });
 
   return { resolved: true, verification, task };
+}
+
+// ─── Stale / non-actionable resolution ──────────────────────────────
+
+/**
+ * Auto-resolve a stale incident when the broker position AND DB trade are both gone.
+ * Returns { resolved: true } if the incident was successfully classified as stale.
+ * Checks DB trades to confirm no open trade exists for the symbol.
+ */
+export async function resolveAsStale(
+  taskId: string,
+  symbol: string,
+  reason: string,
+): Promise<{ resolved: boolean; task: CriticalTask | null }> {
+  if (!redis) return { resolved: false, task: null };
+
+  // Verify no matching open DB trade exists (fail-safe: if trade exists, not stale)
+  try {
+    const trades = await readTrades<Record<string, any>>();
+    const norm = normalizeTicker(symbol);
+    const hasOpenTrade = trades.some(
+      (t: any) => normalizeTicker(t.ticker) === norm && isOpenTradeStatus(t.status),
+    );
+    if (hasOpenTrade) {
+      // DB still has an open trade — not stale, needs real resolution
+      return { resolved: false, task: null };
+    }
+  } catch {
+    // If we can't read trades, fail-safe: don't mark as stale
+    return { resolved: false, task: null };
+  }
+
+  const task = await redis.hget<CriticalTask>(CRITICAL_TASKS_KEY, taskId);
+  if (!task) return { resolved: false, task: null };
+
+  const now = new Date().toISOString();
+  task.resolvedAt = now;
+  task.status = "stale";
+  task.resolutionReason = reason;
+  task.lastAttemptAt = now;
+  await redis.hset(CRITICAL_TASKS_KEY, { [taskId]: task });
+
+  await setAttemptMetadata(taskId, {
+    lastAttemptAt: now,
+    lastAttemptResult: "success",
+    lastVerificationResult: "skipped",
+    lastVerificationReason: reason,
+  });
+
+  console.log("[incident-resolution] stale incident auto-resolved", {
+    taskId,
+    symbol,
+    reason,
+  });
+
+  return { resolved: true, task };
 }

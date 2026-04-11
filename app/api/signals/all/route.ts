@@ -1,6 +1,21 @@
 import { NextResponse } from "next/server";
 import { readSignals } from "@/lib/jsonDb";
-import { getSignalTimestampMs, parseSince, resolveSinceField } from "@/lib/signals/since";
+import { getSignalTimestampMs, parseSince, resolveSinceField, type SinceField } from "@/lib/signals/since";
+
+/**
+ * Robust timestamp extraction: tries the requested field first,
+ * then falls back to createdAt (handles both ISO strings and numeric epochs).
+ */
+function robustTimestampMs(s: any, field: SinceField): { ms: number | null; usedField: string } {
+  const primary = getSignalTimestampMs(s, field);
+  if (primary != null) return { ms: primary, usedField: field };
+  // Fallback to createdAt if a different field was requested
+  if (field !== "createdAt") {
+    const fallback = getSignalTimestampMs(s, "createdAt");
+    if (fallback != null) return { ms: fallback, usedField: "createdAt" };
+  }
+  return { ms: null, usedField: "none" };
+}
 
 function normalizeSignal(s: any) {
   return {
@@ -79,11 +94,16 @@ export async function GET(req: Request) {
   const normalized = signals.map(normalizeSignal);
 
   let filtered = normalized;
+  let countUsingCreatedAt = 0;
+  let countUsingFallbackField = 0;
   if (sinceDate) {
     const sinceMs = sinceDate.getTime();
     filtered = filtered.filter((s: any) => {
-      const t = getSignalTimestampMs(s, sinceField);
-      return t != null && Number.isFinite(t) && t >= sinceMs;
+      const { ms, usedField } = robustTimestampMs(s, sinceField);
+      if (ms == null || !Number.isFinite(ms)) return false;
+      if (usedField === sinceField) countUsingCreatedAt++;
+      else countUsingFallbackField++;
+      return ms >= sinceMs;
     });
   }
 
@@ -97,18 +117,19 @@ export async function GET(req: Request) {
   }
 
   const sortedSignals = [...filtered].sort((a: any, b: any) => {
-    const ta = Date.parse(a?.createdAt ?? "");
-    const tb = Date.parse(b?.createdAt ?? "");
-    const taOk = Number.isFinite(ta);
-    const tbOk = Number.isFinite(tb);
+    const { ms: ta } = robustTimestampMs(a, "createdAt");
+    const { ms: tb } = robustTimestampMs(b, "createdAt");
+    const taOk = ta != null && Number.isFinite(ta);
+    const tbOk = tb != null && Number.isFinite(tb);
     if (!taOk && !tbOk) return 0;
     if (!taOk) return 1;
     if (!tbOk) return -1;
-    return order === "asc" ? ta - tb : tb - ta;
+    return order === "asc" ? ta! - tb! : tb! - ta!;
   });
 
   const totalBefore = normalized.length;
   const totalAfter = sortedSignals.length;
+  const filteredCountBeforeLimit = sortedSignals.length;
   const sliced = sortedSignals.slice(0, limit);
   
   // Count signals with non-null direction for smoke testing
@@ -116,12 +137,25 @@ export async function GET(req: Request) {
     (s: any) => s.direction === "LONG" || s.direction === "SHORT"
   ).length;
 
+  // Diagnostic: min/max createdAt seen across ALL normalized signals
+  let minCreatedAtSeen: string | null = null;
+  let maxCreatedAtSeen: string | null = null;
+  for (const s of normalized) {
+    const { ms } = robustTimestampMs(s, "createdAt");
+    if (ms != null && Number.isFinite(ms)) {
+      const iso = new Date(ms).toISOString();
+      if (!minCreatedAtSeen || iso < minCreatedAtSeen) minCreatedAtSeen = iso;
+      if (!maxCreatedAtSeen || iso > maxCreatedAtSeen) maxCreatedAtSeen = iso;
+    }
+  }
+
   return NextResponse.json(
     {
       ok: true,
       meta: {
         totalBefore,
         totalAfter,
+        filteredCountBeforeLimit,
         withDirection,
         since: sinceDate ? sinceDate.toISOString() : null,
         sinceISO: sinceDate ? sinceDate.toISOString() : null,
@@ -131,6 +165,11 @@ export async function GET(req: Request) {
         onlyActive,
         statusesApplied,
         statusesProvided: providedStatuses,
+        signalSourceUsed: "direct_redis_read",
+        minCreatedAtSeen,
+        maxCreatedAtSeen,
+        countUsingCreatedAt,
+        countUsingFallbackField,
       },
       signals: sliced,
     },

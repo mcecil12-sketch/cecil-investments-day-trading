@@ -14,7 +14,7 @@ export const redis =
 
 // ─── Critical Task Queue ────────────────────────────────────────────
 
-export type CriticalTaskStatus = "open" | "resolved" | "expected_fail" | "expired";
+export type CriticalTaskStatus = "open" | "resolved" | "expected_fail" | "expired" | "stale";
 
 export interface CriticalTask {
   id: string;
@@ -82,7 +82,7 @@ export async function getCriticalTasks(): Promise<CriticalTask[]> {
   const unresolved: CriticalTask[] = [];
   for (const t of Object.values(all)) {
     if (!t) continue;
-    if (t.resolvedAt || t.status === "resolved" || t.status === "expired" || t.status === "expected_fail") continue;
+    if (t.resolvedAt || t.status === "resolved" || t.status === "expired" || t.status === "expected_fail" || t.status === "stale") continue;
     // Auto-expire if TTL passed
     if (t.expiresAt && Date.parse(t.expiresAt) <= now) {
       t.status = "expired";

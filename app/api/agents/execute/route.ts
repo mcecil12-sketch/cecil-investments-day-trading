@@ -12,7 +12,7 @@ import { runSmokeValidation } from "@/lib/agents/preCommitValidation";
 import { getCriticalTasks, partitionCriticalTasks, expireSyntheticTask } from "@/lib/redis";
 import { redis } from "@/lib/redis";
 import { runSafeExecutionGate, type GateResult } from "@/lib/agents/safe-execution-gate";
-import { resolveWithVerification, setAttemptMetadata } from "@/lib/agents/incident-resolution";
+import { resolveWithVerification, setAttemptMetadata, resolveAsStale } from "@/lib/agents/incident-resolution";
 import { runIncidentResolver, type ActionResult } from "@/lib/agents/resolvers";
 import { generatePatchPlan, classifyTaskAsActionable } from "@/lib/agents/patch-executor";
 import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
@@ -420,13 +420,14 @@ export async function POST(req: NextRequest) {
         id: string;
         incidentCode: string;
         symbol: string;
-        status: "resolved" | "failed" | "skipped";
+        status: "resolved" | "failed" | "skipped" | "stale_resolved" | "expired";
         reason: string | null;
         action?: ActionResult;
       };
       const results: ItemResult[] = [];
       let resolvedCount = 0;
       let failedCount = 0;
+      let staleResolvedCount = 0;
 
       for (const ct of batch) {
         try {
@@ -435,9 +436,31 @@ export async function POST(req: NextRequest) {
             action: actionResult.action,
             ok: actionResult.ok,
             attempted: actionResult.attempted,
+            reasonCode: actionResult.reasonCode,
           });
 
           if (actionResult.attempted && !actionResult.ok) {
+            // Check if this is a stale/non-actionable incident
+            if (actionResult.reasonCode === "no_broker_position") {
+              const staleResult = await resolveAsStale(
+                ct.id,
+                ct.symbol,
+                "stale_unactionable_no_broker_position",
+              );
+              if (staleResult.resolved) {
+                staleResolvedCount++;
+                results.push({
+                  id: ct.id,
+                  incidentCode: ct.incidentCode,
+                  symbol: ct.symbol,
+                  status: "stale_resolved",
+                  reason: "stale_unactionable_no_broker_position",
+                  action: actionResult,
+                });
+                continue;
+              }
+            }
+
             failedCount++;
             await setAttemptMetadata(ct.id, {
               lastAttemptAt: new Date().toISOString(),
@@ -484,25 +507,28 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      const remainingCount = blockingCritical.length - resolvedCount;
-      const allResolved = remainingCount === 0;
+      const remainingCount = blockingCritical.length - resolvedCount - staleResolvedCount;
+      const allResolved = remainingCount <= 0;
 
-      console.log(`[AGENT-EXECUTE] Critical batch done: resolved=${resolvedCount} failed=${failedCount} remaining=${remainingCount}`);
+      console.log(`[AGENT-EXECUTE] Critical batch done: resolved=${resolvedCount} stale=${staleResolvedCount} failed=${failedCount} remaining=${remainingCount}`);
 
       const critResult = {
         ok: true,
         message: allResolved
-          ? "All critical incidents resolved after verification"
-          : `Resolved ${resolvedCount}/${batch.length} critical incidents`,
-        criticalBypassApplied: true,
+          ? staleResolvedCount > 0 && resolvedCount === 0
+            ? "All critical incidents auto-resolved as stale/non-actionable — autonomy unblocked"
+            : "All critical incidents resolved after verification"
+          : `Resolved ${resolvedCount + staleResolvedCount}/${batch.length} critical incidents`,
+        criticalBypassApplied: !allResolved,
         selectedSource: "critical-task-queue",
-        executionStatus: allResolved ? "CRITICAL_BATCH_RESOLVED" : resolvedCount > 0 ? "CRITICAL_BATCH_PARTIAL" : "BYPASSED_CRITICAL",
+        executionStatus: allResolved ? "CRITICAL_BATCH_RESOLVED" : resolvedCount + staleResolvedCount > 0 ? "CRITICAL_BATCH_PARTIAL" : "BYPASSED_CRITICAL",
         selectedTaskId: batch[0]?.id ?? null,
         selectedTaskTitle: batch[0] ? `[CRITICAL] ${batch[0].incidentCode}: ${batch[0].symbol}` : null,
         criticalTaskCount: blockingCritical.length,
         syntheticExpiredCount: syntheticCritical.length,
         attemptedCriticalCount: batch.length,
         resolvedCriticalCount: resolvedCount,
+        staleResolvedCriticalCount: staleResolvedCount,
         failedCriticalCount: failedCount,
         skippedCriticalCount: 0,
         remainingCriticalCount: remainingCount,
@@ -510,7 +536,7 @@ export async function POST(req: NextRequest) {
         safeExecutionGate: gateResult,
         executionPhases: [
           phaseResult("SELECT_TASK", "passed", "critical_queue"),
-          phaseResult("APPLY_PATCH", resolvedCount > 0 ? "passed" : "failed", `resolved ${resolvedCount}/${batch.length}`),
+          phaseResult("APPLY_PATCH", resolvedCount + staleResolvedCount > 0 ? "passed" : "failed", `resolved ${resolvedCount}/${batch.length} stale ${staleResolvedCount}`),
           phaseResult("VERIFY", "passed", "gate_passed"),
           phaseResult("RESOLVE_OR_FAIL", allResolved ? "passed" : "failed", `remaining: ${remainingCount}`),
         ],

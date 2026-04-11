@@ -34,7 +34,9 @@ export function resolveSinceField(raw: string | null): SinceField {
 
 export function getSignalTimestampMs(signal: any, field: SinceField): number | null {
   const raw = signal?.[field];
-  if (!raw) return null;
+  if (raw == null) return null;
+  // Handle numeric epoch ms (e.g. from Redis deserialization)
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
   const t = Date.parse(raw);
   return Number.isFinite(t) ? t : null;
 }
