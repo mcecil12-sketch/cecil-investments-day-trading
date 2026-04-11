@@ -13,6 +13,8 @@ import {
   type AuditResult,
 } from "@/lib/risk/protection-integrity";
 
+import { readSignals } from "@/lib/jsonDb";
+
 type Check = {
   name: string;
   ok: boolean;
@@ -76,13 +78,20 @@ export async function GET(req: Request) {
 
   let aiHealth: any = { status: "UNKNOWN" };
   let funnel: any = { today: {} };
-  let signalsPayload: any = { signals: [] };
+
+  // Read signals directly to avoid self-referential HTTP fetch issue
+  // (internal fetch fails when called by cron/agents without cookie auth)
+  let allSignals: any[] = [];
+  try {
+    allSignals = await readSignals();
+  } catch {
+    allSignals = [];
+  }
 
   if (!publicMode) {
-    const [aiHealthResp, funnelResp, signalsResp] = await Promise.all([
+    const [aiHealthResp, funnelResp] = await Promise.all([
       fetch(`${base}/api/ai-health`, { headers: { cookie }, cache: "no-store" }),
       fetch(`${base}/api/funnel-stats`, { headers: { cookie }, cache: "no-store" }),
-      fetch(`${base}/api/signals/all?since=48h&onlyActive=1&order=desc&limit=500`, { headers: { cookie }, cache: "no-store" }),
     ]);
 
     if (!aiHealthResp.ok) {
@@ -97,16 +106,9 @@ export async function GET(req: Request) {
         { status: 502 }
       );
     }
-    if (!signalsResp.ok) {
-      return NextResponse.json(
-        { ok: false, error: "upstream_signals_failed", status: signalsResp.status },
-        { status: 502 }
-      );
-    }
 
     aiHealth = await aiHealthResp.json();
     funnel = await funnelResp.json();
-    signalsPayload = await signalsResp.json();
   } else {
     try {
       const fr = await fetch(`${base}/api/funnel-stats`, { cache: "no-store" });
@@ -148,9 +150,7 @@ export async function GET(req: Request) {
     protectionCritical = openTrades.length > 0;
   }
 
-  const signals: any[] = Array.isArray(signalsPayload)
-    ? signalsPayload
-    : signalsPayload?.signals ?? [];
+  const signals: any[] = Array.isArray(allSignals) ? allSignals : [];
 
   const signalsToday = signals.filter((s) => {
     const createdAt = s?.createdAt;

@@ -348,13 +348,16 @@ export interface AdaptiveGuardrailAction {
   id: string;
   actionType: AdaptiveActionType;
   reason: string;
-  triggerPattern: string;
+  triggerPattern?: string;
   appliedAt: string;
   expiresAt: string;
-  status: AdaptiveActionStatus;
+  status?: AdaptiveActionStatus;
   previousValue: number | string | boolean | null;
   appliedValue: number | string | boolean;
+  rolledBack?: boolean;
   rolledBackAt?: string | null;
+  rollbackReason?: string | null;
+  source?: string;
 }
 
 export interface AdaptiveGuardrailState {

@@ -9,7 +9,7 @@ import { approveExecution } from "@/lib/agents/governance/manager";
 import { listEngineeringTasks, updateEngineeringTaskById } from "@/lib/agents/store";
 import { openImpactEnvelope, closeImpactEnvelope } from "@/lib/agents/executionImpact";
 import { runSmokeValidation } from "@/lib/agents/preCommitValidation";
-import { getCriticalTasks } from "@/lib/redis";
+import { getCriticalTasks, partitionCriticalTasks, expireSyntheticTask } from "@/lib/redis";
 import { redis } from "@/lib/redis";
 import { runSafeExecutionGate, type GateResult } from "@/lib/agents/safe-execution-gate";
 import { resolveWithVerification, setAttemptMetadata } from "@/lib/agents/incident-resolution";
@@ -19,6 +19,9 @@ import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
 import { runStructuredVerification } from "@/lib/agents/verification-runner";
 import { evaluateAdaptiveGuardrails } from "@/lib/agents/adaptiveGuardrails";
 import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
+import { runLearningAnalysis } from "@/lib/agents/learning-detectors";
+import { applyOneRemediation, checkPendingRemediations } from "@/lib/agents/learning-remediation";
+import { getLedgerSummary, recordLedgerEntry } from "@/lib/agents/learning-ledger";
 import type {
   EngineeringTask,
   ExecutionPhase,
@@ -104,6 +107,34 @@ async function storeLatestExecution(result: Record<string, unknown>): Promise<vo
   } catch {
     // non-fatal
   }
+}
+
+/** Build learning/remediation block for execute responses (returns null-safe object). */
+function buildLearningBlock(
+  learningResult: Awaited<ReturnType<typeof runLearningAnalysis>> | null,
+  remediationResult: { applied: boolean; reason: string } | null,
+  verificationResult: { checked: number; rolledBack: number; verified: number } | null,
+  ledgerSummary: { openRemediations: number; pendingVerifications: number; recentRollbacks: number; lastEntryAt: string | null } | null,
+) {
+  return {
+    learning: learningResult
+      ? {
+          findingsCount: learningResult.findings.length,
+          highSeverityCount: learningResult.findings.filter((f) => f.severity === "CRITICAL" || f.severity === "HIGH").length,
+          findings: learningResult.findings.map((f) => ({ id: f.id, category: f.category, severity: f.severity, suggestedAction: f.suggestedAction })),
+        }
+      : null,
+    remediation: remediationResult ?? null,
+    verificationCheck: verificationResult ?? null,
+    ledger: ledgerSummary
+      ? {
+          openRemediations: ledgerSummary.openRemediations,
+          pendingVerifications: ledgerSummary.pendingVerifications,
+          recentRollbacks: ledgerSummary.recentRollbacks,
+          lastEntryAt: ledgerSummary.lastEntryAt,
+        }
+      : null,
+  };
 }
 
 // ─── GitHub commit execution (preserved from Phase 3) ───────────────
@@ -305,12 +336,21 @@ export async function POST(req: NextRequest) {
     // ─── Critical Task Batch Drain ────────────────────────────────────
     // When unresolved protection incidents exist, attempt to resolve all
     // eligible critical tasks in one run (capped for safety).
+    // Synthetic (drill) tasks are auto-expired if they fail — they have no
+    // broker-side positions to repair.
     const criticalTasks = await getCriticalTasks().catch(() => []);
-    if (criticalTasks.length > 0) {
-      const MAX_PER_RUN = Math.max(1, Math.min(20, Number(process.env.MAX_CRITICAL_RESOLUTIONS_PER_RUN) || 5));
-      const batch = criticalTasks.slice(0, MAX_PER_RUN);
+    const { blocking: blockingCritical, synthetic: syntheticCritical } = partitionCriticalTasks(criticalTasks);
 
-      console.log(`[AGENT-EXECUTE] Critical batch start: ${batch.length}/${criticalTasks.length} tasks, cap=${MAX_PER_RUN}`);
+    // Auto-expire synthetic drill tasks — they never have real broker state
+    for (const st of syntheticCritical) {
+      await expireSyntheticTask(st.id, "auto_expired_synthetic_drill").catch(() => {});
+    }
+
+    if (blockingCritical.length > 0) {
+      const MAX_PER_RUN = Math.max(1, Math.min(20, Number(process.env.MAX_CRITICAL_RESOLUTIONS_PER_RUN) || 5));
+      const batch = blockingCritical.slice(0, MAX_PER_RUN);
+
+      console.log(`[AGENT-EXECUTE] Critical batch start: ${batch.length}/${blockingCritical.length} blocking tasks (${syntheticCritical.length} synthetic auto-expired), cap=${MAX_PER_RUN}`);
 
       // Run safe execution gate once for the batch (build + smoke validation)
       let gateResult: GateResult | null = null;
@@ -350,12 +390,13 @@ export async function POST(req: NextRequest) {
           executionStatus: "BYPASSED_CRITICAL",
           selectedTaskId: batch[0]?.id ?? null,
           selectedTaskTitle: batch[0] ? `[CRITICAL] ${batch[0].incidentCode}: ${batch[0].symbol}` : null,
-          criticalTaskCount: criticalTasks.length,
+          criticalTaskCount: blockingCritical.length,
+          syntheticExpiredCount: syntheticCritical.length,
           attemptedCriticalCount: 0,
           resolvedCriticalCount: 0,
           failedCriticalCount: 0,
           skippedCriticalCount: batch.length,
-          remainingCriticalCount: criticalTasks.length,
+          remainingCriticalCount: blockingCritical.length,
           criticalResolutionResults: batch.map((ct) => ({
             id: ct.id,
             incidentCode: ct.incidentCode,
@@ -443,7 +484,7 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      const remainingCount = criticalTasks.length - resolvedCount;
+      const remainingCount = blockingCritical.length - resolvedCount;
       const allResolved = remainingCount === 0;
 
       console.log(`[AGENT-EXECUTE] Critical batch done: resolved=${resolvedCount} failed=${failedCount} remaining=${remainingCount}`);
@@ -458,7 +499,8 @@ export async function POST(req: NextRequest) {
         executionStatus: allResolved ? "CRITICAL_BATCH_RESOLVED" : resolvedCount > 0 ? "CRITICAL_BATCH_PARTIAL" : "BYPASSED_CRITICAL",
         selectedTaskId: batch[0]?.id ?? null,
         selectedTaskTitle: batch[0] ? `[CRITICAL] ${batch[0].incidentCode}: ${batch[0].symbol}` : null,
-        criticalTaskCount: criticalTasks.length,
+        criticalTaskCount: blockingCritical.length,
+        syntheticExpiredCount: syntheticCritical.length,
         attemptedCriticalCount: batch.length,
         resolvedCriticalCount: resolvedCount,
         failedCriticalCount: failedCount,
@@ -479,6 +521,44 @@ export async function POST(req: NextRequest) {
       };
       await storeLatestExecution(critResult);
       return NextResponse.json(critResult);
+    }
+
+    // ─── Learning Analysis + Safe Remediation ────────────────────────
+    // After critical incidents are clear, run learning analysis to detect
+    // trade performance and signal health issues. Apply at most one
+    // safe remediation per run. Check pending verification windows.
+    let learningResult = null;
+    let remediationResult = null;
+    let verificationResult = null;
+    let ledgerSummary = null;
+    try {
+      learningResult = await runLearningAnalysis();
+
+      if (learningResult.findings.length > 0) {
+        // Record high-severity findings in ledger
+        for (const finding of learningResult.findings.filter(
+          (f) => f.severity === "CRITICAL" || f.severity === "HIGH",
+        )) {
+          await recordLedgerEntry({
+            type: "finding_detected",
+            findingId: finding.id,
+            findingCategory: finding.category,
+            findingSeverity: finding.severity,
+            reason: finding.evidence,
+          }).catch(() => {});
+        }
+
+        // Apply at most one safe remediation
+        remediationResult = await applyOneRemediation(learningResult.findings);
+      }
+
+      // Check pending remediation verifications
+      verificationResult = await checkPendingRemediations(learningResult.findings);
+
+      // Get ledger summary for response
+      ledgerSummary = await getLedgerSummary();
+    } catch (err) {
+      console.warn("[AGENT-EXECUTE] Learning analysis failed (non-fatal):", err);
     }
 
     // ─── SELECT_TASK phase ────────────────────────────────────────────
@@ -505,6 +585,7 @@ export async function POST(req: NextRequest) {
         message: "No execution-ready tasks",
         ...noTaskResult,
         adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
       };
       await storeLatestExecution(result);
       return NextResponse.json(result);
@@ -546,6 +627,7 @@ export async function POST(req: NextRequest) {
           verification: { buildOk: true, smokeOk: true, details: {} },
           resolution: { resolved: false, reason: guardrailError },
           adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
         };
         await storeLatestExecution(result);
         return NextResponse.json(result);
@@ -572,6 +654,7 @@ export async function POST(req: NextRequest) {
           resolution: { resolved: false, reason: "github_write_disabled" },
           failure: { phase: "APPLY_PATCH", reason: ghCapability.reason ?? "github_write_disabled" },
           adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
         };
         await storeLatestExecution(result);
         return NextResponse.json(result, { status: 500 });
@@ -585,6 +668,7 @@ export async function POST(req: NextRequest) {
           githubWriteCapability: ghCapability,
           patchPlan,
           adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
           dryRun,
         };
         await storeLatestExecution(fullResult);
@@ -609,6 +693,7 @@ export async function POST(req: NextRequest) {
           resolution: { resolved: false, reason: message },
           failure: { phase: "APPLY_PATCH", reason: message },
           adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
         };
         await storeLatestExecution(result);
         return NextResponse.json(result, { status: 500 });
@@ -647,6 +732,7 @@ export async function POST(req: NextRequest) {
         resolution: { resolved: false, reason: approval.reason },
         failure: { phase: "GENERATE_PATCH_PLAN", reason: approval.reason },
         adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
       };
       await storeLatestExecution(result);
       return NextResponse.json(result, { status: 403 });
@@ -710,6 +796,7 @@ export async function POST(req: NextRequest) {
           verification: { buildOk: true, smokeOk: true, details: {} },
           resolution: { resolved: false, reason: guardrailError },
           adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
         };
         await storeLatestExecution(result);
         return NextResponse.json(result);
@@ -733,6 +820,7 @@ export async function POST(req: NextRequest) {
           resolution: { resolved: false, reason: "github_write_disabled" },
           failure: { phase: "APPLY_PATCH", reason: ghCapability.reason ?? "github_write_disabled" },
           adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
         };
         await storeLatestExecution(result);
         return NextResponse.json(result, { status: 500 });
@@ -746,6 +834,7 @@ export async function POST(req: NextRequest) {
           githubWriteCapability: ghCapability,
           patchPlan,
           adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
           dryRun,
         };
         await storeLatestExecution(fullResult);
@@ -769,6 +858,7 @@ export async function POST(req: NextRequest) {
           resolution: { resolved: false, reason: message },
           failure: { phase: "APPLY_PATCH", reason: message },
           adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
         };
         await storeLatestExecution(result);
         return NextResponse.json(result, { status: 500 });
@@ -793,6 +883,7 @@ export async function POST(req: NextRequest) {
       verification: { buildOk: true, smokeOk: true, details: {} },
       resolution: { resolved: false, reason: "plan_prepared_not_executed" },
       adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+      ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
     };
     await storeLatestExecution(planResult);
     return NextResponse.json(planResult);
