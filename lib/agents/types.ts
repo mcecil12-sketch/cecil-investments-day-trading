@@ -331,3 +331,123 @@ export interface EngineeringManagerBrief {
   strategistBias: MarketBias;
   learningSignalsSummary: string;
 }
+
+// ─── Phase 4: Adaptive Guardrails & True Execution Autonomy ─────────────────
+
+export type AdaptiveActionType =
+  | "reduce_max_open_positions"
+  | "reduce_max_entries_per_day"
+  | "raise_min_score_threshold"
+  | "increase_cooldown_after_loss"
+  | "suppress_side"
+  | "suppress_mode";
+
+export type AdaptiveActionStatus = "ACTIVE" | "EXPIRED" | "ROLLED_BACK";
+
+export interface AdaptiveGuardrailAction {
+  id: string;
+  actionType: AdaptiveActionType;
+  reason: string;
+  triggerPattern: string;
+  appliedAt: string;
+  expiresAt: string;
+  status: AdaptiveActionStatus;
+  previousValue: number | string | boolean | null;
+  appliedValue: number | string | boolean;
+  rolledBackAt?: string | null;
+}
+
+export interface AdaptiveGuardrailState {
+  actions: AdaptiveGuardrailAction[];
+  lastEvaluatedAt: string | null;
+  evaluationSource: string | null;
+}
+
+export type ExecutionPhase =
+  | "SELECT_TASK"
+  | "GENERATE_PATCH_PLAN"
+  | "APPLY_PATCH"
+  | "COMMIT_PUSH"
+  | "VERIFY"
+  | "RESOLVE_OR_FAIL";
+
+export type ExecutionPhaseStatus = "pending" | "running" | "passed" | "failed" | "skipped";
+
+export interface ExecutionPhaseResult {
+  phase: ExecutionPhase;
+  status: ExecutionPhaseStatus;
+  durationMs?: number;
+  detail?: string;
+}
+
+export interface ExecutionStateMachineResult {
+  executionStatus: "COMPLETED" | "FAILED" | "DRY_RUN" | "NO_TASK" | "BYPASSED_CRITICAL";
+  selectedSource: "critical-task-queue" | "engineering-backlog" | "none";
+  selectedTaskId: string | null;
+  selectedTaskTitle: string | null;
+  executionPhases: ExecutionPhaseResult[];
+  patchApplied: boolean;
+  commitSha?: string | null;
+  branchName?: string | null;
+  verification: {
+    buildOk: boolean;
+    smokeOk: boolean;
+    details: Record<string, unknown>;
+  };
+  resolution: {
+    resolved: boolean;
+    reason?: string;
+  };
+  failure?: {
+    phase: string;
+    reason: string;
+  };
+  dryRun?: boolean;
+}
+
+export interface PatchPlanDetail {
+  summary: string;
+  filesToModify: string[];
+  expectedDiffType: "code_change" | "config_change" | "ops_only";
+  validationSteps: string[];
+  rollbackNotes: string;
+}
+
+export interface GitHubWriteCapability {
+  writeEnabled: boolean;
+  reason?: string;
+}
+
+export interface StructuredVerificationResult {
+  gateResult: {
+    passed: boolean;
+    buildOk: boolean;
+    smokeOk: boolean;
+    failureReason: string | null;
+  };
+  probeResults: Array<{
+    route: string;
+    ok: boolean;
+    status: number | null;
+    reason: string | null;
+  }>;
+  taskSpecificResults: Array<{
+    target: string;
+    ok: boolean;
+    detail: string | null;
+  }>;
+  overall: boolean;
+  verifiedAt: string;
+}
+
+export interface ActionableBacklogTask {
+  id: string;
+  title: string;
+  category: string;
+  priorityBucket: TaskPriorityBucket;
+  executionReady: boolean;
+  patchStrategy: "code_change" | "config_change" | "ops_only";
+  targetFiles: string[];
+  smokeTargets: string[];
+  successCriteria: string[];
+}

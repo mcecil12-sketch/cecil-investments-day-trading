@@ -9,6 +9,12 @@ import { NextResponse } from "next/server";
 import { checkAgentCronAuth, unauthorizedAgentResponse } from "@/lib/agents/auth";
 import { readEmBrief, runEmOrchestration } from "@/lib/agents/engineeringManager";
 import { getCriticalTasks } from "@/lib/redis";
+import { readAdaptiveGuardrailState, getActiveActions } from "@/lib/agents/adaptiveGuardrails";
+import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
+import { listEngineeringTasks } from "@/lib/agents/store";
+import { classifyTaskAsActionable } from "@/lib/agents/patch-executor";
+import { redis } from "@/lib/redis";
+import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
 
 export async function GET(req: Request) {
   const auth = checkAgentCronAuth(req);
@@ -44,7 +50,24 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: true, fresh: false, scoredTasks: [], message: "No priorities computed yet. POST /api/agents/run to initialize." });
   }
 
-  const criticalTasks = await getCriticalTasks().catch(() => []);
+  const [criticalTasks, adaptiveState, tasks, latestExecRaw] = await Promise.all([
+    getCriticalTasks().catch(() => []),
+    readAdaptiveGuardrailState().catch(() => ({ actions: [], lastEvaluatedAt: null, evaluationSource: null })),
+    listEngineeringTasks(100).catch(() => []),
+    redis ? redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
+  ]);
+  const activeAdaptiveActions = getActiveActions(adaptiveState);
+  const ghCapability = checkGitHubWriteCapability();
+  const executionReadyTasks = tasks.filter(
+    (t) => t.status === "READY_FOR_EXECUTION" || t.executionStatus === "READY",
+  );
+  const latestExec: Record<string, unknown> | null = (() => {
+    if (!latestExecRaw) return null;
+    try {
+      const parsed = typeof latestExecRaw === "string" ? JSON.parse(latestExecRaw) : latestExecRaw;
+      return typeof parsed === "object" && parsed !== null ? parsed as Record<string, unknown> : null;
+    } catch { return null; }
+  })();
   const criticalEntries = criticalTasks.map((t) => ({
     taskId: t.id,
     title: `[CRITICAL] ${t.incidentCode}: ${t.symbol} — ${t.detail}`,
@@ -70,5 +93,27 @@ export async function GET(req: Request) {
     selfHealPending,
     criticalTasks: criticalEntries,
     scoredTasks: brief.scoredTasks,
+    // Phase 4: Adaptive guardrails & execution autonomy
+    executionReadyTaskCount: executionReadyTasks.length,
+    patchCapable: ghCapability.writeEnabled,
+    githubWriteAvailable: ghCapability.writeEnabled,
+    githubWriteReason: ghCapability.reason ?? null,
+    adaptiveGuardrails: {
+      activeActionCount: activeAdaptiveActions.length,
+      lastEvaluatedAt: adaptiveState.lastEvaluatedAt,
+      activeActions: activeAdaptiveActions.map((a) => ({
+        id: a.id,
+        actionType: a.actionType,
+        reason: a.reason,
+        expiresAt: a.expiresAt,
+      })),
+    },
+    latestAutonomousAction: latestExec ? {
+      executionStatus: latestExec.executionStatus ?? null,
+      selectedTaskId: latestExec.selectedTaskId ?? null,
+      selectedTaskTitle: latestExec.selectedTaskTitle ?? null,
+      patchApplied: latestExec.patchApplied ?? false,
+      commitSha: latestExec.commitSha ?? null,
+    } : null,
   });
 }

@@ -11,6 +11,10 @@ export const AGENT_STRATEGIST_KEY = "agents:strategist:v1";
 export const AGENT_PERF_LEARNING_KEY = "agents:perf_learning:v1";
 export const AGENT_EM_BRIEF_KEY = "agents:em_brief:v1";
 
+// Phase 4 keys
+export const AGENT_ADAPTIVE_GUARDRAILS_KEY = "agents:adaptive_guardrails:v1";
+export const AGENT_LATEST_EXECUTION_KEY = "agents:latest_execution:v1";
+
 export const AGENT_STORE_KEYS = {
   state: AGENT_STATE_KEY,
   briefs: AGENT_BRIEFS_KEY,
@@ -22,4 +26,6 @@ export const AGENT_STORE_KEYS = {
   strategist: AGENT_STRATEGIST_KEY,
   perfLearning: AGENT_PERF_LEARNING_KEY,
   emBrief: AGENT_EM_BRIEF_KEY,
+  adaptiveGuardrails: AGENT_ADAPTIVE_GUARDRAILS_KEY,
+  latestExecution: AGENT_LATEST_EXECUTION_KEY,
 } as const;

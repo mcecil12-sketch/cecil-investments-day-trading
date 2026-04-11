@@ -3,6 +3,10 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { checkAgentReadAuth, unauthorizedAgentResponse } from "@/lib/agents/auth";
 import { ensureAgentState, listEngineeringTasks, readAgentStateSnapshot } from "@/lib/agents/store";
+import { readAdaptiveGuardrailState, getActiveActions } from "@/lib/agents/adaptiveGuardrails";
+import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
+import { redis } from "@/lib/redis";
+import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
 import type { EngineeringTask } from "@/lib/agents/types";
 
 function executionVisibilityRank(task: EngineeringTask): number {
@@ -28,11 +32,15 @@ export async function GET(req: Request) {
     return unauthorizedAgentResponse(auth.error);
   }
 
-  const snapshot = await readAgentStateSnapshot();
-  const state = await ensureAgentState();
-  const tasks = (await listEngineeringTasks(200)).sort(
-    (a, b) => executionVisibilityRank(a) - executionVisibilityRank(b),
-  );
+  const [snapshot, state, tasks, adaptiveState, latestExecRaw] = await Promise.all([
+    readAgentStateSnapshot(),
+    ensureAgentState(),
+    listEngineeringTasks(200).then((t) =>
+      t.sort((a, b) => executionVisibilityRank(a) - executionVisibilityRank(b)),
+    ),
+    readAdaptiveGuardrailState().catch(() => ({ actions: [], lastEvaluatedAt: null, evaluationSource: null })),
+    redis ? redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
+  ]);
 
   const openTasks = tasks.filter(
     (task) =>
@@ -49,6 +57,16 @@ export async function GET(req: Request) {
     .filter((task) => task.status === "READY_FOR_EXECUTION")
     .at(-1) ?? null;
 
+  const activeAdaptiveActions = getActiveActions(adaptiveState);
+  const ghCapability = checkGitHubWriteCapability();
+  const latestExec: Record<string, unknown> | null = (() => {
+    if (!latestExecRaw) return null;
+    try {
+      const parsed = typeof latestExecRaw === "string" ? JSON.parse(latestExecRaw) : latestExecRaw;
+      return typeof parsed === "object" && parsed !== null ? parsed as Record<string, unknown> : null;
+    } catch { return null; }
+  })();
+
   const derivedState = {
     ...state,
     openEngineeringTaskCount: openTasks.length + blockedTasks.length,
@@ -56,6 +74,25 @@ export async function GET(req: Request) {
     blockedTaskCount: blockedTasks.length,
     latestExecutionTaskTitle: latestReadyForExecution?.title ?? null,
     latestExecutionStatus: latestReadyForExecution?.executionStatus ?? null,
+    // Phase 4: Adaptive guardrails & execution autonomy
+    githubWriteEnabled: ghCapability.writeEnabled,
+    patchExecutorEnabled: ghCapability.writeEnabled,
+    latestExecutionTaskId: latestExec?.selectedTaskId ?? latestReadyForExecution?.id ?? null,
+    latestCommitSha: latestExec?.commitSha ?? null,
+    latestVerificationSummary: latestExec?.verification ?? null,
+    latestFailureReason: latestExec?.failure
+      ? (latestExec.failure as Record<string, unknown>)?.reason ?? null
+      : null,
+    adaptiveGuardrails: {
+      activeActionCount: activeAdaptiveActions.length,
+      lastEvaluatedAt: adaptiveState.lastEvaluatedAt,
+      actions: activeAdaptiveActions.map((a) => ({
+        id: a.id,
+        actionType: a.actionType,
+        reason: a.reason,
+        expiresAt: a.expiresAt,
+      })),
+    },
   };
 
   return NextResponse.json({

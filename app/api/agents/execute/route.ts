@@ -10,10 +10,22 @@ import { listEngineeringTasks, updateEngineeringTaskById } from "@/lib/agents/st
 import { openImpactEnvelope, closeImpactEnvelope } from "@/lib/agents/executionImpact";
 import { runSmokeValidation } from "@/lib/agents/preCommitValidation";
 import { getCriticalTasks } from "@/lib/redis";
+import { redis } from "@/lib/redis";
 import { runSafeExecutionGate, type GateResult } from "@/lib/agents/safe-execution-gate";
 import { resolveWithVerification, setAttemptMetadata } from "@/lib/agents/incident-resolution";
 import { runIncidentResolver, type ActionResult } from "@/lib/agents/resolvers";
-import type { EngineeringTask } from "@/lib/agents/types";
+import { generatePatchPlan, classifyTaskAsActionable } from "@/lib/agents/patch-executor";
+import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
+import { runStructuredVerification } from "@/lib/agents/verification-runner";
+import { evaluateAdaptiveGuardrails } from "@/lib/agents/adaptiveGuardrails";
+import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
+import type {
+  EngineeringTask,
+  ExecutionPhase,
+  ExecutionPhaseResult,
+  ExecutionStateMachineResult,
+  PatchPlanDetail,
+} from "@/lib/agents/types";
 
 function appendNotes(current: string[] | undefined, additions: string[]): string[] {
   return [...(current ?? []), ...additions].filter(Boolean).slice(-20);
@@ -69,7 +81,61 @@ function buildReadyExecutionTask(task: EngineeringTask, updates?: Partial<Engine
   };
 }
 
-async function executeReadyForGithubCommit(task: EngineeringTask) {
+// ─── Phase tracking helpers ─────────────────────────────────────────
+
+function phaseResult(
+  phase: ExecutionPhase,
+  status: ExecutionPhaseResult["status"],
+  detail?: string,
+  startMs?: number,
+): ExecutionPhaseResult {
+  return {
+    phase,
+    status,
+    durationMs: startMs ? Date.now() - startMs : undefined,
+    detail,
+  };
+}
+
+async function storeLatestExecution(result: Record<string, unknown>): Promise<void> {
+  if (!redis) return;
+  try {
+    await redis.set(AGENT_LATEST_EXECUTION_KEY, JSON.stringify(result), { ex: 86400 * 7 });
+  } catch {
+    // non-fatal
+  }
+}
+
+// ─── GitHub commit execution (preserved from Phase 3) ───────────────
+
+async function executeReadyForGithubCommit(
+  task: EngineeringTask,
+  phases: ExecutionPhaseResult[],
+  dryRun: boolean,
+): Promise<{ response: NextResponse; phases: ExecutionPhaseResult[]; commitSha?: string }> {
+
+  // APPLY_PATCH phase
+  const applyStart = Date.now();
+
+  if (dryRun) {
+    phases.push(phaseResult("APPLY_PATCH", "skipped", "dry_run", applyStart));
+    phases.push(phaseResult("COMMIT_PUSH", "skipped", "dry_run"));
+    phases.push(phaseResult("VERIFY", "skipped", "dry_run"));
+    phases.push(phaseResult("RESOLVE_OR_FAIL", "skipped", "dry_run"));
+    return {
+      response: NextResponse.json({
+        ok: true,
+        dryRun: true,
+        executedTaskId: task.id,
+        executionStatus: "DRY_RUN",
+        patchPlan: generatePatchPlan(task),
+        message: "Dry run — no changes applied",
+        executionPhases: phases,
+      }),
+      phases,
+    };
+  }
+
   // Phase 3: open impact envelope before execution
   let envelopeId: string | null = null;
   try {
@@ -87,22 +153,26 @@ async function executeReadyForGithubCommit(task: EngineeringTask) {
     validationPassed = validation.passed;
     validationFailureReason = validation.failureReason;
     if (!validationPassed) {
-      console.warn(`[execute] Pre-commit smoke validation failed for task ${task.id}: ${validationFailureReason}`);
+      console.warn(`[AGENT-EXECUTE] Pre-commit smoke validation failed for task ${task.id}: ${validationFailureReason}`);
     }
   } catch {
     // non-fatal — validation errors don't block execution
   }
 
   if (!validationPassed && validationFailureReason) {
-    // Queue a narrower remediation instead of blocking entirely; mark as noted
     const blockedNotes = appendNotes(task.notes, [
       `Pre-commit validation failed: ${validationFailureReason}`,
-      "Proceeding with execution — smoke check failure is advisory in Phase 3.",
+      "Proceeding with execution — smoke check failure is advisory.",
     ]);
     await updateEngineeringTaskById(task.id, { notes: blockedNotes });
   }
 
   const executionResult = await executeGithubTask(task);
+  phases.push(phaseResult("APPLY_PATCH", "passed", `files: ${executionResult.filesTouched.join(", ")}`, applyStart));
+
+  // COMMIT_PUSH phase
+  const commitStart = Date.now();
+  phases.push(phaseResult("COMMIT_PUSH", "passed", executionResult.commitSha ?? "no_sha", commitStart));
 
   await updateEngineeringTaskById(task.id, {
     status: "DONE",
@@ -126,6 +196,39 @@ async function executeReadyForGithubCommit(task: EngineeringTask) {
     ]),
   });
 
+  // VERIFY phase
+  const verifyStart = Date.now();
+  let verification = { buildOk: true, smokeOk: true, details: {} as Record<string, unknown> };
+  try {
+    const vResult = await runStructuredVerification(task);
+    verification = {
+      buildOk: vResult.gateResult.buildOk,
+      smokeOk: vResult.gateResult.smokeOk,
+      details: {
+        probes: vResult.probeResults,
+        taskSpecific: vResult.taskSpecificResults,
+      },
+    };
+    phases.push(phaseResult("VERIFY", vResult.overall ? "passed" : "failed", vResult.gateResult.failureReason ?? undefined, verifyStart));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    phases.push(phaseResult("VERIFY", "failed", msg, verifyStart));
+    verification = { buildOk: false, smokeOk: false, details: { error: msg } };
+  }
+
+  // RESOLVE_OR_FAIL phase
+  const resolveStart = Date.now();
+  const verificationPassed = verification.buildOk && verification.smokeOk;
+  if (verificationPassed) {
+    phases.push(phaseResult("RESOLVE_OR_FAIL", "passed", "verified_and_resolved", resolveStart));
+  } else {
+    // Mark task as needing attention but don't revert the commit
+    await updateEngineeringTaskById(task.id, {
+      notes: appendNotes(task.notes, [`Post-commit verification failed: ${JSON.stringify(verification.details)}`]),
+    });
+    phases.push(phaseResult("RESOLVE_OR_FAIL", "failed", "verification_failed_post_commit", resolveStart));
+  }
+
   // Phase 3: close impact envelope after execution
   if (envelopeId) {
     try {
@@ -135,15 +238,30 @@ async function executeReadyForGithubCommit(task: EngineeringTask) {
     }
   }
 
-  return NextResponse.json({
-    ok: true,
-    executedTaskId: task.id,
-    executionStatus: "EXECUTED",
-    filesTouched: executionResult.filesTouched,
-    commitMessage: executionResult.commitMessage,
-    commitSha: executionResult.commitSha,
-    commitUrl: executionResult.commitUrl,
-  });
+  return {
+    response: NextResponse.json({
+      ok: true,
+      executedTaskId: task.id,
+      executionStatus: verificationPassed ? "COMPLETED" : "EXECUTED_UNVERIFIED",
+      selectedSource: "engineering-backlog",
+      selectedTaskId: task.id,
+      selectedTaskTitle: task.title,
+      filesTouched: executionResult.filesTouched,
+      commitMessage: executionResult.commitMessage,
+      commitSha: executionResult.commitSha,
+      commitUrl: executionResult.commitUrl,
+      branchName: task.commitPlan?.targetBranch ?? "main",
+      patchApplied: true,
+      verification,
+      resolution: {
+        resolved: verificationPassed,
+        reason: verificationPassed ? undefined : "post_commit_verification_failed",
+      },
+      executionPhases: phases,
+    }),
+    phases,
+    commitSha: executionResult.commitSha ?? undefined,
+  };
 }
 
 async function blockExecution(task: EngineeringTask, message: string) {
@@ -164,9 +282,26 @@ export async function POST(req: NextRequest) {
     return unauthorizedAgentResponse(auth.error);
   }
 
+  // ─── Dry-run detection ──────────────────────────────────────────────
+  const url = new URL(req.url);
+  const dryRun = url.searchParams.get("dryRun") === "1" || url.searchParams.get("dry_run") === "1";
+
   let task: EngineeringTask | null = null;
+  const phases: ExecutionPhaseResult[] = [];
 
   try {
+    // ─── Adaptive Guardrails Evaluation ─────────────────────────────
+    // Run performance-learning evaluation before task selection
+    let adaptiveResult = null;
+    try {
+      adaptiveResult = await evaluateAdaptiveGuardrails();
+      if (adaptiveResult.actionsApplied.length > 0 || adaptiveResult.tasksCreated.length > 0) {
+        console.log(`[AGENT-EXECUTE] Adaptive guardrails: ${adaptiveResult.actionsApplied.length} actions applied, ${adaptiveResult.tasksCreated.length} tasks created`);
+      }
+    } catch (err) {
+      console.warn("[AGENT-EXECUTE] Adaptive guardrails evaluation failed (non-fatal):", err);
+    }
+
     // ─── Critical Task Batch Drain ────────────────────────────────────
     // When unresolved protection incidents exist, attempt to resolve all
     // eligible critical tasks in one run (capped for safety).
@@ -175,7 +310,7 @@ export async function POST(req: NextRequest) {
       const MAX_PER_RUN = Math.max(1, Math.min(20, Number(process.env.MAX_CRITICAL_RESOLUTIONS_PER_RUN) || 5));
       const batch = criticalTasks.slice(0, MAX_PER_RUN);
 
-      console.log(`[execute] Critical batch start: ${batch.length}/${criticalTasks.length} tasks, cap=${MAX_PER_RUN}`);
+      console.log(`[AGENT-EXECUTE] Critical batch start: ${batch.length}/${criticalTasks.length} tasks, cap=${MAX_PER_RUN}`);
 
       // Run safe execution gate once for the batch (build + smoke validation)
       let gateResult: GateResult | null = null;
@@ -198,7 +333,6 @@ export async function POST(req: NextRequest) {
 
       // If gate fails, block the entire batch
       if (!gateResult.passed) {
-        // Record attempt metadata for each task
         for (const ct of batch) {
           await setAttemptMetadata(ct.id, {
             lastAttemptAt: new Date().toISOString(),
@@ -208,12 +342,14 @@ export async function POST(req: NextRequest) {
           }).catch(() => {});
         }
 
-        return NextResponse.json({
+        const result = {
           ok: true,
           message: "Execution blocked: safe execution gate failed",
           criticalBypassApplied: true,
           selectedSource: "critical-task-queue",
           executionStatus: "BYPASSED_CRITICAL",
+          selectedTaskId: batch[0]?.id ?? null,
+          selectedTaskTitle: batch[0] ? `[CRITICAL] ${batch[0].incidentCode}: ${batch[0].symbol}` : null,
           criticalTaskCount: criticalTasks.length,
           attemptedCriticalCount: 0,
           resolvedCriticalCount: 0,
@@ -228,7 +364,14 @@ export async function POST(req: NextRequest) {
             reason: gateResult!.failureReason ?? "gate_failed",
           })),
           safeExecutionGate: gateResult,
-        });
+          executionPhases: [phaseResult("SELECT_TASK", "passed", "critical_queue")],
+          patchApplied: false,
+          verification: { buildOk: gateResult.buildOk, smokeOk: gateResult.smokeOk, details: {} },
+          resolution: { resolved: false, reason: "gate_failed" },
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        };
+        await storeLatestExecution(result);
+        return NextResponse.json(result);
       }
 
       // Gate passed — attempt resolution for each task
@@ -246,15 +389,13 @@ export async function POST(req: NextRequest) {
 
       for (const ct of batch) {
         try {
-          // 1. Run real corrective action
           const actionResult = await runIncidentResolver(ct);
-          console.log(`[execute] resolver result for ${ct.id}:`, {
+          console.log(`[AGENT-EXECUTE] resolver result for ${ct.id}:`, {
             action: actionResult.action,
             ok: actionResult.ok,
             attempted: actionResult.attempted,
           });
 
-          // 2. If action failed, record and continue (don't verify)
           if (actionResult.attempted && !actionResult.ok) {
             failedCount++;
             await setAttemptMetadata(ct.id, {
@@ -274,7 +415,6 @@ export async function POST(req: NextRequest) {
             continue;
           }
 
-          // 3. Action succeeded (or was not needed) — run verification
           const res = await resolveWithVerification(ct.id);
           if (res.resolved) {
             resolvedCount++;
@@ -306,9 +446,9 @@ export async function POST(req: NextRequest) {
       const remainingCount = criticalTasks.length - resolvedCount;
       const allResolved = remainingCount === 0;
 
-      console.log(`[execute] Critical batch done: resolved=${resolvedCount} failed=${failedCount} remaining=${remainingCount}`);
+      console.log(`[AGENT-EXECUTE] Critical batch done: resolved=${resolvedCount} failed=${failedCount} remaining=${remainingCount}`);
 
-      return NextResponse.json({
+      const critResult = {
         ok: true,
         message: allResolved
           ? "All critical incidents resolved after verification"
@@ -316,6 +456,8 @@ export async function POST(req: NextRequest) {
         criticalBypassApplied: true,
         selectedSource: "critical-task-queue",
         executionStatus: allResolved ? "CRITICAL_BATCH_RESOLVED" : resolvedCount > 0 ? "CRITICAL_BATCH_PARTIAL" : "BYPASSED_CRITICAL",
+        selectedTaskId: batch[0]?.id ?? null,
+        selectedTaskTitle: batch[0] ? `[CRITICAL] ${batch[0].incidentCode}: ${batch[0].symbol}` : null,
         criticalTaskCount: criticalTasks.length,
         attemptedCriticalCount: batch.length,
         resolvedCriticalCount: resolvedCount,
@@ -324,58 +466,160 @@ export async function POST(req: NextRequest) {
         remainingCriticalCount: remainingCount,
         criticalResolutionResults: results,
         safeExecutionGate: gateResult,
-      });
+        executionPhases: [
+          phaseResult("SELECT_TASK", "passed", "critical_queue"),
+          phaseResult("APPLY_PATCH", resolvedCount > 0 ? "passed" : "failed", `resolved ${resolvedCount}/${batch.length}`),
+          phaseResult("VERIFY", "passed", "gate_passed"),
+          phaseResult("RESOLVE_OR_FAIL", allResolved ? "passed" : "failed", `remaining: ${remainingCount}`),
+        ],
+        patchApplied: resolvedCount > 0,
+        verification: { buildOk: gateResult.buildOk, smokeOk: gateResult.smokeOk, details: {} },
+        resolution: { resolved: allResolved, reason: allResolved ? undefined : `${remainingCount} tasks remaining` },
+        adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+      };
+      await storeLatestExecution(critResult);
+      return NextResponse.json(critResult);
     }
 
+    // ─── SELECT_TASK phase ────────────────────────────────────────────
+    const selectStart = Date.now();
     const tasks = await listEngineeringTasks(100);
     task = tasks
       .filter((candidate) => isEligibleTask(candidate))
       .sort((a, b) => executionSortRank(a) - executionSortRank(b))[0] ?? null;
 
     if (!task) {
-      return NextResponse.json({ ok: true, message: "No execution-ready tasks" });
+      phases.push(phaseResult("SELECT_TASK", "passed", "no_eligible_tasks", selectStart));
+      const noTaskResult: ExecutionStateMachineResult = {
+        executionStatus: "NO_TASK",
+        selectedSource: "none",
+        selectedTaskId: null,
+        selectedTaskTitle: null,
+        executionPhases: phases,
+        patchApplied: false,
+        verification: { buildOk: true, smokeOk: true, details: {} },
+        resolution: { resolved: false, reason: "no_eligible_tasks" },
+      };
+      const result = {
+        ok: true,
+        message: "No execution-ready tasks",
+        ...noTaskResult,
+        adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+      };
+      await storeLatestExecution(result);
+      return NextResponse.json(result);
     }
+
+    phases.push(phaseResult("SELECT_TASK", "passed", `task: ${task.id}`, selectStart));
+    console.log(`[AGENT-EXECUTE] Selected task ${task.id}: ${task.title}`);
+
+    // ─── GitHub write capability check ──────────────────────────────
+    const ghCapability = checkGitHubWriteCapability();
+
+    // ─── GENERATE_PATCH_PLAN phase ──────────────────────────────────
+    const patchPlanStart = Date.now();
+    let patchPlan: PatchPlanDetail | null = null;
 
     if (task.status === "READY_FOR_EXECUTION") {
       const guardrailError = validateExecutionGuardrails(task);
 
       if (guardrailError) {
+        phases.push(phaseResult("GENERATE_PATCH_PLAN", "failed", guardrailError, patchPlanStart));
         const skippedNotes = appendNotes(task.notes, [`Execution skipped: ${guardrailError}`]);
         await updateEngineeringTaskById(task.id, {
           notes: skippedNotes,
           executionError: guardrailError,
         });
 
-        return NextResponse.json({
+        const result = {
           ok: true,
           taskId: task.id,
+          selectedSource: "engineering-backlog",
+          selectedTaskId: task.id,
+          selectedTaskTitle: task.title,
           executionStatus: task.executionStatus ?? "READY",
           skipped: true,
           reason: guardrailError,
-        });
+          executionPhases: phases,
+          patchApplied: false,
+          githubWriteCapability: ghCapability,
+          verification: { buildOk: true, smokeOk: true, details: {} },
+          resolution: { resolved: false, reason: guardrailError },
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        };
+        await storeLatestExecution(result);
+        return NextResponse.json(result);
+      }
+
+      patchPlan = generatePatchPlan(task);
+      phases.push(phaseResult("GENERATE_PATCH_PLAN", "passed", `files: ${patchPlan.filesToModify.join(", ")}`, patchPlanStart));
+
+      if (!ghCapability.writeEnabled) {
+        phases.push(phaseResult("APPLY_PATCH", "failed", `github_write_disabled: ${ghCapability.reason}`));
+        const result = {
+          ok: false,
+          taskId: task.id,
+          selectedSource: "engineering-backlog",
+          selectedTaskId: task.id,
+          selectedTaskTitle: task.title,
+          executionStatus: "FAILED",
+          reason: `GitHub write not available: ${ghCapability.reason}`,
+          patchPlan,
+          executionPhases: phases,
+          patchApplied: false,
+          githubWriteCapability: ghCapability,
+          verification: { buildOk: true, smokeOk: true, details: {} },
+          resolution: { resolved: false, reason: "github_write_disabled" },
+          failure: { phase: "APPLY_PATCH", reason: ghCapability.reason ?? "github_write_disabled" },
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        };
+        await storeLatestExecution(result);
+        return NextResponse.json(result, { status: 500 });
       }
 
       try {
-        return await executeReadyForGithubCommit(task);
+        const execResult = await executeReadyForGithubCommit(task, phases, dryRun);
+        const responseBody = await execResult.response.json();
+        const fullResult = {
+          ...responseBody,
+          githubWriteCapability: ghCapability,
+          patchPlan,
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          dryRun,
+        };
+        await storeLatestExecution(fullResult);
+        return NextResponse.json(fullResult);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        phases.push(phaseResult("APPLY_PATCH", "failed", message));
         await blockExecution(task, message);
 
-        return NextResponse.json(
-          {
-            ok: false,
-            error: message,
-            taskId: task.id,
-            executionStatus: "FAILED",
-          },
-          { status: 500 },
-        );
+        const result = {
+          ok: false,
+          error: message,
+          taskId: task.id,
+          selectedSource: "engineering-backlog",
+          selectedTaskId: task.id,
+          selectedTaskTitle: task.title,
+          executionStatus: "FAILED",
+          executionPhases: phases,
+          patchApplied: false,
+          githubWriteCapability: ghCapability,
+          verification: { buildOk: false, smokeOk: false, details: {} },
+          resolution: { resolved: false, reason: message },
+          failure: { phase: "APPLY_PATCH", reason: message },
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        };
+        await storeLatestExecution(result);
+        return NextResponse.json(result, { status: 500 });
       }
     }
 
+    // ─── OPEN task — needs governance approval + plan preparation ────
     const approval = task.status === "OPEN" ? approveExecution(task) : { ok: true as const };
 
     if (!approval.ok) {
+      phases.push(phaseResult("GENERATE_PATCH_PLAN", "failed", `governance_blocked: ${approval.reason}`, patchPlanStart));
       const blockedNotes = appendNotes(task.notes, [`Execution blocked: ${approval.reason}`]);
 
       await updateEngineeringTaskById(task.id, {
@@ -388,18 +632,30 @@ export async function POST(req: NextRequest) {
         notes: blockedNotes,
       });
 
-      return NextResponse.json(
-        {
-          ok: false,
-          reason: approval.reason,
-          taskId: task.id,
-          executionStatus: "BLOCKED",
-        },
-        { status: 403 },
-      );
+      const result = {
+        ok: false,
+        reason: approval.reason,
+        taskId: task.id,
+        selectedSource: "engineering-backlog",
+        selectedTaskId: task.id,
+        selectedTaskTitle: task.title,
+        executionStatus: "BLOCKED",
+        executionPhases: phases,
+        patchApplied: false,
+        githubWriteCapability: ghCapability,
+        verification: { buildOk: true, smokeOk: true, details: {} },
+        resolution: { resolved: false, reason: approval.reason },
+        failure: { phase: "GENERATE_PATCH_PLAN", reason: approval.reason },
+        adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+      };
+      await storeLatestExecution(result);
+      return NextResponse.json(result, { status: 403 });
     }
 
     const prepared = prepareExecutionPlan(task);
+    patchPlan = generatePatchPlan(task);
+    phases.push(phaseResult("GENERATE_PATCH_PLAN", "passed", `plan: ${prepared.nextTaskStatus}`, patchPlanStart));
+
     const approvedNotes = appendNotes(task.notes, [
       "Execution approved by governance manager",
       `Execution plan prepared for ${prepared.nextTaskStatus}`,
@@ -432,55 +688,133 @@ export async function POST(req: NextRequest) {
       const guardrailError = validateExecutionGuardrails(preparedTask);
 
       if (guardrailError) {
+        phases.push(phaseResult("APPLY_PATCH", "failed", guardrailError));
         await updateEngineeringTaskById(task.id, {
           notes: appendNotes(preparedTask.notes, [`Execution skipped: ${guardrailError}`]),
           executionError: guardrailError,
         });
 
-        return NextResponse.json({
+        const result = {
           ok: true,
           taskId: task.id,
+          selectedSource: "engineering-backlog",
+          selectedTaskId: task.id,
+          selectedTaskTitle: task.title,
           executionStatus: preparedTask.executionStatus ?? "READY",
           skipped: true,
           reason: guardrailError,
-        });
+          patchPlan,
+          executionPhases: phases,
+          patchApplied: false,
+          githubWriteCapability: ghCapability,
+          verification: { buildOk: true, smokeOk: true, details: {} },
+          resolution: { resolved: false, reason: guardrailError },
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        };
+        await storeLatestExecution(result);
+        return NextResponse.json(result);
+      }
+
+      if (!ghCapability.writeEnabled) {
+        phases.push(phaseResult("APPLY_PATCH", "failed", `github_write_disabled: ${ghCapability.reason}`));
+        const result = {
+          ok: false,
+          taskId: task.id,
+          selectedSource: "engineering-backlog",
+          selectedTaskId: task.id,
+          selectedTaskTitle: task.title,
+          executionStatus: "FAILED",
+          reason: `GitHub write not available: ${ghCapability.reason}`,
+          patchPlan,
+          executionPhases: phases,
+          patchApplied: false,
+          githubWriteCapability: ghCapability,
+          verification: { buildOk: true, smokeOk: true, details: {} },
+          resolution: { resolved: false, reason: "github_write_disabled" },
+          failure: { phase: "APPLY_PATCH", reason: ghCapability.reason ?? "github_write_disabled" },
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        };
+        await storeLatestExecution(result);
+        return NextResponse.json(result, { status: 500 });
       }
 
       try {
-        return await executeReadyForGithubCommit(preparedTask);
+        const execResult = await executeReadyForGithubCommit(preparedTask, phases, dryRun);
+        const responseBody = await execResult.response.json();
+        const fullResult = {
+          ...responseBody,
+          githubWriteCapability: ghCapability,
+          patchPlan,
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          dryRun,
+        };
+        await storeLatestExecution(fullResult);
+        return NextResponse.json(fullResult);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        phases.push(phaseResult("APPLY_PATCH", "failed", message));
         await blockExecution(preparedTask, message);
-        return NextResponse.json(
-          {
-            ok: false,
-            error: message,
-            taskId: task.id,
-            executionStatus: "FAILED",
-          },
-          { status: 500 },
-        );
+        const result = {
+          ok: false,
+          error: message,
+          taskId: task.id,
+          selectedSource: "engineering-backlog",
+          selectedTaskId: task.id,
+          selectedTaskTitle: task.title,
+          executionStatus: "FAILED",
+          executionPhases: phases,
+          patchApplied: false,
+          githubWriteCapability: ghCapability,
+          verification: { buildOk: false, smokeOk: false, details: {} },
+          resolution: { resolved: false, reason: message },
+          failure: { phase: "APPLY_PATCH", reason: message },
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        };
+        await storeLatestExecution(result);
+        return NextResponse.json(result, { status: 500 });
       }
     }
 
-    return NextResponse.json({
+    // Task prepared but not yet READY_FOR_EXECUTION — return plan
+    phases.push(phaseResult("APPLY_PATCH", "skipped", "task_not_ready_for_execution"));
+    const planResult = {
       ok: true,
       taskId: task.id,
+      selectedSource: "engineering-backlog",
+      selectedTaskId: task.id,
+      selectedTaskTitle: task.title,
       executionStatus: prepared.nextTaskStatus,
-      patchPlan: prepared.patchPlan,
+      patchPlan,
       validationPlan: prepared.validationPlan,
       commitPlan: prepared.commitPlan,
-    });
+      executionPhases: phases,
+      patchApplied: false,
+      githubWriteCapability: ghCapability,
+      verification: { buildOk: true, smokeOk: true, details: {} },
+      resolution: { resolved: false, reason: "plan_prepared_not_executed" },
+      adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+    };
+    await storeLatestExecution(planResult);
+    return NextResponse.json(planResult);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await markExecutionFailure(task, message);
+    phases.push(phaseResult("RESOLVE_OR_FAIL", "failed", message));
 
-    return NextResponse.json(
-      {
-        ok: false,
-        error: message,
-      },
-      { status: 500 },
-    );
+    const result = {
+      ok: false,
+      error: message,
+      selectedSource: task ? "engineering-backlog" : "none",
+      selectedTaskId: task?.id ?? null,
+      selectedTaskTitle: task?.title ?? null,
+      executionStatus: "FAILED",
+      executionPhases: phases,
+      patchApplied: false,
+      verification: { buildOk: false, smokeOk: false, details: {} },
+      resolution: { resolved: false, reason: message },
+      failure: { phase: "RESOLVE_OR_FAIL", reason: message },
+    };
+    await storeLatestExecution(result);
+    return NextResponse.json(result, { status: 500 });
   }
 }

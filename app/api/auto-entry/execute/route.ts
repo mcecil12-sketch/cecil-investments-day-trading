@@ -40,6 +40,15 @@ import { buildAutoEntryFunnelFields } from "./funnel";
 import { isOperationallyOpenTrade } from "@/lib/trades/operational";
 import { buildOpenOrdersBySymbol, planConservativeReplacement } from "@/lib/autoManage/reliability";
 import { readExecutionOverlays, type ExecutionOverlays } from "@/lib/agents/overlays";
+import {
+  readAdaptiveGuardrailState,
+  getActiveActions,
+  getEffectiveMaxOpenPositions,
+  getEffectiveMaxEntriesPerDay,
+  getEffectiveMinScoreAdjustment,
+  getEffectiveCooldownAfterLoss,
+  getSuppressedSides,
+} from "@/lib/agents/adaptiveGuardrails";
 
 async function bumpAutoEntryFunnelSafe(fields: Record<string, number | undefined>) {
   if (!fields || Object.keys(fields).length === 0) return;
@@ -700,12 +709,26 @@ export async function POST(req: Request) {
     } catch {}
     return String(process.env.VERCEL_URL || "unknown-host");
   })();
-  const [guardState, toggleState, brokerTruth, overlay] = await Promise.all([
+  const [guardState, toggleState, brokerTruth, overlay, adaptiveState] = await Promise.all([
     guardrailsStore.getGuardrailsState(etDate),
     guardrailsStore.getAutoEntryEnabledState(guardConfig),
     fetchBrokerTruth(),
     readExecutionOverlays(),
+    readAdaptiveGuardrailState().catch(() => ({ actions: [] as import("@/lib/agents/types").AdaptiveGuardrailAction[], lastEvaluatedAt: null, evaluationSource: null })),
   ]);
+
+  // Apply adaptive guardrail tightenings (never loosen base config)
+  const adaptiveActions = getActiveActions(adaptiveState as import("@/lib/agents/types").AdaptiveGuardrailState);
+  const adaptiveMaxOpen = getEffectiveMaxOpenPositions(guardConfig.maxOpenPositions, adaptiveActions);
+  const adaptiveMaxEntries = getEffectiveMaxEntriesPerDay(guardConfig.maxEntriesPerDay, adaptiveActions);
+  const adaptiveCooldown = getEffectiveCooldownAfterLoss(guardConfig.cooldownAfterLossMin, adaptiveActions);
+  const adaptiveScoreAdj = getEffectiveMinScoreAdjustment(0, adaptiveActions);
+  const suppressedSides = getSuppressedSides(adaptiveActions);
+
+  // Tighten guardConfig with adaptive limits (mutate local copy)
+  guardConfig.maxOpenPositions = adaptiveMaxOpen;
+  guardConfig.maxEntriesPerDay = adaptiveMaxEntries;
+  guardConfig.cooldownAfterLossMin = adaptiveCooldown;
 
   let marketOpen = true;
   let marketTimestamp = nowIso();
@@ -1378,6 +1401,45 @@ export async function POST(req: Request) {
   const ticker = String(trade.ticker || "").toUpperCase();
   const side = String(trade.side || "LONG").toUpperCase();
 
+  // Adaptive guardrails: suppress side
+  if (suppressedSides.length > 0) {
+    const normalizedSide = side === "BUY" ? "LONG" : side === "SELL" ? "SHORT" : side;
+    if (suppressedSides.includes(normalizedSide)) {
+      counts.skipped += 1;
+      await recordOutcome({
+        outcome: "SKIP",
+        reason: "adaptive_side_suppressed",
+        ticker,
+        tradeId: String(trade?.id || ""),
+        detail: `Side ${normalizedSide} suppressed by adaptive guardrail`,
+      });
+      return NextResponse.json(
+        {
+          ok: true,
+          skipped: true,
+          reason: "adaptive_side_suppressed",
+          detail: `Side ${normalizedSide} suppressed by adaptive guardrail`,
+          market: { isOpen: marketOpen, timestamp: marketTimestamp },
+          openPositionsCount: brokerTruth.positionsCount,
+          maxOpenPositions: guardConfig.maxOpenPositions,
+          entriesToday: guardState.entriesToday,
+          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+          pendingCount: counts.pendingCount,
+          eligibleCount: counts.eligibleCount,
+          executedCount: counts.executed,
+          counts,
+          notes: notes.slice(0, 40),
+          guardrails: guardSummary,
+          adaptiveGuardrails: {
+            activeActionCount: adaptiveActions.length,
+            suppressedSides,
+          },
+        },
+        { status: 200 },
+      );
+    }
+  }
+
   // Overlay: grade and score checks against the selected trade
   {
     const tradeScore = typeof trade?.aiScore === "number" && Number.isFinite(trade.aiScore) ? trade.aiScore : null;
@@ -1421,23 +1483,25 @@ export async function POST(req: Request) {
       );
     }
 
-    if (overlay.minScoreAdjustment !== 0 && tradeScore != null) {
+    if ((overlay.minScoreAdjustment !== 0 || adaptiveScoreAdj !== 0) && tradeScore != null) {
       // Determine the base threshold for this tier
       const autoConfig = getAutoConfig();
       const baseTierMin =
         tradeTier === "A" ? autoConfig.tierAmin :
         tradeTier === "B" ? autoConfig.tierBmin :
         autoConfig.tierCmin;
-      const effectiveTierMin = baseTierMin + overlay.minScoreAdjustment;
+      const totalScoreAdj = overlay.minScoreAdjustment + adaptiveScoreAdj;
+      const effectiveTierMin = baseTierMin + totalScoreAdj;
 
       if (tradeScore < effectiveTierMin) {
+        const adjSource = adaptiveScoreAdj !== 0 ? ` + adaptive ${adaptiveScoreAdj}` : "";
         counts.skipped += 1;
         await recordOutcome({
           outcome: "SKIP",
           reason: "overlay_score_below_adjusted_threshold",
           ticker,
           tradeId: String(trade?.id || ""),
-          detail: `score ${tradeScore} < adjusted threshold ${effectiveTierMin} (base ${baseTierMin} + adj ${overlay.minScoreAdjustment})`,
+          detail: `score ${tradeScore} < adjusted threshold ${effectiveTierMin} (base ${baseTierMin} + overlay ${overlay.minScoreAdjustment}${adjSource})`,
         });
         return NextResponse.json(
           {
