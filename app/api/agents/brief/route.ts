@@ -37,7 +37,7 @@ export async function GET(req: Request) {
     readAdaptiveGuardrailState().catch(() => ({ actions: [], lastEvaluatedAt: null, evaluationSource: null })),
     listEngineeringTasks(100).catch(() => []),
     redis ? redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
-    listManualActionTasks({ limit: 5 }).catch(() => []),
+    listManualActionTasks({ limit: 10 }).catch(() => []),
     countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0 })),
   ]);
 
@@ -79,6 +79,8 @@ export async function GET(req: Request) {
     manualQueueSummary: {
       openCount: manualCounts.openCount,
       executionReadyCount: manualCounts.executionReadyCount,
+      inProgressCount: manualCounts.inProgressCount,
+      blockedCount: manualCounts.blockedCount,
       topManualTasks: manualTasks
         .filter((t) => t.status === "OPEN" || t.status === "SELECTED" || t.status === "IN_PROGRESS")
         .slice(0, 5)
@@ -91,6 +93,18 @@ export async function GET(req: Request) {
           executionReady: t.executionReady,
           createdAt: t.createdAt,
         })),
+      latestManualExecution: (() => {
+        const recent = manualTasks.find(
+          (t) => t.status === "DONE" || t.status === "FAILED" || t.status === "BLOCKED",
+        );
+        if (!recent) return null;
+        return {
+          id: recent.id,
+          title: recent.title,
+          status: recent.status,
+          latestExecutionResult: recent.latestExecutionResult ?? null,
+        };
+      })(),
     },
     emBrief: emBrief
       ? {
@@ -135,10 +149,12 @@ export async function GET(req: Request) {
       repoWriteReason: ghCapability.reason ?? null,
       latestExecutionResult: latestExec ? {
         executionStatus: latestExec.executionStatus ?? null,
+        selectedSource: latestExec.selectedSource ?? null,
         selectedTaskId: latestExec.selectedTaskId ?? null,
         selectedTaskTitle: latestExec.selectedTaskTitle ?? null,
         patchApplied: latestExec.patchApplied ?? false,
         commitSha: latestExec.commitSha ?? null,
+        manualTaskStatus: latestExec.manualTaskStatus ?? null,
       } : null,
     },
   });

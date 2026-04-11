@@ -204,6 +204,16 @@ export async function updateManualActionTask(
   return updated;
 }
 
+/** Peek at the next execution-ready OPEN task without mutating state. */
+export async function peekNextManualActionTask(): Promise<ManualActionTask | null> {
+  const open = await listManualActionTasks({
+    status: "OPEN",
+    executionReady: true,
+  });
+  return open.length > 0 ? open[0] : null;
+}
+
+/** Claim the next OPEN execution-ready task: OPEN -> SELECTED */
 export async function claimNextManualActionTask(): Promise<ManualActionTask | null> {
   const open = await listManualActionTasks({
     status: "OPEN",
@@ -222,24 +232,109 @@ export async function claimNextManualActionTask(): Promise<ManualActionTask | nu
   return claimed;
 }
 
-export async function resolveManualActionTask(
+/** Claim a specific task by id: OPEN -> SELECTED */
+export async function claimManualActionTask(
+  id: string,
+): Promise<ManualActionTask | null> {
+  const task = await getManualActionTask(id);
+  if (!task || task.status !== "OPEN") return null;
+  const now = new Date().toISOString();
+  const claimed: ManualActionTask = {
+    ...task,
+    status: "SELECTED",
+    selectedAt: now,
+    updatedAt: now,
+  };
+  await saveTask(claimed);
+  return claimed;
+}
+
+/** Start a claimed task: SELECTED -> IN_PROGRESS */
+export async function startManualActionTask(
+  id: string,
+): Promise<ManualActionTask | null> {
+  const task = await getManualActionTask(id);
+  if (!task || task.status !== "SELECTED") return null;
+  const now = new Date().toISOString();
+  const started: ManualActionTask = {
+    ...task,
+    status: "IN_PROGRESS",
+    startedAt: now,
+    updatedAt: now,
+  };
+  await saveTask(started);
+  return started;
+}
+
+/** Complete a task successfully: IN_PROGRESS -> DONE */
+export async function completeManualActionTask(
   id: string,
   result: ManualActionExecutionResult,
 ): Promise<ManualActionTask | null> {
   const task = await getManualActionTask(id);
   if (!task) return null;
   const now = new Date().toISOString();
-  const resolved: ManualActionTask = {
+  const completed: ManualActionTask = {
     ...task,
     status: "DONE",
     completedAt: now,
     updatedAt: now,
     latestExecutionResult: { ...result, finishedAt: now },
   };
-  await saveTask(resolved);
-  return resolved;
+  await saveTask(completed);
+  return completed;
 }
 
+/** Block a task: IN_PROGRESS | SELECTED -> BLOCKED */
+export async function blockManualActionTask(
+  id: string,
+  reason: string,
+  result?: ManualActionExecutionResult,
+): Promise<ManualActionTask | null> {
+  const task = await getManualActionTask(id);
+  if (!task) return null;
+  const now = new Date().toISOString();
+  const blocked: ManualActionTask = {
+    ...task,
+    status: "BLOCKED",
+    blockedReason: reason,
+    updatedAt: now,
+    latestExecutionResult: result
+      ? { ...result, finishedAt: now }
+      : task.latestExecutionResult,
+  };
+  await saveTask(blocked);
+  return blocked;
+}
+
+/** Release a claimed/selected task back to OPEN: SELECTED -> OPEN */
+export async function releaseManualActionTask(
+  id: string,
+  reason?: string,
+): Promise<ManualActionTask | null> {
+  const task = await getManualActionTask(id);
+  if (!task || task.status !== "SELECTED") return null;
+  const now = new Date().toISOString();
+  const released: ManualActionTask = {
+    ...task,
+    status: "OPEN",
+    selectedAt: null,
+    updatedAt: now,
+    blockedReason: reason ?? task.blockedReason,
+  };
+  await saveTask(released);
+  return released;
+}
+
+/** @deprecated Use completeManualActionTask instead */
+export async function resolveManualActionTask(
+  id: string,
+  result: ManualActionExecutionResult,
+): Promise<ManualActionTask | null> {
+  return completeManualActionTask(id, result);
+}
+
+/** Fail a task: IN_PROGRESS -> FAILED */
 export async function failManualActionTask(
   id: string,
   result: ManualActionExecutionResult,

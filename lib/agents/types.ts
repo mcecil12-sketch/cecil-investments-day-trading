@@ -368,6 +368,7 @@ export interface AdaptiveGuardrailState {
 
 export type ExecutionPhase =
   | "SELECT_TASK"
+  | "CLAIM_TASK"
   | "GENERATE_PATCH_PLAN"
   | "APPLY_PATCH"
   | "COMMIT_PUSH"

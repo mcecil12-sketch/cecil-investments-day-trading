@@ -23,13 +23,16 @@ import { runLearningAnalysis } from "@/lib/agents/learning-detectors";
 import { applyOneRemediation, checkPendingRemediations } from "@/lib/agents/learning-remediation";
 import { getLedgerSummary, recordLedgerEntry } from "@/lib/agents/learning-ledger";
 import {
+  peekNextManualActionTask,
   claimNextManualActionTask,
-  updateManualActionTask,
-  resolveManualActionTask,
+  startManualActionTask,
+  completeManualActionTask,
+  blockManualActionTask,
   failManualActionTask,
   countOpenExecutionReadyManualTasks,
   type ManualActionTask,
 } from "@/lib/agents/manual-action-queue";
+import { executeManualTask } from "@/lib/agents/manual-task-executor";
 import type {
   EngineeringTask,
   ExecutionPhase,
@@ -560,25 +563,86 @@ export async function POST(req: NextRequest) {
     // ─── Manual Queue Execution (priority B) ─────────────────────────
     // After critical incidents are resolved, check for execution-ready
     // manual queue tasks before falling through to autonomous backlog.
+    // Lifecycle: SELECT -> CLAIM -> APPLY PATCH -> VERIFY -> RESOLVE/FAIL
     const manualCounts = await countOpenExecutionReadyManualTasks().catch(() => ({
       openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0,
     }));
 
     if (manualCounts.executionReadyCount > 0) {
+      // ── DRY RUN: peek only, never mutate ──────────────────────────
+      if (dryRun) {
+        const peekedTask = await peekNextManualActionTask();
+        if (peekedTask) {
+          const dryRunResult = {
+            ok: true,
+            dryRun: true,
+            executionStatus: "MANUAL_TASK_DRY_RUN",
+            selectedSource: "manual-action-queue",
+            selectedTaskId: peekedTask.id,
+            selectedTaskTitle: peekedTask.title,
+            patchApplied: false,
+            manualTask: {
+              id: peekedTask.id,
+              title: peekedTask.title,
+              description: peekedTask.description,
+              priority: peekedTask.priority,
+              taskType: peekedTask.taskType,
+              executionReady: peekedTask.executionReady,
+              status: peekedTask.status,
+              acceptanceCriteria: peekedTask.acceptanceCriteria,
+              fileHints: peekedTask.fileHints,
+              routeHints: peekedTask.routeHints,
+            },
+            manualQueueCounts: manualCounts,
+            manualTaskStatus: peekedTask.status,
+            executionPhases: [
+              phaseResult("SELECT_TASK", "passed", "manual_queue_dry_run"),
+              phaseResult("CLAIM_TASK", "skipped", "dry_run"),
+              phaseResult("APPLY_PATCH", "skipped", "dry_run"),
+              phaseResult("VERIFY", "skipped", "dry_run"),
+              phaseResult("RESOLVE_OR_FAIL", "skipped", "dry_run"),
+            ],
+            verification: { buildOk: true, smokeOk: true, details: {} },
+            resolution: { resolved: false, reason: "dry_run" },
+            adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          };
+          await storeLatestExecution(dryRunResult);
+          return NextResponse.json(dryRunResult);
+        }
+      }
+
+      // ── REAL EXECUTION: claim -> gate -> execute -> resolve ────────
       const manualTask = await claimNextManualActionTask();
       if (manualTask) {
-        const now = new Date().toISOString();
+        const manualPhases: ExecutionPhaseResult[] = [];
+        manualPhases.push(phaseResult("SELECT_TASK", "passed", "manual_queue"));
+        manualPhases.push(phaseResult("CLAIM_TASK", "passed", `claimed: ${manualTask.id}`));
 
-        // Mark as IN_PROGRESS
-        await updateManualActionTask(manualTask.id, {
-          status: "IN_PROGRESS",
-        });
-        const updatedManualTask = { ...manualTask, status: "IN_PROGRESS" as const, startedAt: now };
+        // Start: SELECTED -> IN_PROGRESS
+        const startedTask = await startManualActionTask(manualTask.id);
+        if (!startedTask) {
+          manualPhases.push(phaseResult("CLAIM_TASK", "failed", "start_failed"));
+          const failResult = {
+            ok: false,
+            executionStatus: "MANUAL_TASK_FAILED",
+            selectedSource: "manual-action-queue",
+            selectedTaskId: manualTask.id,
+            selectedTaskTitle: manualTask.title,
+            patchApplied: false,
+            manualTaskStatus: "SELECTED",
+            manualQueueCounts: manualCounts,
+            executionPhases: manualPhases,
+            verification: { buildOk: false, smokeOk: false, details: {} },
+            resolution: { resolved: false, reason: "lifecycle_start_failed" },
+            adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          };
+          await storeLatestExecution(failResult);
+          return NextResponse.json(failResult, { status: 500 });
+        }
 
-        // Run safe execution gate for manual tasks too
+        // Run safe execution gate
         let manualGateResult: GateResult | null = null;
         try {
-          // Use a synthetic critical task shape just for gate validation
           manualGateResult = await runSafeExecutionGate({
             id: manualTask.id,
             incidentCode: "MANUAL_QUEUE",
@@ -595,7 +659,7 @@ export async function POST(req: NextRequest) {
             buildProbe: { route: "/api/agents/state", ok: false, status: null, reason: errMsg },
             smokeOk: false,
             smokeProbes: [],
-            validatedAt: now,
+            validatedAt: new Date().toISOString(),
             failureReason: `gate_exception: ${errMsg}`,
             baseUrl: "unknown",
             authMode: "unknown",
@@ -604,10 +668,13 @@ export async function POST(req: NextRequest) {
 
         if (manualGateResult && !manualGateResult.passed) {
           // Gate failed — block the manual task
-          await updateManualActionTask(manualTask.id, {
-            status: "BLOCKED",
-            blockedReason: manualGateResult.failureReason ?? "safe_execution_gate_failed",
+          const blockedReason = manualGateResult.failureReason ?? "safe_execution_gate_failed";
+          await blockManualActionTask(manualTask.id, blockedReason, {
+            ok: false,
+            summary: `Safe execution gate failed: ${blockedReason}`,
+            error: blockedReason,
           });
+          manualPhases.push(phaseResult("APPLY_PATCH", "failed", blockedReason));
 
           const blockedResult = {
             ok: true,
@@ -617,12 +684,10 @@ export async function POST(req: NextRequest) {
             selectedTaskId: manualTask.id,
             selectedTaskTitle: manualTask.title,
             patchApplied: false,
+            manualTaskStatus: "BLOCKED",
             safeExecutionGate: manualGateResult,
             manualQueueCounts: manualCounts,
-            executionPhases: [
-              phaseResult("SELECT_TASK", "passed", "manual_queue"),
-              phaseResult("APPLY_PATCH", "failed", manualGateResult.failureReason ?? "gate_failed"),
-            ],
+            executionPhases: manualPhases,
             verification: { buildOk: manualGateResult.buildOk, smokeOk: manualGateResult.smokeOk, details: {} },
             resolution: { resolved: false, reason: "gate_failed" },
             adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
@@ -631,83 +696,132 @@ export async function POST(req: NextRequest) {
           return NextResponse.json(blockedResult);
         }
 
-        if (dryRun) {
-          // Dry run: don't mutate beyond selection, report plan
-          // Revert to SELECTED so it can be claimed again
-          await updateManualActionTask(manualTask.id, { status: "OPEN" });
+        // Gate passed — invoke manual task executor
+        manualPhases.push(phaseResult("APPLY_PATCH", "passed", "gate_passed_invoking_executor"));
 
-          const dryRunResult = {
+        let execResult;
+        try {
+          execResult = await executeManualTask(manualTask);
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          execResult = {
+            ok: false,
+            patchApplied: false,
+            blocked: false,
+            summary: `Executor threw: ${errMsg}`,
+            failureReason: errMsg,
+          };
+        }
+
+        // Apply patch phase result
+        manualPhases.push(phaseResult(
+          "APPLY_PATCH",
+          execResult.patchApplied ? "passed" : execResult.blocked ? "failed" : "failed",
+          execResult.patchApplied
+            ? `patch_applied: ${execResult.commitSha ?? "no_sha"}`
+            : execResult.blockedReason ?? execResult.failureReason ?? "executor_failed",
+        ));
+
+        // Verify phase
+        manualPhases.push(phaseResult(
+          "VERIFY",
+          execResult.ok ? "passed" : execResult.blocked ? "skipped" : "failed",
+          execResult.ok
+            ? "verification_passed"
+            : execResult.blocked
+              ? execResult.blockedReason ?? "blocked"
+              : execResult.failureReason ?? "verification_failed",
+        ));
+
+        // Resolve or fail phase
+        if (execResult.ok && execResult.patchApplied) {
+          // SUCCESS — mark DONE
+          await completeManualActionTask(manualTask.id, {
             ok: true,
-            dryRun: true,
-            executionStatus: "MANUAL_TASK_SELECTED",
+            summary: execResult.summary,
+            commitSha: execResult.commitSha,
+            verification: execResult.verification as Record<string, unknown>,
+          });
+          manualPhases.push(phaseResult("RESOLVE_OR_FAIL", "passed", "completed"));
+
+          const completedResult = {
+            ok: true,
+            executionStatus: "MANUAL_TASK_COMPLETED",
+            selectedSource: "manual-action-queue",
+            selectedTaskId: manualTask.id,
+            selectedTaskTitle: manualTask.title,
+            patchApplied: true,
+            commitSha: execResult.commitSha ?? null,
+            manualTaskStatus: "DONE",
+            safeExecutionGate: manualGateResult,
+            manualQueueCounts: manualCounts,
+            executionPhases: manualPhases,
+            verification: execResult.verification ?? { buildOk: true, smokeOk: true, details: {} },
+            resolution: { resolved: true },
+            adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          };
+          await storeLatestExecution(completedResult);
+          return NextResponse.json(completedResult);
+        } else if (execResult.blocked) {
+          // BLOCKED — executor couldn't run
+          await blockManualActionTask(
+            manualTask.id,
+            execResult.blockedReason ?? "executor_blocked",
+            {
+              ok: false,
+              summary: execResult.summary,
+              error: execResult.blockedReason,
+            },
+          );
+          manualPhases.push(phaseResult("RESOLVE_OR_FAIL", "failed", execResult.blockedReason ?? "blocked"));
+
+          const blockedExecResult = {
+            ok: false,
+            executionStatus: "MANUAL_TASK_BLOCKED",
             selectedSource: "manual-action-queue",
             selectedTaskId: manualTask.id,
             selectedTaskTitle: manualTask.title,
             patchApplied: false,
-            manualTask: {
-              id: manualTask.id,
-              title: manualTask.title,
-              description: manualTask.description,
-              priority: manualTask.priority,
-              taskType: manualTask.taskType,
-              executionReady: manualTask.executionReady,
-              acceptanceCriteria: manualTask.acceptanceCriteria,
-              fileHints: manualTask.fileHints,
-              routeHints: manualTask.routeHints,
-            },
+            manualTaskStatus: "BLOCKED",
+            safeExecutionGate: manualGateResult,
             manualQueueCounts: manualCounts,
-            executionPhases: [
-              phaseResult("SELECT_TASK", "passed", "manual_queue"),
-              phaseResult("APPLY_PATCH", "skipped", "dry_run"),
-              phaseResult("VERIFY", "skipped", "dry_run"),
-              phaseResult("RESOLVE_OR_FAIL", "skipped", "dry_run"),
-            ],
-            verification: { buildOk: true, smokeOk: true, details: {} },
-            resolution: { resolved: false, reason: "dry_run" },
+            executionPhases: manualPhases,
+            verification: execResult.verification ?? { buildOk: false, smokeOk: false, details: {} },
+            resolution: { resolved: false, reason: execResult.blockedReason ?? "executor_blocked" },
             adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
           };
-          await storeLatestExecution(dryRunResult);
-          return NextResponse.json(dryRunResult);
-        }
+          await storeLatestExecution(blockedExecResult);
+          return NextResponse.json(blockedExecResult);
+        } else {
+          // FAILED — execution ran but didn't succeed
+          await failManualActionTask(manualTask.id, {
+            ok: false,
+            summary: execResult.summary,
+            commitSha: execResult.commitSha,
+            verification: execResult.verification as Record<string, unknown>,
+            error: execResult.failureReason,
+          });
+          manualPhases.push(phaseResult("RESOLVE_OR_FAIL", "failed", execResult.failureReason ?? "execution_failed"));
 
-        // Non-dry-run: Manual task selected for execution.
-        // If the system has full patch execution plumbing for this task, it
-        // would be wired here. For now, we truthfully report selection and
-        // return an execution plan so external executors can act on it.
-        const manualResult = {
-          ok: true,
-          executionStatus: "MANUAL_TASK_SELECTED",
-          selectedSource: "manual-action-queue",
-          selectedTaskId: manualTask.id,
-          selectedTaskTitle: manualTask.title,
-          patchApplied: false,
-          manualTask: {
-            id: updatedManualTask.id,
-            title: updatedManualTask.title,
-            description: updatedManualTask.description,
-            objective: updatedManualTask.objective,
-            priority: updatedManualTask.priority,
-            taskType: updatedManualTask.taskType,
-            executionReady: updatedManualTask.executionReady,
-            status: updatedManualTask.status,
-            acceptanceCriteria: updatedManualTask.acceptanceCriteria,
-            fileHints: updatedManualTask.fileHints,
-            routeHints: updatedManualTask.routeHints,
-          },
-          manualQueueCounts: manualCounts,
-          safeExecutionGate: manualGateResult,
-          executionPhases: [
-            phaseResult("SELECT_TASK", "passed", "manual_queue"),
-            phaseResult("APPLY_PATCH", "skipped", "manual_task_awaiting_executor"),
-            phaseResult("VERIFY", "skipped", "pending"),
-            phaseResult("RESOLVE_OR_FAIL", "skipped", "pending"),
-          ],
-          verification: { buildOk: true, smokeOk: true, details: {} },
-          resolution: { resolved: false, reason: "manual_task_in_progress" },
-          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
-        };
-        await storeLatestExecution(manualResult);
-        return NextResponse.json(manualResult);
+          const failedExecResult = {
+            ok: false,
+            executionStatus: "MANUAL_TASK_FAILED",
+            selectedSource: "manual-action-queue",
+            selectedTaskId: manualTask.id,
+            selectedTaskTitle: manualTask.title,
+            patchApplied: execResult.patchApplied,
+            commitSha: execResult.commitSha ?? null,
+            manualTaskStatus: "FAILED",
+            safeExecutionGate: manualGateResult,
+            manualQueueCounts: manualCounts,
+            executionPhases: manualPhases,
+            verification: execResult.verification ?? { buildOk: false, smokeOk: false, details: {} },
+            resolution: { resolved: false, reason: execResult.failureReason ?? "execution_failed" },
+            adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          };
+          await storeLatestExecution(failedExecResult);
+          return NextResponse.json(failedExecResult);
+        }
       }
     }
 

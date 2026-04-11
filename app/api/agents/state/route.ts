@@ -50,7 +50,7 @@ export async function GET(req: Request) {
     ),
     readAdaptiveGuardrailState().catch(() => ({ actions: [], lastEvaluatedAt: null, evaluationSource: null })),
     redis ? redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
-    listManualActionTasks({ limit: 5 }).catch(() => []),
+    listManualActionTasks({ limit: 10 }).catch(() => []),
     countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0 })),
   ]);
 
@@ -96,6 +96,15 @@ export async function GET(req: Request) {
     latestFailureReason: latestExec?.failure
       ? (latestExec.failure as Record<string, unknown>)?.reason ?? null
       : null,
+    latestExecutionResult: latestExec ? {
+      executionStatus: latestExec.executionStatus ?? null,
+      selectedSource: latestExec.selectedSource ?? null,
+      selectedTaskId: latestExec.selectedTaskId ?? null,
+      selectedTaskTitle: latestExec.selectedTaskTitle ?? null,
+      patchApplied: latestExec.patchApplied ?? false,
+      commitSha: latestExec.commitSha ?? null,
+      manualTaskStatus: latestExec.manualTaskStatus ?? null,
+    } : null,
     adaptiveGuardrails: {
       activeActionCount: activeAdaptiveActions.length,
       lastEvaluatedAt: adaptiveState.lastEvaluatedAt,
@@ -128,6 +137,18 @@ export async function GET(req: Request) {
         .filter((t) => t.status === "OPEN" || t.status === "SELECTED" || t.status === "IN_PROGRESS")
         .slice(0, 5)
         .map((t) => t.title),
+      latestManualExecution: (() => {
+        const recent = manualTasks.find(
+          (t) => t.status === "DONE" || t.status === "FAILED" || t.status === "BLOCKED",
+        );
+        if (!recent) return null;
+        return {
+          id: recent.id,
+          title: recent.title,
+          status: recent.status,
+          latestExecutionResult: recent.latestExecutionResult ?? null,
+        };
+      })(),
     },
   });
 }
