@@ -192,6 +192,29 @@ export async function resolveWithVerification(
     };
   }
 
+  // Synthetic drills — auto-resolve without broker verification
+  if (task.synthetic) {
+    task.resolvedAt = new Date().toISOString();
+    await redis.hset(CRITICAL_TASKS_KEY, { [taskId]: task });
+    const syntheticMeta: AttemptMetadata = {
+      lastAttemptAt: task.resolvedAt,
+      lastAttemptResult: "success",
+      lastVerificationResult: "skipped",
+      lastVerificationReason: "synthetic_drill",
+    };
+    await setAttemptMetadata(taskId, syntheticMeta);
+    return {
+      resolved: true,
+      verification: {
+        passed: true,
+        source: "synthetic",
+        reason: "synthetic_drill_auto_resolved",
+        checkedAt: task.resolvedAt,
+      },
+      task,
+    };
+  }
+
   // Run post-fix verification
   const verification = await runPostFixVerification(task);
 

@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { checkAgentCronAuth, unauthorizedAgentResponse } from "@/lib/agents/auth";
 import { readEmBrief, runEmOrchestration } from "@/lib/agents/engineeringManager";
-import { getCriticalTasks } from "@/lib/redis";
+import { getCriticalTasks, partitionCriticalTasks } from "@/lib/redis";
 import { readAdaptiveGuardrailState, getActiveActions } from "@/lib/agents/adaptiveGuardrails";
 import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
 import { listEngineeringTasks } from "@/lib/agents/store";
@@ -26,7 +26,8 @@ export async function GET(req: Request) {
   if (refresh) {
     const result = await runEmOrchestration();
     const criticalTasks = await getCriticalTasks().catch(() => []);
-    const criticalEntries = criticalTasks.map((t) => ({
+    const { blocking, synthetic } = partitionCriticalTasks(criticalTasks);
+    const criticalEntries = blocking.map((t) => ({
       taskId: t.id,
       title: `[CRITICAL] ${t.incidentCode}: ${t.symbol} — ${t.detail}`,
       priority: "CRITICAL" as const,
@@ -37,6 +38,10 @@ export async function GET(req: Request) {
       ok: true,
       fresh: true,
       critical: criticalEntries.length,
+      unresolvedCriticalCount: criticalTasks.length,
+      blockingCriticalCount: blocking.length,
+      syntheticCriticalCount: synthetic.length,
+      selfHealPending: blocking.length > 0,
       criticalTasks: criticalEntries,
       selectedTaskId: result.selectedTaskId,
       selectedTaskTitle: result.selectedTaskTitle,
@@ -74,10 +79,14 @@ export async function GET(req: Request) {
     priority: "CRITICAL" as const,
     source: "protection-integrity",
     createdAt: t.createdAt,
+    synthetic: t.synthetic ?? false,
   }));
 
+  const { blocking: blockingCritical, synthetic: syntheticCritical } = partitionCriticalTasks(criticalTasks);
+
   // CRITICAL tasks override normal priority — surface at top
-  const selfHealPending = criticalTasks.length > 0;
+  // Only BLOCKING (real) incidents should trigger self-heal pending
+  const selfHealPending = blockingCritical.length > 0;
 
   return NextResponse.json({
     ok: true,
@@ -88,8 +97,10 @@ export async function GET(req: Request) {
     selectedTaskTitle: selfHealPending ? criticalEntries[0]?.title ?? brief.selectedTaskTitle : brief.selectedTaskTitle,
     strategistBias: brief.strategistBias,
     learningSignalsSummary: brief.learningSignalsSummary,
-    critical: criticalEntries.length,
-    unresolvedCriticalCount: criticalEntries.length,
+    critical: blockingCritical.length,
+    unresolvedCriticalCount: criticalTasks.length,
+    blockingCriticalCount: blockingCritical.length,
+    syntheticCriticalCount: syntheticCritical.length,
     selfHealPending,
     criticalTasks: criticalEntries,
     scoredTasks: brief.scoredTasks,

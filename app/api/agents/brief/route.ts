@@ -9,8 +9,17 @@ import { NextResponse } from "next/server";
 import { checkAgentCronAuth, unauthorizedAgentResponse } from "@/lib/agents/auth";
 import { getStrategistBrief } from "@/lib/agents/newsStrategist";
 import { readEmBrief } from "@/lib/agents/engineeringManager";
-import { getCriticalTasks } from "@/lib/redis";
-import { readAdaptiveGuardrailState, getActiveActions } from "@/lib/agents/adaptiveGuardrails";
+import { getCriticalTasks, partitionCriticalTasks } from "@/lib/redis";
+import {
+  readAdaptiveGuardrailState,
+  getActiveActions,
+  getEffectiveMaxOpenPositions,
+  getEffectiveMaxEntriesPerDay,
+  getEffectiveMinScoreAdjustment,
+  getEffectiveCooldownAfterLoss,
+  getSuppressedSides,
+} from "@/lib/agents/adaptiveGuardrails";
+import { getGuardrailConfig } from "@/lib/autoEntry/guardrails";
 import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
 import { listEngineeringTasks } from "@/lib/agents/store";
 import { redis } from "@/lib/redis";
@@ -30,11 +39,14 @@ export async function GET(req: Request) {
   ]);
 
   const criticalCount = criticalTasks.length;
-  const selfHealPending = criticalCount > 0;
+  const { blocking: blockingCritical, synthetic: syntheticCritical } = partitionCriticalTasks(criticalTasks);
+  const selfHealPending = blockingCritical.length > 0;
   const criticalIncidentSummary = {
     criticalCount,
+    blockingCriticalCount: blockingCritical.length,
+    syntheticCriticalCount: syntheticCritical.length,
     selfHealPending,
-    topCriticalTasks: criticalTasks.slice(0, 5).map((t) => ({
+    topCriticalTasks: blockingCritical.slice(0, 5).map((t) => ({
       id: t.id,
       incidentCode: t.incidentCode,
       symbol: t.symbol,
@@ -44,6 +56,7 @@ export async function GET(req: Request) {
   };
 
   const activeAdaptiveActions = getActiveActions(adaptiveState);
+  const baseConfig = getGuardrailConfig();
   const ghCapability = checkGitHubWriteCapability();
   const executionReadyTasks = tasks.filter(
     (t) => t.status === "READY_FOR_EXECUTION" || t.executionStatus === "READY",
@@ -88,6 +101,13 @@ export async function GET(req: Request) {
         expiresAt: a.expiresAt,
         appliedValue: a.appliedValue,
       })),
+      effectiveOverrides: {
+        maxOpenPositions: getEffectiveMaxOpenPositions(baseConfig.maxOpenPositions, activeAdaptiveActions),
+        maxEntriesPerDay: getEffectiveMaxEntriesPerDay(baseConfig.maxEntriesPerDay, activeAdaptiveActions),
+        minScoreAdjustment: getEffectiveMinScoreAdjustment(0, activeAdaptiveActions),
+        cooldownAfterLossMin: getEffectiveCooldownAfterLoss(baseConfig.cooldownAfterLossMin, activeAdaptiveActions),
+        suppressedSides: getSuppressedSides(activeAdaptiveActions),
+      },
     },
     executionAutonomy: {
       executionReadyTaskCount: executionReadyTasks.length,

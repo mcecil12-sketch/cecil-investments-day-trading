@@ -3,7 +3,16 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { checkAgentReadAuth, unauthorizedAgentResponse } from "@/lib/agents/auth";
 import { ensureAgentState, listEngineeringTasks, readAgentStateSnapshot } from "@/lib/agents/store";
-import { readAdaptiveGuardrailState, getActiveActions } from "@/lib/agents/adaptiveGuardrails";
+import {
+  readAdaptiveGuardrailState,
+  getActiveActions,
+  getEffectiveMaxOpenPositions,
+  getEffectiveMaxEntriesPerDay,
+  getEffectiveMinScoreAdjustment,
+  getEffectiveCooldownAfterLoss,
+  getSuppressedSides,
+} from "@/lib/agents/adaptiveGuardrails";
+import { getGuardrailConfig } from "@/lib/autoEntry/guardrails";
 import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
 import { redis } from "@/lib/redis";
 import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
@@ -58,6 +67,7 @@ export async function GET(req: Request) {
     .at(-1) ?? null;
 
   const activeAdaptiveActions = getActiveActions(adaptiveState);
+  const baseConfig = getGuardrailConfig();
   const ghCapability = checkGitHubWriteCapability();
   const latestExec: Record<string, unknown> | null = (() => {
     if (!latestExecRaw) return null;
@@ -92,6 +102,13 @@ export async function GET(req: Request) {
         reason: a.reason,
         expiresAt: a.expiresAt,
       })),
+      effectiveOverrides: {
+        maxOpenPositions: getEffectiveMaxOpenPositions(baseConfig.maxOpenPositions, activeAdaptiveActions),
+        maxEntriesPerDay: getEffectiveMaxEntriesPerDay(baseConfig.maxEntriesPerDay, activeAdaptiveActions),
+        minScoreAdjustment: getEffectiveMinScoreAdjustment(0, activeAdaptiveActions),
+        cooldownAfterLossMin: getEffectiveCooldownAfterLoss(baseConfig.cooldownAfterLossMin, activeAdaptiveActions),
+        suppressedSides: getSuppressedSides(activeAdaptiveActions),
+      },
     },
   };
 

@@ -384,6 +384,16 @@ async function resolveBrokerDbMismatch(
 export async function runIncidentResolver(
   task: CriticalTask,
 ): Promise<ActionResult> {
+  // Synthetic drills — no real broker action needed
+  if (task.synthetic) {
+    return {
+      attempted: false,
+      action: "synthetic_drill",
+      ok: true,
+      detail: `Synthetic drill for ${task.incidentCode} on ${task.symbol} — no broker action taken`,
+    };
+  }
+
   // Fetch fresh broker truth (bypass cache by waiting for cache TTL or accepting cached)
   let truth: BrokerTruth;
   try {

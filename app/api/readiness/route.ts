@@ -14,6 +14,7 @@ import {
 } from "@/lib/risk/protection-integrity";
 
 import { readSignals } from "@/lib/jsonDb";
+import { readTodayFunnel } from "@/lib/funnelRedis";
 
 type Check = {
   name: string;
@@ -161,6 +162,7 @@ export async function GET(req: Request) {
   });
 
   const scoredToday = signalsToday.filter((s) => (s?.status || "").toUpperCase() === "SCORED");
+  const pendingToday = signalsToday.filter((s) => (s?.status || "").toUpperCase() === "PENDING");
   const scoresToday = scoredToday
     .map((s) => s?.aiScore)
     .filter((x: any) => typeof x === "number" && Number.isFinite(x));
@@ -170,11 +172,19 @@ export async function GET(req: Request) {
     ? scoresToday.reduce((a: number, b: number) => a + b, 0) / scoresToday.length
     : null;
 
-  const funnelToday = funnel?.today ?? {};
-  const lastScanAt = funnelToday?.lastScanAt ?? null;
-  const lastScanStatus = funnelToday?.lastScanStatus ?? null;
-  const lastScanMode = funnelToday?.lastScanMode ?? null;
-  const lastScanSource = funnelToday?.lastScanSource ?? null;
+  // Direct funnel read (bypasses auth issues for cron callers)
+  let directFunnel: Record<string, any> | null = null;
+  try {
+    directFunnel = await readTodayFunnel();
+  } catch {}
+
+  const funnelToday = funnel?.today ?? directFunnel ?? {};
+  // Prefer direct funnel if the HTTP-fetched funnel is empty
+  const effectiveFunnel = (funnelToday?.scansRun != null) ? funnelToday : (directFunnel ?? funnelToday);
+  const lastScanAt = effectiveFunnel?.lastScanAt ?? null;
+  const lastScanStatus = effectiveFunnel?.lastScanStatus ?? null;
+  const lastScanMode = effectiveFunnel?.lastScanMode ?? null;
+  const lastScanSource = effectiveFunnel?.lastScanSource ?? null;
   const minsSinceLastScan = minutesSince(lastScanAt);
 
   const aiStatus = (aiHealth?.status || "").toString();
@@ -305,17 +315,29 @@ export async function GET(req: Request) {
       lastScanSource,
       lastScanStatus,
       minsSinceLastScan,
-      scansRun: funnelToday?.scansRun ?? null,
-      scansSkipped: funnelToday?.scansSkipped ?? null,
-      scanRunsByMode: funnelToday?.scanRunsByMode ?? null,
-      scanSkipsByMode: funnelToday?.scanSkipsByMode ?? null,
+      scansRun: effectiveFunnel?.scansRun ?? null,
+      scansSkipped: effectiveFunnel?.scansSkipped ?? null,
+      scanRunsByMode: effectiveFunnel?.scanRunsByMode ?? null,
+      scanSkipsByMode: effectiveFunnel?.scanSkipsByMode ?? null,
+      signalsPosted: effectiveFunnel?.signalsPosted ?? null,
+      signalsReceived: effectiveFunnel?.signalsReceived ?? null,
     },
     today: {
       totalSignals: signalsToday.length,
       scored: scoredToday.length,
+      pending: pendingToday.length,
       avgScore: avgScoreToday,
       maxScore: maxScoreToday,
       lastScoredAt,
+      // Signal flow diagnostics
+      signalSourceUsed: "direct_redis_read",
+      recentSignalsWindowUsed: todayEt,
+      recentSignalsFound: signalsToday.length,
+      recentScoredFound: scoredToday.length,
+      storeTotal: signals.length,
+      funnelScansRun: effectiveFunnel?.scansRun ?? 0,
+      funnelSignalsPosted: effectiveFunnel?.signalsPosted ?? 0,
+      funnelGptScored: effectiveFunnel?.gptScored ?? 0,
     },
     autoEntry: {
       etDateUsed: todayEt,
