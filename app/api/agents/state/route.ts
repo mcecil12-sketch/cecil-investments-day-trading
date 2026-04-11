@@ -17,6 +17,7 @@ import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
 import { redis } from "@/lib/redis";
 import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
 import type { EngineeringTask } from "@/lib/agents/types";
+import { listManualActionTasks, countOpenExecutionReadyManualTasks } from "@/lib/agents/manual-action-queue";
 
 function executionVisibilityRank(task: EngineeringTask): number {
   const incidentRank = task.incidentId ? 0 : 100;
@@ -41,7 +42,7 @@ export async function GET(req: Request) {
     return unauthorizedAgentResponse(auth.error);
   }
 
-  const [snapshot, state, tasks, adaptiveState, latestExecRaw] = await Promise.all([
+  const [snapshot, state, tasks, adaptiveState, latestExecRaw, manualTasks, manualCounts] = await Promise.all([
     readAgentStateSnapshot(),
     ensureAgentState(),
     listEngineeringTasks(200).then((t) =>
@@ -49,6 +50,8 @@ export async function GET(req: Request) {
     ),
     readAdaptiveGuardrailState().catch(() => ({ actions: [], lastEvaluatedAt: null, evaluationSource: null })),
     redis ? redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
+    listManualActionTasks({ limit: 5 }).catch(() => []),
+    countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0 })),
   ]);
 
   const openTasks = tasks.filter(
@@ -116,5 +119,15 @@ export async function GET(req: Request) {
     ok: true,
     state: derivedState,
     initialized: snapshot.source !== "stored",
+    manualQueue: {
+      openCount: manualCounts.openCount,
+      inProgressCount: manualCounts.inProgressCount,
+      blockedCount: manualCounts.blockedCount,
+      executionReadyCount: manualCounts.executionReadyCount,
+      nextTitles: manualTasks
+        .filter((t) => t.status === "OPEN" || t.status === "SELECTED" || t.status === "IN_PROGRESS")
+        .slice(0, 5)
+        .map((t) => t.title),
+    },
   });
 }

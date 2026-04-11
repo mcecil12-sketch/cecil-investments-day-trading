@@ -15,6 +15,7 @@ import { listEngineeringTasks } from "@/lib/agents/store";
 import { classifyTaskAsActionable } from "@/lib/agents/patch-executor";
 import { redis } from "@/lib/redis";
 import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
+import { listManualActionTasks, countOpenExecutionReadyManualTasks } from "@/lib/agents/manual-action-queue";
 
 export async function GET(req: Request) {
   const auth = checkAgentCronAuth(req);
@@ -34,6 +35,29 @@ export async function GET(req: Request) {
       source: "protection-integrity",
       createdAt: t.createdAt,
     }));
+    const [manualTasks, manualCounts] = await Promise.all([
+      listManualActionTasks({ limit: 10 }).catch(() => []),
+      countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0 })),
+    ]);
+    const openManualTasks = manualTasks.filter(
+      (t) => t.status === "OPEN" || t.status === "SELECTED" || t.status === "IN_PROGRESS",
+    );
+
+    // Determine selectedSource
+    let selectedSource: string = "autonomous-backlog";
+    let selectedTaskId: string | null = result.selectedTaskId;
+    let selectedTaskTitle: string | null = result.selectedTaskTitle;
+
+    if (blocking.length > 0) {
+      selectedSource = "critical-task-queue";
+      selectedTaskId = criticalEntries[0]?.taskId ?? selectedTaskId;
+      selectedTaskTitle = criticalEntries[0]?.title ?? selectedTaskTitle;
+    } else if (openManualTasks.length > 0 && openManualTasks[0].executionReady) {
+      selectedSource = "manual-action-queue";
+      selectedTaskId = openManualTasks[0].id;
+      selectedTaskTitle = openManualTasks[0].title;
+    }
+
     return NextResponse.json({
       ok: true,
       fresh: true,
@@ -43,10 +67,22 @@ export async function GET(req: Request) {
       syntheticCriticalCount: synthetic.length,
       selfHealPending: blocking.length > 0,
       criticalTasks: criticalEntries,
-      selectedTaskId: result.selectedTaskId,
-      selectedTaskTitle: result.selectedTaskTitle,
+      selectedSource,
+      selectedTaskId,
+      selectedTaskTitle,
       strategistBias: result.strategist.marketBias,
       scoredTasks: result.scoredTasks,
+      manualQueueCount: manualCounts.openCount,
+      manualExecutionReadyCount: manualCounts.executionReadyCount,
+      manualTasks: openManualTasks.slice(0, 5).map((t) => ({
+        id: t.id,
+        title: t.title,
+        priority: t.priority,
+        taskType: t.taskType,
+        status: t.status,
+        executionReady: t.executionReady,
+        createdAt: t.createdAt,
+      })),
     });
   }
 
@@ -55,11 +91,13 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: true, fresh: false, scoredTasks: [], message: "No priorities computed yet. POST /api/agents/run to initialize." });
   }
 
-  const [criticalTasks, adaptiveState, tasks, latestExecRaw] = await Promise.all([
+  const [criticalTasks, adaptiveState, tasks, latestExecRaw, manualTasks, manualCounts] = await Promise.all([
     getCriticalTasks().catch(() => []),
     readAdaptiveGuardrailState().catch(() => ({ actions: [], lastEvaluatedAt: null, evaluationSource: null })),
     listEngineeringTasks(100).catch(() => []),
     redis ? redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
+    listManualActionTasks({ limit: 10 }).catch(() => []),
+    countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0 })),
   ]);
   const activeAdaptiveActions = getActiveActions(adaptiveState);
   const ghCapability = checkGitHubWriteCapability();
@@ -90,13 +128,33 @@ export async function GET(req: Request) {
   // Selected task should prefer blocking (live) incidents over synthetic
   const blockingEntries = criticalEntries.filter((e) => !e.synthetic);
 
+  const openManualTasks = manualTasks.filter(
+    (t) => t.status === "OPEN" || t.status === "SELECTED" || t.status === "IN_PROGRESS",
+  );
+
+  // Determine selectedSource applying priority cascade
+  let selectedSource: string = "autonomous-backlog";
+  let resolvedSelectedTaskId: string | null = brief.selectedTaskId;
+  let resolvedSelectedTaskTitle: string | null = brief.selectedTaskTitle;
+
+  if (selfHealPending) {
+    selectedSource = "critical-task-queue";
+    resolvedSelectedTaskId = blockingEntries[0]?.taskId ?? brief.selectedTaskId;
+    resolvedSelectedTaskTitle = blockingEntries[0]?.title ?? brief.selectedTaskTitle;
+  } else if (openManualTasks.length > 0 && openManualTasks[0].executionReady) {
+    selectedSource = "manual-action-queue";
+    resolvedSelectedTaskId = openManualTasks[0].id;
+    resolvedSelectedTaskTitle = openManualTasks[0].title;
+  }
+
   return NextResponse.json({
     ok: true,
     fresh: false,
     id: brief.id,
     createdAt: brief.createdAt,
-    selectedTaskId: selfHealPending ? blockingEntries[0]?.taskId ?? brief.selectedTaskId : brief.selectedTaskId,
-    selectedTaskTitle: selfHealPending ? blockingEntries[0]?.title ?? brief.selectedTaskTitle : brief.selectedTaskTitle,
+    selectedSource,
+    selectedTaskId: resolvedSelectedTaskId,
+    selectedTaskTitle: resolvedSelectedTaskTitle,
     strategistBias: brief.strategistBias,
     learningSignalsSummary: brief.learningSignalsSummary,
     critical: blockingCritical.length,
@@ -106,6 +164,17 @@ export async function GET(req: Request) {
     selfHealPending,
     criticalTasks: criticalEntries,
     scoredTasks: brief.scoredTasks,
+    manualQueueCount: manualCounts.openCount,
+    manualExecutionReadyCount: manualCounts.executionReadyCount,
+    manualTasks: openManualTasks.slice(0, 5).map((t) => ({
+      id: t.id,
+      title: t.title,
+      priority: t.priority,
+      taskType: t.taskType,
+      status: t.status,
+      executionReady: t.executionReady,
+      createdAt: t.createdAt,
+    })),
     // Phase 4: Adaptive guardrails & execution autonomy
     executionReadyTaskCount: executionReadyTasks.length,
     patchCapable: ghCapability.writeEnabled,

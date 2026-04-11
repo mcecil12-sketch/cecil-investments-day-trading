@@ -24,18 +24,21 @@ import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
 import { listEngineeringTasks } from "@/lib/agents/store";
 import { redis } from "@/lib/redis";
 import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
+import { listManualActionTasks, countOpenExecutionReadyManualTasks } from "@/lib/agents/manual-action-queue";
 
 export async function GET(req: Request) {
   const auth = checkAgentCronAuth(req);
   if (!auth.ok) return unauthorizedAgentResponse(auth.error);
 
-  const [strategist, emBrief, criticalTasks, adaptiveState, tasks, latestExecRaw] = await Promise.all([
+  const [strategist, emBrief, criticalTasks, adaptiveState, tasks, latestExecRaw, manualTasks, manualCounts] = await Promise.all([
     getStrategistBrief().catch(() => null),
     readEmBrief().catch(() => null),
     getCriticalTasks().catch(() => []),
     readAdaptiveGuardrailState().catch(() => ({ actions: [], lastEvaluatedAt: null, evaluationSource: null })),
     listEngineeringTasks(100).catch(() => []),
     redis ? redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
+    listManualActionTasks({ limit: 5 }).catch(() => []),
+    countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0 })),
   ]);
 
   const criticalCount = criticalTasks.length;
@@ -73,6 +76,22 @@ export async function GET(req: Request) {
     ok: true,
     strategist,
     criticalIncidentSummary,
+    manualQueueSummary: {
+      openCount: manualCounts.openCount,
+      executionReadyCount: manualCounts.executionReadyCount,
+      topManualTasks: manualTasks
+        .filter((t) => t.status === "OPEN" || t.status === "SELECTED" || t.status === "IN_PROGRESS")
+        .slice(0, 5)
+        .map((t) => ({
+          id: t.id,
+          title: t.title,
+          priority: t.priority,
+          taskType: t.taskType,
+          status: t.status,
+          executionReady: t.executionReady,
+          createdAt: t.createdAt,
+        })),
+    },
     emBrief: emBrief
       ? {
           id: emBrief.id,

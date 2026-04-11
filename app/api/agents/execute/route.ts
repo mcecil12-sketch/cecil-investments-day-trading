@@ -22,6 +22,14 @@ import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
 import { runLearningAnalysis } from "@/lib/agents/learning-detectors";
 import { applyOneRemediation, checkPendingRemediations } from "@/lib/agents/learning-remediation";
 import { getLedgerSummary, recordLedgerEntry } from "@/lib/agents/learning-ledger";
+import {
+  claimNextManualActionTask,
+  updateManualActionTask,
+  resolveManualActionTask,
+  failManualActionTask,
+  countOpenExecutionReadyManualTasks,
+  type ManualActionTask,
+} from "@/lib/agents/manual-action-queue";
 import type {
   EngineeringTask,
   ExecutionPhase,
@@ -547,6 +555,160 @@ export async function POST(req: NextRequest) {
       };
       await storeLatestExecution(critResult);
       return NextResponse.json(critResult);
+    }
+
+    // ─── Manual Queue Execution (priority B) ─────────────────────────
+    // After critical incidents are resolved, check for execution-ready
+    // manual queue tasks before falling through to autonomous backlog.
+    const manualCounts = await countOpenExecutionReadyManualTasks().catch(() => ({
+      openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0,
+    }));
+
+    if (manualCounts.executionReadyCount > 0) {
+      const manualTask = await claimNextManualActionTask();
+      if (manualTask) {
+        const now = new Date().toISOString();
+
+        // Mark as IN_PROGRESS
+        await updateManualActionTask(manualTask.id, {
+          status: "IN_PROGRESS",
+        });
+        const updatedManualTask = { ...manualTask, status: "IN_PROGRESS" as const, startedAt: now };
+
+        // Run safe execution gate for manual tasks too
+        let manualGateResult: GateResult | null = null;
+        try {
+          // Use a synthetic critical task shape just for gate validation
+          manualGateResult = await runSafeExecutionGate({
+            id: manualTask.id,
+            incidentCode: "MANUAL_QUEUE",
+            symbol: "SYSTEM",
+            severity: manualTask.priority,
+            detail: manualTask.title,
+            createdAt: manualTask.createdAt,
+          });
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          manualGateResult = {
+            passed: false,
+            buildOk: false,
+            buildProbe: { route: "/api/agents/state", ok: false, status: null, reason: errMsg },
+            smokeOk: false,
+            smokeProbes: [],
+            validatedAt: now,
+            failureReason: `gate_exception: ${errMsg}`,
+            baseUrl: "unknown",
+            authMode: "unknown",
+          };
+        }
+
+        if (manualGateResult && !manualGateResult.passed) {
+          // Gate failed — block the manual task
+          await updateManualActionTask(manualTask.id, {
+            status: "BLOCKED",
+            blockedReason: manualGateResult.failureReason ?? "safe_execution_gate_failed",
+          });
+
+          const blockedResult = {
+            ok: true,
+            message: "Manual queue task blocked: safe execution gate failed",
+            executionStatus: "MANUAL_TASK_BLOCKED",
+            selectedSource: "manual-action-queue",
+            selectedTaskId: manualTask.id,
+            selectedTaskTitle: manualTask.title,
+            patchApplied: false,
+            safeExecutionGate: manualGateResult,
+            manualQueueCounts: manualCounts,
+            executionPhases: [
+              phaseResult("SELECT_TASK", "passed", "manual_queue"),
+              phaseResult("APPLY_PATCH", "failed", manualGateResult.failureReason ?? "gate_failed"),
+            ],
+            verification: { buildOk: manualGateResult.buildOk, smokeOk: manualGateResult.smokeOk, details: {} },
+            resolution: { resolved: false, reason: "gate_failed" },
+            adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          };
+          await storeLatestExecution(blockedResult);
+          return NextResponse.json(blockedResult);
+        }
+
+        if (dryRun) {
+          // Dry run: don't mutate beyond selection, report plan
+          // Revert to SELECTED so it can be claimed again
+          await updateManualActionTask(manualTask.id, { status: "OPEN" });
+
+          const dryRunResult = {
+            ok: true,
+            dryRun: true,
+            executionStatus: "MANUAL_TASK_SELECTED",
+            selectedSource: "manual-action-queue",
+            selectedTaskId: manualTask.id,
+            selectedTaskTitle: manualTask.title,
+            patchApplied: false,
+            manualTask: {
+              id: manualTask.id,
+              title: manualTask.title,
+              description: manualTask.description,
+              priority: manualTask.priority,
+              taskType: manualTask.taskType,
+              executionReady: manualTask.executionReady,
+              acceptanceCriteria: manualTask.acceptanceCriteria,
+              fileHints: manualTask.fileHints,
+              routeHints: manualTask.routeHints,
+            },
+            manualQueueCounts: manualCounts,
+            executionPhases: [
+              phaseResult("SELECT_TASK", "passed", "manual_queue"),
+              phaseResult("APPLY_PATCH", "skipped", "dry_run"),
+              phaseResult("VERIFY", "skipped", "dry_run"),
+              phaseResult("RESOLVE_OR_FAIL", "skipped", "dry_run"),
+            ],
+            verification: { buildOk: true, smokeOk: true, details: {} },
+            resolution: { resolved: false, reason: "dry_run" },
+            adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+          };
+          await storeLatestExecution(dryRunResult);
+          return NextResponse.json(dryRunResult);
+        }
+
+        // Non-dry-run: Manual task selected for execution.
+        // If the system has full patch execution plumbing for this task, it
+        // would be wired here. For now, we truthfully report selection and
+        // return an execution plan so external executors can act on it.
+        const manualResult = {
+          ok: true,
+          executionStatus: "MANUAL_TASK_SELECTED",
+          selectedSource: "manual-action-queue",
+          selectedTaskId: manualTask.id,
+          selectedTaskTitle: manualTask.title,
+          patchApplied: false,
+          manualTask: {
+            id: updatedManualTask.id,
+            title: updatedManualTask.title,
+            description: updatedManualTask.description,
+            objective: updatedManualTask.objective,
+            priority: updatedManualTask.priority,
+            taskType: updatedManualTask.taskType,
+            executionReady: updatedManualTask.executionReady,
+            status: updatedManualTask.status,
+            acceptanceCriteria: updatedManualTask.acceptanceCriteria,
+            fileHints: updatedManualTask.fileHints,
+            routeHints: updatedManualTask.routeHints,
+          },
+          manualQueueCounts: manualCounts,
+          safeExecutionGate: manualGateResult,
+          executionPhases: [
+            phaseResult("SELECT_TASK", "passed", "manual_queue"),
+            phaseResult("APPLY_PATCH", "skipped", "manual_task_awaiting_executor"),
+            phaseResult("VERIFY", "skipped", "pending"),
+            phaseResult("RESOLVE_OR_FAIL", "skipped", "pending"),
+          ],
+          verification: { buildOk: true, smokeOk: true, details: {} },
+          resolution: { resolved: false, reason: "manual_task_in_progress" },
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        };
+        await storeLatestExecution(manualResult);
+        return NextResponse.json(manualResult);
+      }
     }
 
     // ─── Learning Analysis + Safe Remediation ────────────────────────
