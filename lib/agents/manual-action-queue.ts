@@ -375,6 +375,7 @@ export async function countOpenExecutionReadyManualTasks(): Promise<{
   executionReadyCount: number;
   inProgressCount: number;
   blockedCount: number;
+  selectedCount: number;
 }> {
   const tasks = await getAllTasks();
   const active = tasks.filter(
@@ -385,5 +386,92 @@ export async function countOpenExecutionReadyManualTasks(): Promise<{
     executionReadyCount: active.filter((t) => t.executionReady && (t.status === "OPEN" || t.status === "SELECTED")).length,
     inProgressCount: active.filter((t) => t.status === "IN_PROGRESS").length,
     blockedCount: active.filter((t) => t.status === "BLOCKED").length,
+    selectedCount: active.filter((t) => t.status === "SELECTED").length,
   };
+}
+
+// ─── Stale Task Recovery ──────────────────────────────────────────────
+
+const STALE_IN_PROGRESS_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+const STALE_SELECTED_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+export interface StaleRecoveryResult {
+  recoveredCount: number;
+  recovered: Array<{ id: string; title: string; previousStatus: ManualActionStatus; reason: string }>;
+}
+
+/** Recover stale IN_PROGRESS and SELECTED tasks that have exceeded timeout thresholds. */
+export async function recoverStaleManualTasks(): Promise<StaleRecoveryResult> {
+  const tasks = await getAllTasks();
+  const now = Date.now();
+  const recovered: StaleRecoveryResult["recovered"] = [];
+
+  for (const task of tasks) {
+    if (task.status === "IN_PROGRESS" && task.startedAt) {
+      const startedMs = new Date(task.startedAt).getTime();
+      if (now - startedMs > STALE_IN_PROGRESS_TIMEOUT_MS) {
+        await failManualActionTask(task.id, {
+          ok: false,
+          summary: `Stale recovery: IN_PROGRESS for ${Math.round((now - startedMs) / 60000)}m without completion`,
+          error: "stale_in_progress_timeout",
+        });
+        recovered.push({
+          id: task.id,
+          title: task.title,
+          previousStatus: "IN_PROGRESS",
+          reason: `stale_timeout_${Math.round((now - startedMs) / 60000)}m`,
+        });
+      }
+    } else if (task.status === "SELECTED" && task.selectedAt) {
+      const selectedMs = new Date(task.selectedAt).getTime();
+      if (now - selectedMs > STALE_SELECTED_TIMEOUT_MS) {
+        // Release back to OPEN so it can be re-claimed
+        await releaseManualActionTask(task.id, "stale_selected_timeout");
+        recovered.push({
+          id: task.id,
+          title: task.title,
+          previousStatus: "SELECTED",
+          reason: `stale_selected_timeout_${Math.round((now - selectedMs) / 60000)}m`,
+        });
+      }
+    }
+  }
+
+  return { recoveredCount: recovered.length, recovered };
+}
+
+// ─── Duplicate Detection ──────────────────────────────────────────────
+
+function normalizeTitle(title: string): string {
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+}
+
+/** Check if a duplicate OPEN or IN_PROGRESS task exists with the same normalized title and taskType. */
+export async function findDuplicateManualTask(
+  title: string,
+  taskType: ManualActionTask["taskType"],
+): Promise<ManualActionTask | null> {
+  const tasks = await getAllTasks();
+  const normalizedInput = normalizeTitle(title);
+  const activeStatuses: ManualActionStatus[] = ["OPEN", "SELECTED", "IN_PROGRESS"];
+
+  return tasks.find(
+    (t) =>
+      activeStatuses.includes(t.status) &&
+      t.taskType === taskType &&
+      normalizeTitle(t.title) === normalizedInput,
+  ) ?? null;
+}
+
+/** Check if any active manual task (OPEN/SELECTED/IN_PROGRESS) exists and is execution-relevant. */
+export async function getActiveManualTask(): Promise<ManualActionTask | null> {
+  const tasks = await getAllTasks();
+  const active = tasks
+    .filter((t) => t.status === "IN_PROGRESS" || t.status === "SELECTED" || (t.status === "OPEN" && t.executionReady))
+    .sort((a, b) => {
+      // IN_PROGRESS first, then SELECTED, then OPEN
+      const statusRank: Record<string, number> = { IN_PROGRESS: 0, SELECTED: 1, OPEN: 2 };
+      return (statusRank[a.status] ?? 3) - (statusRank[b.status] ?? 3);
+    });
+  return active[0] ?? null;
 }

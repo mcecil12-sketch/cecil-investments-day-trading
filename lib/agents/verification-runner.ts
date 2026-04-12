@@ -33,20 +33,35 @@ interface ProbeResult {
   ok: boolean;
   status: number | null;
   reason: string | null;
+  method?: string;
 }
 
-async function probeRoute(base: string, route: string, headers: Record<string, string>): Promise<ProbeResult> {
+async function probeRoute(
+  base: string,
+  route: string,
+  headers: Record<string, string>,
+  method: "GET" | "POST" = "GET",
+  body?: Record<string, unknown>,
+): Promise<ProbeResult> {
   try {
-    const res = await fetch(`${base}${route}`, {
-      method: "GET",
-      headers,
+    const fetchOptions: RequestInit = {
+      method,
+      headers: {
+        ...headers,
+        ...(method === "POST" ? { "content-type": "application/json" } : {}),
+      },
       signal: AbortSignal.timeout(10_000),
-    });
+    };
+    if (method === "POST" && body) {
+      fetchOptions.body = JSON.stringify(body);
+    }
+    const res = await fetch(`${base}${route}`, fetchOptions);
     return {
       route,
       ok: res.ok,
       status: res.status,
       reason: res.ok ? null : `HTTP ${res.status}`,
+      method,
     };
   } catch (err) {
     return {
@@ -54,6 +69,7 @@ async function probeRoute(base: string, route: string, headers: Record<string, s
       ok: false,
       status: null,
       reason: err instanceof Error ? err.message : String(err),
+      method,
     };
   }
 }
@@ -62,16 +78,27 @@ async function probeRoute(base: string, route: string, headers: Record<string, s
 
 const DEFAULT_SMOKE_ROUTES = ["/api/readiness", "/api/trades/protection-audit"];
 
-function getTaskSmokeRoutes(task: EngineeringTask): string[] {
-  const routes: string[] = [];
+function getTaskSmokeRoutes(task: EngineeringTask): Array<{ route: string; method: "GET" | "POST" }> {
+  const routes: Array<{ route: string; method: "GET" | "POST" }> = [];
+  const seen = new Set<string>();
+
+  function addRoute(route: string, method: "GET" | "POST" = "GET") {
+    const key = `${method}:${route}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      routes.push({ route, method });
+    }
+  }
+
   if (task.validationPlan?.smokeChecks) {
     for (const check of task.validationPlan.smokeChecks) {
       const trimmed = check.trim();
       if (trimmed.startsWith("/api/")) {
-        routes.push(trimmed);
+        addRoute(trimmed, "GET");
       } else if (trimmed.startsWith("GET ") || trimmed.startsWith("POST ")) {
+        const method = trimmed.startsWith("POST ") ? "POST" : "GET";
         const path = trimmed.replace(/^(GET|POST)\s+/, "").trim();
-        if (path.startsWith("/api/")) routes.push(path);
+        if (path.startsWith("/api/")) addRoute(path, method);
       }
     }
   }
@@ -79,14 +106,47 @@ function getTaskSmokeRoutes(task: EngineeringTask): string[] {
     for (const line of task.smokeTestBlock.split("\n")) {
       const trimmed = line.trim();
       if (trimmed.startsWith("/api/")) {
-        routes.push(trimmed);
+        addRoute(trimmed, "GET");
       } else if (trimmed.startsWith("GET ") || trimmed.startsWith("POST ")) {
+        const method = trimmed.startsWith("POST ") ? "POST" : "GET";
         const path = trimmed.replace(/^(GET|POST)\s+/, "").trim();
-        if (path.startsWith("/api/")) routes.push(path);
+        if (path.startsWith("/api/")) addRoute(path, method);
       }
     }
   }
-  return [...new Set(routes)];
+  return routes;
+}
+
+// ─── Task-type-specific verification strategies ─────────────────────
+
+/** Known route→method mapping for routes that don't accept GET. */
+const KNOWN_POST_ROUTES: Record<string, { method: "POST"; body?: Record<string, unknown> }> = {
+  "/api/ai/score/drain": { method: "POST", body: { budgetMs: 5000, limit: 1 } },
+};
+
+/** Returns task-type-specific verification probes based on the task's characteristics. */
+function getTaskTypeVerificationProbes(task: EngineeringTask): Array<{
+  route: string;
+  method: "GET" | "POST";
+  body?: Record<string, unknown>;
+  label: string;
+}> {
+  // Detect SCORING tasks by title, taskType hint, or route hints
+  const isScoringTask =
+    task.title?.toLowerCase().includes("scoring") ||
+    task.title?.toLowerCase().includes("score") ||
+    task.title?.toLowerCase().includes("drain") ||
+    (task.validationPlan?.smokeChecks ?? []).some((c) => c.includes("/api/ai/score/drain"));
+
+  if (isScoringTask) {
+    return [
+      { route: "/api/ai/score/drain", method: "POST", body: { budgetMs: 5000, limit: 1 }, label: "scoring_drain_reachable" },
+      { route: "/api/signals/all", method: "GET", label: "signals_all_reachable" },
+      { route: "/api/readiness", method: "GET", label: "readiness_reachable" },
+    ];
+  }
+
+  return [];
 }
 
 // ─── Main Runner ────────────────────────────────────────────────────
@@ -112,18 +172,40 @@ export async function runStructuredVerification(
     console.log(`[VERIFY] Smoke probe: ${result.ok ? "PASS" : "FAIL"} (${result.route})`);
   }
 
-  // 3. Task-specific probes
+  // 3. Task-specific probes (from smokeChecks / smokeTestBlock with correct methods)
   const taskRoutes = getTaskSmokeRoutes(task);
-  const taskResults: Array<{ target: string; ok: boolean; detail: string | null }> = [];
-  for (const route of taskRoutes) {
-    if (DEFAULT_SMOKE_ROUTES.includes(route)) continue; // already probed
-    const result = await probeRoute(base, route, headers);
+  const taskResults: Array<{ target: string; ok: boolean; detail: string | null; method?: string }> = [];
+  for (const { route, method } of taskRoutes) {
+    if (DEFAULT_SMOKE_ROUTES.includes(route) && method === "GET") continue; // already probed
+    // Check known POST routes override
+    const knownOverride = KNOWN_POST_ROUTES[route];
+    const probeMethod = knownOverride?.method ?? method;
+    const probeBody = knownOverride?.body;
+    const result = await probeRoute(base, route, headers, probeMethod, probeBody);
     taskResults.push({
       target: route,
       ok: result.ok,
       detail: result.reason,
+      method: probeMethod,
     });
-    console.log(`[VERIFY] Task probe: ${result.ok ? "PASS" : "FAIL"} (${result.route})`);
+    console.log(`[VERIFY] Task probe: ${result.ok ? "PASS" : "FAIL"} (${probeMethod} ${result.route})`);
+  }
+
+  // 4. Task-type-specific verification probes (scoring, scanner, etc.)
+  const typeProbes = getTaskTypeVerificationProbes(task);
+  for (const { route, method, body, label } of typeProbes) {
+    // Skip if already probed in task-specific or default probes
+    const alreadyProbed = taskResults.some((r) => r.target === route) ||
+      (DEFAULT_SMOKE_ROUTES.includes(route) && method === "GET");
+    if (alreadyProbed) continue;
+    const result = await probeRoute(base, route, headers, method, body);
+    taskResults.push({
+      target: route,
+      ok: result.ok,
+      detail: result.ok ? null : `${label}: ${result.reason}`,
+      method,
+    });
+    console.log(`[VERIFY] Type probe: ${result.ok ? "PASS" : "FAIL"} (${method} ${result.route} [${label}])`);
   }
 
   const buildOk = buildProbe.ok;

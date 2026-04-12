@@ -30,6 +30,8 @@ import {
   blockManualActionTask,
   failManualActionTask,
   countOpenExecutionReadyManualTasks,
+  recoverStaleManualTasks,
+  getActiveManualTask,
   type ManualActionTask,
 } from "@/lib/agents/manual-action-queue";
 import { executeManualTask } from "@/lib/agents/manual-task-executor";
@@ -564,51 +566,96 @@ export async function POST(req: NextRequest) {
     // After critical incidents are resolved, check for execution-ready
     // manual queue tasks before falling through to autonomous backlog.
     // Lifecycle: SELECT -> CLAIM -> APPLY PATCH -> VERIFY -> RESOLVE/FAIL
+
+    // Step 1: Recover stale tasks before counting
+    let staleRecovery = { recoveredCount: 0, recovered: [] as Array<{ id: string; title: string; previousStatus: string; reason: string }> };
+    try {
+      staleRecovery = await recoverStaleManualTasks();
+      if (staleRecovery.recoveredCount > 0) {
+        console.log(`[AGENT-EXECUTE] Stale recovery: ${staleRecovery.recoveredCount} tasks recovered`, staleRecovery.recovered);
+      }
+    } catch (err) {
+      console.warn("[AGENT-EXECUTE] Stale recovery failed (non-fatal):", err);
+    }
+
     const manualCounts = await countOpenExecutionReadyManualTasks().catch(() => ({
-      openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0,
+      openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0, selectedCount: 0,
     }));
 
-    if (manualCounts.executionReadyCount > 0) {
-      // ── DRY RUN: peek only, never mutate ──────────────────────────
+    // Step 2: Check if any active manual task exists (IN_PROGRESS, SELECTED, or execution-ready OPEN)
+    // If so, manual queue MUST remain the top execution path — never drift to engineering backlog
+    const activeManualTask = await getActiveManualTask().catch(() => null);
+    const hasActiveManualTask = activeManualTask !== null;
+    const hasManualWork = manualCounts.executionReadyCount > 0 || manualCounts.inProgressCount > 0 || manualCounts.selectedCount > 0;
+
+    if (hasManualWork) {
+      // ── DRY RUN: peek only, ZERO mutations ────────────────────────
       if (dryRun) {
-        const peekedTask = await peekNextManualActionTask();
-        if (peekedTask) {
-          const dryRunResult = {
-            ok: true,
-            dryRun: true,
-            executionStatus: "MANUAL_TASK_DRY_RUN",
-            selectedSource: "manual-action-queue",
-            selectedTaskId: peekedTask.id,
-            selectedTaskTitle: peekedTask.title,
-            patchApplied: false,
-            manualTask: {
-              id: peekedTask.id,
-              title: peekedTask.title,
-              description: peekedTask.description,
-              priority: peekedTask.priority,
-              taskType: peekedTask.taskType,
-              executionReady: peekedTask.executionReady,
-              status: peekedTask.status,
-              acceptanceCriteria: peekedTask.acceptanceCriteria,
-              fileHints: peekedTask.fileHints,
-              routeHints: peekedTask.routeHints,
-            },
-            manualQueueCounts: manualCounts,
-            manualTaskStatus: peekedTask.status,
-            executionPhases: [
-              phaseResult("SELECT_TASK", "passed", "manual_queue_dry_run"),
-              phaseResult("CLAIM_TASK", "skipped", "dry_run"),
-              phaseResult("APPLY_PATCH", "skipped", "dry_run"),
-              phaseResult("VERIFY", "skipped", "dry_run"),
-              phaseResult("RESOLVE_OR_FAIL", "skipped", "dry_run"),
-            ],
-            verification: { buildOk: true, smokeOk: true, details: {} },
-            resolution: { resolved: false, reason: "dry_run" },
-            adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
-          };
-          await storeLatestExecution(dryRunResult);
-          return NextResponse.json(dryRunResult);
-        }
+        // For dry run, show either the active task or the next peeked task
+        const dryRunTask = activeManualTask ?? await peekNextManualActionTask();
+        const dryRunResult = {
+          ok: true,
+          dryRun: true,
+          executionStatus: "MANUAL_TASK_DRY_RUN",
+          selectedSource: "manual-action-queue",
+          selectedTaskId: dryRunTask?.id ?? null,
+          selectedTaskTitle: dryRunTask?.title ?? null,
+          patchApplied: false,
+          commitSha: null,
+          manualTask: dryRunTask ? {
+            id: dryRunTask.id,
+            title: dryRunTask.title,
+            description: dryRunTask.description,
+            priority: dryRunTask.priority,
+            taskType: dryRunTask.taskType,
+            executionReady: dryRunTask.executionReady,
+            status: dryRunTask.status,
+            acceptanceCriteria: dryRunTask.acceptanceCriteria,
+            fileHints: dryRunTask.fileHints,
+            routeHints: dryRunTask.routeHints,
+          } : null,
+          manualQueueCounts: manualCounts,
+          manualTaskStatus: dryRunTask?.status ?? null,
+          staleRecovery: staleRecovery.recoveredCount > 0 ? staleRecovery : undefined,
+          executionPhases: [
+            phaseResult("SELECT_TASK", "passed", dryRunTask ? "manual_queue_dry_run" : "no_manual_task_available"),
+            phaseResult("CLAIM_TASK", "skipped", "dry_run"),
+            phaseResult("APPLY_PATCH", "skipped", "dry_run"),
+            phaseResult("VERIFY", "skipped", "dry_run"),
+            phaseResult("RESOLVE_OR_FAIL", "skipped", "dry_run"),
+          ],
+          verification: { buildOk: true, smokeOk: true, details: {} },
+          resolution: { resolved: false, reason: "dry_run" },
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        };
+        // dryRun: NO storeLatestExecution — zero mutations
+        return NextResponse.json(dryRunResult);
+      }
+
+      // ── Check for stuck IN_PROGRESS task (block execution, don't start new) ──
+      if (manualCounts.inProgressCount > 0 && activeManualTask?.status === "IN_PROGRESS") {
+        // There's already a task in progress — don't claim another one, report it
+        const stuckResult = {
+          ok: false,
+          executionStatus: "MANUAL_TASK_IN_PROGRESS",
+          selectedSource: "manual-action-queue",
+          selectedTaskId: activeManualTask.id,
+          selectedTaskTitle: activeManualTask.title,
+          patchApplied: false,
+          manualTaskStatus: "IN_PROGRESS",
+          manualQueueCounts: manualCounts,
+          staleRecovery: staleRecovery.recoveredCount > 0 ? staleRecovery : undefined,
+          executionPhases: [
+            phaseResult("SELECT_TASK", "passed", "manual_queue_in_progress_exists"),
+            phaseResult("CLAIM_TASK", "skipped", "task_already_in_progress"),
+          ],
+          verification: { buildOk: true, smokeOk: true, details: {} },
+          resolution: { resolved: false, reason: "manual_task_already_in_progress" },
+          message: `Manual task ${activeManualTask.id} is still IN_PROGRESS — waiting for completion or stale recovery`,
+          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        };
+        await storeLatestExecution(stuckResult);
+        return NextResponse.json(stuckResult);
       }
 
       // ── REAL EXECUTION: claim -> gate -> execute -> resolve ────────
@@ -823,6 +870,29 @@ export async function POST(req: NextRequest) {
           return NextResponse.json(failedExecResult);
         }
       }
+    } else if (hasActiveManualTask) {
+      // Manual task exists (maybe BLOCKED or non-executionReady) — report status, don't drift to backlog
+      // This only triggers if the active task isn't execution-ready but still requires attention
+      const manualBlockResult = {
+        ok: true,
+        executionStatus: "MANUAL_QUEUE_ACTIVE_NOT_READY",
+        selectedSource: "manual-action-queue",
+        selectedTaskId: activeManualTask!.id,
+        selectedTaskTitle: activeManualTask!.title,
+        patchApplied: false,
+        manualTaskStatus: activeManualTask!.status,
+        manualQueueCounts: manualCounts,
+        staleRecovery: staleRecovery.recoveredCount > 0 ? staleRecovery : undefined,
+        executionPhases: [
+          phaseResult("SELECT_TASK", "passed", "manual_queue_active_not_ready"),
+        ],
+        verification: { buildOk: true, smokeOk: true, details: {} },
+        resolution: { resolved: false, reason: "manual_task_active_but_not_execution_ready" },
+        message: `Manual task ${activeManualTask!.id} (${activeManualTask!.status}) is active — won't drift to engineering backlog`,
+        adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+      };
+      await storeLatestExecution(manualBlockResult);
+      return NextResponse.json(manualBlockResult);
     }
 
     // ─── Learning Analysis + Safe Remediation ────────────────────────
@@ -973,12 +1043,12 @@ export async function POST(req: NextRequest) {
           ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
           dryRun,
         };
-        await storeLatestExecution(fullResult);
+        if (!dryRun) await storeLatestExecution(fullResult);
         return NextResponse.json(fullResult);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         phases.push(phaseResult("APPLY_PATCH", "failed", message));
-        await blockExecution(task, message);
+        if (!dryRun) await blockExecution(task, message);
 
         const result = {
           ok: false,
@@ -987,7 +1057,7 @@ export async function POST(req: NextRequest) {
           selectedSource: "engineering-backlog",
           selectedTaskId: task.id,
           selectedTaskTitle: task.title,
-          executionStatus: "FAILED",
+          executionStatus: dryRun ? "DRY_RUN" : "FAILED",
           executionPhases: phases,
           patchApplied: false,
           githubWriteCapability: ghCapability,
@@ -996,8 +1066,9 @@ export async function POST(req: NextRequest) {
           failure: { phase: "APPLY_PATCH", reason: message },
           adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
           ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
+          dryRun,
         };
-        await storeLatestExecution(result);
+        if (!dryRun) await storeLatestExecution(result);
         return NextResponse.json(result, { status: 500 });
       }
     }
@@ -1139,12 +1210,12 @@ export async function POST(req: NextRequest) {
           ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
           dryRun,
         };
-        await storeLatestExecution(fullResult);
+        if (!dryRun) await storeLatestExecution(fullResult);
         return NextResponse.json(fullResult);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         phases.push(phaseResult("APPLY_PATCH", "failed", message));
-        await blockExecution(preparedTask, message);
+        if (!dryRun) await blockExecution(preparedTask, message);
         const result = {
           ok: false,
           error: message,
@@ -1152,7 +1223,7 @@ export async function POST(req: NextRequest) {
           selectedSource: "engineering-backlog",
           selectedTaskId: task.id,
           selectedTaskTitle: task.title,
-          executionStatus: "FAILED",
+          executionStatus: dryRun ? "DRY_RUN" : "FAILED",
           executionPhases: phases,
           patchApplied: false,
           githubWriteCapability: ghCapability,
@@ -1161,8 +1232,9 @@ export async function POST(req: NextRequest) {
           failure: { phase: "APPLY_PATCH", reason: message },
           adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
           ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
+          dryRun,
         };
-        await storeLatestExecution(result);
+        if (!dryRun) await storeLatestExecution(result);
         return NextResponse.json(result, { status: 500 });
       }
     }

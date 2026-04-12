@@ -17,7 +17,7 @@ import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
 import { redis } from "@/lib/redis";
 import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
 import type { EngineeringTask } from "@/lib/agents/types";
-import { listManualActionTasks, countOpenExecutionReadyManualTasks } from "@/lib/agents/manual-action-queue";
+import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask } from "@/lib/agents/manual-action-queue";
 
 function executionVisibilityRank(task: EngineeringTask): number {
   const incidentRank = task.incidentId ? 0 : 100;
@@ -42,7 +42,7 @@ export async function GET(req: Request) {
     return unauthorizedAgentResponse(auth.error);
   }
 
-  const [snapshot, state, tasks, adaptiveState, latestExecRaw, manualTasks, manualCounts] = await Promise.all([
+  const [snapshot, state, tasks, adaptiveState, latestExecRaw, manualTasks, manualCounts, activeManualTask] = await Promise.all([
     readAgentStateSnapshot(),
     ensureAgentState(),
     listEngineeringTasks(200).then((t) =>
@@ -51,7 +51,8 @@ export async function GET(req: Request) {
     readAdaptiveGuardrailState().catch(() => ({ actions: [], lastEvaluatedAt: null, evaluationSource: null })),
     redis ? redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
     listManualActionTasks({ limit: 10 }).catch(() => []),
-    countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0 })),
+    countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0, selectedCount: 0 })),
+    getActiveManualTask().catch(() => null),
   ]);
 
   const openTasks = tasks.filter(
@@ -133,6 +134,16 @@ export async function GET(req: Request) {
       inProgressCount: manualCounts.inProgressCount,
       blockedCount: manualCounts.blockedCount,
       executionReadyCount: manualCounts.executionReadyCount,
+      selectedCount: manualCounts.selectedCount,
+      activeManualTask: activeManualTask ? {
+        id: activeManualTask.id,
+        title: activeManualTask.title,
+        status: activeManualTask.status,
+        priority: activeManualTask.priority,
+        taskType: activeManualTask.taskType,
+        startedAt: activeManualTask.startedAt,
+        selectedAt: activeManualTask.selectedAt,
+      } : null,
       nextTitles: manualTasks
         .filter((t) => t.status === "OPEN" || t.status === "SELECTED" || t.status === "IN_PROGRESS")
         .slice(0, 5)

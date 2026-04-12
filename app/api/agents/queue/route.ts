@@ -6,6 +6,7 @@ import {
   createManualActionTask,
   listManualActionTasks,
   countOpenExecutionReadyManualTasks,
+  findDuplicateManualTask,
   type ManualActionStatus,
   type ManualActionTaskInput,
 } from "@/lib/agents/manual-action-queue";
@@ -77,6 +78,26 @@ export async function POST(req: NextRequest) {
       { ok: false, error: `Invalid taskType. Must be one of: ${validTypes.join(", ")}` },
       { status: 400 },
     );
+  }
+
+  // Duplicate protection: check for existing OPEN/SELECTED/IN_PROGRESS task with same title+taskType
+  const url = new URL(req.url);
+  const forceDuplicate = url.searchParams.get("force") === "1";
+  if (!forceDuplicate) {
+    const duplicate = await findDuplicateManualTask(body.title, body.taskType);
+    if (duplicate) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Duplicate task already exists in active state",
+          duplicateTaskId: duplicate.id,
+          duplicateStatus: duplicate.status,
+          duplicateTitle: duplicate.title,
+          hint: "Add ?force=1 to create anyway",
+        },
+        { status: 409 },
+      );
+    }
   }
 
   const task = await createManualActionTask(body);
