@@ -21,8 +21,8 @@ export const maxDuration = 120; // Allow up to 120s runtime on Vercel/Next.js
 // Execution guards: wall-clock timeout and max signals per run
 // budgetMs is passed as query param; we cap it at HARD_CAP_MS to respect maxDuration=120
 const HARD_CAP_MS = 110000; // ~110s internal budget (maxDuration=120s with safety margin)
-const SOFT_STOP_MARGIN_MS = 2000; // Stop starting new work when <2s remaining (reduced from 8s)
-const MAX_PER_RUN = Number(process.env.AI_SCORE_DRAIN_MAX ?? 25);
+const SOFT_STOP_MARGIN_MS = 2000; // Stop starting new work when <2s remaining
+const MAX_PER_RUN = Number(process.env.AI_SCORE_DRAIN_MAX ?? 100); // Safety cap: max signals per invocation
 const SCORING_CONCURRENCY = Number(
   process.env.AI_SCORE_CONCURRENCY ?? process.env.AI_SCORE_DRAIN_CONCURRENCY ?? 5
 ); // Parallel scoring workers
@@ -32,10 +32,16 @@ const AI_SCORE_FRESH_HOURS = Number(process.env.AI_SCORE_FRESH_HOURS ?? 24); // 
 const AI_SCORE_RECOVERY_HOURS = Number(process.env.AI_SCORE_RECOVERY_HOURS ?? 48); // Window for recovery mode (default 48h)
 
 // Performance tuning: batching
-const AI_SCORE_BATCH_SIZE = Number(process.env.AI_SCORE_BATCH_SIZE ?? 12); // Target number of scorer attempts per run
-const AI_SCORE_CLAIM_BATCH_SIZE = Number(process.env.AI_SCORE_CLAIM_BATCH_SIZE ?? 0); // 0 means auto sizing
-const AI_SCORE_MAX_CANDIDATE_SCAN = Number(process.env.AI_SCORE_MAX_CANDIDATE_SCAN ?? 80);
-const AI_SCORE_DEFAULT_CLAIM_MULTIPLIER = Number(process.env.AI_SCORE_CLAIM_MULTIPLIER ?? 2);
+// SCORE_DRAIN_BATCH_SIZE controls how many signals are scored per iteration of the loop.
+// The drain loops until budget exhausted, MAX_PER_RUN reached, or no eligible signals remain.
+const SCORE_DRAIN_BATCH_SIZE = Number(
+  process.env.SCORE_DRAIN_BATCH_SIZE ?? process.env.AI_SCORE_BATCH_SIZE ?? 25
+);
+const AI_SCORE_MAX_CANDIDATE_SCAN = Number(process.env.AI_SCORE_MAX_CANDIDATE_SCAN ?? 200);
+
+// Reclaim configuration
+const RECLAIM_STALE_MINUTES = Number(process.env.SCORE_DRAIN_RECLAIM_MINUTES ?? 10);
+const MAX_SCORING_RETRIES = Number(process.env.SCORE_DRAIN_MAX_RETRIES ?? 3);
 
 const DRAIN_LOCK_KEY = "ai:score:drain:lock";
 const DRAIN_LOCK_TTL_MAX = 120; // seconds
@@ -487,24 +493,12 @@ export async function POST(req: Request) {
     bodyLimit !== undefined && Number.isFinite(bodyLimit) && bodyLimit > 0 ? bodyLimit : undefined
   ) ?? MAX_PER_RUN;
   const maxPerRunComputed = Math.min(MAX_PER_RUN, effectiveLimit);
-  const configuredBatchSize = Math.max(1, Math.trunc(AI_SCORE_BATCH_SIZE) || 1);
-  const runtimeBatchSize = Math.min(maxPerRunComputed, configuredBatchSize);
-  const autoClaimBatchSize = Math.max(
-    runtimeBatchSize,
-    Math.ceil(runtimeBatchSize * Math.max(1, AI_SCORE_DEFAULT_CLAIM_MULTIPLIER || 1))
-  );
-  const configuredClaimBatchSize = Math.max(
-    0,
-    Math.trunc(Number.isFinite(AI_SCORE_CLAIM_BATCH_SIZE) ? AI_SCORE_CLAIM_BATCH_SIZE : 0)
-  );
-  const claimBatchTarget = Math.min(
-    maxPerRunComputed,
-    configuredClaimBatchSize > 0 ? configuredClaimBatchSize : autoClaimBatchSize
-  );
-  // Scan deeper than per-run score limit so pre-GPT skips do not starve scorer throughput.
+  // Per-iteration batch size: how many signals to score in each loop iteration
+  const perIterationBatchSize = Math.max(1, Math.min(maxPerRunComputed, SCORE_DRAIN_BATCH_SIZE));
+  // Scan deeper than per-run limit so pre-GPT skips don't starve scorer throughput
   const maxCandidateScan = Math.max(
-    claimBatchTarget,
-    Math.trunc(AI_SCORE_MAX_CANDIDATE_SCAN) || claimBatchTarget
+    maxPerRunComputed * 2,
+    Math.trunc(AI_SCORE_MAX_CANDIDATE_SCAN) || maxPerRunComputed * 2
   );
 
   // Initialize result object (guaranteed to be returned as JSON)
@@ -526,6 +520,10 @@ export async function POST(req: Request) {
     errorCount: number;
     timeoutCount: number;
     skippedAlreadyClaimed: number;
+    backlogBefore?: number;
+    backlogAfter?: number;
+    throughputPerSecond?: number;
+    loopIterations?: number;
     details: Array<{
       id: string;
       ticker: string;
@@ -555,8 +553,7 @@ export async function POST(req: Request) {
     skippedPriceTooLow?: number;
     skippedSpreadTooWide?: number;
     // Batch/diagnostics
-    batchSize?: number;
-    claimBatchTarget?: number;
+    perIterationBatchSize?: number;
     candidateScanBudget?: number;
     selectedCount?: number;
     preGptSkipped?: number;
@@ -606,6 +603,10 @@ export async function POST(req: Request) {
     errorCount: 0,
     timeoutCount: 0,
     skippedAlreadyClaimed: 0,
+    backlogBefore: 0,
+    backlogAfter: 0,
+    throughputPerSecond: 0,
+    loopIterations: 0,
     details: [],
     deadlineMsConfigured,
     softStopMarginMs: SOFT_STOP_MARGIN_MS,
@@ -619,8 +620,7 @@ export async function POST(req: Request) {
     skippedDollarVolume: 0,
     skippedPriceTooLow: 0,
     skippedSpreadTooWide: 0,
-    batchSize: runtimeBatchSize,
-    claimBatchTarget,
+    perIterationBatchSize,
     candidateScanBudget: maxCandidateScan,
     selectedCount: 0,
     preGptSkipped: 0,
@@ -707,14 +707,18 @@ export async function POST(req: Request) {
     const RECENT_WINDOW_HOURS = effectiveFreshHours;
 
     // === RECLAIM STALE SCORING SIGNALS ===
-    // Before picking new signals, find any stuck SCORING signals older than 10 minutes and revert them to PENDING
-    const SCORING_STALE_MINUTES = 10;
-    const scoringStaleThreshold = new Date(now.getTime() - SCORING_STALE_MINUTES * 60 * 1000);
+    // Before picking new signals, reclaim stuck SCORING signals older than RECLAIM_STALE_MINUTES
+    const scoringStaleThreshold = new Date(now.getTime() - RECLAIM_STALE_MINUTES * 60 * 1000);
     const staleScoring = signals.filter(
       (s) => s.status === "SCORING" && new Date(s.scoringStartedAt || s.createdAt) < scoringStaleThreshold
     );
+    // Also reclaim CLAIMED signals (legacy status) older than threshold
+    const staleClaimed = signals.filter(
+      (s) => (s.status as string) === "CLAIMED" && new Date(s.scoringStartedAt || s.createdAt) < scoringStaleThreshold
+    );
+    const allStale = [...staleScoring, ...staleClaimed];
 
-    for (const s of staleScoring.slice(0, 200)) {
+    for (const s of allStale.slice(0, 200)) {
       // Limit reclaim batch to 200 per run
       s.status = "PENDING";
       s.scoringLockUntil = undefined;
@@ -730,10 +734,6 @@ export async function POST(req: Request) {
       });
     }
     result.pipeline!.reclaimedOldClaims = result.reclaimedCount;
-
-    // === TRACK CLAIMED AND FINALIZED SIGNAL IDs ===
-    const claimedIds: string[] = [];
-    const finalizedIds: string[] = [];
 
     // Check budget exhaustion BEFORE picking/claiming signals
     const elapsedBeforePick = Date.now() - startedAtMs;
@@ -769,21 +769,23 @@ export async function POST(req: Request) {
     let pickedStrategy: PickStrategy = wantBacklogStrategy
       ? "backlog_oldest_first"
       : "recent_first";
-    let pickedSignals: any[] = [];
+    let allCandidates: any[] = [];
+
+    // === BACKLOG TRACKING ===
+    const backlogBefore = signals.filter((s) => s.status === "PENDING").length;
+    result.backlogBefore = backlogBefore;
 
     if (pickedStrategy === "backlog_oldest_first") {
       // Backlog mode: pick oldest-first from ALL PENDING (legacy recovery)
-      // Note: User must explicitly request backlog=true or strategy=backlog_oldest_first
       const pendingSignals = signals.filter((s) => s.status === "PENDING");
       result.pendingScanned = pendingSignals.length;
       result.scanned = pendingSignals.length;
       result.freshCandidatesAvailable = pendingSignals.length;
-      pickedSignals = [...pendingSignals]
+      allCandidates = [...pendingSignals]
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
-        .slice(0, Math.min(maxCandidateScan, claimBatchTarget));
+        .slice(0, maxCandidateScan);
     } else {
-      // Default live mode: pick freshest signals within the live window first.
-      // Recovery mode handles older backlog separately.
+      // Default live mode: pick freshest signals within the live window first
       const pendingSignals = signals.filter((s) => s.status === "PENDING");
       result.scanned = pendingSignals.length;
       result.pendingScanned = pendingSignals.length;
@@ -798,9 +800,9 @@ export async function POST(req: Request) {
       result.skippedStale = pendingSignals.length - freshPending.length;
 
       if (freshPending.length > 0) {
-        pickedSignals = [...freshPending]
+        allCandidates = [...freshPending]
           .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-          .slice(0, Math.min(maxCandidateScan, claimBatchTarget));
+          .slice(0, maxCandidateScan);
       } else {
         console.log("[score/drain] fresh window empty, no signals to process", {
           mode: result.mode,
@@ -810,283 +812,339 @@ export async function POST(req: Request) {
       }
     }
 
-    // === PRE-GPT GATING: Filter for eligibility before sending to AI ===
-    // Stop early once we have enough scorer-eligible signals for this run.
+    // === MAIN PROCESSING LOOP ===
+    // Processes signals in batches until budget exhausted, MAX_PER_RUN reached, or no candidates remain.
+    // Each iteration: gate batch → claim → score → apply results → persist
     const nowIso = new Date().toISOString();
-    const selectedForScoring: any[] = [];
-    const preGptSkippedIds: string[] = [];
     const eligibilityThresholds = getEligibilityThresholds();
-
-    for (const signal of pickedSignals) {
-      if (selectedForScoring.length >= runtimeBatchSize) {
-        break;
-      }
-
-      result.freshCandidatesScanned = (result.freshCandidatesScanned ?? 0) + 1;
-      const hydration = await hydrateSignalContextIfNeeded(signal, eligibilityThresholds.minBars);
-      if (hydration.hydrated) {
-        result.contextHydrated = (result.contextHydrated ?? 0) + 1;
-      }
-      if (hydration.failed) {
-        result.contextHydrationFailed = (result.contextHydrationFailed ?? 0) + 1;
-      }
-
-      const eligResult = evaluateSignalEligibility(
-        signal.signalContext || null,
-        signal.entryPrice,
-        signal.createdAt,
-        { staleAgeHours: freshHoursUsed }
-      );
-
-      if (!eligResult.eligible) {
-        applyPreGptSkip(signal, eligResult.reason, eligResult.detail, nowIso);
-        preGptSkippedIds.push(signal.id);
-        result.preGptSkipped = (result.preGptSkipped ?? 0) + 1;
-        result.persistedArchived = (result.persistedArchived ?? 0) + 1;
-
-        switch (eligResult.reason) {
-          case "insufficient_bars":
-            result.skippedInsufficientBars = (result.skippedInsufficientBars ?? 0) + 1;
-            break;
-          case "volume_too_low":
-            result.skippedVolumeTooLow = (result.skippedVolumeTooLow ?? 0) + 1;
-            break;
-          case "dollar_volume_too_low":
-            result.skippedDollarVolume = (result.skippedDollarVolume ?? 0) + 1;
-            break;
-          case "price_too_low":
-            result.skippedPriceTooLow = (result.skippedPriceTooLow ?? 0) + 1;
-            break;
-          case "spread_too_wide":
-            result.skippedSpreadTooWide = (result.skippedSpreadTooWide ?? 0) + 1;
-            break;
-          case "stale":
-            result.skippedStale = (result.skippedStale ?? 0) + 1;
-            break;
-        }
-
-        console.log("[score/drain] signal blocked by pre-GPT gate", {
-          id: signal.id,
-          ticker: signal.ticker,
-          reason: eligResult.reason,
-          detail: eligResult.detail,
-        });
-        finalizedIds.push(signal.id);
-        continue;
-      }
-
-      selectedForScoring.push(signal);
-    }
-
-    // Claim selected signals only (reduces claim/release churn).
-    const claimUntil = new Date(Date.now() + 2 * 60 * 1000).toISOString();
-    for (const signal of selectedForScoring) {
-      signal.status = "SCORING";
-      signal.scoringLockUntil = claimUntil;
-      signal.scoringStartedAt = nowIso;
-      signal.updatedAt = nowIso;
-      claimedIds.push(signal.id);
-    }
-
-    result.claimedThisRun = selectedForScoring.length;
-    result.selectedCount = selectedForScoring.length;
-    result.sentToScorer = selectedForScoring.length;
-    result.pipeline!.pendingScanned = result.pendingScanned ?? 0;
-    result.pipeline!.freshCandidatesScanned = result.freshCandidatesScanned ?? 0;
-    result.pipeline!.claimedThisRun = result.claimedThisRun;
-    result.pipeline!.contextHydrated = result.contextHydrated ?? 0;
-    result.pipeline!.contextHydrationFailed = result.contextHydrationFailed ?? 0;
-    result.pipeline!.preGptSkipped = result.preGptSkipped ?? 0;
-    result.pipeline!.sentToScorer = selectedForScoring.length;
-
-    if (preGptSkippedIds.length > 0 || selectedForScoring.length > 0) {
-      await writeSignals(signals);
-    }
-
-    if (preGptSkippedIds.length > 0) {
-      console.log("[score/drain] pre-GPT gating archived", {
-        count: preGptSkippedIds.length,
-        reasons: {
-          insufficient_bars: result.skippedInsufficientBars,
-          volume_too_low: result.skippedVolumeTooLow,
-          dollar_volume_too_low: result.skippedDollarVolume,
-          price_too_low: result.skippedPriceTooLow,
-          spread_too_wide: result.skippedSpreadTooWide,
-        },
-      });
-    }
-
-    // For response visibility: compute createdAt range based on picked signals
-    const newestPickedCreatedAt = pickedSignals.length > 0
-      ? pickedSignals.reduce((max, s) => (new Date(s.createdAt) > new Date(max) ? s.createdAt : max), pickedSignals[0].createdAt)
-      : null;
-    const oldestPickedCreatedAt = pickedSignals.length > 0
-      ? pickedSignals.reduce((min, s) => (new Date(s.createdAt) < new Date(min) ? s.createdAt : min), pickedSignals[0].createdAt)
-      : null;
+    const claimedIds: string[] = [];
+    const finalizedIds: string[] = [];
+    const preGptSkippedIds: string[] = [];
+    let candidateIdx = 0;
+    let totalSentToScorer = 0;
+    let loopIterations = 0;
 
     console.log("[score/drain] start", {
       pickedStrategy,
-      pickedCount: pickedSignals.length,
-      claimBatchTarget,
-      claimedThisRun: result.claimedThisRun,
-      candidateScanBudget: maxCandidateScan,
-      freshCandidatesAvailable: result.freshCandidatesAvailable,
-      freshCandidatesScanned: result.freshCandidatesScanned,
+      totalCandidates: allCandidates.length,
+      backlogBefore,
       maxPerRun: maxPerRunComputed,
-      batchSize: runtimeBatchSize,
+      perIterationBatchSize,
       budgetMs,
       hardCapMs: HARD_CAP_MS,
       softStopMarginMs: SOFT_STOP_MARGIN_MS,
       concurrency: SCORING_CONCURRENCY,
       recentWindowHours: RECENT_WINDOW_HOURS,
-      newestPickedCreatedAt,
-      oldestPickedCreatedAt,
-      preGptSkipped: result.preGptSkipped,
-      selectedForScoring: selectedForScoring.length,
     });
 
-    // Process eligible signals with concurrency (pre-GPT filtered)
-    const concurrentResult = await scoreSignalsConcurrent(
-      selectedForScoring,
-      deadlineAtMs,
-      SCORING_CONCURRENCY
-    );
-
-    // Check if we hit soft stop
-    if (concurrentResult.timeoutCount > 0 || (deadlineAtMs - Date.now() < SOFT_STOP_MARGIN_MS)) {
-      result.expired = true;
-    }
-
-    // Apply scoring results to signals and track finalized IDs
-    // CRITICAL: Always persist completed results, even if budget is exceeded
-    // Only stop processing NEW results if budget exceeded
-    let budgetExceededDuringProcessing = false;
-    for (const procResult of concurrentResult.results) {
-      const signal = procResult.signal;
-      
-      // Check budget but DON'T break - still process already-computed results
-      const elapsed = Date.now() - startedAtMs;
-      if (elapsed > budgetMs && !budgetExceededDuringProcessing) {
-        budgetExceededDuringProcessing = true;
+    while (candidateIdx < allCandidates.length && totalSentToScorer < maxPerRunComputed) {
+      // Check budget before starting new iteration
+      const remainingMs = deadlineAtMs - Date.now();
+      if (remainingMs < SOFT_STOP_MARGIN_MS) {
         result.expired = true;
-        result.reason = "budget_exhausted";
-        console.log("[score/drain] budget exhausted during result processing, persisting completed scores", {
-          elapsed,
-          budgetMs,
-          processed: result.completedCount,
-          remaining: concurrentResult.results.length - result.completedCount,
+        result.reason = "budget_soft_stop";
+        console.log("[score/drain] soft stop in processing loop", {
+          remainingMs,
+          margin: SOFT_STOP_MARGIN_MS,
+          loopIterations,
+          totalSentToScorer,
+          candidateIdx,
+          totalCandidates: allCandidates.length,
         });
-        // Continue processing - these results are already computed
-      }
-      
-      result.attemptedCount += 1;
-
-      if (procResult.status === "TIMEOUT") {
-        const nowIso = new Date().toISOString();
-        applyScoreError(signal, "timeout_deadline_exceeded", nowIso, "timeout");
-        finalizedIds.push(signal.id);
-        result.errored += 1;
-        result.errorCount += 1;
-        result.persistedError = (result.persistedError ?? 0) + 1;
-        await releaseSignalClaim(signal.id);
-        console.log("[score/drain] timeout finalized as error", {
-          id: signal.id,
-          ticker: signal.ticker,
-        });
-        continue;
+        break;
       }
 
-      result.completedCount += 1;
+      loopIterations++;
+      const iterationStartMs = Date.now();
 
-      if (procResult.status === "ERROR") {
-        const nowIso = new Date().toISOString();
-        if (procResult.errorCode === "insufficient_bars") {
-          // Archive as skip (not error)
-          applyInsufficientBars(signal, procResult.errorReason || "Insufficient recent bars", nowIso);
-          
-          // Log with bars diagnostics if available
-          const ctx = signal.signalContext;
-          const barsDiags = ctx ? {
-            barsUsed: ctx.barsUsed,
-            firstBar: ctx.firstBar || null,
-            lastBar: ctx.lastBar || null,
-            windowMinutes: ctx.windowMinutes || null,
-            feed: ctx.feed || null,
-          } : null;
-          
-          console.log("[score/drain] insufficient_bars skip", {
+      // Determine batch size for this iteration (respect overall max)
+      const iterBatchSize = Math.min(
+        perIterationBatchSize,
+        maxPerRunComputed - totalSentToScorer
+      );
+
+      // === Gate next batch of candidates ===
+      const batchForScoring: any[] = [];
+      while (batchForScoring.length < iterBatchSize && candidateIdx < allCandidates.length) {
+        const signal = allCandidates[candidateIdx++];
+
+        // Skip if status changed in a prior iteration (e.g., reclaimed then archived)
+        if (signal.status !== "PENDING") continue;
+
+        result.freshCandidatesScanned = (result.freshCandidatesScanned ?? 0) + 1;
+        const hydration = await hydrateSignalContextIfNeeded(signal, eligibilityThresholds.minBars);
+        if (hydration.hydrated) {
+          result.contextHydrated = (result.contextHydrated ?? 0) + 1;
+        }
+        if (hydration.failed) {
+          result.contextHydrationFailed = (result.contextHydrationFailed ?? 0) + 1;
+        }
+
+        const eligResult = evaluateSignalEligibility(
+          signal.signalContext || null,
+          signal.entryPrice,
+          signal.createdAt,
+          { staleAgeHours: freshHoursUsed }
+        );
+
+        if (!eligResult.eligible) {
+          applyPreGptSkip(signal, eligResult.reason, eligResult.detail, nowIso);
+          preGptSkippedIds.push(signal.id);
+          result.preGptSkipped = (result.preGptSkipped ?? 0) + 1;
+          result.persistedArchived = (result.persistedArchived ?? 0) + 1;
+
+          switch (eligResult.reason) {
+            case "insufficient_bars":
+              result.skippedInsufficientBars = (result.skippedInsufficientBars ?? 0) + 1;
+              break;
+            case "volume_too_low":
+              result.skippedVolumeTooLow = (result.skippedVolumeTooLow ?? 0) + 1;
+              break;
+            case "dollar_volume_too_low":
+              result.skippedDollarVolume = (result.skippedDollarVolume ?? 0) + 1;
+              break;
+            case "price_too_low":
+              result.skippedPriceTooLow = (result.skippedPriceTooLow ?? 0) + 1;
+              break;
+            case "spread_too_wide":
+              result.skippedSpreadTooWide = (result.skippedSpreadTooWide ?? 0) + 1;
+              break;
+            case "stale":
+              result.skippedStale = (result.skippedStale ?? 0) + 1;
+              break;
+          }
+
+          finalizedIds.push(signal.id);
+          continue;
+        }
+
+        batchForScoring.push(signal);
+      }
+
+      // If no eligible signals found, we've exhausted candidates
+      if (batchForScoring.length === 0) {
+        console.log("[score/drain] no eligible candidates remaining", {
+          loopIterations,
+          candidateIdx,
+          totalCandidates: allCandidates.length,
+          totalSentToScorer,
+        });
+        break;
+      }
+
+      // === Claim signals for scoring ===
+      const claimUntil = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+      for (const signal of batchForScoring) {
+        signal.status = "SCORING";
+        signal.scoringLockUntil = claimUntil;
+        signal.scoringStartedAt = nowIso;
+        signal.updatedAt = nowIso;
+        claimedIds.push(signal.id);
+      }
+
+      totalSentToScorer += batchForScoring.length;
+
+      // Persist claims + pre-GPT archives before scoring
+      await writeSignals(signals);
+
+      console.log("[score/drain] loop iteration start", {
+        iteration: loopIterations,
+        batchSize: batchForScoring.length,
+        totalSentToScorer,
+        candidateIdx,
+        remainingMs: deadlineAtMs - Date.now(),
+        maxPerRun: maxPerRunComputed,
+        timeSpentMs: Date.now() - startedAtMs,
+      });
+
+      // === Score this batch ===
+      const concurrentResult = await scoreSignalsConcurrent(
+        batchForScoring,
+        deadlineAtMs,
+        SCORING_CONCURRENCY
+      );
+
+      // === Apply scoring results ===
+      for (const procResult of concurrentResult.results) {
+        const signal = procResult.signal;
+        result.attemptedCount += 1;
+
+        if (procResult.status === "TIMEOUT") {
+          // Retry logic: revert to PENDING for next drain run, up to MAX_SCORING_RETRIES
+          const attempts = (signal.scoringAttempts ?? 0) + 1;
+          signal.scoringAttempts = attempts;
+
+          if (attempts >= MAX_SCORING_RETRIES) {
+            // Exhausted retries: finalize as error
+            const nowIso2 = new Date().toISOString();
+            applyScoreError(signal, `timeout_after_${attempts}_attempts`, nowIso2, "timeout");
+            finalizedIds.push(signal.id);
+            result.errored += 1;
+            result.errorCount += 1;
+            result.persistedError = (result.persistedError ?? 0) + 1;
+            console.warn("[score/drain] timeout finalized after max retries", {
+              id: signal.id,
+              ticker: signal.ticker,
+              attempts,
+            });
+          } else {
+            // Revert to PENDING for retry on next run
+            signal.status = "PENDING";
+            signal.scoringLockUntil = undefined;
+            signal.scoringStartedAt = undefined;
+            signal.updatedAt = new Date().toISOString();
+            console.log("[score/drain] timeout reverted to PENDING for retry", {
+              id: signal.id,
+              ticker: signal.ticker,
+              attempts,
+              maxRetries: MAX_SCORING_RETRIES,
+            });
+          }
+
+          result.timeoutCount += 1;
+          await releaseSignalClaim(signal.id);
+          continue;
+        }
+
+        result.completedCount += 1;
+
+        if (procResult.status === "ERROR") {
+          const nowIso2 = new Date().toISOString();
+          if (procResult.errorCode === "insufficient_bars") {
+            applyInsufficientBars(signal, procResult.errorReason || "Insufficient recent bars", nowIso2);
+            finalizedIds.push(signal.id);
+            result.persistedArchived = (result.persistedArchived ?? 0) + 1;
+            await releaseSignalClaim(signal.id);
+            continue;
+          } else if (procResult.errorCode === "parse_failed") {
+            applyParseFailed(
+              signal,
+              procResult.errorReason || "unparseable",
+              procResult.errorMeta,
+              nowIso2
+            );
+          } else if (procResult.errorCode === "breaker_open" || procResult.errorCode === "rate_limit") {
+            // Transient failure: revert to PENDING for retry
+            signal.status = "PENDING";
+            signal.scoringLockUntil = undefined;
+            signal.scoringStartedAt = undefined;
+            signal.scoringAttempts = (signal.scoringAttempts ?? 0) + 1;
+            signal.updatedAt = new Date().toISOString();
+            result.errorCount += 1;
+            await releaseSignalClaim(signal.id);
+            console.log("[score/drain] transient error reverted to PENDING", {
+              id: signal.id,
+              ticker: signal.ticker,
+              errorCode: procResult.errorCode,
+            });
+            continue;
+          } else {
+            applyScoreError(signal, procResult.errorReason, nowIso2, procResult.errorCode);
+          }
+
+          finalizedIds.push(signal.id);
+          await releaseSignalClaim(signal.id);
+          result.errored += 1;
+          result.errorCount += 1;
+          result.persistedError = (result.persistedError ?? 0) + 1;
+          console.warn("[score/drain] score error", {
             id: signal.id,
             ticker: signal.ticker,
             reason: procResult.errorReason,
-            barsDiags,
+            code: procResult.errorCode,
           });
-          
-          finalizedIds.push(signal.id);
-          result.persistedArchived = (result.persistedArchived ?? 0) + 1;
-          await releaseSignalClaim(signal.id);
-          // Don't increment error counters - this is a skip
           continue;
-        } else if (procResult.errorCode === "parse_failed") {
-          applyParseFailed(
-            signal,
-            procResult.errorReason || "unparseable",
-            procResult.errorMeta,
-            nowIso
-          );
-        } else {
-          applyScoreError(signal, procResult.errorReason, nowIso, procResult.errorCode);
         }
 
+        // Success: SCORED
+        const scored = procResult.scoreResult;
+        // HARDENING: Never write SCORED with null score - treat as parse_failed
+        if (!Number.isFinite(scored.aiScore)) {
+          const nowIso2 = new Date().toISOString();
+          applyParseFailed(
+            signal,
+            "null_score_from_model",
+            undefined,
+            nowIso2
+          );
+          finalizedIds.push(signal.id);
+          await releaseSignalClaim(signal.id);
+          result.errored += 1;
+          result.errorCount += 1;
+          result.persistedError = (result.persistedError ?? 0) + 1;
+          console.warn("[score/drain] score error: null score", {
+            id: signal.id,
+            ticker: signal.ticker,
+          });
+          continue;
+        }
+        applyScoreSuccess(signal, scored, new Date().toISOString());
         finalizedIds.push(signal.id);
-        await releaseSignalClaim(signal.id); // Release claim after finalizing
-        result.errored += 1;
-        result.errorCount += 1;
-        result.persistedError = (result.persistedError ?? 0) + 1;
-        console.warn("[score/drain] score error", {
-          id: signal.id,
-          ticker: signal.ticker,
-          reason: procResult.errorReason,
-          code: procResult.errorCode,
-        });
-        continue;
+        await releaseSignalClaim(signal.id);
+
+        result.scored += 1;
+        result.scoredCount += 1;
+        result.persistedScored = (result.persistedScored ?? 0) + 1;
       }
 
-      // Success: SCORED
-      const scored = procResult.scoreResult;
-      // HARDENING: Never write SCORED with null score - treat as parse_failed
-      if (!Number.isFinite(scored.aiScore)) {
-        const nowIso = new Date().toISOString();
-        applyParseFailed(
-          signal,
-          "null_score_from_model",
-          undefined,
-          nowIso
-        );
-        finalizedIds.push(signal.id);
-        await releaseSignalClaim(signal.id); // Release claim after finalizing
-        result.errored += 1;
-        result.errorCount += 1;
-        result.persistedError = (result.persistedError ?? 0) + 1;
-        console.warn("[score/drain] score error: null score", {
-          id: signal.id,
-          ticker: signal.ticker,
-        });
-        continue;
-      }
-      applyScoreSuccess(signal, scored, new Date().toISOString());
-      finalizedIds.push(signal.id);
-      await releaseSignalClaim(signal.id); // Release claim after finalizing
+      // Persist progress after each iteration (crash recovery)
+      await writeSignals(signals);
 
-      result.scored += 1;
-      result.scoredCount += 1;
-      result.persistedScored = (result.persistedScored ?? 0) + 1;
+      // Check if we should continue the loop
+      const iterDurationMs = Date.now() - iterationStartMs;
+      const postIterRemainingMs = deadlineAtMs - Date.now();
+
+      console.log("[score/drain] loop iteration complete", {
+        iteration: loopIterations,
+        batchScored: concurrentResult.scoredCount,
+        batchErrors: concurrentResult.errorCount,
+        batchTimeouts: concurrentResult.timeoutCount,
+        iterDurationMs,
+        totalSentToScorer,
+        postIterRemainingMs,
+        timeSpentMs: Date.now() - startedAtMs,
+      });
+
+      // If soft stop reached or too many timeouts in this batch, break
+      if (postIterRemainingMs < SOFT_STOP_MARGIN_MS) {
+        result.expired = true;
+        result.reason = "budget_soft_stop";
+        break;
+      }
+      if (concurrentResult.timeoutCount > 0 && concurrentResult.timeoutCount >= batchForScoring.length) {
+        // All signals in this batch timed out - stop to avoid wasting budget
+        result.expired = true;
+        result.reason = "batch_all_timeout";
+        console.log("[score/drain] stopping: all signals in batch timed out");
+        break;
+      }
     }
+
+    // === POST-LOOP METRICS ===
+    result.loopIterations = loopIterations;
+    result.claimedThisRun = claimedIds.length;
+    result.selectedCount = totalSentToScorer;
+    result.sentToScorer = totalSentToScorer;
+    result.pipeline!.pendingScanned = result.pendingScanned ?? 0;
+    result.pipeline!.freshCandidatesScanned = result.freshCandidatesScanned ?? 0;
+    result.pipeline!.claimedThisRun = claimedIds.length;
+    result.pipeline!.contextHydrated = result.contextHydrated ?? 0;
+    result.pipeline!.contextHydrationFailed = result.contextHydrationFailed ?? 0;
+    result.pipeline!.preGptSkipped = result.preGptSkipped ?? 0;
+    result.pipeline!.sentToScorer = totalSentToScorer;
+
+    // For response visibility: compute createdAt range
+    const newestPickedCreatedAt = allCandidates.length > 0
+      ? allCandidates.reduce((max, s) => (new Date(s.createdAt) > new Date(max) ? s.createdAt : max), allCandidates[0].createdAt)
+      : null;
+    const oldestPickedCreatedAt = allCandidates.length > 0
+      ? allCandidates.reduce((min, s) => (new Date(s.createdAt) < new Date(min) ? s.createdAt : min), allCandidates[0].createdAt)
+      : null;
 
     result.processed =
       (result.persistedScored ?? 0) +
       (result.persistedError ?? 0) +
       (result.persistedArchived ?? 0);
-    result.timeoutCount = concurrentResult.timeoutCount;
     result.skippedCount =
       (result.preGptSkipped ?? 0) +
       result.timeoutCount +
@@ -1279,9 +1337,20 @@ export async function POST(req: Request) {
       timeoutCount: result.timeoutCount,
       skippedCount: result.skippedCount,
       expired: result.expired,
+      loopIterations: result.loopIterations,
+      backlogBefore: result.backlogBefore,
       durationMs: Date.now() - startedAtMs,
       remainingTimeMs: deadlineAtMs - Date.now(),
     });
+
+    // === FINAL METRICS ===
+    const backlogAfter = signals.filter((s) => s.status === "PENDING").length;
+    result.backlogAfter = backlogAfter;
+    const totalDurationMs = Date.now() - startedAtMs;
+    const totalDurationSec = totalDurationMs / 1000;
+    result.throughputPerSecond = totalDurationSec > 0
+      ? Math.round((result.processed / totalDurationSec) * 100) / 100
+      : 0;
 
     // Add selection strategy and window info to response
     result.pickedStrategy = pickedStrategy;
@@ -1293,8 +1362,6 @@ export async function POST(req: Request) {
     // Add drain-specific response fields
     const response = {
       ...result,
-      claimBatchSize: result.claimedThisRun ?? 0,
-      claimBatchTarget,
       budgetMs,
       effectiveLimit: maxPerRunComputed,
     };

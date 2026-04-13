@@ -218,6 +218,10 @@ export async function GET(req: Request) {
     (scoredToday.length > 0 &&
       (minsSinceLastScore == null || minsSinceLastScore <= SIGNALS_STALE_MINUTES));
 
+  // Track if backlog is growing (scoring falling behind intake)
+  const scoringBacklogWarning =
+    marketOpen && pendingToday.length > 50 && scoredToday.length < pendingToday.length;
+
   // --- Broker truth for max open positions check ---
   const brokerPositionsCount =
     typeof brokerTruth.positionsCount === "number"
@@ -260,7 +264,7 @@ export async function GET(req: Request) {
       ok: publicMode ? true : scoringFlowing,
       detail: !marketOpen
         ? "market closed; scoring freshness not required"
-        : `scoredToday=${scoredToday.length} lastScore=${lastScoredAt || "none"} (${minsSinceLastScore?.toFixed(1) ?? "?"}m)`,
+        : `scoredToday=${scoredToday.length} pending=${pendingToday.length} lastScore=${lastScoredAt || "none"} (${minsSinceLastScore?.toFixed(1) ?? "?"}m)${scoringBacklogWarning ? " [BACKLOG WARNING]" : ""}`,
     },
     {
       name: "max_open_positions",
