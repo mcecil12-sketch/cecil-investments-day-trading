@@ -123,12 +123,18 @@ function getTaskSmokeRoutes(task: EngineeringTask): Array<{ route: string; metho
 /** Known route→method mapping for routes that don't accept GET. */
 const KNOWN_POST_ROUTES: Record<string, { method: "POST"; body?: Record<string, unknown> }> = {
   "/api/ai/score/drain": { method: "POST", body: { budgetMs: 5000, limit: 1 } },
+  "/api/agents/chat-intake": { method: "POST" },
+  "/api/agents/chat-command": { method: "POST" },
+  "/api/agents/intake": { method: "POST" },
+  "/api/agents/execute": { method: "POST" },
 };
 
 /** Routes that must NEVER be probed during verification (self-referential or trigger side-effects). */
 const EXCLUDED_PROBE_ROUTES = new Set([
   "/api/agents/execute",
   "/api/agents/intake",
+  "/api/agents/chat-intake",
+  "/api/agents/chat-command",
 ]);
 
 /** Returns task-type-specific verification probes based on the task's characteristics. */
