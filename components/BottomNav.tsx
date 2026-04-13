@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { HomeIcon, LineChartIcon, BarChart3Icon, SettingsIcon, type LucideProps } from "lucide-react";
+import { HomeIcon, LineChartIcon, BarChart3Icon, SettingsIcon, BotIcon, type LucideProps } from "lucide-react";
 import React from "react";
 
 type TabDef = {
@@ -14,7 +14,8 @@ type TabDef = {
 const TABS: TabDef[] = [
   { href: "/today", label: "Home", Icon: HomeIcon },
   { href: "/trades", label: "Trades", Icon: LineChartIcon },
-  { href: "/performance", label: "Performance", Icon: BarChart3Icon },
+  { href: "/agents", label: "Agents", Icon: BotIcon },
+  { href: "/performance", label: "Perf", Icon: BarChart3Icon },
   { href: "/settings", label: "Settings", Icon: SettingsIcon },
 ];
 
@@ -24,6 +25,8 @@ export function BottomNav() {
     ? "/today"
     : pathname?.startsWith("/trades")
     ? "/trades"
+    : pathname?.startsWith("/agents")
+    ? "/agents"
     : pathname?.startsWith("/performance")
     ? "/performance"
     : pathname?.startsWith("/settings")
