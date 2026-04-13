@@ -12,7 +12,6 @@ export const metadata: Metadata = {
   title: "Cecil Trading",
   description: "AI-powered day trading assistant",
   manifest: "/manifest.json",
-  themeColor: "#000000",
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
@@ -46,4 +45,5 @@ export const viewport = {
   width: "device-width",
   initialScale: 1,
   viewportFit: "cover",
+  themeColor: "#000000",
 };

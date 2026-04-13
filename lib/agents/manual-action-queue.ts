@@ -35,6 +35,8 @@ export interface ManualActionExecutionResult {
   finishedAt?: string;
 }
 
+export type ManualActionSource = "manual_queue" | "chat_intake" | (string & {});
+
 export interface ManualActionTask {
   id: string;
   title: string;
@@ -42,7 +44,7 @@ export interface ManualActionTask {
   objective?: string;
   priority: ManualActionPriority;
   taskType: ManualActionTaskType;
-  source: "manual_queue";
+  source: ManualActionSource;
   executionReady: boolean;
   status: ManualActionStatus;
   acceptanceCriteria?: string[];
@@ -72,6 +74,7 @@ export type ManualActionTaskInput = Pick<
       | "fileHints"
       | "routeHints"
       | "createdBy"
+      | "source"
     >
   >;
 
@@ -140,7 +143,7 @@ export async function createManualActionTask(
     objective: input.objective,
     priority: input.priority,
     taskType: input.taskType,
-    source: "manual_queue",
+    source: input.source ?? "manual_queue",
     executionReady: input.executionReady ?? false,
     status: "OPEN",
     acceptanceCriteria: input.acceptanceCriteria,
