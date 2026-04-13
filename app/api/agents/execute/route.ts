@@ -33,6 +33,7 @@ import {
   recoverStaleManualTasks,
   getActiveManualTask,
   type ManualActionTask,
+  type StaleRecoveryResult,
 } from "@/lib/agents/manual-action-queue";
 import { executeManualTask } from "@/lib/agents/manual-task-executor";
 import type {
@@ -567,23 +568,27 @@ export async function POST(req: NextRequest) {
     // manual queue tasks before falling through to autonomous backlog.
     // Lifecycle: SELECT -> CLAIM -> APPLY PATCH -> VERIFY -> RESOLVE/FAIL
 
-    // Step 1: Recover stale tasks before counting
-    let staleRecovery = { recoveredCount: 0, recovered: [] as Array<{ id: string; title: string; previousStatus: string; reason: string }> };
+    // Step 1: Recover stale tasks BEFORE any active-task detection.
+    // In dryRun, preview only (no mutations). In real mode, mutate then reload.
+    let staleRecovery: StaleRecoveryResult;
     try {
-      staleRecovery = await recoverStaleManualTasks();
-      if (staleRecovery.recoveredCount > 0) {
-        console.log(`[AGENT-EXECUTE] Stale recovery: ${staleRecovery.recoveredCount} tasks recovered`, staleRecovery.recovered);
+      staleRecovery = await recoverStaleManualTasks(dryRun);
+      if (staleRecovery.recoveredCount > 0 || staleRecovery.recovered.length > 0) {
+        console.log(
+          `[AGENT-EXECUTE] Stale recovery (dryRun=${dryRun}): ${staleRecovery.recoveredCount} tasks recovered, ` +
+          `candidates=${staleRecovery.recovered.length} failedIds=[${staleRecovery.failedTaskIds}] releasedIds=[${staleRecovery.releasedTaskIds}]`,
+        );
       }
     } catch (err) {
       console.warn("[AGENT-EXECUTE] Stale recovery failed (non-fatal):", err);
+      staleRecovery = { attempted: true, recoveredCount: 0, recovered: [], recoveredTaskIds: [], failedTaskIds: [], releasedTaskIds: [], reasonCodes: [] };
     }
 
+    // Step 2: RELOAD queue state from source of truth AFTER recovery.
+    // This ensures counts and active-task reflect recovered state.
     const manualCounts = await countOpenExecutionReadyManualTasks().catch(() => ({
       openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0, selectedCount: 0,
     }));
-
-    // Step 2: Check if any active manual task exists (IN_PROGRESS, SELECTED, or execution-ready OPEN)
-    // If so, manual queue MUST remain the top execution path — never drift to engineering backlog
     const activeManualTask = await getActiveManualTask().catch(() => null);
     const hasActiveManualTask = activeManualTask !== null;
     const hasManualWork = manualCounts.executionReadyCount > 0 || manualCounts.inProgressCount > 0 || manualCounts.selectedCount > 0;
@@ -616,7 +621,7 @@ export async function POST(req: NextRequest) {
           } : null,
           manualQueueCounts: manualCounts,
           manualTaskStatus: dryRunTask?.status ?? null,
-          staleRecovery: staleRecovery.recoveredCount > 0 ? staleRecovery : undefined,
+          staleRecovery: staleRecovery.attempted ? staleRecovery : undefined,
           executionPhases: [
             phaseResult("SELECT_TASK", "passed", dryRunTask ? "manual_queue_dry_run" : "no_manual_task_available"),
             phaseResult("CLAIM_TASK", "skipped", "dry_run"),
@@ -630,32 +635,6 @@ export async function POST(req: NextRequest) {
         };
         // dryRun: NO storeLatestExecution — zero mutations
         return NextResponse.json(dryRunResult);
-      }
-
-      // ── Check for stuck IN_PROGRESS task (block execution, don't start new) ──
-      if (manualCounts.inProgressCount > 0 && activeManualTask?.status === "IN_PROGRESS") {
-        // There's already a task in progress — don't claim another one, report it
-        const stuckResult = {
-          ok: false,
-          executionStatus: "MANUAL_TASK_IN_PROGRESS",
-          selectedSource: "manual-action-queue",
-          selectedTaskId: activeManualTask.id,
-          selectedTaskTitle: activeManualTask.title,
-          patchApplied: false,
-          manualTaskStatus: "IN_PROGRESS",
-          manualQueueCounts: manualCounts,
-          staleRecovery: staleRecovery.recoveredCount > 0 ? staleRecovery : undefined,
-          executionPhases: [
-            phaseResult("SELECT_TASK", "passed", "manual_queue_in_progress_exists"),
-            phaseResult("CLAIM_TASK", "skipped", "task_already_in_progress"),
-          ],
-          verification: { buildOk: true, smokeOk: true, details: {} },
-          resolution: { resolved: false, reason: "manual_task_already_in_progress" },
-          message: `Manual task ${activeManualTask.id} is still IN_PROGRESS — waiting for completion or stale recovery`,
-          adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
-        };
-        await storeLatestExecution(stuckResult);
-        return NextResponse.json(stuckResult);
       }
 
       // ── REAL EXECUTION: claim -> gate -> execute -> resolve ────────
@@ -678,6 +657,7 @@ export async function POST(req: NextRequest) {
             patchApplied: false,
             manualTaskStatus: "SELECTED",
             manualQueueCounts: manualCounts,
+            staleRecovery: staleRecovery.attempted ? staleRecovery : undefined,
             executionPhases: manualPhases,
             verification: { buildOk: false, smokeOk: false, details: {} },
             resolution: { resolved: false, reason: "lifecycle_start_failed" },
@@ -734,6 +714,7 @@ export async function POST(req: NextRequest) {
             manualTaskStatus: "BLOCKED",
             safeExecutionGate: manualGateResult,
             manualQueueCounts: manualCounts,
+            staleRecovery: staleRecovery.attempted ? staleRecovery : undefined,
             executionPhases: manualPhases,
             verification: { buildOk: manualGateResult.buildOk, smokeOk: manualGateResult.smokeOk, details: {} },
             resolution: { resolved: false, reason: "gate_failed" },
@@ -802,6 +783,7 @@ export async function POST(req: NextRequest) {
             manualTaskStatus: "DONE",
             safeExecutionGate: manualGateResult,
             manualQueueCounts: manualCounts,
+            staleRecovery: staleRecovery.attempted ? staleRecovery : undefined,
             executionPhases: manualPhases,
             verification: execResult.verification ?? { buildOk: true, smokeOk: true, details: {} },
             resolution: { resolved: true },
@@ -832,6 +814,7 @@ export async function POST(req: NextRequest) {
             manualTaskStatus: "BLOCKED",
             safeExecutionGate: manualGateResult,
             manualQueueCounts: manualCounts,
+            staleRecovery: staleRecovery.attempted ? staleRecovery : undefined,
             executionPhases: manualPhases,
             verification: execResult.verification ?? { buildOk: false, smokeOk: false, details: {} },
             resolution: { resolved: false, reason: execResult.blockedReason ?? "executor_blocked" },
@@ -861,6 +844,7 @@ export async function POST(req: NextRequest) {
             manualTaskStatus: "FAILED",
             safeExecutionGate: manualGateResult,
             manualQueueCounts: manualCounts,
+            staleRecovery: staleRecovery.attempted ? staleRecovery : undefined,
             executionPhases: manualPhases,
             verification: execResult.verification ?? { buildOk: false, smokeOk: false, details: {} },
             resolution: { resolved: false, reason: execResult.failureReason ?? "execution_failed" },
@@ -882,7 +866,7 @@ export async function POST(req: NextRequest) {
         patchApplied: false,
         manualTaskStatus: activeManualTask!.status,
         manualQueueCounts: manualCounts,
-        staleRecovery: staleRecovery.recoveredCount > 0 ? staleRecovery : undefined,
+        staleRecovery: staleRecovery.attempted ? staleRecovery : undefined,
         executionPhases: [
           phaseResult("SELECT_TASK", "passed", "manual_queue_active_not_ready"),
         ],

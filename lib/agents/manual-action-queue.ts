@@ -395,49 +395,131 @@ export async function countOpenExecutionReadyManualTasks(): Promise<{
 const STALE_IN_PROGRESS_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 const STALE_SELECTED_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
-export interface StaleRecoveryResult {
-  recoveredCount: number;
-  recovered: Array<{ id: string; title: string; previousStatus: ManualActionStatus; reason: string }>;
+export interface StaleRecoveryCandidate {
+  id: string;
+  title: string;
+  previousStatus: ManualActionStatus;
+  reasonCode: string;
+  action: "failed" | "released";
 }
 
-/** Recover stale IN_PROGRESS and SELECTED tasks that have exceeded timeout thresholds. */
-export async function recoverStaleManualTasks(): Promise<StaleRecoveryResult> {
+export interface StaleRecoveryResult {
+  attempted: boolean;
+  recoveredCount: number;
+  recovered: StaleRecoveryCandidate[];
+  recoveredTaskIds: string[];
+  failedTaskIds: string[];
+  releasedTaskIds: string[];
+  reasonCodes: string[];
+}
+
+function emptyStaleRecovery(): StaleRecoveryResult {
+  return { attempted: false, recoveredCount: 0, recovered: [], recoveredTaskIds: [], failedTaskIds: [], releasedTaskIds: [], reasonCodes: [] };
+}
+
+/** Identify stale IN_PROGRESS and SELECTED tasks. Does not mutate state. */
+export async function detectStaleManualTasks(): Promise<StaleRecoveryCandidate[]> {
   const tasks = await getAllTasks();
   const now = Date.now();
-  const recovered: StaleRecoveryResult["recovered"] = [];
+  const candidates: StaleRecoveryCandidate[] = [];
 
   for (const task of tasks) {
-    if (task.status === "IN_PROGRESS" && task.startedAt) {
-      const startedMs = new Date(task.startedAt).getTime();
-      if (now - startedMs > STALE_IN_PROGRESS_TIMEOUT_MS) {
-        await failManualActionTask(task.id, {
-          ok: false,
-          summary: `Stale recovery: IN_PROGRESS for ${Math.round((now - startedMs) / 60000)}m without completion`,
-          error: "stale_in_progress_timeout",
-        });
-        recovered.push({
+    if (task.status === "IN_PROGRESS") {
+      // Case 1: startedAt is null — task was never properly started, always stale
+      if (!task.startedAt) {
+        // Fall back to selectedAt or updatedAt to compute age
+        const refTime = task.selectedAt ?? task.updatedAt ?? task.createdAt;
+        const ageMin = refTime ? Math.round((now - new Date(refTime).getTime()) / 60000) : 0;
+        candidates.push({
           id: task.id,
           title: task.title,
           previousStatus: "IN_PROGRESS",
-          reason: `stale_timeout_${Math.round((now - startedMs) / 60000)}m`,
+          reasonCode: `stale_in_progress_missing_startedAt_${ageMin}m`,
+          action: "failed",
         });
+        continue;
       }
-    } else if (task.status === "SELECTED" && task.selectedAt) {
-      const selectedMs = new Date(task.selectedAt).getTime();
-      if (now - selectedMs > STALE_SELECTED_TIMEOUT_MS) {
-        // Release back to OPEN so it can be re-claimed
-        await releaseManualActionTask(task.id, "stale_selected_timeout");
-        recovered.push({
+      // Case 2: startedAt exists but exceeds timeout
+      const startedMs = new Date(task.startedAt).getTime();
+      if (now - startedMs > STALE_IN_PROGRESS_TIMEOUT_MS) {
+        candidates.push({
           id: task.id,
           title: task.title,
-          previousStatus: "SELECTED",
-          reason: `stale_selected_timeout_${Math.round((now - selectedMs) / 60000)}m`,
+          previousStatus: "IN_PROGRESS",
+          reasonCode: `stale_in_progress_timeout_${Math.round((now - startedMs) / 60000)}m`,
+          action: "failed",
         });
+      }
+    } else if (task.status === "SELECTED") {
+      // Case 3: SELECTED exceeds timeout
+      const refTime = task.selectedAt ?? task.updatedAt ?? task.createdAt;
+      if (refTime) {
+        const selectedMs = new Date(refTime).getTime();
+        if (now - selectedMs > STALE_SELECTED_TIMEOUT_MS) {
+          candidates.push({
+            id: task.id,
+            title: task.title,
+            previousStatus: "SELECTED",
+            reasonCode: `stale_selected_timeout_${Math.round((now - selectedMs) / 60000)}m`,
+            action: "released",
+          });
+        }
       }
     }
   }
+  return candidates;
+}
 
-  return { recoveredCount: recovered.length, recovered };
+/** Recover stale IN_PROGRESS and SELECTED tasks that have exceeded timeout thresholds.
+ *  If dryRun=true, returns candidates without mutating state. */
+export async function recoverStaleManualTasks(dryRun = false): Promise<StaleRecoveryResult> {
+  const candidates = await detectStaleManualTasks();
+  if (candidates.length === 0) return { ...emptyStaleRecovery(), attempted: true };
+
+  if (dryRun) {
+    return {
+      attempted: true,
+      recoveredCount: 0,
+      recovered: candidates,
+      recoveredTaskIds: [],
+      failedTaskIds: candidates.filter((c) => c.action === "failed").map((c) => c.id),
+      releasedTaskIds: candidates.filter((c) => c.action === "released").map((c) => c.id),
+      reasonCodes: candidates.map((c) => c.reasonCode),
+    };
+  }
+
+  const recovered: StaleRecoveryCandidate[] = [];
+  const failedIds: string[] = [];
+  const releasedIds: string[] = [];
+
+  for (const candidate of candidates) {
+    try {
+      if (candidate.action === "failed") {
+        await failManualActionTask(candidate.id, {
+          ok: false,
+          summary: `Stale recovery: ${candidate.reasonCode}`,
+          error: candidate.reasonCode,
+        });
+        failedIds.push(candidate.id);
+      } else {
+        await releaseManualActionTask(candidate.id, candidate.reasonCode);
+        releasedIds.push(candidate.id);
+      }
+      recovered.push(candidate);
+    } catch (err) {
+      console.warn(`[STALE-RECOVERY] Failed to recover task ${candidate.id}:`, err);
+    }
+  }
+
+  return {
+    attempted: true,
+    recoveredCount: recovered.length,
+    recovered,
+    recoveredTaskIds: recovered.map((r) => r.id),
+    failedTaskIds: failedIds,
+    releasedTaskIds: releasedIds,
+    reasonCodes: recovered.map((r) => r.reasonCode),
+  };
 }
 
 // ─── Duplicate Detection ──────────────────────────────────────────────
