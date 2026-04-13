@@ -83,6 +83,7 @@ function getTaskSmokeRoutes(task: EngineeringTask): Array<{ route: string; metho
   const seen = new Set<string>();
 
   function addRoute(route: string, method: "GET" | "POST" = "GET") {
+    if (EXCLUDED_PROBE_ROUTES.has(route)) return; // never probe self-referential routes
     const key = `${method}:${route}`;
     if (!seen.has(key)) {
       seen.add(key);
@@ -123,6 +124,12 @@ function getTaskSmokeRoutes(task: EngineeringTask): Array<{ route: string; metho
 const KNOWN_POST_ROUTES: Record<string, { method: "POST"; body?: Record<string, unknown> }> = {
   "/api/ai/score/drain": { method: "POST", body: { budgetMs: 5000, limit: 1 } },
 };
+
+/** Routes that must NEVER be probed during verification (self-referential or trigger side-effects). */
+const EXCLUDED_PROBE_ROUTES = new Set([
+  "/api/agents/execute",
+  "/api/agents/intake",
+]);
 
 /** Returns task-type-specific verification probes based on the task's characteristics. */
 function getTaskTypeVerificationProbes(task: EngineeringTask): Array<{

@@ -337,14 +337,17 @@ export async function POST(req: NextRequest) {
   try {
     // ─── Adaptive Guardrails Evaluation ─────────────────────────────
     // Run performance-learning evaluation before task selection
+    // dryRun: skip entirely — evaluateAdaptiveGuardrails may apply actions
     let adaptiveResult = null;
-    try {
-      adaptiveResult = await evaluateAdaptiveGuardrails();
-      if (adaptiveResult.actionsApplied.length > 0 || adaptiveResult.tasksCreated.length > 0) {
-        console.log(`[AGENT-EXECUTE] Adaptive guardrails: ${adaptiveResult.actionsApplied.length} actions applied, ${adaptiveResult.tasksCreated.length} tasks created`);
+    if (!dryRun) {
+      try {
+        adaptiveResult = await evaluateAdaptiveGuardrails();
+        if (adaptiveResult.actionsApplied.length > 0 || adaptiveResult.tasksCreated.length > 0) {
+          console.log(`[AGENT-EXECUTE] Adaptive guardrails: ${adaptiveResult.actionsApplied.length} actions applied, ${adaptiveResult.tasksCreated.length} tasks created`);
+        }
+      } catch (err) {
+        console.warn("[AGENT-EXECUTE] Adaptive guardrails evaluation failed (non-fatal):", err);
       }
-    } catch (err) {
-      console.warn("[AGENT-EXECUTE] Adaptive guardrails evaluation failed (non-fatal):", err);
     }
 
     // ─── Critical Task Batch Drain ────────────────────────────────────
@@ -356,11 +359,41 @@ export async function POST(req: NextRequest) {
     const { blocking: blockingCritical, synthetic: syntheticCritical } = partitionCriticalTasks(criticalTasks);
 
     // Auto-expire synthetic drill tasks — they never have real broker state
-    for (const st of syntheticCritical) {
-      await expireSyntheticTask(st.id, "auto_expired_synthetic_drill").catch(() => {});
+    if (!dryRun) {
+      for (const st of syntheticCritical) {
+        await expireSyntheticTask(st.id, "auto_expired_synthetic_drill").catch(() => {});
+      }
     }
 
     if (blockingCritical.length > 0) {
+      // ─── DRY RUN: preview critical batch, ZERO mutations ──────────
+      if (dryRun) {
+        return NextResponse.json({
+          ok: true,
+          dryRun: true,
+          executionStatus: "CRITICAL_BATCH_DRY_RUN",
+          selectedSource: "critical-task-queue",
+          patchApplied: false,
+          commitSha: null,
+          criticalTaskCount: blockingCritical.length,
+          syntheticCount: syntheticCritical.length,
+          blockingTasks: blockingCritical.map((ct) => ({
+            id: ct.id,
+            incidentCode: ct.incidentCode,
+            symbol: ct.symbol,
+            severity: ct.severity,
+          })),
+          executionPhases: [
+            phaseResult("SELECT_TASK", "passed", "critical_queue_dry_run"),
+            phaseResult("APPLY_PATCH", "skipped", "dry_run"),
+            phaseResult("VERIFY", "skipped", "dry_run"),
+            phaseResult("RESOLVE_OR_FAIL", "skipped", "dry_run"),
+          ],
+          verification: { buildOk: true, smokeOk: true, details: {} },
+          resolution: { resolved: false, reason: "dry_run" },
+        });
+      }
+
       const MAX_PER_RUN = Math.max(1, Math.min(20, Number(process.env.MAX_CRITICAL_RESOLUTIONS_PER_RUN) || 5));
       const batch = blockingCritical.slice(0, MAX_PER_RUN);
 
@@ -875,7 +908,7 @@ export async function POST(req: NextRequest) {
         message: `Manual task ${activeManualTask!.id} (${activeManualTask!.status}) is active — won't drift to engineering backlog`,
         adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
       };
-      await storeLatestExecution(manualBlockResult);
+      if (!dryRun) await storeLatestExecution(manualBlockResult);
       return NextResponse.json(manualBlockResult);
     }
 
@@ -891,21 +924,23 @@ export async function POST(req: NextRequest) {
       learningResult = await runLearningAnalysis();
 
       if (learningResult.findings.length > 0) {
-        // Record high-severity findings in ledger
-        for (const finding of learningResult.findings.filter(
-          (f) => f.severity === "CRITICAL" || f.severity === "HIGH",
-        )) {
-          await recordLedgerEntry({
-            type: "finding_detected",
-            findingId: finding.id,
-            findingCategory: finding.category,
-            findingSeverity: finding.severity,
-            reason: finding.evidence,
-          }).catch(() => {});
-        }
+        if (!dryRun) {
+          // Record high-severity findings in ledger
+          for (const finding of learningResult.findings.filter(
+            (f) => f.severity === "CRITICAL" || f.severity === "HIGH",
+          )) {
+            await recordLedgerEntry({
+              type: "finding_detected",
+              findingId: finding.id,
+              findingCategory: finding.category,
+              findingSeverity: finding.severity,
+              reason: finding.evidence,
+            }).catch(() => {});
+          }
 
-        // Apply at most one safe remediation
-        remediationResult = await applyOneRemediation(learningResult.findings);
+          // Apply at most one safe remediation
+          remediationResult = await applyOneRemediation(learningResult.findings);
+        }
       }
 
       // Check pending remediation verifications
@@ -943,12 +978,42 @@ export async function POST(req: NextRequest) {
         adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
         ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
       };
-      await storeLatestExecution(result);
+      if (!dryRun) await storeLatestExecution(result);
       return NextResponse.json(result);
     }
 
     phases.push(phaseResult("SELECT_TASK", "passed", `task: ${task.id}`, selectStart));
     console.log(`[AGENT-EXECUTE] Selected task ${task.id}: ${task.title}`);
+
+    // ─── DRY RUN: preview engineering backlog, ZERO mutations ────────
+    if (dryRun) {
+      const dryRunPatchPlan = generatePatchPlan(task);
+      return NextResponse.json({
+        ok: true,
+        dryRun: true,
+        executionStatus: "DRY_RUN",
+        selectedSource: "engineering-backlog",
+        selectedTaskId: task.id,
+        selectedTaskTitle: task.title,
+        taskStatus: task.status,
+        patchApplied: false,
+        commitSha: null,
+        patchPlan: dryRunPatchPlan,
+        githubWriteCapability: checkGitHubWriteCapability(),
+        executionPhases: [
+          ...phases,
+          phaseResult("GENERATE_PATCH_PLAN", "skipped", "dry_run"),
+          phaseResult("APPLY_PATCH", "skipped", "dry_run"),
+          phaseResult("COMMIT_PUSH", "skipped", "dry_run"),
+          phaseResult("VERIFY", "skipped", "dry_run"),
+          phaseResult("RESOLVE_OR_FAIL", "skipped", "dry_run"),
+        ],
+        verification: { buildOk: true, smokeOk: true, details: {} },
+        resolution: { resolved: false, reason: "dry_run" },
+        adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
+        ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
+      });
+    }
 
     // ─── GitHub write capability check ──────────────────────────────
     const ghCapability = checkGitHubWriteCapability();
@@ -1243,27 +1308,29 @@ export async function POST(req: NextRequest) {
       adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
       ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
     };
-    await storeLatestExecution(planResult);
+    if (!dryRun) await storeLatestExecution(planResult);
     return NextResponse.json(planResult);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await markExecutionFailure(task, message);
+    if (!dryRun) await markExecutionFailure(task, message);
     phases.push(phaseResult("RESOLVE_OR_FAIL", "failed", message));
 
     const result = {
       ok: false,
       error: message,
+      dryRun,
       selectedSource: task ? "engineering-backlog" : "none",
       selectedTaskId: task?.id ?? null,
       selectedTaskTitle: task?.title ?? null,
-      executionStatus: "FAILED",
+      executionStatus: dryRun ? "DRY_RUN" : "FAILED",
       executionPhases: phases,
       patchApplied: false,
+      commitSha: null,
       verification: { buildOk: false, smokeOk: false, details: {} },
       resolution: { resolved: false, reason: message },
       failure: { phase: "RESOLVE_OR_FAIL", reason: message },
     };
-    await storeLatestExecution(result);
+    if (!dryRun) await storeLatestExecution(result);
     return NextResponse.json(result, { status: 500 });
   }
 }
