@@ -1,0 +1,191 @@
+openapi: "3.1.0"
+info:
+  title: Cecil Agent Action API
+  description: >
+    GPT Action relay for submitting conversational agent tasks into the
+    Cecil investment day-trading agent system.
+  version: "1.0.0"
+
+servers:
+  - url: https://cecil-investments-day-trading.vercel.app
+    description: Production
+
+paths:
+  /api/agents/chat-intake-public:
+    post:
+      operationId: submitAgentTask
+      summary: Submit a conversational agent task
+      description: >
+        Accepts a natural-language task message (beginning with
+        "Execute the following task:") and feeds it through the canonical
+        intake pipeline — parsing, validation, dedup, creation, and
+        optional auto-execution.
+      security:
+        - chatIntakeToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatActionRequest"
+      responses:
+        "201":
+          description: Task created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatActionResponse"
+        "200":
+          description: Duplicate task already exists (deduped)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatActionResponse"
+        "400":
+          description: Invalid or unparseable request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid x-chat-intake-token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  securitySchemes:
+    chatIntakeToken:
+      type: apiKey
+      in: header
+      name: x-chat-intake-token
+      description: >
+        Static bearer token matching the CHAT_INTAKE_TOKEN environment
+        variable configured on the server.
+
+  schemas:
+    ChatActionRequest:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          description: >
+            Conversational task message.  Must start with
+            "Execute the following task:" followed by structured fields
+            (Title, Description, Type, Priority, Execute, File Hints, etc.).
+          example: |
+            Execute the following task:
+            Title: Fix overnight scan crash
+            Type: BUGFIX
+            Priority: HIGH
+            Execute: true
+            Description: The nightly scanner throws a null-ref on empty watchlists.
+            File Hints:
+            - lib/scanner/run.ts
+            - lib/scanner/watchlist.ts
+        executeOverride:
+          type: boolean
+          nullable: true
+          description: >
+            Optional override for the parsed executionReady flag.
+            true  — force execution-ready (still subject to fileHint
+                    downgrade and blocking-incident checks).
+            false — force not execution-ready.
+            null / omitted — use the value parsed from the message.
+          default: null
+
+    ChatActionResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        created:
+          type: boolean
+          description: Whether a new task was created.
+        deduped:
+          type: boolean
+          description: Whether the request matched an existing active task.
+        parsedPayload:
+          type: object
+          description: Summary of the parsed task fields.
+          properties:
+            title:
+              type: string
+            description:
+              type: string
+            priority:
+              type: string
+            taskType:
+              type: string
+            executionReady:
+              type: boolean
+            source:
+              type: string
+        task:
+          type: object
+          description: The created or matched task record.
+          properties:
+            id:
+              type: string
+              format: uuid
+            title:
+              type: string
+            status:
+              type: string
+            priority:
+              type: string
+            taskType:
+              type: string
+            executionReady:
+              type: boolean
+            source:
+              type: string
+        autoExecute:
+          type: object
+          properties:
+            attempted:
+              type: boolean
+            triggered:
+              type: boolean
+            skippedReason:
+              type: string
+              nullable: true
+        warning:
+          type: string
+          nullable: true
+        queueCounts:
+          type: object
+          properties:
+            openCount:
+              type: integer
+            executionReadyCount:
+              type: integer
+            inProgressCount:
+              type: integer
+            blockedCount:
+              type: integer
+            selectedCount:
+              type: integer
+        activeManualTask:
+          type: object
+          nullable: true
+          description: Currently active manual task, if any.
+        blockingIncidentCount:
+          type: integer
+        latestExecutionResult:
+          type: object
+          nullable: true
+
+    ErrorResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: false
+        error:
+          type: string
+        message:
+          type: string
