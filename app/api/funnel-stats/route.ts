@@ -37,6 +37,10 @@ export async function GET() {
       fromQualifiedShort: num(today.seedFromQualifiedShort),
       totalCandidates: num(today.seedTotalCandidates),
       createdCount: num(today.seedCreatedCount),
+      // Phase 3c: Deduplication visibility
+      uniqueCandidates: num(today.seedUniqueCandidates),
+      duplicatesCollapsed: num(today.seedDuplicatesCollapsed),
+      // Skip reasons
       skippedNotQualified: num(today.seedSkippedNotQualified),
       skippedOverlayGrade: num(today.seedSkippedOverlayGrade),
       skippedMissingSymbol: num(today.seedSkippedMissingSymbol),
@@ -57,6 +61,12 @@ export async function GET() {
                     num(today.seedSkippedMissingPrices) + num(today.seedSkippedTierDisabled) +
                     num(today.seedSkippedOther),
     },
+    // Phase 3c: Short quality tracking
+    shortQuality: {
+      qualified: num(today.shortQualified),
+      seeded: num(today.shortSeeded),
+      skippedWeakStructure: num(today.shortSkippedWeakStructure),
+    },
     execute: {
       fromSeededLong: num(today.executeFromSeededLong),
       fromSeededShort: num(today.executeFromSeededShort),
@@ -64,10 +74,16 @@ export async function GET() {
       skippedLiquidity: num(today.executeSkippedLiquidity),
       skippedBracketInvalid: num(today.executeSkippedBracketInvalid),
       skippedOther: num(today.executeSkippedOther),
+      // Phase 3c: Invalid trade cleanup visibility
+      invalidMarked: num(today.executeInvalidMarked),
+      staleArchived: num(today.executeStaleArchived),
+      duplicatesArchived: num(today.executeDuplicatesArchived),
       // Derived
       totalExecuted: num(today.executeFromSeededLong) + num(today.executeFromSeededShort),
       totalSkipped: num(today.executeSkippedPriceDrift) + num(today.executeSkippedLiquidity) +
                     num(today.executeSkippedBracketInvalid) + num(today.executeSkippedOther),
+      totalCleaned: num(today.executeInvalidMarked) + num(today.executeStaleArchived) + 
+                    num(today.executeDuplicatesArchived),
     },
     // End-to-end conversion summary
     conversion: {

@@ -922,6 +922,15 @@ export async function POST(req: Request) {
     await writeTrades(trades);
   }
 
+  // Phase 3c: Bump invalid/stale/duplicate counters for visibility
+  if (counts.invalidMarked > 0 || counts.staleArchived > 0 || counts.duplicatesArchived > 0) {
+    await bumpAutoEntryFunnelSafe({
+      executeInvalidMarked: counts.invalidMarked,
+      executeStaleArchived: counts.staleArchived,
+      executeDuplicatesArchived: counts.duplicatesArchived,
+    });
+  }
+
   const openPositions = trades.filter(
     (t) =>
       Boolean(t?.status === "OPEN") &&

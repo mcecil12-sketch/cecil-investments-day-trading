@@ -11,6 +11,10 @@ export const dynamic = "force-dynamic";
 
 type RawSignal = Record<string, any>;
 
+// -------------------------------------------------------------------------
+// Helper Functions
+// -------------------------------------------------------------------------
+
 function getNum(obj: any, paths: string[]): number | null {
   for (const path of paths) {
     const parts = path.split(".");
@@ -25,6 +29,22 @@ function getNum(obj: any, paths: string[]): number | null {
     if (cur == null || cur === "") continue;
     const n = Number(cur);
     if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function getStr(obj: any, paths: string[]): string | null {
+  for (const path of paths) {
+    const parts = path.split(".");
+    let cur: any = obj;
+    for (const p of parts) {
+      if (cur == null) {
+        cur = undefined;
+        break;
+      }
+      cur = cur[p];
+    }
+    if (cur != null && cur !== "") return String(cur);
   }
   return null;
 }
@@ -55,6 +75,138 @@ function parseSignalsPayload(payload: any): RawSignal[] {
   if (Array.isArray(payload?.data)) return payload.data;
   if (Array.isArray(payload?.items)) return payload.items;
   return [];
+}
+
+// -------------------------------------------------------------------------
+// Phase 3c: Short-Side Quality Enhancement
+// -------------------------------------------------------------------------
+
+type ShortQualityResult = {
+  pass: boolean;
+  reason: string | null;
+  penalty: number;
+};
+
+/**
+ * Lightweight short-side quality check.
+ * Uses existing signal fields only - does NOT block, just penalizes score.
+ */
+function evaluateShortQuality(signal: RawSignal): ShortQualityResult {
+  let penalty = 0;
+  const reasons: string[] = [];
+
+  // 1. Trend check: prefer "down" trend for shorts
+  const trend = getStr(signal, ["trend", "ai.trend", "context.trend"]);
+  if (trend) {
+    const trendLower = trend.toLowerCase();
+    if (trendLower === "flat" || trendLower === "neutral") {
+      penalty += 5;
+      reasons.push("flat_trend");
+    } else if (trendLower === "up" || trendLower === "bullish") {
+      penalty += 10;
+      reasons.push("bullish_trend");
+    }
+    // "down" or "bearish" = no penalty
+  }
+
+  // 2. VWAP alignment: shorts should prefer at/below VWAP or rejection above
+  const vwapPosition = getStr(signal, ["vwapPosition", "ai.vwapPosition", "context.vwapPosition"]);
+  const price = getNum(signal, ["entryPrice", "price", "lastPrice"]);
+  const vwap = getNum(signal, ["vwap", "context.vwap"]);
+  
+  if (vwapPosition) {
+    const vpLower = vwapPosition.toLowerCase();
+    if (vpLower === "above" || vpLower.includes("above")) {
+      // Above VWAP short - slightly risky
+      penalty += 3;
+      reasons.push("above_vwap");
+    }
+  } else if (price && vwap && vwap > 0) {
+    const distPct = ((price - vwap) / vwap) * 100;
+    if (distPct > 1.0) {
+      // More than 1% above VWAP
+      penalty += 3;
+      reasons.push("above_vwap_calc");
+    }
+  }
+
+  // 3. Relative volume check: shorts need decent volume
+  const relVol = getNum(signal, ["relVol", "relativeVolume", "context.relVol"]);
+  if (relVol != null && relVol < 1.2) {
+    // Below 1.2x relative volume - weak liquidity for short
+    penalty += 5;
+    reasons.push("low_relvol");
+  }
+
+  // Threshold: if penalty >= 15, soft reject (but don't hard block)
+  const pass = penalty < 15;
+  return {
+    pass,
+    penalty,
+    reason: reasons.length > 0 ? reasons.join(",") : null,
+  };
+}
+
+// -------------------------------------------------------------------------
+// Phase 3c: Candidate Deduplication & Ranking
+// -------------------------------------------------------------------------
+
+type QualifiedCandidate = {
+  signal: RawSignal;
+  symbol: string;
+  side: "LONG" | "SHORT";
+  aiScore: number;
+  entryPrice: number;
+  stopPrice: number;
+  targetPrice: number;
+  tier: string;
+  signalId: string;
+  createdAt: string;
+  shortPenalty: number;
+  effectiveScore: number;
+};
+
+/**
+ * Deduplicate candidates by symbol+side, keeping only the best per group.
+ * Returns unique candidates and count of collapsed duplicates.
+ */
+function dedupeCandidates(candidates: QualifiedCandidate[]): {
+  unique: QualifiedCandidate[];
+  collapsedCount: number;
+} {
+  const bySymbolSide = new Map<string, QualifiedCandidate[]>();
+  
+  for (const c of candidates) {
+    const key = `${c.symbol}:${c.side}`;
+    const existing = bySymbolSide.get(key) || [];
+    existing.push(c);
+    bySymbolSide.set(key, existing);
+  }
+
+  const unique: QualifiedCandidate[] = [];
+  let collapsedCount = 0;
+
+  for (const [, group] of bySymbolSide) {
+    // Sort by effectiveScore DESC, then createdAt DESC (newest first)
+    group.sort((a, b) => {
+      if (b.effectiveScore !== a.effectiveScore) {
+        return b.effectiveScore - a.effectiveScore;
+      }
+      // Tie-breaker: newest signal first
+      const aTime = new Date(a.createdAt).getTime() || 0;
+      const bTime = new Date(b.createdAt).getTime() || 0;
+      return bTime - aTime;
+    });
+
+    // Keep only the best
+    unique.push(group[0]);
+    collapsedCount += group.length - 1;
+  }
+
+  // Final sort by effectiveScore DESC for consistent ordering
+  unique.sort((a, b) => b.effectiveScore - a.effectiveScore);
+
+  return { unique, collapsedCount };
 }
 
 async function fetchScoredSignalsFromInternalApi(): Promise<RawSignal[]> {
@@ -131,27 +283,32 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // PHASE 3c: Two-Pass Candidate Processing with Deduplication
+  // -------------------------------------------------------------------------
+  // Pass 1: Collect all qualifying candidates (no limit yet)
+  // Pass 2: Dedupe by symbol+side, keeping best per group
+  // Pass 3: Apply limit AFTER deduplication
+  // -------------------------------------------------------------------------
+
   const created: any[] = [];
   const skipped: any[] = [];
-
-  // Phase 3: Direction-aware attribution tracking
   const skipReasonCounts: Record<string, number> = {};
+  
+  // Phase 3c: Track short quality metrics
+  let shortQualified = 0;
+  let shortSkippedWeakStructure = 0;
   let seededLong = 0;
   let seededShort = 0;
 
-  const seenCandidateSymbolSide = new Set<string>();
-  let totalCandidates = 0;
+  const effectiveMinScore = minScore + overlay.minScoreAdjustment;
+  const allQualifyingCandidates: QualifiedCandidate[] = [];
 
-  const sortedSignals = [...(signals || [])].sort(
-    (a: any, b: any) =>
-      (getNum(b, ["aiScore", "score"]) ?? Number.NEGATIVE_INFINITY) -
-      (getNum(a, ["aiScore", "score"]) ?? Number.NEGATIVE_INFINITY)
-  );
-
-  for (const s of sortedSignals) {
-
+  // PASS 1: Collect all qualifying candidates
+  for (const s of signals || []) {
     const status = String(s?.status || "").toUpperCase();
     if (status !== "SCORED") continue;
+    
     if (s?.qualified !== true) {
       skipped.push({ symbol: getSymbol(s) || "UNKNOWN", reason: "not_qualified" });
       continue;
@@ -170,7 +327,6 @@ export async function POST(req: NextRequest) {
     }
 
     const aiScore = getNum(s, ["aiScore", "score"]);
-    const effectiveMinScore = minScore + overlay.minScoreAdjustment;
     if (aiScore == null || aiScore < effectiveMinScore) {
       skipped.push({
         symbol,
@@ -188,55 +344,104 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
-    const symbolSide = `${symbol}:${side}`;
-    if (seenCandidateSymbolSide.has(symbolSide)) {
-      skipped.push({ symbol, reason: "duplicate_symbol_side_in_batch" });
-      continue;
-    }
-    seenCandidateSymbolSide.add(symbolSide);
-    totalCandidates += 1;
-
-    if (created.length >= effectiveLimit) {
-      skipped.push({ symbol, reason: "limit_reached" });
-      continue;
-    }
-
-    const signalId = String(s.id || "");
-
-    if (signalId && existingBySignalId.has(signalId)) {
-      skipped.push({ symbol, reason: "already_has_trade_for_signal" });
-      continue;
-    }
-
-    if (existingPendingBySymbolSide.has(symbolSide)) {
-      skipped.push({ symbol, reason: "already_has_pending_for_symbol_side" });
-      continue;
-    }
-
     const tier = tierForScore(aiScore) || "C";
     if (tier === "C" && !cfg.allowedTiers.includes("C")) {
       skipped.push({ symbol, reason: "tier_c_disabled" });
       continue;
     }
 
-    // Overlay grade filter: PM/Risk may restrict to A-only or A/B-only
     if (!overlay.allowedGrades.includes(tier as "A" | "B" | "C")) {
       skipped.push({ symbol, reason: "overlay_grade_excluded", grade: tier, allowedGrades: overlay.allowedGrades });
       continue;
     }
 
-    const now = new Date().toISOString();
-    const sessionMeta = deriveSessionMeta(now);
-    const scoredAt = String(s?.scoredAt || s?.updatedAt || s?.createdAt || now);
+    const signalId = String(s.id || "");
 
-    const trade = {
-      id: crypto.randomUUID(),
-      ticker: symbol,
+    // Check for existing trades
+    if (signalId && existingBySignalId.has(signalId)) {
+      skipped.push({ symbol, reason: "already_has_trade_for_signal" });
+      continue;
+    }
+
+    const symbolSide = `${symbol}:${side}`;
+    if (existingPendingBySymbolSide.has(symbolSide)) {
+      skipped.push({ symbol, reason: "already_has_pending_for_symbol_side" });
+      continue;
+    }
+
+    // Phase 3c: Short-side quality check
+    let shortPenalty = 0;
+    if (side === "SHORT") {
+      const shortQuality = evaluateShortQuality(s);
+      shortPenalty = shortQuality.penalty;
+      
+      if (!shortQuality.pass) {
+        shortSkippedWeakStructure += 1;
+        skipped.push({ 
+          symbol, 
+          reason: "short_weak_structure", 
+          penalty: shortPenalty,
+          detail: shortQuality.reason 
+        });
+        continue;
+      }
+      shortQualified += 1;
+    }
+
+    // Calculate effective score (aiScore - shortPenalty for shorts)
+    const effectiveScore = aiScore - shortPenalty;
+
+    const createdAt = String(s?.createdAt || s?.updatedAt || new Date().toISOString());
+
+    allQualifyingCandidates.push({
+      signal: s,
+      symbol,
       side,
+      aiScore,
       entryPrice,
       stopPrice,
       targetPrice,
-      takeProfitPrice: targetPrice,
+      tier,
+      signalId,
+      createdAt,
+      shortPenalty,
+      effectiveScore,
+    });
+  }
+
+  // PASS 2: Deduplicate by symbol+side
+  const { unique: uniqueCandidates, collapsedCount: duplicatesCollapsedCount } = dedupeCandidates(allQualifyingCandidates);
+  const totalCandidates = allQualifyingCandidates.length;
+  const uniqueCandidatesCount = uniqueCandidates.length;
+
+  // Track collapsed duplicates as skipped
+  if (duplicatesCollapsedCount > 0) {
+    skipped.push(...Array(duplicatesCollapsedCount).fill({ symbol: "COLLAPSED", reason: "duplicate_collapsed_in_dedupe" }));
+  }
+
+  // PASS 3: Apply limit AFTER deduplication and create trades
+  const candidatesToSeed = uniqueCandidates.slice(0, effectiveLimit);
+  const limitSkippedCandidates = uniqueCandidates.slice(effectiveLimit);
+
+  // Track limit-reached skips
+  for (const c of limitSkippedCandidates) {
+    skipped.push({ symbol: c.symbol, reason: "limit_reached" });
+  }
+
+  // Create trades for selected candidates
+  for (const c of candidatesToSeed) {
+    const now = new Date().toISOString();
+    const sessionMeta = deriveSessionMeta(now);
+    const scoredAt = String(c.signal?.scoredAt || c.signal?.updatedAt || c.createdAt || now);
+
+    const trade = {
+      id: crypto.randomUUID(),
+      ticker: c.symbol,
+      side: c.side,
+      entryPrice: c.entryPrice,
+      stopPrice: c.stopPrice,
+      targetPrice: c.targetPrice,
+      takeProfitPrice: c.targetPrice,
       status: "AUTO_PENDING",
       source: "AUTO",
       paper: true,
@@ -245,39 +450,41 @@ export async function POST(req: NextRequest) {
       scoredAt,
       etDate: sessionMeta.etDate,
       sessionTag: sessionMeta.sessionTag,
-      signalId,
-      aiScore,
-      tier,
+      signalId: c.signalId,
+      aiScore: c.aiScore,
+      tier: c.tier,
       autoEntryStatus: "AUTO_PENDING",
+      // Phase 3c: Track short penalty for debugging
+      ...(c.side === "SHORT" && c.shortPenalty > 0 ? { shortPenalty: c.shortPenalty } : {}),
     };
 
     await upsertTrade(trade);
 
-    existingBySignalId.add(signalId);
-    existingPendingBySymbolSide.add(symbolSide);
+    existingBySignalId.add(c.signalId);
+    existingPendingBySymbolSide.add(`${c.symbol}:${c.side}`);
 
-    // Phase 3: Track by direction
-    if (side === "LONG") seededLong += 1;
-    if (side === "SHORT") seededShort += 1;
+    if (c.side === "LONG") seededLong += 1;
+    if (c.side === "SHORT") seededShort += 1;
 
     created.push({
       id: trade.id,
-      symbol,
-      side,
-      signalId,
-      aiScore,
-      tier,
+      symbol: c.symbol,
+      side: c.side,
+      signalId: c.signalId,
+      aiScore: c.aiScore,
+      effectiveScore: c.effectiveScore,
+      tier: c.tier,
     });
   }
 
-  // Phase 3: Aggregate skip reasons for funnel tracking
+  // Aggregate skip reasons
   for (const s of skipped) {
     const reason = s.reason || "unknown";
     skipReasonCounts[reason] = (skipReasonCounts[reason] ?? 0) + 1;
   }
 
-  // Phase 3b: Compute explicit skip counts for visibility
-  const duplicateSkippedCount = (skipReasonCounts["duplicate_symbol_side_in_batch"] ?? 0);
+  // Compute explicit skip counts
+  const duplicateSkippedCount = (skipReasonCounts["duplicate_collapsed_in_dedupe"] ?? 0);
   const alreadyHasTradeSkippedCount = (skipReasonCounts["already_has_trade_for_signal"] ?? 0) + 
                                       (skipReasonCounts["already_has_pending_for_symbol_side"] ?? 0);
   const limitReachedSkippedCount = (skipReasonCounts["limit_reached"] ?? 0);
@@ -288,13 +495,22 @@ export async function POST(req: NextRequest) {
   const missingPricesSkippedCount = (skipReasonCounts["missing_required_prices"] ?? 0);
   const tierDisabledSkippedCount = (skipReasonCounts["tier_c_disabled"] ?? 0);
   const overlayGradeSkippedCount = (skipReasonCounts["overlay_grade_excluded"] ?? 0);
+  const shortWeakStructureSkippedCount = (skipReasonCounts["short_weak_structure"] ?? 0);
 
-  // Phase 3: Bump attribution counters (including new detailed counters)
+  // Bump funnel counters
   await bumpTodayFunnel({
     seedFromQualifiedLong: seededLong,
     seedFromQualifiedShort: seededShort,
     seedTotalCandidates: totalCandidates,
     seedCreatedCount: created.length,
+    // Phase 3c: Deduplication visibility
+    seedUniqueCandidates: uniqueCandidatesCount,
+    seedDuplicatesCollapsed: duplicatesCollapsedCount,
+    // Phase 3c: Short quality
+    shortQualified: shortQualified,
+    shortSeeded: seededShort,
+    shortSkippedWeakStructure: shortSkippedWeakStructure,
+    // Skip reasons
     seedSkippedNotQualified: notQualifiedSkippedCount,
     seedSkippedOverlayGrade: overlayGradeSkippedCount,
     seedSkippedMissingSymbol: skipReasonCounts["missing_symbol"] ?? 0,
@@ -305,7 +521,7 @@ export async function POST(req: NextRequest) {
     seedSkippedMissingDirection: missingDirectionSkippedCount,
     seedSkippedMissingPrices: missingPricesSkippedCount,
     seedSkippedTierDisabled: tierDisabledSkippedCount,
-    seedSkippedOther: skipped.length - (
+    seedSkippedOther: Math.max(0, skipped.length - (
       notQualifiedSkippedCount +
       overlayGradeSkippedCount +
       (skipReasonCounts["missing_symbol"] ?? 0) +
@@ -315,8 +531,9 @@ export async function POST(req: NextRequest) {
       belowMinScoreSkippedCount +
       missingDirectionSkippedCount +
       missingPricesSkippedCount +
-      tierDisabledSkippedCount
-    ),
+      tierDisabledSkippedCount +
+      shortWeakStructureSkippedCount
+    )),
   });
 
   return NextResponse.json(
@@ -327,14 +544,20 @@ export async function POST(req: NextRequest) {
       effectiveLimit,
       minScore,
       totalSignals: (signals || []).length,
+      // Phase 3c: Improved visibility
       totalCandidates,
+      uniqueCandidatesCount,
+      duplicatesCollapsedCount,
       createdCount: created.length,
       skippedCount: skipped.length,
       skippedByOverlayCount: skipped.filter((s) => s.reason === "overlay_grade_excluded" || s.reason === "below_overlay_adjusted_minScore").length,
-      // Phase 3: Add direction breakdown
+      // Direction breakdown
       seededLong,
       seededShort,
-      // Phase 3b: Explicit skip counts for visibility (PART 3)
+      // Phase 3c: Short-side metrics
+      shortQualified,
+      shortSkippedWeakStructure,
+      // Explicit skip counts
       duplicateSkippedCount,
       alreadyHasTradeSkippedCount,
       limitReachedSkippedCount,
@@ -344,6 +567,7 @@ export async function POST(req: NextRequest) {
       missingPricesSkippedCount,
       tierDisabledSkippedCount,
       overlayGradeSkippedCount,
+      shortWeakStructureSkippedCount,
       skipReasonCounts,
       created,
       skipped: skipped.slice(0, 50),

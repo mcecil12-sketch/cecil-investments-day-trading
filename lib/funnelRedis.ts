@@ -90,6 +90,12 @@ const NUMERIC_COUNTERS = [
   "seedSkippedMissingDirection",
   "seedSkippedMissingPrices",
   "seedSkippedTierDisabled",
+  // Phase 3c: Short quality tracking
+  "shortQualified",
+  "shortSeeded",
+  "shortSkippedWeakStructure",
+  "seedUniqueCandidates",
+  "seedDuplicatesCollapsed",
   // Phase 3: Execute attribution
   "executeFromSeededLong",
   "executeFromSeededShort",
@@ -97,6 +103,10 @@ const NUMERIC_COUNTERS = [
   "executeSkippedLiquidity",
   "executeSkippedBracketInvalid",
   "executeSkippedOther",
+  // Phase 3c: Execute invalid tracking
+  "executeInvalidMarked",
+  "executeStaleArchived",
+  "executeDuplicatesArchived",
 ] as const;
 
 type NumericCounterKey = (typeof NUMERIC_COUNTERS)[number];
