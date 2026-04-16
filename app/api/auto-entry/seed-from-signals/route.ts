@@ -276,20 +276,46 @@ export async function POST(req: NextRequest) {
     skipReasonCounts[reason] = (skipReasonCounts[reason] ?? 0) + 1;
   }
 
-  // Phase 3: Bump attribution counters
+  // Phase 3b: Compute explicit skip counts for visibility
+  const duplicateSkippedCount = (skipReasonCounts["duplicate_symbol_side_in_batch"] ?? 0);
+  const alreadyHasTradeSkippedCount = (skipReasonCounts["already_has_trade_for_signal"] ?? 0) + 
+                                      (skipReasonCounts["already_has_pending_for_symbol_side"] ?? 0);
+  const limitReachedSkippedCount = (skipReasonCounts["limit_reached"] ?? 0);
+  const notQualifiedSkippedCount = (skipReasonCounts["not_qualified"] ?? 0);
+  const belowMinScoreSkippedCount = (skipReasonCounts["below_minScore"] ?? 0) + 
+                                    (skipReasonCounts["below_overlay_adjusted_minScore"] ?? 0);
+  const missingDirectionSkippedCount = (skipReasonCounts["missing_direction"] ?? 0);
+  const missingPricesSkippedCount = (skipReasonCounts["missing_required_prices"] ?? 0);
+  const tierDisabledSkippedCount = (skipReasonCounts["tier_c_disabled"] ?? 0);
+  const overlayGradeSkippedCount = (skipReasonCounts["overlay_grade_excluded"] ?? 0);
+
+  // Phase 3: Bump attribution counters (including new detailed counters)
   await bumpTodayFunnel({
     seedFromQualifiedLong: seededLong,
     seedFromQualifiedShort: seededShort,
-    seedSkippedNotQualified: skipReasonCounts["not_qualified"] ?? 0,
-    seedSkippedOverlayGrade: skipReasonCounts["overlay_grade_excluded"] ?? 0,
+    seedTotalCandidates: totalCandidates,
+    seedCreatedCount: created.length,
+    seedSkippedNotQualified: notQualifiedSkippedCount,
+    seedSkippedOverlayGrade: overlayGradeSkippedCount,
     seedSkippedMissingSymbol: skipReasonCounts["missing_symbol"] ?? 0,
-    seedSkippedAlreadyHasTrade: (skipReasonCounts["already_has_trade_for_signal"] ?? 0) + (skipReasonCounts["already_has_pending_for_symbol_side"] ?? 0),
+    seedSkippedAlreadyHasTrade: alreadyHasTradeSkippedCount,
+    seedSkippedDuplicate: duplicateSkippedCount,
+    seedSkippedLimitReached: limitReachedSkippedCount,
+    seedSkippedBelowMinScore: belowMinScoreSkippedCount,
+    seedSkippedMissingDirection: missingDirectionSkippedCount,
+    seedSkippedMissingPrices: missingPricesSkippedCount,
+    seedSkippedTierDisabled: tierDisabledSkippedCount,
     seedSkippedOther: skipped.length - (
-      (skipReasonCounts["not_qualified"] ?? 0) +
-      (skipReasonCounts["overlay_grade_excluded"] ?? 0) +
+      notQualifiedSkippedCount +
+      overlayGradeSkippedCount +
       (skipReasonCounts["missing_symbol"] ?? 0) +
-      (skipReasonCounts["already_has_trade_for_signal"] ?? 0) +
-      (skipReasonCounts["already_has_pending_for_symbol_side"] ?? 0)
+      alreadyHasTradeSkippedCount +
+      duplicateSkippedCount +
+      limitReachedSkippedCount +
+      belowMinScoreSkippedCount +
+      missingDirectionSkippedCount +
+      missingPricesSkippedCount +
+      tierDisabledSkippedCount
     ),
   });
 
@@ -308,6 +334,16 @@ export async function POST(req: NextRequest) {
       // Phase 3: Add direction breakdown
       seededLong,
       seededShort,
+      // Phase 3b: Explicit skip counts for visibility (PART 3)
+      duplicateSkippedCount,
+      alreadyHasTradeSkippedCount,
+      limitReachedSkippedCount,
+      notQualifiedSkippedCount,
+      belowMinScoreSkippedCount,
+      missingDirectionSkippedCount,
+      missingPricesSkippedCount,
+      tierDisabledSkippedCount,
+      overlayGradeSkippedCount,
       skipReasonCounts,
       created,
       skipped: skipped.slice(0, 50),

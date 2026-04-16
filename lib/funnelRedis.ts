@@ -81,6 +81,16 @@ const NUMERIC_COUNTERS = [
   "seedSkippedMissingSymbol",
   "seedSkippedAlreadyHasTrade",
   "seedSkippedOther",
+  // Phase 3b: Detailed seed visibility counters
+  "seedTotalCandidates",
+  "seedCreatedCount",
+  "seedSkippedDuplicate",
+  "seedSkippedLimitReached",
+  "seedSkippedBelowMinScore",
+  "seedSkippedMissingDirection",
+  "seedSkippedMissingPrices",
+  "seedSkippedTierDisabled",
+  // Phase 3: Execute attribution
   "executeFromSeededLong",
   "executeFromSeededShort",
   "executeSkippedPriceDrift",
@@ -161,7 +171,21 @@ export async function readTodayFunnel(): Promise<FunnelToday> {
   const key = targetKey(date);
   if (!redis) return defaultToday(date);
   const stored = (await redis.get<FunnelToday>(key)) ?? defaultToday(date);
-  return stored;
+  
+  // Ensure all NUMERIC_COUNTERS have 0 defaults (handles data from before Phase 3)
+  const merged: FunnelToday = {
+    ...defaultToday(date),
+    ...stored,
+  };
+  
+  // Explicitly ensure all numeric counters are numbers (not null/undefined)
+  for (const counterKey of NUMERIC_COUNTERS) {
+    if (typeof merged[counterKey] !== "number") {
+      merged[counterKey] = 0;
+    }
+  }
+  
+  return merged;
 }
 
 export async function bumpTodayFunnel(
