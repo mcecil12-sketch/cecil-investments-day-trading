@@ -4,6 +4,7 @@ import { getAutoConfig, tierForScore } from "@/lib/autoEntry/config";
 import { deriveSessionMeta } from "@/lib/autoEntry/eligibility";
 import { getEtDateString } from "@/lib/time/etDate";
 import { readExecutionOverlays } from "@/lib/agents/overlays";
+import { bumpTodayFunnel } from "@/lib/funnelRedis";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -133,6 +134,11 @@ export async function POST(req: NextRequest) {
   const created: any[] = [];
   const skipped: any[] = [];
 
+  // Phase 3: Direction-aware attribution tracking
+  const skipReasonCounts: Record<string, number> = {};
+  let seededLong = 0;
+  let seededShort = 0;
+
   const seenCandidateSymbolSide = new Set<string>();
   let totalCandidates = 0;
 
@@ -249,6 +255,11 @@ export async function POST(req: NextRequest) {
 
     existingBySignalId.add(signalId);
     existingPendingBySymbolSide.add(symbolSide);
+
+    // Phase 3: Track by direction
+    if (side === "LONG") seededLong += 1;
+    if (side === "SHORT") seededShort += 1;
+
     created.push({
       id: trade.id,
       symbol,
@@ -258,6 +269,29 @@ export async function POST(req: NextRequest) {
       tier,
     });
   }
+
+  // Phase 3: Aggregate skip reasons for funnel tracking
+  for (const s of skipped) {
+    const reason = s.reason || "unknown";
+    skipReasonCounts[reason] = (skipReasonCounts[reason] ?? 0) + 1;
+  }
+
+  // Phase 3: Bump attribution counters
+  await bumpTodayFunnel({
+    seedFromQualifiedLong: seededLong,
+    seedFromQualifiedShort: seededShort,
+    seedSkippedNotQualified: skipReasonCounts["not_qualified"] ?? 0,
+    seedSkippedOverlayGrade: skipReasonCounts["overlay_grade_excluded"] ?? 0,
+    seedSkippedMissingSymbol: skipReasonCounts["missing_symbol"] ?? 0,
+    seedSkippedAlreadyHasTrade: (skipReasonCounts["already_has_trade_for_signal"] ?? 0) + (skipReasonCounts["already_has_pending_for_symbol_side"] ?? 0),
+    seedSkippedOther: skipped.length - (
+      (skipReasonCounts["not_qualified"] ?? 0) +
+      (skipReasonCounts["overlay_grade_excluded"] ?? 0) +
+      (skipReasonCounts["missing_symbol"] ?? 0) +
+      (skipReasonCounts["already_has_trade_for_signal"] ?? 0) +
+      (skipReasonCounts["already_has_pending_for_symbol_side"] ?? 0)
+    ),
+  });
 
   return NextResponse.json(
     {
@@ -271,6 +305,10 @@ export async function POST(req: NextRequest) {
       createdCount: created.length,
       skippedCount: skipped.length,
       skippedByOverlayCount: skipped.filter((s) => s.reason === "overlay_grade_excluded" || s.reason === "below_overlay_adjusted_minScore").length,
+      // Phase 3: Add direction breakdown
+      seededLong,
+      seededShort,
+      skipReasonCounts,
       created,
       skipped: skipped.slice(0, 50),
       overlay: {

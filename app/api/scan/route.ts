@@ -5,6 +5,12 @@ import { AlpacaBar, fetchRecentBars } from "@/lib/alpaca";
 import { fetchAlpacaClock } from "@/lib/alpacaClock";
 import { bumpScanRun, bumpScanSkip, bumpTodayFunnel } from "@/lib/funnelRedis";
 import { redis } from "@/lib/redis";
+import {
+  shouldPostSignal,
+  getPrePostConfig,
+  type CandidateContext,
+  type GatingStats,
+} from "@/lib/scanner/prePostGating";
 
 const DEFAULT_WATCHLIST = ["SPY", "QQQ", "TSLA", "NVDA", "META", "AMD"];
 
@@ -1199,6 +1205,8 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
   let postedSignals = 0;
   let queuedSignals = 0;
   let candidatesSkippedDeduped = 0;
+  let candidatesSkippedPrePostGate = 0;
+  const prePostGateReasons: Record<string, number> = {};
   const postDebug: any[] = [];
 
   for (const candidate of topCandidates) {
@@ -1223,6 +1231,38 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
           console.warn("[SCAN] dedupe check failed (non-fatal)", err);
           // Continue without dedupe on Redis error
         }
+      }
+
+      // Pre-post gating: direction-aware quality gate before posting
+      const gateContext: CandidateContext = {
+        ticker: candidate.ticker,
+        side: candidate.side,
+        patternScore: candidate.patternScore,
+        patternType: candidate.patternType,
+        relVol: (candidate as any).relVol,
+        avgDollarVol: (candidate as any).avgDollarVol,
+        spreadPct: (candidate as any).spreadPct,
+        vwapDistPct: (candidate as any).distToVwapPct,
+        atrPct: (candidate as any).atrPct,
+        minutesSinceOpen: (candidate as any).minutesSinceOpen,
+        preScore: (candidate as any).preScore,
+      };
+      const gateResult = shouldPostSignal(gateContext);
+      if (!gateResult.shouldPost) {
+        candidatesSkippedPrePostGate += 1;
+        const reason = gateResult.reason ?? "unknown";
+        prePostGateReasons[reason] = (prePostGateReasons[reason] ?? 0) + 1;
+        if (debugScan) {
+          postDebug.push({
+            ticker: candidate.ticker,
+            side: candidate.side,
+            skipped: true,
+            skipReason: "prePostGate",
+            gateReason: gateResult.reason,
+            gateNote: gateResult.note,
+          });
+        }
+        continue;
       }
       
       if (aiSeedMode) {
@@ -1306,6 +1346,25 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     await bumpTodayFunnel({ signalsPosted: result.postedCount });
   }
 
+  // Phase 3: Direction-aware attribution tracking
+  const postedLong = posted.filter((s) => s.side === "LONG").length;
+  const postedShort = posted.filter((s) => s.side === "SHORT").length;
+  const gatedLong = prePostGateReasons
+    ? Object.values(prePostGateReasons).reduce((sum, v) => sum + v, 0) -
+      (prePostGateReasons["patternScoreTooLow"] ?? 0) // rough split - can refine later
+    : 0;
+  const gatedShort = candidatesSkippedPrePostGate - gatedLong;
+
+  // Bump direction-aware counters
+  if (postedLong > 0 || postedShort > 0 || candidatesSkippedPrePostGate > 0) {
+    await bumpTodayFunnel({
+      scanPrePostGatePassLong: postedLong,
+      scanPrePostGatePassShort: postedShort,
+      scanPrePostGateSkipLong: Math.max(0, gatedLong),
+      scanPrePostGateSkipShort: Math.max(0, gatedShort),
+    });
+  }
+
   const summarySnapshot = logSummary();
 
   return NextResponse.json({
@@ -1314,6 +1373,9 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     candidatesFound: candidates.length,
     candidatesPersisted: posted.length,
     candidatesSkippedDeduped,
+    candidatesSkippedPrePostGate,
+    prePostGateReasons,
+    prePostGateConfig: getPrePostConfig(),
     capApplied,
     capValue,
     topPreScore,

@@ -66,6 +66,27 @@ const NUMERIC_COUNTERS = [
   "autoEntrySkipNoPending",
   "autoEntrySkipMarketClosed",
   "autoEntrySkipOther",
+  // Phase 3: Direction-aware attribution tracking
+  "scanCandidatesLong",
+  "scanCandidatesShort",
+  "scanPrePostGateSkipLong",
+  "scanPrePostGateSkipShort",
+  "scanPrePostGatePassLong",
+  "scanPrePostGatePassShort",
+  // Phase 3: qualified->AUTO_PENDING->execution attribution
+  "seedFromQualifiedLong",
+  "seedFromQualifiedShort",
+  "seedSkippedNotQualified",
+  "seedSkippedOverlayGrade",
+  "seedSkippedMissingSymbol",
+  "seedSkippedAlreadyHasTrade",
+  "seedSkippedOther",
+  "executeFromSeededLong",
+  "executeFromSeededShort",
+  "executeSkippedPriceDrift",
+  "executeSkippedLiquidity",
+  "executeSkippedBracketInvalid",
+  "executeSkippedOther",
 ] as const;
 
 type NumericCounterKey = (typeof NUMERIC_COUNTERS)[number];

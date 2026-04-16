@@ -970,6 +970,7 @@ export async function POST(req: Request) {
     ticker?: string;
     tradeId?: string;
     detail?: string;
+    side?: "LONG" | "SHORT"; // Phase 3: Direction-aware attribution
   }) => {
     const initial = evaluateBreakerTransition({
       outcome: params.outcome,
@@ -1035,6 +1036,7 @@ export async function POST(req: Request) {
     await bumpAutoEntryFunnelSafe(buildAutoEntryFunnelFields({
       outcome: params.outcome,
       reason: params.reason,
+      side: params.side, // Phase 3: Direction-aware attribution
     }));
   };
 
@@ -2266,7 +2268,9 @@ export async function POST(req: Request) {
     await guardrailsStore.bumpEntry(etDate, ticker);
     guardSummary.entriesToday += 1;
     guardSummary.openPositions += 1;
-    await recordOutcome({ outcome: "SUCCESS", reason: "placed", ticker, tradeId });
+    // Phase 3: Include side for direction-aware attribution
+    const normalizedSide = sideEnum === "LONG" ? "LONG" : sideEnum === "SHORT" ? "SHORT" : undefined;
+    await recordOutcome({ outcome: "SUCCESS", reason: "placed", ticker, tradeId, side: normalizedSide });
     await fireNotification({
       type: "AUTO_ENTRY_PLACED",
       tradeId,
