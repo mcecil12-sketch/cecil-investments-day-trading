@@ -38,7 +38,9 @@ function extractFirstJsonObject(s: string): string | null {
 }
 
 function clampScore(x: number): number {
-  if (!Number.isFinite(x)) return 0;
+  // HARDENING: Return NaN for non-finite values instead of 0
+  // This ensures parse failures propagate correctly
+  if (!Number.isFinite(x)) return NaN;
   if (x < 0) return 0;
   if (x > 10) return 10;
   return Math.round(x * 10) / 10;
@@ -94,6 +96,16 @@ export function parseAiScoreOutput(
           : undefined;
       const finalScore = obj.finalScore ?? obj.aiScore ?? obj.score ?? derivedDirectionalScore;
       const score = clampScore(Number(finalScore));
+      
+      // HARDENING: Reject NaN scores (clampScore returns NaN for invalid input)
+      if (!Number.isFinite(score)) {
+        console.log("[scoreParse] Invalid score detected, rejecting parse", {
+          rawScore: finalScore,
+          clampedScore: score,
+        });
+        return { ok: false, reason: "invalid_score", rawHead };
+      }
+      
       const longScore = typeof obj.longScore === "number" ? clampScore(obj.longScore) : undefined;
       const shortScore = typeof obj.shortScore === "number" ? clampScore(obj.shortScore) : undefined;
       const bestDirection = obj.bestDirection || obj.chosenDirection || undefined;
@@ -127,8 +139,8 @@ export function parseAiScoreOutput(
             reasons,
             reasoning,
             rawJson: obj,
-            longScore,
-            shortScore,
+            longScore: Number.isFinite(longScore) ? longScore : undefined,
+            shortScore: Number.isFinite(shortScore) ? shortScore : undefined,
             bestDirection,
             finalScore,
             longSummary,
@@ -144,7 +156,7 @@ export function parseAiScoreOutput(
   }
 
   const h = heuristicParse(cleaned);
-  if (h) return { ok: true, parsed: h };
+  if (h && Number.isFinite(h.score)) return { ok: true, parsed: h };
 
   return { ok: false, reason: "unparseable", rawHead };
 }

@@ -138,8 +138,14 @@ function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n))
 }
 
+/**
+ * Clamp score to valid range [1.0, 10.0].
+ * Note: Returns 1.0 for invalid scores (not 0) to prevent aiScore=0 bugs.
+ * For strict validation that should fail on invalid input, use scoreParse.ts.
+ */
 function clampScore(x: any) {
   const n = typeof x === "number" ? x : Number(x)
+  // HARDENING: Return 1.0 minimum for invalid/zero scores (never 0)
   if (!Number.isFinite(n)) return 1.0
   if (n <= 0) return 1.0
   if (n > 10) return 10.0

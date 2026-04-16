@@ -38,7 +38,7 @@ export function applyInsufficientBars(signal: any, reason: string, nowIso: strin
 
 /**
  * Apply pre-GPT skip reason for signals that don't meet eligibility gates.
- * Used for hard gates: bars, volume, price, etc. (before AI scoring).
+ * Used for hard gates: bars, volume, price, trend, relVol, etc. (before AI scoring).
  * 
  * @param signal The signal being skipped
  * @param reason The specific skip reason (e.g., "volume_too_low", "price_too_low")
@@ -63,11 +63,16 @@ export function applyPreGptSkip(
   // Build summary with detail if available
   const summaryMap: Record<SkipReason, string> = {
     insufficient_bars: "Insufficient recent bars",
+    missing_context: "Missing signal context",
     volume_too_low: "Average volume below minimum",
     dollar_volume_too_low: "Dollar volume below minimum",
     price_too_low: "Entry price below minimum",
+    price_too_high: "Entry price exceeds maximum",
     spread_too_wide: "Spread exceeds maximum",
+    low_rel_volume: "Relative volume below minimum",
+    flat_trend: "Flat trend (no directional bias)",
     stale: "Signal too old (stale)",
+    stale_market_hours: "Signal too old for market hours",
   };
   
   signal.aiSummary = detail
@@ -86,11 +91,16 @@ export function applyPreGptSkip(
   // Track in funnel by reason
   const funnelMetrics: Record<SkipReason, string> = {
     insufficient_bars: "skipInsufficientBars",
+    missing_context: "skipMissingContext",
     volume_too_low: "skipVolumeTooLow",
     dollar_volume_too_low: "skipDollarVolume",
     price_too_low: "skipPriceTooLow",
+    price_too_high: "skipPriceTooHigh",
     spread_too_wide: "skipSpreadTooWide",
+    low_rel_volume: "skipLowRelVolume",
+    flat_trend: "skipFlatTrend",
     stale: "skipStale",
+    stale_market_hours: "skipStaleMarketHours",
   };
   
   const funnelKey = funnelMetrics[reason];

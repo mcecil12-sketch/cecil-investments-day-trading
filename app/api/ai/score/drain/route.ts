@@ -11,8 +11,9 @@ import {
   applyScoreSuccess,
   applyPreGptSkip,
 } from "@/lib/ai/scoreDrainApply";
-import { evaluateSignalEligibility, getEligibilityThresholds } from "@/lib/ai/eligibilityGates";
+import { evaluateSignalEligibility, getEligibilityThresholds, computePreScore } from "@/lib/ai/eligibilityGates";
 import { buildSignalContext } from "@/lib/signalContext";
+import { fetchAlpacaClock } from "@/lib/alpacaClock";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -31,6 +32,10 @@ const SCORING_CONCURRENCY = Number(
 const AI_SCORE_FRESH_HOURS = Number(process.env.AI_SCORE_FRESH_HOURS ?? 24); // Window for live mode (default 24h)
 const AI_SCORE_RECOVERY_HOURS = Number(process.env.AI_SCORE_RECOVERY_HOURS ?? 48); // Window for recovery mode (default 48h)
 
+// Dynamic batch size configuration: larger during market hours for throughput
+const BATCH_SIZE_MARKET_OPEN = Number(process.env.SCORE_DRAIN_BATCH_SIZE_OPEN ?? 25);
+const BATCH_SIZE_MARKET_CLOSED = Number(process.env.SCORE_DRAIN_BATCH_SIZE_CLOSED ?? 5);
+
 // Performance tuning: batching
 // SCORE_DRAIN_BATCH_SIZE controls how many signals are scored per iteration of the loop.
 // The drain loops until budget exhausted, MAX_PER_RUN reached, or no eligible signals remain.
@@ -38,6 +43,10 @@ const SCORE_DRAIN_BATCH_SIZE = Number(
   process.env.SCORE_DRAIN_BATCH_SIZE ?? process.env.AI_SCORE_BATCH_SIZE ?? 25
 );
 const AI_SCORE_MAX_CANDIDATE_SCAN = Number(process.env.AI_SCORE_MAX_CANDIDATE_SCAN ?? 200);
+
+// Multi-pass drain configuration
+const MAX_DRAIN_PASSES = Number(process.env.MAX_DRAIN_PASSES ?? 3);
+const SAFE_EXECUTION_TIME_MS = Number(process.env.DRAIN_SAFE_EXECUTION_MS ?? 10000); // 10s default safe time per pass
 
 // Reclaim configuration
 const RECLAIM_STALE_MINUTES = Number(process.env.SCORE_DRAIN_RECLAIM_MINUTES ?? 10);
@@ -493,8 +502,8 @@ export async function POST(req: Request) {
     bodyLimit !== undefined && Number.isFinite(bodyLimit) && bodyLimit > 0 ? bodyLimit : undefined
   ) ?? MAX_PER_RUN;
   const maxPerRunComputed = Math.min(MAX_PER_RUN, effectiveLimit);
-  // Per-iteration batch size: how many signals to score in each loop iteration
-  const perIterationBatchSize = Math.max(1, Math.min(maxPerRunComputed, SCORE_DRAIN_BATCH_SIZE));
+  // Per-iteration batch size: initially use default, will be updated with dynamic batch after market status check
+  let perIterationBatchSize = Math.max(1, Math.min(maxPerRunComputed, SCORE_DRAIN_BATCH_SIZE));
   // Scan deeper than per-run limit so pre-GPT skips don't starve scorer throughput
   const maxCandidateScan = Math.max(
     maxPerRunComputed * 2,
@@ -546,12 +555,38 @@ export async function POST(req: Request) {
     mode?: "live" | "recovery";
     freshHoursUsed?: number;
     freshHoursSource?: "mode_default" | "query_override";
-    // Pre-GPT gating skip counters
+    // Pre-GPT gating skip counters (enhanced v2)
     skippedInsufficientBars?: number;
+    skippedMissingContext?: number;
     skippedVolumeTooLow?: number;
     skippedDollarVolume?: number;
     skippedPriceTooLow?: number;
+    skippedPriceTooHigh?: number;
     skippedSpreadTooWide?: number;
+    skippedLowRelVolume?: number;
+    skippedFlatTrend?: number;
+    skippedStaleMarketHours?: number;
+    // Market status
+    isMarketOpen?: boolean;
+    dynamicBatchSize?: number;
+    // Multi-pass drain stats
+    passesCompleted?: number;
+    totalProcessed?: number;
+    remainingEstimate?: number;
+    // Skip reasons summary object
+    skipReasons?: {
+      insufficient_bars: number;
+      missing_context: number;
+      low_rel_volume: number;
+      flat_trend: number;
+      low_price: number;
+      high_price: number;
+      illiquid: number;
+      dollar_volume_too_low: number;
+      stale_signal: number;
+      stale_market_hours: number;
+      spread_too_wide: number;
+    };
     // Batch/diagnostics
     perIterationBatchSize?: number;
     candidateScanBudget?: number;
@@ -615,11 +650,38 @@ export async function POST(req: Request) {
     eligible: 0,
     skippedStale: 0,
     skippedStatus: 0,
+    // Pre-GPT skip counters (enhanced v2)
     skippedInsufficientBars: 0,
+    skippedMissingContext: 0,
     skippedVolumeTooLow: 0,
     skippedDollarVolume: 0,
     skippedPriceTooLow: 0,
+    skippedPriceTooHigh: 0,
     skippedSpreadTooWide: 0,
+    skippedLowRelVolume: 0,
+    skippedFlatTrend: 0,
+    skippedStaleMarketHours: 0,
+    // Market status (populated after clock check)
+    isMarketOpen: false,
+    dynamicBatchSize: SCORE_DRAIN_BATCH_SIZE,
+    // Multi-pass drain stats
+    passesCompleted: 0,
+    totalProcessed: 0,
+    remainingEstimate: 0,
+    // Skip reasons summary (populated at end)
+    skipReasons: {
+      insufficient_bars: 0,
+      missing_context: 0,
+      low_rel_volume: 0,
+      flat_trend: 0,
+      low_price: 0,
+      high_price: 0,
+      illiquid: 0,
+      dollar_volume_too_low: 0,
+      stale_signal: 0,
+      stale_market_hours: 0,
+      spread_too_wide: 0,
+    },
     perIterationBatchSize,
     candidateScanBudget: maxCandidateScan,
     selectedCount: 0,
@@ -673,6 +735,25 @@ export async function POST(req: Request) {
     // Recovery mode (optional): score signals within AI_SCORE_RECOVERY_HOURS window
     const signals = await readSignals();
     const now = new Date();
+    
+    // === MARKET STATUS DETECTION ===
+    // Fetch market clock to determine if market is open for dynamic batch sizing
+    let isMarketOpen = false;
+    try {
+      const clock = await fetchAlpacaClock();
+      isMarketOpen = clock?.is_open === true;
+    } catch (err) {
+      console.warn("[score/drain] market clock fetch failed, assuming closed", err);
+    }
+    result.isMarketOpen = isMarketOpen;
+    
+    // === DYNAMIC BATCH SIZING ===
+    // Use larger batch size during market hours for throughput, smaller when closed
+    const dynamicBatchSize = isMarketOpen ? BATCH_SIZE_MARKET_OPEN : BATCH_SIZE_MARKET_CLOSED;
+    result.dynamicBatchSize = dynamicBatchSize;
+    // Update perIterationBatchSize with dynamic value
+    perIterationBatchSize = Math.max(1, Math.min(maxPerRunComputed, dynamicBatchSize));
+    result.perIterationBatchSize = perIterationBatchSize;
     
     // Parse mode: "live" (default, fresh signals only) or "recovery" (broader window)
     const modeParam = (qp.get("mode") || "live").toLowerCase();
@@ -880,11 +961,16 @@ export async function POST(req: Request) {
           result.contextHydrationFailed = (result.contextHydrationFailed ?? 0) + 1;
         }
 
+        // Enhanced eligibility evaluation with new gates
         const eligResult = evaluateSignalEligibility(
           signal.signalContext || null,
           signal.entryPrice,
           signal.createdAt,
-          { staleAgeHours: freshHoursUsed }
+          { 
+            staleAgeHours: freshHoursUsed,
+            isMarketOpen,
+            // Note: skipFlatTrend and skipLowRelVol can be enabled via query params if needed
+          }
         );
 
         if (!eligResult.eligible) {
@@ -893,24 +979,51 @@ export async function POST(req: Request) {
           result.preGptSkipped = (result.preGptSkipped ?? 0) + 1;
           result.persistedArchived = (result.persistedArchived ?? 0) + 1;
 
+          // Track skip reasons by category
           switch (eligResult.reason) {
             case "insufficient_bars":
               result.skippedInsufficientBars = (result.skippedInsufficientBars ?? 0) + 1;
+              result.skipReasons!.insufficient_bars += 1;
+              break;
+            case "missing_context":
+              result.skippedMissingContext = (result.skippedMissingContext ?? 0) + 1;
+              result.skipReasons!.missing_context += 1;
               break;
             case "volume_too_low":
               result.skippedVolumeTooLow = (result.skippedVolumeTooLow ?? 0) + 1;
+              result.skipReasons!.illiquid += 1;
               break;
             case "dollar_volume_too_low":
               result.skippedDollarVolume = (result.skippedDollarVolume ?? 0) + 1;
+              result.skipReasons!.dollar_volume_too_low += 1;
               break;
             case "price_too_low":
               result.skippedPriceTooLow = (result.skippedPriceTooLow ?? 0) + 1;
+              result.skipReasons!.low_price += 1;
+              break;
+            case "price_too_high":
+              result.skippedPriceTooHigh = (result.skippedPriceTooHigh ?? 0) + 1;
+              result.skipReasons!.high_price += 1;
               break;
             case "spread_too_wide":
               result.skippedSpreadTooWide = (result.skippedSpreadTooWide ?? 0) + 1;
+              result.skipReasons!.spread_too_wide += 1;
+              break;
+            case "low_rel_volume":
+              result.skippedLowRelVolume = (result.skippedLowRelVolume ?? 0) + 1;
+              result.skipReasons!.low_rel_volume += 1;
+              break;
+            case "flat_trend":
+              result.skippedFlatTrend = (result.skippedFlatTrend ?? 0) + 1;
+              result.skipReasons!.flat_trend += 1;
               break;
             case "stale":
               result.skippedStale = (result.skippedStale ?? 0) + 1;
+              result.skipReasons!.stale_signal += 1;
+              break;
+            case "stale_market_hours":
+              result.skippedStaleMarketHours = (result.skippedStaleMarketHours ?? 0) + 1;
+              result.skipReasons!.stale_market_hours += 1;
               break;
           }
 
@@ -918,7 +1031,17 @@ export async function POST(req: Request) {
           continue;
         }
 
+        // Compute and attach preScore for ranking
+        const preScore = computePreScore(signal.signalContext || null, signal.entryPrice);
+        signal._preScore = preScore;
+
         batchForScoring.push(signal);
+      }
+
+      // === PRE-SCORE RANKING ===
+      // Sort eligible signals by preScore DESC to prioritize best candidates
+      if (batchForScoring.length > 1) {
+        batchForScoring.sort((a, b) => (b._preScore ?? 0) - (a._preScore ?? 0));
       }
 
       // If no eligible signals found, we've exhausted candidates
@@ -1122,9 +1245,11 @@ export async function POST(req: Request) {
 
     // === POST-LOOP METRICS ===
     result.loopIterations = loopIterations;
+    result.passesCompleted = loopIterations;
     result.claimedThisRun = claimedIds.length;
     result.selectedCount = totalSentToScorer;
     result.sentToScorer = totalSentToScorer;
+    result.totalProcessed = totalSentToScorer;
     result.pipeline!.pendingScanned = result.pendingScanned ?? 0;
     result.pipeline!.freshCandidatesScanned = result.freshCandidatesScanned ?? 0;
     result.pipeline!.claimedThisRun = claimedIds.length;
@@ -1132,6 +1257,10 @@ export async function POST(req: Request) {
     result.pipeline!.contextHydrationFailed = result.contextHydrationFailed ?? 0;
     result.pipeline!.preGptSkipped = result.preGptSkipped ?? 0;
     result.pipeline!.sentToScorer = totalSentToScorer;
+    
+    // Estimate remaining backlog
+    const remainingCandidates = allCandidates.length - candidateIdx;
+    result.remainingEstimate = Math.max(0, remainingCandidates);
 
     // For response visibility: compute createdAt range
     const newestPickedCreatedAt = allCandidates.length > 0
@@ -1297,7 +1426,7 @@ export async function POST(req: Request) {
       }
     }
     
-    // Track drain metrics + pre-GPT skipping
+    // Track drain metrics + pre-GPT skipping (enhanced with all skip reasons)
     try {
       await bumpTodayFunnel({
         drainsRun: 1,
@@ -1310,11 +1439,17 @@ export async function POST(req: Request) {
         drainPersistedArchived: result.persistedArchived ?? 0,
         drainPersistedError: result.persistedError ?? 0,
         drainPreGptSkipped: result.preGptSkipped ?? 0,
+        // Detailed skip reasons
         drainSkippedInsufficientBars: result.skippedInsufficientBars ?? 0,
+        drainSkippedMissingContext: result.skippedMissingContext ?? 0,
         drainSkippedVolumeTooLow: result.skippedVolumeTooLow ?? 0,
         drainSkippedDollarVolume: result.skippedDollarVolume ?? 0,
         drainSkippedPriceTooLow: result.skippedPriceTooLow ?? 0,
+        drainSkippedPriceTooHigh: result.skippedPriceTooHigh ?? 0,
         drainSkippedSpreadTooWide: result.skippedSpreadTooWide ?? 0,
+        drainSkippedLowRelVolume: result.skippedLowRelVolume ?? 0,
+        drainSkippedFlatTrend: result.skippedFlatTrend ?? 0,
+        drainSkippedStaleMarketHours: result.skippedStaleMarketHours ?? 0,
         qualified: result.qualifiedPersisted ?? 0,
         shownInApp: result.shownInAppPersisted ?? 0,
       });
