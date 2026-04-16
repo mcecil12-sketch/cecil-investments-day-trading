@@ -5,6 +5,9 @@ import { deriveSessionMeta } from "@/lib/autoEntry/eligibility";
 import { getEtDateString } from "@/lib/time/etDate";
 import { readExecutionOverlays } from "@/lib/agents/overlays";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
+import { fetchBrokerTruth } from "@/lib/broker/truth";
+import { getGuardrailsState } from "@/lib/autoEntry/guardrailsStore";
+import { getGuardrailConfig } from "@/lib/autoEntry/guardrails";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -237,36 +240,140 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true, skipped: true, reason: "AUTO_TRADING_ENABLED=false" }, { status: 200 });
   }
 
-  // Parse query params from URL (not from JSON body)
+  // Parse params from both URL query params AND JSON body for flexibility
   const url = new URL(req.url);
-  const limitRaw = url.searchParams.get("limit");
-  const minScoreRaw = url.searchParams.get("minScore");
+  const limitRawQuery = url.searchParams.get("limit");
+  const minScoreRawQuery = url.searchParams.get("minScore");
 
-  const limitParsed = Number(limitRaw);
-  const minScoreParsed = Number(minScoreRaw);
+  // Also try to read from JSON body (workflow sends params in body)
+  let bodyLimit: number | undefined;
+  let bodyMinScore: number | undefined;
+  try {
+    const body = await req.json().catch(() => ({}));
+    if (body && typeof body === "object") {
+      if (typeof body.limit === "number" && Number.isFinite(body.limit)) bodyLimit = body.limit;
+      if (typeof body.minScore === "number" && Number.isFinite(body.minScore)) bodyMinScore = body.minScore;
+    }
+  } catch {
+    // Ignore parse errors
+  }
 
-  // Apply defaults and bounds
-  const limit = Number.isFinite(limitParsed)
+  // Priority: query param > body > default
+  const limitParsed = Number(limitRawQuery) || bodyLimit;
+  const minScoreParsed = Number(minScoreRawQuery) || bodyMinScore;
+
+  // Apply defaults and bounds - DEFAULT IS NOW 3 (capacity-aware, not throttled to 1)
+  const requestedLimit = (typeof limitParsed === "number" && Number.isFinite(limitParsed))
     ? Math.max(1, Math.min(50, limitParsed))
-    : 1;
+    : 3; // Default changed from 1 to 3 for capacity-aware seeding
 
-  const minScore = Number.isFinite(minScoreParsed)
+  const minScore = (typeof minScoreParsed === "number" && Number.isFinite(minScoreParsed))
     ? minScoreParsed
     : 0;
 
   const today = getEtDateString();
 
-  const [signals, trades, overlay] = await Promise.all([
+  // Fetch guardrails config for capacity calculations
+  const guardConfig = getGuardrailConfig();
+
+  // Parallel fetch: signals, trades, overlay, broker truth, guardrails state
+  const [signals, trades, overlay, brokerTruth, guardState] = await Promise.all([
     fetchScoredSignalsFromInternalApi(),
     readTrades<any>(),
     readExecutionOverlays(),
+    fetchBrokerTruth(),
+    getGuardrailsState(today),
   ]);
 
-  // Effective limit: honor maxEntriesOverride when it tightens the requested limit
-  const effectiveLimit =
-    overlay.maxEntriesOverride != null && overlay.maxEntriesOverride >= 0
-      ? Math.min(limit, overlay.maxEntriesOverride)
-      : limit;
+  // -------------------------------------------------------------------------
+  // CAPACITY-AWARE LIMIT CALCULATION
+  // -------------------------------------------------------------------------
+  // Compute remaining capacity from broker truth and guardrails state
+  const currentOpenPositions = brokerTruth.positionsCount ?? 0;
+  const maxOpenPositions = guardConfig.maxOpenPositions;
+  const entriesToday = guardState.entriesToday ?? 0;
+  const maxEntriesPerDay = guardConfig.maxEntriesPerDay;
+
+  const remainingPositionSlots = Math.max(0, maxOpenPositions - currentOpenPositions);
+  const remainingEntriesToday = Math.max(0, maxEntriesPerDay - entriesToday);
+
+  // Determine the tightest constraint for limit calculation
+  let effectiveLimit = requestedLimit;
+  let limitReason = "requested_limit";
+
+  // Apply overlay maxEntriesOverride if set
+  if (overlay.maxEntriesOverride != null && overlay.maxEntriesOverride >= 0) {
+    if (overlay.maxEntriesOverride < effectiveLimit) {
+      effectiveLimit = overlay.maxEntriesOverride;
+      limitReason = "overlay_max_entries_override";
+    }
+  }
+
+  // Apply position capacity constraint
+  if (remainingPositionSlots < effectiveLimit) {
+    effectiveLimit = remainingPositionSlots;
+    limitReason = remainingPositionSlots === 0 ? "no_position_capacity" : "position_capacity";
+  }
+
+  // Apply entries/day constraint
+  if (remainingEntriesToday < effectiveLimit) {
+    effectiveLimit = remainingEntriesToday;
+    limitReason = remainingEntriesToday === 0 ? "entries_per_day_exhausted" : "entries_per_day";
+  }
+
+  // Ensure non-negative
+  effectiveLimit = Math.max(0, effectiveLimit);
+
+  // If no capacity, return early with success (no error)
+  if (effectiveLimit === 0) {
+    console.log("[seed-from-signals] no capacity available", {
+      requestedLimit,
+      effectiveLimit,
+      limitReason,
+      currentOpenPositions,
+      maxOpenPositions,
+      remainingPositionSlots,
+      entriesToday,
+      maxEntriesPerDay,
+      remainingEntriesToday,
+    });
+
+    return NextResponse.json({
+      ok: true,
+      today,
+      requestedLimit,
+      effectiveLimit: 0,
+      limitReason,
+      minScore,
+      totalSignals: (signals || []).length,
+      createdCount: 0,
+      skippedCount: 0,
+      // Capacity diagnostics
+      capacityDiagnostics: {
+        currentOpenPositions,
+        maxOpenPositions,
+        remainingPositionSlots,
+        entriesToday,
+        maxEntriesPerDay,
+        remainingEntriesToday,
+        brokerTruthError: brokerTruth.error ?? null,
+      },
+      created: [],
+      skipped: [],
+    }, { status: 200 });
+  }
+
+  console.log("[seed-from-signals] capacity check", {
+    requestedLimit,
+    effectiveLimit,
+    limitReason,
+    currentOpenPositions,
+    maxOpenPositions,
+    remainingPositionSlots,
+    entriesToday,
+    maxEntriesPerDay,
+    remainingEntriesToday,
+  });
 
   const existingBySignalId = new Set<string>();
   const existingPendingBySymbolSide = new Set<string>();
@@ -540,8 +647,9 @@ export async function POST(req: NextRequest) {
     {
       ok: true,
       today,
-      limit,
+      requestedLimit,
       effectiveLimit,
+      limitReason,
       minScore,
       totalSignals: (signals || []).length,
       // Phase 3c: Improved visibility
@@ -571,6 +679,16 @@ export async function POST(req: NextRequest) {
       skipReasonCounts,
       created,
       skipped: skipped.slice(0, 50),
+      // Capacity diagnostics for visibility
+      capacityDiagnostics: {
+        currentOpenPositions,
+        maxOpenPositions,
+        remainingPositionSlots,
+        entriesToday,
+        maxEntriesPerDay,
+        remainingEntriesToday,
+        brokerTruthError: brokerTruth.error ?? null,
+      },
       overlay: {
         posture: overlay.posture,
         allowedGrades: overlay.allowedGrades,
