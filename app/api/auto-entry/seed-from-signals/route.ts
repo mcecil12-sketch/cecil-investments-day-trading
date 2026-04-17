@@ -341,23 +341,27 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       today,
+      // Core limits and capacity (top-level for easy access)
       requestedLimit,
       effectiveLimit: 0,
       limitReason,
+      currentOpenPositions,
+      maxOpenPositions,
+      remainingPositionSlots,
+      entriesToday,
+      maxEntriesPerDay,
+      remainingEntriesToday,
+      // Scoring threshold
       minScore,
+      // Signal and candidate counts
       totalSignals: (signals || []).length,
+      totalCandidates: 0,
+      // Seeding results
+      seededCount: 0,
       createdCount: 0,
       skippedCount: 0,
-      // Capacity diagnostics
-      capacityDiagnostics: {
-        currentOpenPositions,
-        maxOpenPositions,
-        remainingPositionSlots,
-        entriesToday,
-        maxEntriesPerDay,
-        remainingEntriesToday,
-        brokerTruthError: brokerTruth.error ?? null,
-      },
+      // Broker truth status
+      brokerTruthError: brokerTruth.error ?? null,
       created: [],
       skipped: [],
     }, { status: 200 });
@@ -643,19 +647,39 @@ export async function POST(req: NextRequest) {
     )),
   });
 
+  // Lightweight summary log
+  console.log("[seed-from-signals] complete", {
+    seededCount: created.length,
+    candidates: totalCandidates,
+    effectiveLimit,
+    openPositions: currentOpenPositions,
+    entriesToday,
+    limitReason,
+  });
+
   return NextResponse.json(
     {
       ok: true,
       today,
+      // Core limits and capacity (top-level for easy access)
       requestedLimit,
       effectiveLimit,
       limitReason,
+      currentOpenPositions,
+      maxOpenPositions,
+      remainingPositionSlots,
+      entriesToday,
+      maxEntriesPerDay,
+      remainingEntriesToday,
+      // Scoring threshold
       minScore,
+      // Signal and candidate counts
       totalSignals: (signals || []).length,
-      // Phase 3c: Improved visibility
       totalCandidates,
       uniqueCandidatesCount,
       duplicatesCollapsedCount,
+      // Seeding results (seededCount = alias for createdCount)
+      seededCount: created.length,
       createdCount: created.length,
       skippedCount: skipped.length,
       skippedByOverlayCount: skipped.filter((s) => s.reason === "overlay_grade_excluded" || s.reason === "below_overlay_adjusted_minScore").length,
@@ -679,16 +703,8 @@ export async function POST(req: NextRequest) {
       skipReasonCounts,
       created,
       skipped: skipped.slice(0, 50),
-      // Capacity diagnostics for visibility
-      capacityDiagnostics: {
-        currentOpenPositions,
-        maxOpenPositions,
-        remainingPositionSlots,
-        entriesToday,
-        maxEntriesPerDay,
-        remainingEntriesToday,
-        brokerTruthError: brokerTruth.error ?? null,
-      },
+      // Broker truth status
+      brokerTruthError: brokerTruth.error ?? null,
       overlay: {
         posture: overlay.posture,
         allowedGrades: overlay.allowedGrades,

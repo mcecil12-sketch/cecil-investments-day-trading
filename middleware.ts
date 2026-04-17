@@ -28,6 +28,7 @@ const PUBLIC_PATHS = [
   "/api/ai-health",
   "/api/ai-scoreboard",
   "/api/funnel-stats",
+  "/api/funnel-health",
   "/api/ai-heartbeat",
   "/api/diag-build",
   "/api/locks",
