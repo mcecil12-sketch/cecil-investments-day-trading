@@ -9,6 +9,7 @@ import { readTrades } from "@/lib/tradesStore";
 import { readSignals } from "@/lib/jsonDb";
 import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
 import { isOpenTradeStatus } from "@/lib/trades/protection";
+import { getSignalTimestampMs } from "@/lib/signals/since";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -275,20 +276,31 @@ export async function GET() {
     // -------------------------------------------------------------------------
     // CONSISTENT ET-TODAY FILTERING
     // All funnel stages use the same dateET filter for coherent attribution
+    // Uses robust timestamp parsing (same as signals/all endpoint)
     // -------------------------------------------------------------------------
 
-    // Helper to check if a timestamp is from today (ET timezone)
-    const isToday = (isoString?: string | null): boolean => {
-      if (!isoString) return false;
+    // Calculate ET-day boundaries as UTC milliseconds
+    // dateET is "YYYY-MM-DD", we need midnight-to-midnight ET in UTC ms
+    const etDayStartMs = new Date(`${dateET}T00:00:00-04:00`).getTime(); // EDT offset
+    const etDayEndMs = etDayStartMs + 24 * 60 * 60 * 1000;
+
+    // Also try EST offset in case we're in winter time
+    const etDayStartMsEST = new Date(`${dateET}T00:00:00-05:00`).getTime();
+    const etDayEndMsEST = etDayStartMsEST + 24 * 60 * 60 * 1000;
+    
+    // Use the current time to determine if we're in EST or EDT
+    const nowMs = Date.now();
+    const useEDT = nowMs >= etDayStartMs && nowMs < etDayEndMs;
+    const dayStartMs = useEDT ? etDayStartMs : etDayStartMsEST;
+    const dayEndMs = useEDT ? etDayEndMs : etDayEndMsEST;
+
+    // Helper to check if a signal is from today (ET timezone) using robust timestamp parsing
+    const isSignalToday = (signal: any): boolean => {
+      if (!signal) return false;
       try {
-        const d = new Date(isoString);
-        const etFormatter = new Intl.DateTimeFormat("en-CA", {
-          timeZone: "America/New_York",
-          year: "numeric",
-          month: "2-digit",
-          day: "2-digit",
-        });
-        return etFormatter.format(d) === dateET;
+        const tsMs = getSignalTimestampMs(signal, "createdAt");
+        if (!tsMs || isNaN(tsMs)) return false;
+        return tsMs >= dayStartMs && tsMs < dayEndMs;
       } catch {
         return false;
       }
@@ -301,8 +313,8 @@ export async function GET() {
     // CANDIDATES: from funnelStats (scanner-attributed, same ET-day)
     const candidates = num(funnelData.candidatesFound);
 
-    // SIGNALS: Filter by createdAt for today
-    const todaySignals = (allSignals || []).filter((s: any) => isToday(s?.createdAt));
+    // SIGNALS: Filter by robust timestamp for ET-today
+    const todaySignals = (allSignals || []).filter(isSignalToday);
     const signalsReceived = todaySignals.length;
     const scored = todaySignals.filter((s: any) => s?.status === "SCORED" || s?.aiScore != null).length;
     const qualified = todaySignals.filter((s: any) => s?.qualified === true).length;
