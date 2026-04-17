@@ -5,7 +5,7 @@ import { requireAuth } from "@/lib/auth";
 import { getGuardrailConfig, minutesSince } from "@/lib/autoEntry/guardrails";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
-import { getEtDateString } from "@/lib/time/etDate";
+import { getEtDateString, getEtDayBoundsMs, isTimestampInEtDay } from "@/lib/time/etDate";
 import { readTrades } from "@/lib/tradesStore";
 import { isOpenTradeStatus } from "@/lib/trades/protection";
 import {
@@ -153,16 +153,29 @@ export async function GET(req: Request) {
 
   const signals: any[] = Array.isArray(allSignals) ? allSignals : [];
 
+  // Use shared ET-day utilities for consistent filtering
+  const { startMs: dayStartMs, endMs: dayEndMs } = getEtDayBoundsMs(todayEt);
+
   const signalsToday = signals.filter((s) => {
     const createdAt = s?.createdAt;
-    if (!createdAt) return false;
-    const t = Date.parse(createdAt);
+    if (createdAt == null) return false;
+    // Handle both numeric timestamps and ISO strings
+    let t: number;
+    if (typeof createdAt === "number" && Number.isFinite(createdAt)) {
+      t = createdAt;
+    } else {
+      t = Date.parse(createdAt);
+    }
     if (!Number.isFinite(t)) return false;
-    return getEtDateString(new Date(t)) === todayEt;
+    return t >= dayStartMs && t < dayEndMs;
   });
 
   const scoredToday = signalsToday.filter((s) => (s?.status || "").toUpperCase() === "SCORED");
   const pendingToday = signalsToday.filter((s) => (s?.status || "").toUpperCase() === "PENDING");
+  
+  // Also count qualified signals for alignment with funnel-health
+  const qualifiedToday = signalsToday.filter((s) => s?.qualified === true);
+  
   const scoresToday = scoredToday
     .map((s) => s?.aiScore)
     .filter((x: any) => typeof x === "number" && Number.isFinite(x));
@@ -329,6 +342,7 @@ export async function GET(req: Request) {
     today: {
       totalSignals: signalsToday.length,
       scored: scoredToday.length,
+      qualified: qualifiedToday.length,
       pending: pendingToday.length,
       avgScore: avgScoreToday,
       maxScore: maxScoreToday,
@@ -336,8 +350,10 @@ export async function GET(req: Request) {
       // Signal flow diagnostics
       signalSourceUsed: "direct_redis_read",
       recentSignalsWindowUsed: todayEt,
+      etDayBounds: { startMs: dayStartMs, endMs: dayEndMs },
       recentSignalsFound: signalsToday.length,
       recentScoredFound: scoredToday.length,
+      recentQualifiedFound: qualifiedToday.length,
       storeTotal: signals.length,
       funnelScansRun: effectiveFunnel?.scansRun ?? 0,
       funnelSignalsPosted: effectiveFunnel?.signalsPosted ?? 0,

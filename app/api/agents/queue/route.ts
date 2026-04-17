@@ -10,6 +10,7 @@ import {
   type ManualActionStatus,
   type ManualActionTaskInput,
 } from "@/lib/agents/manual-action-queue";
+import { getCriticalTasks, partitionCriticalTasks } from "@/lib/redis";
 
 export async function GET(req: NextRequest) {
   const auth = checkAgentCronAuth(req);
@@ -24,19 +25,55 @@ export async function GET(req: NextRequest) {
     ? Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 50))
     : 50;
 
-  const [tasks, counts] = await Promise.all([
+  // Fetch both manual queue and critical tasks in parallel
+  const [tasks, counts, criticalTasks] = await Promise.all([
     listManualActionTasks({
       status: status ?? undefined,
       executionReady,
       limit,
     }),
     countOpenExecutionReadyManualTasks(),
+    getCriticalTasks().catch(() => []),
   ]);
+
+  // Partition critical tasks
+  const { blocking: blockingCritical, synthetic: syntheticCritical } = partitionCriticalTasks(criticalTasks);
+
+  // Build diagnostic summary showing why executionReadyCount might be 0
+  const diagnostics = {
+    manualQueue: {
+      openCount: counts.openCount,
+      executionReadyCount: counts.executionReadyCount,
+      inProgressCount: counts.inProgressCount,
+      blockedCount: counts.blockedCount,
+      selectedCount: counts.selectedCount,
+    },
+    criticalTasks: {
+      total: criticalTasks.length,
+      blocking: blockingCritical.length,
+      synthetic: syntheticCritical.length,
+    },
+    // Summary: total execution-ready work available
+    totalExecutionReady: counts.executionReadyCount + blockingCritical.length,
+    // Explain why tasks might not be ready
+    selectionExplanation:
+      counts.executionReadyCount > 0
+        ? "manual_queue_has_ready_tasks"
+        : blockingCritical.length > 0
+          ? "critical_tasks_available_but_manual_queue_empty"
+          : counts.blockedCount > 0
+            ? "manual_tasks_exist_but_blocked"
+            : counts.openCount > 0
+              ? "manual_tasks_exist_but_not_execution_ready"
+              : "no_work_available",
+  };
 
   return NextResponse.json({
     ok: true,
     tasks,
     counts,
+    criticalTaskCounts: diagnostics.criticalTasks,
+    diagnostics,
   });
 }
 

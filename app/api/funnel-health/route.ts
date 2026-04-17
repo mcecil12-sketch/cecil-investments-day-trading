@@ -4,7 +4,7 @@ import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { getGuardrailConfig } from "@/lib/autoEntry/guardrails";
 import { getGuardrailsState } from "@/lib/autoEntry/guardrailsStore";
 import { readTodayFunnel } from "@/lib/funnelRedis";
-import { getEtDateString } from "@/lib/time/etDate";
+import { getEtDateString, getEtDayBoundsMs, isTimestampInEtDay } from "@/lib/time/etDate";
 import { readTrades } from "@/lib/tradesStore";
 import { readSignals } from "@/lib/jsonDb";
 import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
@@ -69,8 +69,15 @@ type FunnelHealthResponse = {
   // DEBUG: Temporary field for attribution verification (can be removed later)
   _debug?: {
     scope: string;
+    etDayBounds?: {
+      startMs: number;
+      endMs: number;
+      startIso: string;
+      endIso: string;
+    };
     sources: Record<string, string>;
     rawCounts: Record<string, number>;
+    sampleSignals?: Array<Record<string, unknown>>;
   };
 };
 
@@ -276,23 +283,10 @@ export async function GET() {
     // -------------------------------------------------------------------------
     // CONSISTENT ET-TODAY FILTERING
     // All funnel stages use the same dateET filter for coherent attribution
-    // Uses robust timestamp parsing (same as signals/all endpoint)
+    // Uses shared ET-day utilities for correct timezone handling
     // -------------------------------------------------------------------------
 
-    // Calculate ET-day boundaries as UTC milliseconds
-    // dateET is "YYYY-MM-DD", we need midnight-to-midnight ET in UTC ms
-    const etDayStartMs = new Date(`${dateET}T00:00:00-04:00`).getTime(); // EDT offset
-    const etDayEndMs = etDayStartMs + 24 * 60 * 60 * 1000;
-
-    // Also try EST offset in case we're in winter time
-    const etDayStartMsEST = new Date(`${dateET}T00:00:00-05:00`).getTime();
-    const etDayEndMsEST = etDayStartMsEST + 24 * 60 * 60 * 1000;
-    
-    // Use the current time to determine if we're in EST or EDT
-    const nowMs = Date.now();
-    const useEDT = nowMs >= etDayStartMs && nowMs < etDayEndMs;
-    const dayStartMs = useEDT ? etDayStartMs : etDayStartMsEST;
-    const dayEndMs = useEDT ? etDayEndMs : etDayEndMsEST;
+    const { startMs: dayStartMs, endMs: dayEndMs } = getEtDayBoundsMs(dateET);
 
     // Helper to check if a signal is from today (ET timezone) using robust timestamp parsing
     const isSignalToday = (signal: any): boolean => {
@@ -480,6 +474,12 @@ export async function GET() {
       // DEBUG: Temporary fields to verify source attribution
       _debug: {
         scope: dateET,
+        etDayBounds: {
+          startMs: dayStartMs,
+          endMs: dayEndMs,
+          startIso: new Date(dayStartMs).toISOString(),
+          endIso: new Date(dayEndMs).toISOString(),
+        },
         sources: {
           candidates: "funnelRedis.candidatesFound",
           signalsReceived: `signals filtered by createdAt ET-today (${dateET})`,
@@ -500,6 +500,18 @@ export async function GET() {
           funnelExecuteFromSeededLong: num(funnelData.executeFromSeededLong),
           funnelExecuteFromSeededShort: num(funnelData.executeFromSeededShort),
         },
+        // Sample of recent signals for debugging timestamp parsing
+        sampleSignals: (allSignals || []).slice(0, 5).map((s: any) => ({
+          id: s?.id?.slice?.(0, 8) ?? "?",
+          symbol: s?.symbol ?? s?.ticker ?? "?",
+          createdAt: s?.createdAt,
+          createdAtType: typeof s?.createdAt,
+          createdAtMs: typeof s?.createdAt === "number" ? s?.createdAt : 
+                       typeof s?.createdAt === "string" ? Date.parse(s?.createdAt) : null,
+          status: s?.status,
+          qualified: s?.qualified,
+          inTodayWindow: isSignalToday(s),
+        })),
       },
     };
 

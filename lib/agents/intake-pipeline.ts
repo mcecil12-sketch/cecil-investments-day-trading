@@ -34,7 +34,9 @@ export { isConversationalTask, parseConversationalTask };
 // ─── Patchable task types that strongly need fileHints ───────────────
 
 const PATCHABLE_TYPES: Set<ManualActionTaskType> = new Set([
-  "BUGFIX", "SCORING", "AUTO_ENTRY", "SELF_HEAL", "OPTIMIZATION",
+  "BUGFIX", "SCORING", "AUTO_ENTRY", "OPTIMIZATION",
+  // Note: SELF_HEAL and OPS are NOT here — they often operate on broker/system
+  // state via routeHints rather than code patches
 ]);
 
 // ─── Internal execute trigger ───────────────────────────────────────

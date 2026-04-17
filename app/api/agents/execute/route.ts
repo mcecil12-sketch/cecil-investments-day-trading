@@ -39,6 +39,7 @@ import {
 } from "@/lib/agents/manual-action-queue";
 import { executeManualTask } from "@/lib/agents/manual-task-executor";
 import { mapIncidentsToTasks } from "@/lib/agents/critical-incident-mapper";
+import { createTasksFromIncidents, type FunnelIncident } from "@/lib/agents/incident-task-bridge";
 import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { readTrades } from "@/lib/tradesStore";
@@ -50,6 +51,16 @@ import type {
   ExecutionStateMachineResult,
   PatchPlanDetail,
 } from "@/lib/agents/types";
+
+// ─── Helper: resolve base URL for internal API calls ────────────────
+
+function resolveExecuteBaseUrl(): string {
+  if (process.env.NEXT_PUBLIC_BASE_URL) return process.env.NEXT_PUBLIC_BASE_URL.replace(/\/+$/, "");
+  if (process.env.APP_URL) return process.env.APP_URL.replace(/\/+$/, "");
+  if (process.env.NEXTAUTH_URL) return process.env.NEXTAUTH_URL.replace(/\/+$/, "");
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  return "http://localhost:3000";
+}
 
 function appendNotes(current: string[] | undefined, additions: string[]): string[] {
   return [...(current ?? []), ...additions].filter(Boolean).slice(-20);
@@ -359,6 +370,13 @@ export async function POST(req: NextRequest) {
       escalatedCount: number;
       escalationError: string | null;
     } | null;
+    funnelIncidentBridge: {
+      attempted: boolean;
+      incidentsDetected: number;
+      tasksCreated: number;
+      tasksDeduplicated: number;
+      error: string | null;
+    } | null;
   } = {
     criticalTasksChecked: false,
     criticalTasksFound: 0,
@@ -369,6 +387,7 @@ export async function POST(req: NextRequest) {
     staleRecoveryCount: 0,
     executionPathTaken: "unknown",
     proactiveEscalation: null,
+    funnelIncidentBridge: null,
   };
 
   try {
@@ -455,6 +474,72 @@ export async function POST(req: NextRequest) {
       
       // Always capture escalation diagnostics after the check completes
       proactiveDiagnostics.proactiveEscalation = proactiveEscalation;
+    }
+
+    // ─── Proactive Funnel Incident Escalation ─────────────────────────
+    // Bridge funnel-health incidents (UNDERUTILIZED_FUNNEL, QUALIFIED_NOT_SEEDED,
+    // etc.) into ManualActionTasks so executionReadyCount reflects available work.
+    // This ensures the manual queue has actionable tasks for HIGH/CRITICAL incidents.
+    let funnelIncidentBridge: {
+      attempted: boolean;
+      incidentsDetected: number;
+      tasksCreated: number;
+      tasksDeduplicated: number;
+      error: string | null;
+    } | null = null;
+
+    if (!dryRun) {
+      try {
+        // Fetch funnel-health to detect current incidents
+        const baseUrl = resolveExecuteBaseUrl();
+        const funnelRes = await fetch(`${baseUrl}/api/funnel-health`, {
+          headers: { "cache-control": "no-store" },
+          signal: AbortSignal.timeout(10_000),
+        }).catch(() => null);
+
+        if (funnelRes && funnelRes.ok) {
+          const funnelData = await funnelRes.json().catch(() => null);
+          const funnelIncidents: FunnelIncident[] = funnelData?.incidents ?? [];
+
+          // Only process HIGH and CRITICAL incidents
+          const actionableIncidents = funnelIncidents.filter(
+            (i) => i.severity === "CRITICAL" || i.severity === "HIGH"
+          );
+
+          funnelIncidentBridge = {
+            attempted: true,
+            incidentsDetected: actionableIncidents.length,
+            tasksCreated: 0,
+            tasksDeduplicated: 0,
+            error: null,
+          };
+
+          if (actionableIncidents.length > 0) {
+            const bridgeResult = await createTasksFromIncidents(actionableIncidents);
+            funnelIncidentBridge.tasksCreated = bridgeResult.createdCount;
+            funnelIncidentBridge.tasksDeduplicated = bridgeResult.dedupedCount;
+
+            if (bridgeResult.createdCount > 0) {
+              console.log(
+                `[AGENT-EXECUTE] Funnel incident bridge: ${bridgeResult.createdCount} tasks created from ${actionableIncidents.length} incidents: ` +
+                actionableIncidents.map((i) => i.code).join(", ")
+              );
+            }
+          }
+        }
+      } catch (err) {
+        funnelIncidentBridge = {
+          attempted: true,
+          incidentsDetected: 0,
+          tasksCreated: 0,
+          tasksDeduplicated: 0,
+          error: err instanceof Error ? err.message : String(err),
+        };
+        console.warn("[AGENT-EXECUTE] Funnel incident bridge failed (non-fatal):", err);
+      }
+
+      // Capture funnel incident bridge diagnostics
+      proactiveDiagnostics.funnelIncidentBridge = funnelIncidentBridge;
     }
 
     // ─── Critical Task Batch Drain ────────────────────────────────────

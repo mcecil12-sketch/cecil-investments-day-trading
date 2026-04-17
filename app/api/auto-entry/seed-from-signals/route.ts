@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { readTrades, upsertTrade } from "@/lib/tradesStore";
 import { getAutoConfig, tierForScore } from "@/lib/autoEntry/config";
 import { deriveSessionMeta } from "@/lib/autoEntry/eligibility";
-import { getEtDateString } from "@/lib/time/etDate";
+import { getEtDateString, getEtDayBoundsMs } from "@/lib/time/etDate";
 import { readExecutionOverlays } from "@/lib/agents/overlays";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
@@ -272,18 +272,33 @@ export async function POST(req: NextRequest) {
     : 0;
 
   const today = getEtDateString();
+  const { startMs: dayStartMs, endMs: dayEndMs } = getEtDayBoundsMs(today);
 
   // Fetch guardrails config for capacity calculations
   const guardConfig = getGuardrailConfig();
 
   // Parallel fetch: signals, trades, overlay, broker truth, guardrails state
-  const [signals, trades, overlay, brokerTruth, guardState] = await Promise.all([
+  const [rawSignals, trades, overlay, brokerTruth, guardState] = await Promise.all([
     fetchScoredSignalsFromInternalApi(),
     readTrades<any>(),
     readExecutionOverlays(),
     fetchBrokerTruth(),
     getGuardrailsState(today),
   ]);
+
+  // -------------------------------------------------------------------------
+  // ET-TODAY SIGNAL FILTERING
+  // Filter to only today's signals for consistent funnel attribution
+  // -------------------------------------------------------------------------
+  const signals = (rawSignals || []).filter((s: RawSignal) => {
+    const createdAt = s?.createdAt;
+    if (createdAt == null) return false;
+    const tsMs = typeof createdAt === "number" ? createdAt : Date.parse(createdAt);
+    if (!Number.isFinite(tsMs)) return false;
+    return tsMs >= dayStartMs && tsMs < dayEndMs;
+  });
+
+  const signalsFilteredOut = (rawSignals || []).length - signals.length;
 
   // -------------------------------------------------------------------------
   // CAPACITY-AWARE LIMIT CALCULATION
@@ -675,6 +690,9 @@ export async function POST(req: NextRequest) {
       minScore,
       // Signal and candidate counts
       totalSignals: (signals || []).length,
+      signalsFilteredOutByEtDay: signalsFilteredOut,
+      rawSignalsFromApi: (rawSignals || []).length,
+      etDayBounds: { startMs: dayStartMs, endMs: dayEndMs },
       totalCandidates,
       uniqueCandidatesCount,
       duplicatesCollapsedCount,

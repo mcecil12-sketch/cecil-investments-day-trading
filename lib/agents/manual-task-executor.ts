@@ -76,14 +76,135 @@ function toEngineeringTask(task: ManualActionTask): EngineeringTask {
   };
 }
 
+// ─── Task types that don't require code patches ─────────────────────
+
+/** OPS and SELF_HEAL task types operate on broker/system state, not code.
+ *  They can execute via routeHints (API calls) without fileHints. */
+const NON_PATCHABLE_TASK_TYPES = new Set(["OPS", "SELF_HEAL"]);
+
+// ─── Route-based execution for OPS/SELF_HEAL tasks ──────────────────
+
+function resolveBaseUrl(): string {
+  if (process.env.NEXT_PUBLIC_BASE_URL) return process.env.NEXT_PUBLIC_BASE_URL.replace(/\/+$/, "");
+  if (process.env.APP_URL) return process.env.APP_URL.replace(/\/+$/, "");
+  if (process.env.NEXTAUTH_URL) return process.env.NEXTAUTH_URL.replace(/\/+$/, "");
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  return "http://localhost:3000";
+}
+
+function buildInternalHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "cache-control": "no-store",
+  };
+  const cronToken = process.env.CRON_TOKEN ?? process.env.CRON_SECRET ?? "";
+  if (cronToken) headers["x-cron-token"] = cronToken;
+  return headers;
+}
+
+/** Execute an OPS/SELF_HEAL task via route calls instead of code patches.
+ *  This is used for operational tasks that interact with broker/system state. */
+async function executeRouteBasedTask(
+  task: ManualActionTask,
+): Promise<ManualTaskExecutionResult> {
+  const routes = task.routeHints ?? [];
+  if (routes.length === 0) {
+    return {
+      ok: false,
+      patchApplied: false,
+      blocked: true,
+      blockedReason: "no_route_hints",
+      summary: "OPS/SELF_HEAL task has no routeHints to execute",
+      failureReason: "no_route_hints",
+      fileHints: task.fileHints,
+      routeHints: task.routeHints,
+    };
+  }
+
+  const baseUrl = resolveBaseUrl();
+  const headers = buildInternalHeaders();
+  const routeResults: Array<{ route: string; ok: boolean; status: number | null; error?: string }> = [];
+  let allOk = true;
+
+  for (const route of routes) {
+    try {
+      // Determine method: POST for action routes, GET for read routes
+      const method = route.includes("/execute") || route.includes("/seed") || route.includes("/drain")
+        ? "POST"
+        : "GET";
+
+      const res = await fetch(`${baseUrl}${route}`, {
+        method,
+        headers,
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      const isOk = res.ok || res.status === 200 || res.status === 201;
+      routeResults.push({ route, ok: isOk, status: res.status });
+
+      if (!isOk) {
+        allOk = false;
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      routeResults.push({ route, ok: false, status: null, error: errMsg });
+      allOk = false;
+    }
+  }
+
+  const summary = routeResults
+    .map((r) => `${r.route}: ${r.ok ? "OK" : `FAIL(${r.status ?? r.error})`}`)
+    .join("; ");
+
+  return {
+    ok: allOk,
+    patchApplied: false, // Route-based execution doesn't produce commits
+    commitSha: null,
+    summary: `Route-based execution: ${summary}`,
+    verification: {
+      buildOk: true, // No build needed for route-based tasks
+      smokeOk: allOk, // Routes themselves are the smoke check
+      details: { routeResults },
+    },
+    blocked: false,
+    blockedReason: null,
+    failureReason: allOk ? null : "route_execution_failed",
+    fileHints: task.fileHints,
+    routeHints: task.routeHints,
+  };
+}
+
 // ─── Executor ───────────────────────────────────────────────────────
 
 export async function executeManualTask(
   task: ManualActionTask,
 ): Promise<ManualTaskExecutionResult> {
-  // 1. Check write capability
+  const isNonPatchable = NON_PATCHABLE_TASK_TYPES.has(task.taskType);
+  const hasFileHints = task.fileHints && task.fileHints.length > 0;
+  const hasRouteHints = task.routeHints && task.routeHints.length > 0;
+
+  // For OPS/SELF_HEAL tasks without fileHints but with routeHints,
+  // we can execute via API calls rather than code patches
+  if (isNonPatchable && !hasFileHints && hasRouteHints) {
+    return executeRouteBasedTask(task);
+  }
+
+  // 1. Check write capability (only needed for code-patching tasks)
   const ghCapability = checkGitHubWriteCapability();
   if (!ghCapability.writeEnabled) {
+    // For non-patchable tasks, this isn't necessarily blocking
+    if (isNonPatchable) {
+      return {
+        ok: false,
+        patchApplied: false,
+        blocked: true,
+        blockedReason: "no_execution_path",
+        summary: `OPS/SELF_HEAL task has no fileHints and no routeHints — cannot determine execution path`,
+        failureReason: "no_execution_path",
+        fileHints: task.fileHints,
+        routeHints: task.routeHints,
+      };
+    }
     return {
       ok: false,
       patchApplied: false,
@@ -96,8 +217,21 @@ export async function executeManualTask(
     };
   }
 
-  // 2. Check that the task has file hints — we need something to commit
-  if (!task.fileHints || task.fileHints.length === 0) {
+  // 2. Check that patchable tasks have file hints — we need something to commit
+  if (!hasFileHints) {
+    // Non-patchable tasks without routeHints are blocked (already handled above)
+    if (isNonPatchable) {
+      return {
+        ok: false,
+        patchApplied: false,
+        blocked: true,
+        blockedReason: "no_execution_path",
+        summary: `OPS/SELF_HEAL task has no fileHints and no routeHints — cannot determine execution path`,
+        failureReason: "no_execution_path",
+        fileHints: task.fileHints,
+        routeHints: task.routeHints,
+      };
+    }
     return {
       ok: false,
       patchApplied: false,
