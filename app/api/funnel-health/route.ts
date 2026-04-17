@@ -7,6 +7,8 @@ import { readTodayFunnel } from "@/lib/funnelRedis";
 import { getEtDateString } from "@/lib/time/etDate";
 import { readTrades } from "@/lib/tradesStore";
 import { readSignals } from "@/lib/jsonDb";
+import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
+import { isOpenTradeStatus } from "@/lib/trades/protection";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,9 +19,15 @@ export const dynamic = "force-dynamic";
 
 type Incident = {
   code: string;
-  severity: "HIGH" | "MEDIUM" | "LOW";
+  severity: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
   message: string;
   context: Record<string, unknown>;
+};
+
+type FunnelScore = {
+  value: number; // 0-100
+  grade: string; // A, B, C, D, F
+  reason: string;
 };
 
 type FunnelHealthResponse = {
@@ -41,12 +49,14 @@ type FunnelHealthResponse = {
     maxEntriesPerDay: number;
     remainingPositionSlots: number;
     remainingEntriesToday: number;
+    utilization: number | null; // 0-100%
   };
   conversion: {
     signalToQualified: number | null;
     qualifiedToSeeded: number | null;
     seededToExecuted: number | null;
   };
+  score: FunnelScore;
   incidents: Incident[];
   timestamps?: {
     lastSeedAt?: string | null;
@@ -93,23 +103,45 @@ function detectIncidents(params: {
   qualified: number;
   seeded: number;
   executed: number;
+  remainingPositionSlots: number;
   minsSinceLastExecute: number | null;
+  protectionMissingTickers: string[];
 }): Incident[] {
   const incidents: Incident[] = [];
-  const { marketOpen, candidates, qualified, seeded, executed, minsSinceLastExecute } = params;
+  const { 
+    marketOpen, 
+    candidates, 
+    qualified, 
+    seeded, 
+    executed, 
+    remainingPositionSlots,
+    minsSinceLastExecute,
+    protectionMissingTickers,
+  } = params;
 
-  // 1) UNDERUTILIZED_FUNNEL: many candidates but only 0-1 seeded
-  if (candidates > 20 && seeded <= 1) {
+  // CRITICAL: Protection missing on open trades
+  if (protectionMissingTickers.length > 0) {
+    incidents.push({
+      code: "PROTECTION_MISSING",
+      severity: "CRITICAL",
+      message: `${protectionMissingTickers.length} open trade(s) missing stop protection: ${protectionMissingTickers.slice(0, 5).join(", ")}${protectionMissingTickers.length > 5 ? "..." : ""}`,
+      context: { tickers: protectionMissingTickers, count: protectionMissingTickers.length },
+    });
+  }
+
+  // 1) UNDERUTILIZED_FUNNEL: many candidates but seeding below capacity
+  const minSeededExpected = Math.min(2, remainingPositionSlots);
+  if (candidates > 50 && seeded < minSeededExpected) {
     incidents.push({
       code: "UNDERUTILIZED_FUNNEL",
       severity: "HIGH",
-      message: `High candidate count (${candidates}) but only ${seeded} seeded. Check capacity or scoring thresholds.`,
-      context: { candidates, seeded },
+      message: `High candidate count (${candidates}) but only ${seeded} seeded (capacity allows ${remainingPositionSlots}). Check scoring thresholds or capacity constraints.`,
+      context: { candidates, seeded, remainingPositionSlots, minSeededExpected },
     });
   }
 
   // 2) QUALIFIED_NOT_SEEDED: qualified signals exist but none seeded
-  if (qualified > 5 && seeded === 0) {
+  if (qualified > 10 && seeded === 0) {
     incidents.push({
       code: "QUALIFIED_NOT_SEEDED",
       severity: "HIGH",
@@ -139,6 +171,84 @@ function detectIncidents(params: {
   }
 
   return incidents;
+}
+
+// -------------------------------------------------------------------------
+// Funnel Score Calculation
+// -------------------------------------------------------------------------
+
+function computeFunnelScore(params: {
+  signalToQualified: number | null;
+  qualifiedToSeeded: number | null;
+  seededToExecuted: number | null;
+  capacityUtilization: number | null;
+  incidentCount: number;
+  criticalIncidents: number;
+  highIncidents: number;
+}): FunnelScore {
+  const {
+    signalToQualified,
+    qualifiedToSeeded,
+    seededToExecuted,
+    capacityUtilization,
+    incidentCount,
+    criticalIncidents,
+    highIncidents,
+  } = params;
+
+  let score = 100;
+  const reasons: string[] = [];
+
+  // Penalize for critical incidents (-40 each)
+  if (criticalIncidents > 0) {
+    score -= criticalIncidents * 40;
+    reasons.push(`${criticalIncidents} critical incident(s)`);
+  }
+
+  // Penalize for high incidents (-15 each)
+  if (highIncidents > 0) {
+    score -= highIncidents * 15;
+    reasons.push(`${highIncidents} high-severity incident(s)`);
+  }
+
+  // Penalize for low conversion rates
+  if (signalToQualified !== null && signalToQualified < 10) {
+    score -= 10;
+    reasons.push(`low signal→qualified (${signalToQualified}%)`);
+  }
+
+  if (qualifiedToSeeded !== null && qualifiedToSeeded < 20) {
+    score -= 15;
+    reasons.push(`low qualified→seeded (${qualifiedToSeeded}%)`);
+  }
+
+  if (seededToExecuted !== null && seededToExecuted < 50) {
+    score -= 10;
+    reasons.push(`low seeded→executed (${seededToExecuted}%)`);
+  }
+
+  // Penalize for low capacity utilization
+  if (capacityUtilization !== null && capacityUtilization < 30) {
+    score -= 10;
+    reasons.push(`low capacity utilization (${capacityUtilization}%)`);
+  }
+
+  // Clamp score
+  score = Math.max(0, Math.min(100, score));
+
+  // Grade
+  let grade: string;
+  if (score >= 90) grade = "A";
+  else if (score >= 75) grade = "B";
+  else if (score >= 60) grade = "C";
+  else if (score >= 40) grade = "D";
+  else grade = "F";
+
+  return {
+    value: Math.round(score),
+    grade,
+    reason: reasons.length > 0 ? reasons.join("; ") : "healthy",
+  };
 }
 
 // -------------------------------------------------------------------------
@@ -185,8 +295,11 @@ export async function GET() {
     };
 
     // -------------------------------------------------------------------------
-    // Funnel Metrics - FROM ACTUAL DATA (same-day scope)
+    // Funnel Metrics - CONSISTENT SOURCES
     // -------------------------------------------------------------------------
+
+    // CANDIDATES: from funnelStats (scanner-attributed, same ET-day)
+    const candidates = num(funnelData.candidatesFound);
 
     // SIGNALS: Filter by createdAt for today
     const todaySignals = (allSignals || []).filter((s: any) => isToday(s?.createdAt));
@@ -194,29 +307,17 @@ export async function GET() {
     const scored = todaySignals.filter((s: any) => s?.status === "SCORED" || s?.aiScore != null).length;
     const qualified = todaySignals.filter((s: any) => s?.qualified === true).length;
 
+    // SEEDED: from funnelStats (seedCreatedCount is bumped by seed-from-signals)
+    const seeded = num(funnelData.seedCreatedCount);
+
     // TRADES: Filter by etDate for today
     const todayTrades = (allTrades || []).filter((t: any) => t?.etDate === dateET);
     
-    // Seeded = trades in AUTO_PENDING or beyond (created via seeding today)
-    const seeded = todayTrades.filter((t: any) => 
-      t?.source === "AUTO" || 
-      t?.status === "AUTO_PENDING" || 
-      t?.autoEntryStatus === "AUTO_PENDING" ||
-      t?.status === "OPEN" ||
-      t?.status === "CLOSED" ||
-      t?.status === "HIT" ||
-      t?.status === "STOPPED"
-    ).length;
-
-    // Executed = trades that actually entered the market (not AUTO_PENDING)
+    // EXECUTED: trades that actually entered the market (not AUTO_PENDING)
     const executed = todayTrades.filter((t: any) =>
       (t?.source === "AUTO") &&
       (t?.status === "OPEN" || t?.status === "CLOSED" || t?.status === "HIT" || t?.status === "STOPPED")
     ).length;
-
-    // CANDIDATES: Use funnelRedis counter (scanner-attributed)
-    // This is the only counter we keep from funnelRedis as it's bumped by scan runs
-    const candidates = num(funnelData.candidatesFound) || num(funnelData.seedTotalCandidates) || signalsReceived;
 
     // -------------------------------------------------------------------------
     // Capacity Metrics
@@ -227,6 +328,9 @@ export async function GET() {
     const maxEntriesPerDay = guardConfig.maxEntriesPerDay;
     const remainingPositionSlots = Math.max(0, maxOpenPositions - currentOpenPositions);
     const remainingEntriesToday = Math.max(0, maxEntriesPerDay - entriesToday);
+    
+    // Capacity utilization: how much of available capacity was used by seeding
+    const capacityUtilization = safePercent(seeded, Math.max(1, remainingPositionSlots + seeded));
 
     // -------------------------------------------------------------------------
     // Conversion Rates
@@ -234,6 +338,39 @@ export async function GET() {
     const signalToQualified = safePercent(qualified, signalsReceived);
     const qualifiedToSeeded = safePercent(seeded, qualified);
     const seededToExecuted = safePercent(executed, seeded);
+
+    // -------------------------------------------------------------------------
+    // Protection Integrity Audit
+    // -------------------------------------------------------------------------
+    let protectionMissingTickers: string[] = [];
+    
+    if (!brokerTruth.error) {
+      // Find all open trades
+      const openTrades = (allTrades || [])
+        .filter((t: any) => isOpenTradeStatus(t?.status))
+        .map((t: any) => ({
+          id: String(t.id || ""),
+          ticker: String(t.ticker || ""),
+          side: String(t.side || ""),
+          status: String(t.status || ""),
+          stopOrderId: t.stopOrderId || t.alpacaStopOrderId,
+        }));
+
+      if (openTrades.length > 0) {
+        const audit = auditProtectionIntegrity({
+          openTrades,
+          brokerPositions: brokerTruth.positions || [],
+          brokerOrders: brokerTruth.openOrders || [],
+          marketOpen,
+        });
+
+        // Extract tickers with missing protection
+        const missingProtectionIncidents = audit.incidents.filter(
+          (i) => i.code === "MISSING_STOP" || i.code === "BROKER_DB_MISMATCH"
+        );
+        protectionMissingTickers = [...new Set(missingProtectionIncidents.map((i) => i.symbol))];
+      }
+    }
 
     // -------------------------------------------------------------------------
     // Timestamp metrics (best-effort from funnel data)
@@ -255,7 +392,26 @@ export async function GET() {
       qualified,
       seeded,
       executed,
+      remainingPositionSlots,
       minsSinceLastExecute,
+      protectionMissingTickers,
+    });
+
+    // Count incident severities for scoring
+    const criticalIncidents = incidents.filter((i) => i.severity === "CRITICAL").length;
+    const highIncidents = incidents.filter((i) => i.severity === "HIGH").length;
+
+    // -------------------------------------------------------------------------
+    // Funnel Score
+    // -------------------------------------------------------------------------
+    const score = computeFunnelScore({
+      signalToQualified,
+      qualifiedToSeeded,
+      seededToExecuted,
+      capacityUtilization,
+      incidentCount: incidents.length,
+      criticalIncidents,
+      highIncidents,
     });
 
     // -------------------------------------------------------------------------
@@ -271,6 +427,7 @@ export async function GET() {
       openPositions: currentOpenPositions,
       entriesToday,
       incidentCount: incidents.length,
+      score: score.value,
       marketOpen,
     });
 
@@ -293,12 +450,14 @@ export async function GET() {
         maxEntriesPerDay,
         remainingPositionSlots,
         remainingEntriesToday,
+        utilization: capacityUtilization,
       },
       conversion: {
         signalToQualified,
         qualifiedToSeeded,
         seededToExecuted,
       },
+      score,
       incidents,
       timestamps: {
         lastSeedAt: lastScanAt,
@@ -310,12 +469,12 @@ export async function GET() {
       _debug: {
         scope: dateET,
         sources: {
-          candidates: "funnelRedis.candidatesFound || funnelRedis.seedTotalCandidates || signalsReceived",
-          signalsReceived: `signals.json filtered by createdAt=${dateET}`,
-          scored: `signals with status=SCORED or aiScore!=null, createdAt=${dateET}`,
-          qualified: `signals with qualified=true, createdAt=${dateET}`,
-          seeded: `trades with etDate=${dateET} and source=AUTO or status in [AUTO_PENDING, OPEN, CLOSED, HIT, STOPPED]`,
-          executed: `trades with etDate=${dateET} and source=AUTO and status in [OPEN, CLOSED, HIT, STOPPED]`,
+          candidates: "funnelRedis.candidatesFound",
+          signalsReceived: `signals filtered by createdAt ET-today (${dateET})`,
+          scored: `signals with status=SCORED or aiScore!=null, createdAt ET-today`,
+          qualified: `signals with qualified=true, createdAt ET-today`,
+          seeded: "funnelRedis.seedCreatedCount",
+          executed: `trades with etDate=${dateET}, source=AUTO, status in [OPEN,CLOSED,HIT,STOPPED]`,
         },
         rawCounts: {
           totalSignals: (allSignals || []).length,
@@ -323,7 +482,7 @@ export async function GET() {
           totalTrades: (allTrades || []).length,
           todayTrades: todayTrades.length,
           funnelCandidatesFound: num(funnelData.candidatesFound),
-          funnelSeedTotalCandidates: num(funnelData.seedTotalCandidates),
+          funnelSeedCreatedCount: num(funnelData.seedCreatedCount),
           funnelSeedFromQualifiedLong: num(funnelData.seedFromQualifiedLong),
           funnelSeedFromQualifiedShort: num(funnelData.seedFromQualifiedShort),
           funnelExecuteFromSeededLong: num(funnelData.executeFromSeededLong),
@@ -349,8 +508,10 @@ export async function GET() {
           maxEntriesPerDay: 5,
           remainingPositionSlots: 3,
           remainingEntriesToday: 5,
+          utilization: null,
         },
         conversion: { signalToQualified: null, qualifiedToSeeded: null, seededToExecuted: null },
+        score: { value: 0, grade: "F", reason: "error loading data" },
         incidents: [],
       } satisfies FunnelHealthResponse,
       { status: 200 } // Return 200 even on error for graceful degradation
