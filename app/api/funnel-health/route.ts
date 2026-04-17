@@ -6,6 +6,7 @@ import { getGuardrailsState } from "@/lib/autoEntry/guardrailsStore";
 import { readTodayFunnel } from "@/lib/funnelRedis";
 import { getEtDateString } from "@/lib/time/etDate";
 import { readTrades } from "@/lib/tradesStore";
+import { readSignals } from "@/lib/jsonDb";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -54,6 +55,12 @@ type FunnelHealthResponse = {
     minsSinceLastExecute?: number | null;
   };
   error?: string;
+  // DEBUG: Temporary field for attribution verification (can be removed later)
+  _debug?: {
+    scope: string;
+    sources: Record<string, string>;
+    rawCounts: Record<string, number>;
+  };
 };
 
 // -------------------------------------------------------------------------
@@ -143,26 +150,73 @@ export async function GET() {
   
   try {
     // Parallel fetch all required data
-    const [clock, brokerTruth, guardConfig, guardState, funnelData, trades] = await Promise.all([
+    const [clock, brokerTruth, guardConfig, guardState, funnelData, allTrades, allSignals] = await Promise.all([
       fetchAlpacaClock().catch(() => ({ is_open: false } as { is_open: boolean })),
       fetchBrokerTruth(),
       Promise.resolve(getGuardrailConfig()),
       getGuardrailsState(dateET),
       readTodayFunnel(),
       readTrades<any>().catch(() => []),
+      readSignals().catch(() => []),
     ]);
 
     const marketOpen = Boolean(clock?.is_open);
 
     // -------------------------------------------------------------------------
-    // Funnel Metrics (from funnelRedis counters)
+    // CONSISTENT ET-TODAY FILTERING
+    // All funnel stages use the same dateET filter for coherent attribution
     // -------------------------------------------------------------------------
-    const candidates = num(funnelData.candidatesFound);
-    const signalsReceived = num(funnelData.signalsReceived);
-    const scored = num(funnelData.gptScored);
-    const qualified = num(funnelData.qualified);
-    const seeded = num(funnelData.seedFromQualifiedLong) + num(funnelData.seedFromQualifiedShort);
-    const executed = num(funnelData.executeFromSeededLong) + num(funnelData.executeFromSeededShort);
+
+    // Helper to check if a timestamp is from today (ET timezone)
+    const isToday = (isoString?: string | null): boolean => {
+      if (!isoString) return false;
+      try {
+        const d = new Date(isoString);
+        const etFormatter = new Intl.DateTimeFormat("en-CA", {
+          timeZone: "America/New_York",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+        });
+        return etFormatter.format(d) === dateET;
+      } catch {
+        return false;
+      }
+    };
+
+    // -------------------------------------------------------------------------
+    // Funnel Metrics - FROM ACTUAL DATA (same-day scope)
+    // -------------------------------------------------------------------------
+
+    // SIGNALS: Filter by createdAt for today
+    const todaySignals = (allSignals || []).filter((s: any) => isToday(s?.createdAt));
+    const signalsReceived = todaySignals.length;
+    const scored = todaySignals.filter((s: any) => s?.status === "SCORED" || s?.aiScore != null).length;
+    const qualified = todaySignals.filter((s: any) => s?.qualified === true).length;
+
+    // TRADES: Filter by etDate for today
+    const todayTrades = (allTrades || []).filter((t: any) => t?.etDate === dateET);
+    
+    // Seeded = trades in AUTO_PENDING or beyond (created via seeding today)
+    const seeded = todayTrades.filter((t: any) => 
+      t?.source === "AUTO" || 
+      t?.status === "AUTO_PENDING" || 
+      t?.autoEntryStatus === "AUTO_PENDING" ||
+      t?.status === "OPEN" ||
+      t?.status === "CLOSED" ||
+      t?.status === "HIT" ||
+      t?.status === "STOPPED"
+    ).length;
+
+    // Executed = trades that actually entered the market (not AUTO_PENDING)
+    const executed = todayTrades.filter((t: any) =>
+      (t?.source === "AUTO") &&
+      (t?.status === "OPEN" || t?.status === "CLOSED" || t?.status === "HIT" || t?.status === "STOPPED")
+    ).length;
+
+    // CANDIDATES: Use funnelRedis counter (scanner-attributed)
+    // This is the only counter we keep from funnelRedis as it's bumped by scan runs
+    const candidates = num(funnelData.candidatesFound) || num(funnelData.seedTotalCandidates) || signalsReceived;
 
     // -------------------------------------------------------------------------
     // Capacity Metrics
@@ -177,7 +231,7 @@ export async function GET() {
     // -------------------------------------------------------------------------
     // Conversion Rates
     // -------------------------------------------------------------------------
-    const signalToQualified = safePercent(qualified, signalsReceived || candidates);
+    const signalToQualified = safePercent(qualified, signalsReceived);
     const qualifiedToSeeded = safePercent(seeded, qualified);
     const seededToExecuted = safePercent(executed, seeded);
 
@@ -209,6 +263,9 @@ export async function GET() {
     // -------------------------------------------------------------------------
     console.log("[funnel-health] snapshot", {
       candidates,
+      signalsReceived,
+      scored,
+      qualified,
       seeded,
       executed,
       openPositions: currentOpenPositions,
@@ -248,6 +305,30 @@ export async function GET() {
         lastExecuteAt: lastEntryAt,
         minsSinceLastSeed,
         minsSinceLastExecute,
+      },
+      // DEBUG: Temporary fields to verify source attribution
+      _debug: {
+        scope: dateET,
+        sources: {
+          candidates: "funnelRedis.candidatesFound || funnelRedis.seedTotalCandidates || signalsReceived",
+          signalsReceived: `signals.json filtered by createdAt=${dateET}`,
+          scored: `signals with status=SCORED or aiScore!=null, createdAt=${dateET}`,
+          qualified: `signals with qualified=true, createdAt=${dateET}`,
+          seeded: `trades with etDate=${dateET} and source=AUTO or status in [AUTO_PENDING, OPEN, CLOSED, HIT, STOPPED]`,
+          executed: `trades with etDate=${dateET} and source=AUTO and status in [OPEN, CLOSED, HIT, STOPPED]`,
+        },
+        rawCounts: {
+          totalSignals: (allSignals || []).length,
+          todaySignals: todaySignals.length,
+          totalTrades: (allTrades || []).length,
+          todayTrades: todayTrades.length,
+          funnelCandidatesFound: num(funnelData.candidatesFound),
+          funnelSeedTotalCandidates: num(funnelData.seedTotalCandidates),
+          funnelSeedFromQualifiedLong: num(funnelData.seedFromQualifiedLong),
+          funnelSeedFromQualifiedShort: num(funnelData.seedFromQualifiedShort),
+          funnelExecuteFromSeededLong: num(funnelData.executeFromSeededLong),
+          funnelExecuteFromSeededShort: num(funnelData.executeFromSeededShort),
+        },
       },
     };
 
