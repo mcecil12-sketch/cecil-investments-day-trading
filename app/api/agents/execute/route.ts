@@ -32,10 +32,17 @@ import {
   countOpenExecutionReadyManualTasks,
   recoverStaleManualTasks,
   getActiveManualTask,
+  cleanupFailedTasks,
   type ManualActionTask,
   type StaleRecoveryResult,
+  type FailedTaskCleanupResult,
 } from "@/lib/agents/manual-action-queue";
 import { executeManualTask } from "@/lib/agents/manual-task-executor";
+import { mapIncidentsToTasks } from "@/lib/agents/critical-incident-mapper";
+import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
+import { fetchBrokerTruth } from "@/lib/broker/truth";
+import { readTrades } from "@/lib/tradesStore";
+import { isOpenTradeStatus } from "@/lib/trades/protection";
 import type {
   EngineeringTask,
   ExecutionPhase,
@@ -334,6 +341,36 @@ export async function POST(req: NextRequest) {
   let task: EngineeringTask | null = null;
   const phases: ExecutionPhaseResult[] = [];
 
+  // ─── Proactive Diagnostics Tracking ────────────────────────────────
+  // Track whether proactive checks ran and what they found
+  const proactiveDiagnostics: {
+    criticalTasksChecked: boolean;
+    criticalTasksFound: number;
+    criticalTasksBlocking: number;
+    manualQueueChecked: boolean;
+    manualQueueActiveTask: string | null;
+    staleRecoveryAttempted: boolean;
+    staleRecoveryCount: number;
+    executionPathTaken: string;
+    proactiveEscalation: {
+      attempted: boolean;
+      auditOk: boolean | null;
+      criticalDetected: number;
+      escalatedCount: number;
+      escalationError: string | null;
+    } | null;
+  } = {
+    criticalTasksChecked: false,
+    criticalTasksFound: 0,
+    criticalTasksBlocking: 0,
+    manualQueueChecked: false,
+    manualQueueActiveTask: null,
+    staleRecoveryAttempted: false,
+    staleRecoveryCount: 0,
+    executionPathTaken: "unknown",
+    proactiveEscalation: null,
+  };
+
   try {
     // ─── Adaptive Guardrails Evaluation ─────────────────────────────
     // Run performance-learning evaluation before task selection
@@ -350,6 +387,76 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // ─── Proactive Protection Incident Escalation ─────────────────────
+    // Ensure CRITICAL protection incidents are escalated to the critical
+    // task queue even if the ops agent hasn't run. This is a fallback to
+    // guarantee the execute loop can act on missing stop protection, etc.
+    let proactiveEscalation: {
+      attempted: boolean;
+      auditOk: boolean | null;
+      criticalDetected: number;
+      escalatedCount: number;
+      escalationError: string | null;
+    } = {
+      attempted: false,
+      auditOk: null,
+      criticalDetected: 0,
+      escalatedCount: 0,
+      escalationError: null,
+    };
+
+    if (!dryRun) {
+      try {
+        proactiveEscalation.attempted = true;
+        const brokerTruth = await fetchBrokerTruth();
+        if (!brokerTruth.error) {
+          const allTrades = await readTrades<any>().catch(() => []);
+          const openTrades = (Array.isArray(allTrades) ? allTrades : [])
+            .filter((t) => isOpenTradeStatus(t?.status))
+            .map((t: any) => ({
+              id: String(t.id || ""),
+              ticker: String(t.ticker || ""),
+              side: String(t.side || ""),
+              status: String(t.status || ""),
+              qty: Number(t.size || t.qty || 0),
+              stopOrderId: t.stopOrderId || t.alpacaStopOrderId,
+              protectionStatus: t.protectionStatus,
+            }));
+
+          const protectionAudit = auditProtectionIntegrity({
+            openTrades,
+            brokerPositions: brokerTruth.positions || [],
+            brokerOrders: brokerTruth.openOrders || [],
+          });
+
+          proactiveEscalation.auditOk = protectionAudit.ok;
+
+          if (!protectionAudit.ok && protectionAudit.criticalCount > 0) {
+            const criticalIncidents = protectionAudit.incidents.filter(
+              (i) => i.severity === "CRITICAL"
+            );
+            proactiveEscalation.criticalDetected = criticalIncidents.length;
+
+            // Escalate to critical task queue (deduped by date)
+            const escalatedTasks = await mapIncidentsToTasks(criticalIncidents);
+            proactiveEscalation.escalatedCount = escalatedTasks.length;
+
+            if (escalatedTasks.length > 0) {
+              console.log(`[AGENT-EXECUTE] Proactive escalation: ${escalatedTasks.length} CRITICAL protection incident(s) -> critical queue: ${criticalIncidents.map((i) => `${i.symbol}:${i.code}`).join(", ")}`);
+            }
+          }
+        } else {
+          proactiveEscalation.escalationError = "broker_truth_error";
+        }
+      } catch (err) {
+        proactiveEscalation.escalationError = err instanceof Error ? err.message : String(err);
+        console.warn("[AGENT-EXECUTE] Proactive escalation check failed (non-fatal):", err);
+      }
+      
+      // Always capture escalation diagnostics after the check completes
+      proactiveDiagnostics.proactiveEscalation = proactiveEscalation;
+    }
+
     // ─── Critical Task Batch Drain ────────────────────────────────────
     // When unresolved protection incidents exist, attempt to resolve all
     // eligible critical tasks in one run (capped for safety).
@@ -357,6 +464,11 @@ export async function POST(req: NextRequest) {
     // broker-side positions to repair.
     const criticalTasks = await getCriticalTasks().catch(() => []);
     const { blocking: blockingCritical, synthetic: syntheticCritical } = partitionCriticalTasks(criticalTasks);
+    
+    // Update proactive diagnostics
+    proactiveDiagnostics.criticalTasksChecked = true;
+    proactiveDiagnostics.criticalTasksFound = criticalTasks.length;
+    proactiveDiagnostics.criticalTasksBlocking = blockingCritical.length;
 
     // Auto-expire synthetic drill tasks — they never have real broker state
     if (!dryRun) {
@@ -366,6 +478,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (blockingCritical.length > 0) {
+      proactiveDiagnostics.executionPathTaken = "critical_task_resolution";
       // ─── DRY RUN: preview critical batch, ZERO mutations ──────────
       if (dryRun) {
         return NextResponse.json({
@@ -377,6 +490,7 @@ export async function POST(req: NextRequest) {
           commitSha: null,
           criticalTaskCount: blockingCritical.length,
           syntheticCount: syntheticCritical.length,
+          proactiveDiagnostics,
           blockingTasks: blockingCritical.map((ct) => ({
             id: ct.id,
             incidentCode: ct.incidentCode,
@@ -616,6 +730,24 @@ export async function POST(req: NextRequest) {
       console.warn("[AGENT-EXECUTE] Stale recovery failed (non-fatal):", err);
       staleRecovery = { attempted: true, recoveredCount: 0, recovered: [], recoveredTaskIds: [], failedTaskIds: [], releasedTaskIds: [], reasonCodes: [] };
     }
+
+    // Step 1b: Cleanup old FAILED/BLOCKED tasks to prevent queue from wedging.
+    // This runs periodically to archive tasks that are unrecoverable.
+    let failedTaskCleanup: FailedTaskCleanupResult | null = null;
+    if (!dryRun) {
+      try {
+        failedTaskCleanup = await cleanupFailedTasks(false);
+        if (failedTaskCleanup.archivedCount > 0) {
+          console.log(`[AGENT-EXECUTE] Archived ${failedTaskCleanup.archivedCount} old FAILED/BLOCKED tasks: [${failedTaskCleanup.archivedTaskIds}]`);
+        }
+      } catch (err) {
+        console.warn("[AGENT-EXECUTE] Failed task cleanup failed (non-fatal):", err);
+      }
+    }
+
+    // Update proactive diagnostics
+    proactiveDiagnostics.staleRecoveryAttempted = staleRecovery.attempted;
+    proactiveDiagnostics.staleRecoveryCount = staleRecovery.recoveredCount;
 
     // Step 2: RELOAD queue state from source of truth AFTER recovery.
     // This ensures counts and active-task reflect recovered state.

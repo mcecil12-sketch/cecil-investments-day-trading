@@ -560,3 +560,143 @@ export async function getActiveManualTask(): Promise<ManualActionTask | null> {
     });
   return active[0] ?? null;
 }
+
+// ─── Failed/Blocked Task Cleanup ──────────────────────────────────────
+
+const FAILED_TASK_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+const BLOCKED_TASK_AGE_MS = 48 * 60 * 60 * 1000; // 48 hours
+
+export interface FailedTaskCleanupResult {
+  attempted: boolean;
+  totalFailed: number;
+  totalBlocked: number;
+  archivedCount: number;
+  archivedTaskIds: string[];
+}
+
+/**
+ * Cleanup old FAILED and BLOCKED tasks by marking them CANCELED.
+ * This prevents the queue from filling up with unrecoverable tasks.
+ * Does NOT mutate state in dryRun mode.
+ */
+export async function cleanupFailedTasks(dryRun = false): Promise<FailedTaskCleanupResult> {
+  const tasks = await getAllTasks();
+  const now = Date.now();
+  
+  const failedTasks = tasks.filter((t) => t.status === "FAILED");
+  const blockedTasks = tasks.filter((t) => t.status === "BLOCKED");
+  
+  const failedCandidates = failedTasks.filter((t) => {
+    const failedAt = t.failedAt ?? t.updatedAt ?? t.createdAt;
+    if (!failedAt) return true; // No timestamp means definitely stale
+    const ageMs = now - new Date(failedAt).getTime();
+    return ageMs > FAILED_TASK_AGE_MS;
+  });
+  
+  const blockedCandidates = blockedTasks.filter((t) => {
+    const blockedAt = t.updatedAt ?? t.createdAt;
+    if (!blockedAt) return true;
+    const ageMs = now - new Date(blockedAt).getTime();
+    return ageMs > BLOCKED_TASK_AGE_MS;
+  });
+  
+  const candidates = [...failedCandidates, ...blockedCandidates];
+  
+  if (candidates.length === 0 || dryRun) {
+    return {
+      attempted: true,
+      totalFailed: failedTasks.length,
+      totalBlocked: blockedTasks.length,
+      archivedCount: dryRun ? candidates.length : 0,
+      archivedTaskIds: candidates.map((c) => c.id),
+    };
+  }
+  
+  const archivedIds: string[] = [];
+  for (const task of candidates) {
+    try {
+      await cancelManualActionTask(task.id, `auto_archived_stale_${task.status.toLowerCase()}`);
+      archivedIds.push(task.id);
+    } catch (err) {
+      console.warn(`[CLEANUP] Failed to archive task ${task.id}:`, err);
+    }
+  }
+  
+  return {
+    attempted: true,
+    totalFailed: failedTasks.length,
+    totalBlocked: blockedTasks.length,
+    archivedCount: archivedIds.length,
+    archivedTaskIds: archivedIds,
+  };
+}
+
+/**
+ * Get a summary of the manual task queue state for diagnostics.
+ */
+export async function getManualQueueDiagnostics(): Promise<{
+  totalTasks: number;
+  openCount: number;
+  selectedCount: number;
+  inProgressCount: number;
+  blockedCount: number;
+  failedCount: number;
+  doneCount: number;
+  canceledCount: number;
+  executionReadyCount: number;
+  staleTaskIds: string[];
+  healthStatus: "healthy" | "degraded" | "blocked";
+  healthReason: string | null;
+}> {
+  const tasks = await getAllTasks();
+  
+  const byStatus = {
+    OPEN: tasks.filter((t) => t.status === "OPEN").length,
+    SELECTED: tasks.filter((t) => t.status === "SELECTED").length,
+    IN_PROGRESS: tasks.filter((t) => t.status === "IN_PROGRESS").length,
+    BLOCKED: tasks.filter((t) => t.status === "BLOCKED").length,
+    FAILED: tasks.filter((t) => t.status === "FAILED").length,
+    DONE: tasks.filter((t) => t.status === "DONE").length,
+    CANCELED: tasks.filter((t) => t.status === "CANCELED").length,
+  };
+  
+  const executionReady = tasks.filter(
+    (t) => t.executionReady && (t.status === "OPEN" || t.status === "SELECTED")
+  ).length;
+  
+  // Detect stale tasks
+  const staleCandidates = await detectStaleManualTasks();
+  
+  // Determine health status
+  let healthStatus: "healthy" | "degraded" | "blocked" = "healthy";
+  let healthReason: string | null = null;
+  
+  if (byStatus.BLOCKED > 5) {
+    healthStatus = "blocked";
+    healthReason = `${byStatus.BLOCKED} tasks are BLOCKED`;
+  } else if (byStatus.FAILED > 10) {
+    healthStatus = "degraded";
+    healthReason = `${byStatus.FAILED} tasks have FAILED`;
+  } else if (staleCandidates.length > 0) {
+    healthStatus = "degraded";
+    healthReason = `${staleCandidates.length} stale task(s) detected`;
+  } else if (byStatus.IN_PROGRESS > 1) {
+    healthStatus = "degraded";
+    healthReason = `Multiple IN_PROGRESS tasks (${byStatus.IN_PROGRESS})`;
+  }
+  
+  return {
+    totalTasks: tasks.length,
+    openCount: byStatus.OPEN,
+    selectedCount: byStatus.SELECTED,
+    inProgressCount: byStatus.IN_PROGRESS,
+    blockedCount: byStatus.BLOCKED,
+    failedCount: byStatus.FAILED,
+    doneCount: byStatus.DONE,
+    canceledCount: byStatus.CANCELED,
+    executionReadyCount: executionReady,
+    staleTaskIds: staleCandidates.map((c) => c.id),
+    healthStatus,
+    healthReason,
+  };
+}

@@ -15,6 +15,11 @@ import {
   executeRemediationForIncident,
   isRemediationOnCooldown,
 } from "@/lib/agents/remediation";
+import { mapIncidentsToTasks } from "@/lib/agents/critical-incident-mapper";
+import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
+import { fetchBrokerTruth } from "@/lib/broker/truth";
+import { readTrades } from "@/lib/tradesStore";
+import { isOpenTradeStatus } from "@/lib/trades/protection";
 import type { AgentBrief, AgentIncident, AgentIncidentCategory, AgentRunnerResult } from "@/lib/agents/types";
 import { nowIso } from "@/lib/agents/time";
 
@@ -244,6 +249,86 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
     }
   }
 
+  // ------- PROACTIVE PROTECTION INCIDENT ESCALATION -------
+  // Check for CRITICAL protection incidents (MISSING_STOP, etc.) and
+  // escalate them to the critical task queue so execute loop can act.
+  let protectionEscalationSummary: string | null = null;
+  let escalatedCriticalCount = 0;
+  try {
+    const brokerTruth = await fetchBrokerTruth();
+    if (!brokerTruth.error) {
+      const allTrades = await readTrades<any>().catch(() => []);
+      const openTrades = (Array.isArray(allTrades) ? allTrades : [])
+        .filter((t) => isOpenTradeStatus(t?.status))
+        .map((t: any) => ({
+          id: String(t.id || ""),
+          ticker: String(t.ticker || ""),
+          side: String(t.side || ""),
+          status: String(t.status || ""),
+          qty: Number(t.size || t.qty || 0),
+          stopOrderId: t.stopOrderId || t.alpacaStopOrderId,
+          protectionStatus: t.protectionStatus,
+        }));
+
+      const protectionAudit = auditProtectionIntegrity({
+        openTrades,
+        brokerPositions: brokerTruth.positions || [],
+        brokerOrders: brokerTruth.openOrders || [],
+      });
+
+      if (!protectionAudit.ok && protectionAudit.criticalCount > 0) {
+        // Escalate CRITICAL incidents to critical task queue
+        const criticalIncidents = protectionAudit.incidents.filter(
+          (i) => i.severity === "CRITICAL"
+        );
+        const escalatedTasks = await mapIncidentsToTasks(criticalIncidents);
+        escalatedCriticalCount = escalatedTasks.length;
+
+        if (escalatedCriticalCount > 0) {
+          protectionEscalationSummary = `Escalated ${escalatedCriticalCount} CRITICAL protection incident(s) to execution queue: ${criticalIncidents.map((i) => `${i.symbol}:${i.code}`).join(", ")}`;
+          console.log(`[OPS-AGENT] ${protectionEscalationSummary}`);
+
+          // Log action for escalation
+          await appendAgentAction({
+            id: crypto.randomUUID(),
+            createdAt: now,
+            agent: "ops",
+            actionType: "INCIDENT_ESCALATED",
+            status: "APPLIED",
+            summary: protectionEscalationSummary,
+            metadata: {
+              escalatedCount: escalatedCriticalCount,
+              incidents: criticalIncidents.map((i) => ({
+                code: i.code,
+                symbol: i.symbol,
+                severity: i.severity,
+              })),
+            },
+          });
+        }
+
+        // Also upsert agent incident for visibility
+        const result = await upsertIncident({
+          severity: "HIGH",
+          source: "ops",
+          category: "TRADES",
+          title: "Protection integrity critical",
+          summary: `${protectionAudit.criticalCount} trade(s) with CRITICAL protection issues: ${criticalIncidents.map((i) => `${i.symbol}:${i.code}`).slice(0, 5).join(", ")}`,
+          notes: [`Escalated to critical queue: ${escalatedCriticalCount}`, ...telemetry.readinessReasons],
+        });
+        if (result.created && !createdIncidentId) createdIncidentId = result.incident.id;
+      } else if (protectionAudit.ok) {
+        // Resolve any prior protection incidents
+        await resolveIncident(
+          { category: "TRADES", title: "Protection integrity critical" },
+          "All open trades have valid stop protection.",
+        );
+      }
+    }
+  } catch (err) {
+    console.warn("[OPS-AGENT] Protection escalation check failed (non-fatal):", err);
+  }
+
   // ------- Compile open incident categories for state -------
 
   const openIncidents = await listOpenIncidents(50);
@@ -269,6 +354,11 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
       activeIncidentCount,
       recentActionCount: actions.length,
       remediationSummary: remediationSummary ?? null,
+      protectionEscalation: {
+        ran: true,
+        escalatedCriticalCount,
+        summary: protectionEscalationSummary,
+      },
       telemetry,
     },
   };

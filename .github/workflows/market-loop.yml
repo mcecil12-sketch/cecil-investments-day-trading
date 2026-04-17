@@ -144,6 +144,26 @@ jobs:
             -w "\nHTTP %{http_code}\n" | head -c 4000 || true
           echo
 
+          echo "=== agents run (ops/risk proactive escalation) ==="
+          curl -sS -X POST "$BASE/api/agents/run?agent=all" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: github-actions" \
+            -H "x-run-id: $RUN_ID" \
+            -d '{}' \
+            -w "\nHTTP %{http_code}\n" | head -c 4000 || true
+          echo
+
+          echo "=== agents execute (critical task resolution) ==="
+          curl -sS -X POST "$BASE/api/agents/execute" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: github-actions" \
+            -H "x-run-id: $RUN_ID" \
+            -d '{}' \
+            -w "\nHTTP %{http_code}\n" | head -c 4000 || true
+          echo
+
       - name: Finalize closes
         env:
           BASE: ${{ secrets.PROD_BASE_URL }}

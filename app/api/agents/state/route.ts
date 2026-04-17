@@ -17,7 +17,7 @@ import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
 import { redis } from "@/lib/redis";
 import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
 import type { EngineeringTask } from "@/lib/agents/types";
-import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask } from "@/lib/agents/manual-action-queue";
+import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask, getManualQueueDiagnostics } from "@/lib/agents/manual-action-queue";
 
 function executionVisibilityRank(task: EngineeringTask): number {
   const incidentRank = task.incidentId ? 0 : 100;
@@ -42,7 +42,7 @@ export async function GET(req: Request) {
     return unauthorizedAgentResponse(auth.error);
   }
 
-  const [snapshot, state, tasks, adaptiveState, latestExecRaw, manualTasks, manualCounts, activeManualTask] = await Promise.all([
+  const [snapshot, state, tasks, adaptiveState, latestExecRaw, manualTasks, manualCounts, activeManualTask, queueDiagnostics] = await Promise.all([
     readAgentStateSnapshot(),
     ensureAgentState(),
     listEngineeringTasks(200).then((t) =>
@@ -53,6 +53,12 @@ export async function GET(req: Request) {
     listManualActionTasks({ limit: 10 }).catch(() => []),
     countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0, selectedCount: 0 })),
     getActiveManualTask().catch(() => null),
+    getManualQueueDiagnostics().catch(() => ({
+      totalTasks: 0, openCount: 0, selectedCount: 0, inProgressCount: 0,
+      blockedCount: 0, failedCount: 0, doneCount: 0, canceledCount: 0,
+      executionReadyCount: 0, staleTaskIds: [],
+      healthStatus: "healthy" as const, healthReason: null,
+    })),
   ]);
 
   const openTasks = tasks.filter(
@@ -160,6 +166,14 @@ export async function GET(req: Request) {
           latestExecutionResult: recent.latestExecutionResult ?? null,
         };
       })(),
+      diagnostics: {
+        healthStatus: queueDiagnostics.healthStatus,
+        healthReason: queueDiagnostics.healthReason,
+        totalTasks: queueDiagnostics.totalTasks,
+        failedCount: queueDiagnostics.failedCount,
+        canceledCount: queueDiagnostics.canceledCount,
+        staleTaskIds: queueDiagnostics.staleTaskIds,
+      },
     },
   });
 }
