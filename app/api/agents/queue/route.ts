@@ -7,6 +7,7 @@ import {
   listManualActionTasks,
   countOpenExecutionReadyManualTasks,
   findDuplicateManualTask,
+  canRecoverBlockedTask,
   type ManualActionStatus,
   type ManualActionTaskInput,
 } from "@/lib/agents/manual-action-queue";
@@ -47,6 +48,8 @@ export async function GET(req: NextRequest) {
       inProgressCount: counts.inProgressCount,
       blockedCount: counts.blockedCount,
       selectedCount: counts.selectedCount,
+      selectableCount: counts.selectableCount ?? 0,
+      recoverableBlockedCount: counts.recoverableBlockedCount ?? 0,
     },
     criticalTasks: {
       total: criticalTasks.length,
@@ -61,11 +64,13 @@ export async function GET(req: NextRequest) {
         ? "manual_queue_has_ready_tasks"
         : blockingCritical.length > 0
           ? "critical_tasks_available_but_manual_queue_empty"
-          : counts.blockedCount > 0
-            ? "manual_tasks_exist_but_blocked"
-            : counts.openCount > 0
-              ? "manual_tasks_exist_but_not_execution_ready"
-              : "no_work_available",
+          : (counts.recoverableBlockedCount ?? 0) > 0
+            ? "blocked_tasks_can_be_recovered_with_fallback_hints"
+            : counts.blockedCount > 0
+              ? "manual_tasks_exist_but_blocked_no_recovery_available"
+              : counts.openCount > 0
+                ? "manual_tasks_exist_but_not_execution_ready"
+                : "no_work_available",
   };
 
   return NextResponse.json({

@@ -379,17 +379,31 @@ export async function countOpenExecutionReadyManualTasks(): Promise<{
   inProgressCount: number;
   blockedCount: number;
   selectedCount: number;
+  /** Tasks that can be selected right now (OPEN + executionReady, not blocked) */
+  selectableCount: number;
+  /** BLOCKED tasks that could potentially be recovered with fallback hints */
+  recoverableBlockedCount: number;
 }> {
   const tasks = await getAllTasks();
   const active = tasks.filter(
     (t) => t.status !== "DONE" && t.status !== "FAILED" && t.status !== "CANCELED",
   );
+  const blocked = active.filter((t) => t.status === "BLOCKED");
+  const recoverableBlocked = blocked.filter(canRecoverBlockedTask);
+
+  // Selectable = OPEN + executionReady (can be claimed immediately)
+  const selectable = active.filter(
+    (t) => t.status === "OPEN" && t.executionReady === true,
+  );
+
   return {
     openCount: active.filter((t) => t.status === "OPEN" || t.status === "SELECTED" || t.status === "IN_PROGRESS").length,
     executionReadyCount: active.filter((t) => t.executionReady && (t.status === "OPEN" || t.status === "SELECTED")).length,
     inProgressCount: active.filter((t) => t.status === "IN_PROGRESS").length,
-    blockedCount: active.filter((t) => t.status === "BLOCKED").length,
+    blockedCount: blocked.length,
     selectedCount: active.filter((t) => t.status === "SELECTED").length,
+    selectableCount: selectable.length,
+    recoverableBlockedCount: recoverableBlocked.length,
   };
 }
 
@@ -628,6 +642,288 @@ export async function cleanupFailedTasks(dryRun = false): Promise<FailedTaskClea
     totalBlocked: blockedTasks.length,
     archivedCount: archivedIds.length,
     archivedTaskIds: archivedIds,
+  };
+}
+
+// ─── Blocked Task Recovery with Fallback Hints ────────────────────────
+
+/**
+ * Fallback hints by taskType. These are used to unblock tasks that were
+ * created without fileHints or routeHints and got BLOCKED with no_file_hints.
+ *
+ * IMPORTANT: Keep in sync with INCIDENT_DEFAULTS in incident-task-bridge.ts
+ */
+const FALLBACK_HINTS_BY_TASK_TYPE: Record<ManualActionTaskType, { fileHints?: string[]; routeHints?: string[] }> = {
+  OPS: {
+    fileHints: [
+      "app/api/trades/protection-audit/route.ts",
+      "app/api/auto-entry/execute/route.ts",
+      "lib/risk/protection-integrity.ts",
+    ],
+    routeHints: [
+      "/api/trades/protection-audit",
+      "/api/broker/positions",
+      "/api/trades?view=operational",
+    ],
+  },
+  SELF_HEAL: {
+    fileHints: [
+      "app/api/funnel-health/route.ts",
+      "app/api/readiness/route.ts",
+      "lib/autoEntry/guardrails.ts",
+    ],
+    routeHints: [
+      "/api/funnel-health",
+      "/api/readiness",
+      "/api/auto-entry/seed-from-signals",
+    ],
+  },
+  BUGFIX: {
+    fileHints: [
+      "app/api/funnel-health/route.ts",
+      "lib/aiScoring.ts",
+    ],
+    routeHints: ["/api/readiness"],
+  },
+  SCORING: {
+    fileHints: [
+      "app/api/ai/score/drain/route.ts",
+      "lib/aiScoring.ts",
+    ],
+    routeHints: [
+      "/api/ai/score/drain",
+      "/api/signals/all",
+    ],
+  },
+  SCANNER: {
+    fileHints: [
+      "app/api/signals/route.ts",
+      "app/api/signals/all/route.ts",
+    ],
+    routeHints: [
+      "/api/signals",
+      "/api/signals/all",
+    ],
+  },
+  AUTO_ENTRY: {
+    fileHints: [
+      "app/api/auto-entry/execute/route.ts",
+      "app/api/auto-entry/seed-from-signals/route.ts",
+      "lib/autoEntry/guardrails.ts",
+    ],
+    routeHints: [
+      "/api/auto-entry/execute",
+      "/api/auto-entry/seed-from-signals",
+      "/api/funnel-health",
+    ],
+  },
+  BACKLOG: {
+    fileHints: [],
+    routeHints: ["/api/readiness"],
+  },
+  OPTIMIZATION: {
+    fileHints: [],
+    routeHints: ["/api/readiness"],
+  },
+  OTHER: {
+    fileHints: [],
+    routeHints: ["/api/readiness", "/api/funnel-health"],
+  },
+};
+
+export interface BlockedTaskRecoveryCandidate {
+  id: string;
+  title: string;
+  taskType: ManualActionTaskType;
+  blockedReason: string | null;
+  action: "enriched_unblocked" | "enriched_still_blocked" | "already_has_hints" | "no_fallback_available";
+  hintsApplied: boolean;
+  fileHintsAdded?: string[];
+  routeHintsAdded?: string[];
+}
+
+export interface BlockedTaskRecoveryResult {
+  attempted: boolean;
+  recoveredCount: number;
+  enrichedCount: number;
+  candidates: BlockedTaskRecoveryCandidate[];
+  recoveredTaskIds: string[];
+  enrichedTaskIds: string[];
+  skippedTaskIds: string[];
+}
+
+/** Check if a BLOCKED task can be unblocked by applying fallback hints. */
+export function canRecoverBlockedTask(task: ManualActionTask): boolean {
+  if (task.status !== "BLOCKED") return false;
+
+  const reason = task.blockedReason || "";
+  // Only recover tasks blocked specifically for missing hints
+  if (!reason.includes("no_file_hints") && !reason.includes("no_route_hints") && !reason.includes("no_execution_path")) {
+    return false;
+  }
+
+  // Check if the task already has hints (shouldn't happen, but be safe)
+  const hasFileHints = task.fileHints && task.fileHints.length > 0;
+  const hasRouteHints = task.routeHints && task.routeHints.length > 0;
+  if (hasFileHints || hasRouteHints) return false;
+
+  // Check if we have fallback hints for this taskType
+  const fallback = FALLBACK_HINTS_BY_TASK_TYPE[task.taskType];
+  if (!fallback) return false;
+
+  const hasFallbackFileHints = !!(fallback.fileHints && fallback.fileHints.length > 0);
+  const hasFallbackRouteHints = !!(fallback.routeHints && fallback.routeHints.length > 0);
+
+  return hasFallbackFileHints || hasFallbackRouteHints;
+}
+
+/**
+ * Apply fallback hints to a BLOCKED task and unblock it if appropriate.
+ * Returns the updated task or null if no changes were made.
+ */
+export async function enrichAndUnblockTask(
+  taskId: string,
+  dryRun = false,
+): Promise<BlockedTaskRecoveryCandidate | null> {
+  const task = await getManualActionTask(taskId);
+  if (!task || task.status !== "BLOCKED") return null;
+
+  const reason = task.blockedReason || "";
+  const isHintBlocked =
+    reason.includes("no_file_hints") ||
+    reason.includes("no_route_hints") ||
+    reason.includes("no_execution_path");
+
+  // Already has hints — shouldn't be blocked for this reason
+  const hasFileHints = task.fileHints && task.fileHints.length > 0;
+  const hasRouteHints = task.routeHints && task.routeHints.length > 0;
+  if (hasFileHints || hasRouteHints) {
+    return {
+      id: task.id,
+      title: task.title,
+      taskType: task.taskType,
+      blockedReason: task.blockedReason ?? null,
+      action: "already_has_hints",
+      hintsApplied: false,
+    };
+  }
+
+  // Get fallback hints
+  const fallback = FALLBACK_HINTS_BY_TASK_TYPE[task.taskType];
+  if (!fallback) {
+    return {
+      id: task.id,
+      title: task.title,
+      taskType: task.taskType,
+      blockedReason: task.blockedReason ?? null,
+      action: "no_fallback_available",
+      hintsApplied: false,
+    };
+  }
+
+  const fileHintsToAdd = fallback.fileHints && fallback.fileHints.length > 0 ? fallback.fileHints : [];
+  const routeHintsToAdd = fallback.routeHints && fallback.routeHints.length > 0 ? fallback.routeHints : [];
+
+  if (fileHintsToAdd.length === 0 && routeHintsToAdd.length === 0) {
+    return {
+      id: task.id,
+      title: task.title,
+      taskType: task.taskType,
+      blockedReason: task.blockedReason ?? null,
+      action: "no_fallback_available",
+      hintsApplied: false,
+    };
+  }
+
+  // Determine if we can unblock
+  const canUnblock = isHintBlocked && (fileHintsToAdd.length > 0 || routeHintsToAdd.length > 0);
+
+  if (!dryRun) {
+    const patch: ManualActionTaskPatch = {
+      fileHints: fileHintsToAdd.length > 0 ? fileHintsToAdd : task.fileHints,
+      routeHints: routeHintsToAdd.length > 0 ? routeHintsToAdd : task.routeHints,
+    };
+
+    if (canUnblock) {
+      patch.status = "OPEN";
+      patch.blockedReason = null;
+      patch.executionReady = true;
+    }
+
+    await updateManualActionTask(task.id, patch);
+    console.log(`[BLOCKED_RECOVERY] ${canUnblock ? "Unblocked" : "Enriched"} task ${task.id}: added ${fileHintsToAdd.length} fileHints, ${routeHintsToAdd.length} routeHints`);
+  }
+
+  return {
+    id: task.id,
+    title: task.title,
+    taskType: task.taskType,
+    blockedReason: task.blockedReason ?? null,
+    action: canUnblock ? "enriched_unblocked" : "enriched_still_blocked",
+    hintsApplied: true,
+    fileHintsAdded: fileHintsToAdd,
+    routeHintsAdded: routeHintsToAdd,
+  };
+}
+
+/**
+ * Recover BLOCKED tasks by applying fallback hints based on taskType.
+ * Runs BEFORE task selection in the execute loop to maximize available work.
+ */
+export async function recoverBlockedTasksWithFallbackHints(
+  dryRun = false,
+): Promise<BlockedTaskRecoveryResult> {
+  const tasks = await getAllTasks();
+  const blocked = tasks.filter((t) => t.status === "BLOCKED");
+
+  if (blocked.length === 0) {
+    return {
+      attempted: true,
+      recoveredCount: 0,
+      enrichedCount: 0,
+      candidates: [],
+      recoveredTaskIds: [],
+      enrichedTaskIds: [],
+      skippedTaskIds: [],
+    };
+  }
+
+  const candidates: BlockedTaskRecoveryCandidate[] = [];
+  const recoveredIds: string[] = [];
+  const enrichedIds: string[] = [];
+  const skippedIds: string[] = [];
+
+  for (const task of blocked) {
+    const result = await enrichAndUnblockTask(task.id, dryRun);
+    if (!result) {
+      skippedIds.push(task.id);
+      continue;
+    }
+
+    candidates.push(result);
+
+    if (result.action === "enriched_unblocked") {
+      recoveredIds.push(task.id);
+      enrichedIds.push(task.id);
+    } else if (result.action === "enriched_still_blocked") {
+      enrichedIds.push(task.id);
+    } else {
+      skippedIds.push(task.id);
+    }
+  }
+
+  if (recoveredIds.length > 0 || enrichedIds.length > 0) {
+    console.log(`[BLOCKED_RECOVERY] Processed ${blocked.length} BLOCKED tasks: recovered=${recoveredIds.length} enriched=${enrichedIds.length} skipped=${skippedIds.length}`);
+  }
+
+  return {
+    attempted: true,
+    recoveredCount: recoveredIds.length,
+    enrichedCount: enrichedIds.length,
+    candidates,
+    recoveredTaskIds: recoveredIds,
+    enrichedTaskIds: enrichedIds,
+    skippedTaskIds: skippedIds,
   };
 }
 

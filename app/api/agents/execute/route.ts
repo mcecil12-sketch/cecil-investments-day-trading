@@ -31,11 +31,13 @@ import {
   failManualActionTask,
   countOpenExecutionReadyManualTasks,
   recoverStaleManualTasks,
+  recoverBlockedTasksWithFallbackHints,
   getActiveManualTask,
   cleanupFailedTasks,
   type ManualActionTask,
   type StaleRecoveryResult,
   type FailedTaskCleanupResult,
+  type BlockedTaskRecoveryResult,
 } from "@/lib/agents/manual-action-queue";
 import { executeManualTask } from "@/lib/agents/manual-task-executor";
 import { mapIncidentsToTasks } from "@/lib/agents/critical-incident-mapper";
@@ -830,18 +832,41 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Step 1c: Recover BLOCKED tasks with fallback hints.
+    // This unblocks tasks that were BLOCKED with no_file_hints by applying
+    // fallback hints based on their taskType.
+    let blockedRecovery: BlockedTaskRecoveryResult | null = null;
+    try {
+      blockedRecovery = await recoverBlockedTasksWithFallbackHints(dryRun);
+      if (blockedRecovery.recoveredCount > 0) {
+        console.log(
+          `[AGENT-EXECUTE] Blocked task recovery (dryRun=${dryRun}): ${blockedRecovery.recoveredCount} tasks unblocked, ` +
+          `${blockedRecovery.enrichedCount} enriched, recovered=[${blockedRecovery.recoveredTaskIds}]`,
+        );
+      }
+    } catch (err) {
+      console.warn("[AGENT-EXECUTE] Blocked task recovery failed (non-fatal):", err);
+      blockedRecovery = { attempted: true, recoveredCount: 0, enrichedCount: 0, candidates: [], recoveredTaskIds: [], enrichedTaskIds: [], skippedTaskIds: [] };
+    }
+
     // Update proactive diagnostics
     proactiveDiagnostics.staleRecoveryAttempted = staleRecovery.attempted;
     proactiveDiagnostics.staleRecoveryCount = staleRecovery.recoveredCount;
+    // Add blocked recovery diagnostics
+    (proactiveDiagnostics as Record<string, unknown>).blockedRecoveryAttempted = blockedRecovery?.attempted ?? false;
+    (proactiveDiagnostics as Record<string, unknown>).blockedRecoveryCount = blockedRecovery?.recoveredCount ?? 0;
+    (proactiveDiagnostics as Record<string, unknown>).blockedRecoveryEnrichedCount = blockedRecovery?.enrichedCount ?? 0;
 
     // Step 2: RELOAD queue state from source of truth AFTER recovery.
     // This ensures counts and active-task reflect recovered state.
     const manualCounts = await countOpenExecutionReadyManualTasks().catch(() => ({
       openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0, selectedCount: 0,
+      selectableCount: 0, recoverableBlockedCount: 0,
     }));
     const activeManualTask = await getActiveManualTask().catch(() => null);
     const hasActiveManualTask = activeManualTask !== null;
-    const hasManualWork = manualCounts.executionReadyCount > 0 || manualCounts.inProgressCount > 0 || manualCounts.selectedCount > 0;
+    // Use selectableCount for more precise work detection
+    const hasManualWork = (manualCounts.selectableCount ?? manualCounts.executionReadyCount) > 0 || manualCounts.inProgressCount > 0 || manualCounts.selectedCount > 0;
 
     if (hasManualWork) {
       // ── DRY RUN: peek only, ZERO mutations ────────────────────────
