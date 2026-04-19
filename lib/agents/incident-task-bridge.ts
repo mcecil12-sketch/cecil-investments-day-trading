@@ -41,15 +41,25 @@ interface IncidentTaskDefaults {
 /**
  * Default configurations for each incident code.
  * OPS/SELF_HEAL tasks get routeHints, code-patching tasks get fileHints.
+ * 
+ * IMPORTANT: All CRITICAL/HIGH incidents MUST have either fileHints or routeHints
+ * to ensure they become execution-ready and don't get blocked by no_file_hints.
  */
 const INCIDENT_DEFAULTS: Record<string, IncidentTaskDefaults> = {
-  // CRITICAL: Protection issues requiring broker action
+  // ─── CRITICAL: Protection issues requiring immediate broker action ────
+
   PROTECTION_MISSING: {
     priority: "CRITICAL",
     taskType: "OPS",
+    fileHints: [
+      "app/api/trades/protection-audit/route.ts",
+      "app/api/auto-entry/execute/route.ts",
+      "lib/risk/protection-integrity.ts",
+      "lib/risk/stop-verification.ts",
+    ],
     routeHints: [
-      "/api/risk/protection-audit",
-      "/api/trades/open",
+      "/api/trades/protection-audit?enforce=1",
+      "/api/trades?view=operational",
       "/api/broker/positions",
     ],
     executionReady: true,
@@ -60,18 +70,135 @@ const INCIDENT_DEFAULTS: Record<string, IncidentTaskDefaults> = {
       "Context: {context}",
   },
 
-  // HIGH: Funnel underutilization
+  MISSING_STOP: {
+    priority: "CRITICAL",
+    taskType: "OPS",
+    fileHints: [
+      "app/api/trades/protection-audit/route.ts",
+      "lib/risk/protection-integrity.ts",
+      "lib/risk/stop-verification.ts",
+      "lib/autoManage/stopSync.ts",
+    ],
+    routeHints: [
+      "/api/trades/protection-audit?enforce=1",
+      "/api/broker/positions",
+    ],
+    executionReady: true,
+    titleTemplate: "Repair missing stop order",
+    descriptionTemplate:
+      "Critical: Trade has no active stop-loss order at broker. " +
+      "Run protection audit and/or manually create stop. " +
+      "Context: {context}",
+  },
+
+  MISSING_STOP_AT_ENTRY: {
+    priority: "CRITICAL",
+    taskType: "OPS",
+    fileHints: [
+      "app/api/auto-entry/execute/route.ts",
+      "lib/risk/stop-verification.ts",
+      "lib/risk/protection-integrity.ts",
+    ],
+    routeHints: [
+      "/api/trades/protection-audit?enforce=1",
+      "/api/broker/positions",
+    ],
+    executionReady: true,
+    titleTemplate: "Entry created without stop protection",
+    descriptionTemplate:
+      "Critical: Auto-entry executed but stop verification failed. " +
+      "Trade is marked ERROR and requires immediate protection. " +
+      "Context: {context}",
+  },
+
+  STOP_EXPIRED: {
+    priority: "CRITICAL",
+    taskType: "OPS",
+    fileHints: [
+      "app/api/trades/protection-audit/route.ts",
+      "lib/risk/protection-integrity.ts",
+      "lib/autoManage/stopSync.ts",
+    ],
+    routeHints: [
+      "/api/trades/protection-audit?enforce=1",
+    ],
+    executionReady: true,
+    titleTemplate: "Repair expired stop order",
+    descriptionTemplate:
+      "Critical: Stop order expired (likely DAY TIF). " +
+      "Create new GTC stop immediately. Context: {context}",
+  },
+
+  STOP_CANCELED: {
+    priority: "CRITICAL",
+    taskType: "OPS",
+    fileHints: [
+      "app/api/trades/protection-audit/route.ts",
+      "lib/risk/protection-integrity.ts",
+    ],
+    routeHints: [
+      "/api/trades/protection-audit?enforce=1",
+    ],
+    executionReady: true,
+    titleTemplate: "Repair canceled stop order",
+    descriptionTemplate:
+      "Critical: Stop order was canceled. " +
+      "Create new stop immediately. Context: {context}",
+  },
+
+  BROKER_DB_MISMATCH: {
+    priority: "CRITICAL",
+    taskType: "OPS",
+    fileHints: [
+      "app/api/trades/protection-audit/route.ts",
+      "lib/risk/protection-integrity.ts",
+      "lib/trades/operational.ts",
+    ],
+    routeHints: [
+      "/api/trades/protection-audit",
+      "/api/broker/positions",
+      "/api/trades?view=operational",
+    ],
+    executionReady: true,
+    titleTemplate: "Fix broker/DB position mismatch",
+    descriptionTemplate:
+      "Critical: Database shows open trade but broker has no position, or vice versa. " +
+      "Reconcile trade state with broker truth. Context: {context}",
+  },
+
+  EMERGENCY_FLATTEN: {
+    priority: "CRITICAL",
+    taskType: "OPS",
+    fileHints: [
+      "lib/risk/stop-verification.ts",
+      "app/api/trades/protection-audit/route.ts",
+    ],
+    routeHints: [
+      "/api/trades?view=operational",
+      "/api/broker/positions",
+    ],
+    executionReady: true,
+    titleTemplate: "Position flattened due to protection failure",
+    descriptionTemplate:
+      "Critical: Position was emergency-flattened due to inability to establish stop protection. " +
+      "Review incident and understand root cause. Context: {context}",
+  },
+
+  // ─── HIGH: Funnel and flow issues ─────────────────────────────────
+
   UNDERUTILIZED_FUNNEL: {
     priority: "HIGH",
     taskType: "SELF_HEAL",
+    fileHints: [
+      "app/api/funnel-health/route.ts",
+      "app/api/readiness/route.ts",
+      "app/api/auto-entry/seed-from-signals/route.ts",
+      "lib/autoEntry/guardrails.ts",
+    ],
     routeHints: [
       "/api/funnel-health",
-      "/api/scanner/seed",
-      "/api/signals",
-    ],
-    fileHints: [
-      "lib/autoEntry/scoring.ts",
-      "lib/autoEntry/guardrails.ts",
+      "/api/readiness",
+      "/api/auto-entry/seed-from-signals",
     ],
     executionReady: true,
     titleTemplate: "Investigate underutilized funnel",
@@ -80,18 +207,18 @@ const INCIDENT_DEFAULTS: Record<string, IncidentTaskDefaults> = {
       "capacity constraints, and guardrail settings. Context: {context}",
   },
 
-  // HIGH: Qualified signals not being seeded
   QUALIFIED_NOT_SEEDED: {
     priority: "HIGH",
     taskType: "SELF_HEAL",
-    routeHints: [
-      "/api/scanner/seed",
-      "/api/funnel-health",
-      "/api/guardrails/state",
-    ],
     fileHints: [
-      "lib/autoEntry/seed.ts",
+      "app/api/auto-entry/seed-from-signals/route.ts",
       "lib/autoEntry/guardrails.ts",
+      "lib/autoEntry/guardrailsStore.ts",
+    ],
+    routeHints: [
+      "/api/auto-entry/seed-from-signals",
+      "/api/funnel-health",
+      "/api/readiness",
     ],
     executionReady: true,
     titleTemplate: "Fix qualified signals not seeding",
@@ -100,36 +227,84 @@ const INCIDENT_DEFAULTS: Record<string, IncidentTaskDefaults> = {
       "and capacity constraints. Context: {context}",
   },
 
-  // MEDIUM: Seeded trades not executing
   SEED_NOT_EXECUTED: {
     priority: "MEDIUM",
     taskType: "OPS",
+    fileHints: [
+      "app/api/auto-entry/execute/route.ts",
+      "lib/autoEntry/guardrails.ts",
+    ],
     routeHints: [
-      "/api/scanner/execute",
-      "/api/broker/positions",
-      "/api/trades/seeded",
+      "/api/auto-entry/execute",
+      "/api/trades?status=AUTO_PENDING",
+      "/api/funnel-health",
     ],
     executionReady: true,
     titleTemplate: "Investigate seeded trades not executed",
     descriptionTemplate:
       "Trades seeded but not executed. Check execute route and " +
-      "broker integration. Context: {context}",
+      "guardrail state. Context: {context}",
   },
 
-  // MEDIUM: No recent execution activity
   NO_EXECUTION_ACTIVITY: {
     priority: "MEDIUM",
     taskType: "OPS",
+    fileHints: [
+      "app/api/funnel-health/route.ts",
+      "app/api/auto-entry/execute/route.ts",
+    ],
     routeHints: [
       "/api/funnel-health",
-      "/api/scanner/status",
-      "/api/broker/positions",
+      "/api/readiness",
+      "/api/broker/clock",
     ],
     executionReady: true,
     titleTemplate: "Investigate execution inactivity",
     descriptionTemplate:
       "No execution activity during market hours. Check system health " +
       "and market conditions. Context: {context}",
+  },
+
+  // ─── HIGH: Scoring and signal flow issues ─────────────────────────
+
+  SCORING_DEGRADED: {
+    priority: "HIGH",
+    taskType: "SELF_HEAL",
+    fileHints: [
+      "app/api/ai/score/drain/route.ts",
+      "app/api/signals/all/route.ts",
+      "lib/aiScoring.ts",
+    ],
+    routeHints: [
+      "/api/ai/score/drain",
+      "/api/signals/all",
+      "/api/readiness",
+    ],
+    executionReady: true,
+    titleTemplate: "Investigate scoring degradation",
+    descriptionTemplate:
+      "AI scoring appears degraded or not producing qualified signals. " +
+      "Check scoring pipeline and signal flow. Context: {context}",
+  },
+
+  SIGNAL_FLOW_BLOCKED: {
+    priority: "HIGH",
+    taskType: "SELF_HEAL",
+    fileHints: [
+      "app/api/signals/all/route.ts",
+      "app/api/ai/score/drain/route.ts",
+      "app/api/funnel-health/route.ts",
+    ],
+    routeHints: [
+      "/api/signals/all",
+      "/api/ai/score/drain",
+      "/api/funnel-health",
+    ],
+    executionReady: true,
+    titleTemplate: "Investigate signal flow blockage",
+    descriptionTemplate:
+      "Signal flow appears blocked. Check signal ingestion, " +
+      "scoring pipeline, and funnel progression. Context: {context}",
   },
 };
 

@@ -9,6 +9,7 @@ import {
   normalizedOperationalStatus,
 } from "@/lib/trades/operational";
 import { ProtectionStatus } from "@/lib/trades/protection";
+import { getEtDateString, getEtDayBoundsMs } from "@/lib/time/etDate";
 
 export const runtime = "nodejs";
 
@@ -151,6 +152,7 @@ export async function GET(req: Request) {
     const limitParam = url.searchParams.get("limit");
     const orderParam = url.searchParams.get("order") ?? "desc";
     const viewParam = String(url.searchParams.get("view") || "").toLowerCase();
+    const rangeParam = String(url.searchParams.get("range") || "").toLowerCase();
     const includeLegacyErrorsParam = String(url.searchParams.get("includeLegacyErrors") || "").toLowerCase();
     const includeLegacyErrors = includeLegacyErrorsParam === "1" || includeLegacyErrorsParam === "true";
 
@@ -171,6 +173,31 @@ export async function GET(req: Request) {
 
     // Always exclude DISABLED trades (they are archived/cleaned up)
     trades = trades.filter((trade) => trade.status !== "DISABLED");
+
+    // ─── ET-Today Range Filtering ─────────────────────────────────────
+    // range=today filters to true ET-today scope for operational visibility
+    let etDateUsed: string | null = null;
+    if (rangeParam === "today") {
+      etDateUsed = getEtDateString();
+      const { startMs, endMs } = getEtDayBoundsMs(etDateUsed);
+      
+      trades = trades.filter((trade) => {
+        // Use createdAt as primary timestamp, fall back to updatedAt
+        const ts = trade.createdAt || trade.updatedAt;
+        if (!ts) return false;
+        const tsMs = Date.parse(ts);
+        if (!Number.isFinite(tsMs)) return false;
+        return tsMs >= startMs && tsMs < endMs;
+      });
+      
+      // Debug log for ET-day filtering
+      console.log("[trades] range=today filter applied", {
+        etDateUsed,
+        startMs,
+        endMs,
+        matchedCount: trades.length,
+      });
+    }
 
     // Apply filtering by status
     if (statusParam && statusParam !== "ALL") {
@@ -264,6 +291,8 @@ export async function GET(req: Request) {
         order,
         status: statusParam ?? null,
         view: viewParam || "default",
+        range: rangeParam || null,
+        etDateUsed,
         includeLegacyErrors,
       },
     });

@@ -82,6 +82,10 @@ function toEngineeringTask(task: ManualActionTask): EngineeringTask {
  *  They can execute via routeHints (API calls) without fileHints. */
 const NON_PATCHABLE_TASK_TYPES = new Set(["OPS", "SELF_HEAL"]);
 
+/** CRITICAL priority tasks should never be blocked by missing fileHints
+ *  if they have routeHints - they can execute operationally. */
+const CRITICAL_PRIORITY_BYPASS = true;
+
 // ─── Route-based execution for OPS/SELF_HEAL tasks ──────────────────
 
 function resolveBaseUrl(): string {
@@ -182,10 +186,22 @@ export async function executeManualTask(
   const isNonPatchable = NON_PATCHABLE_TASK_TYPES.has(task.taskType);
   const hasFileHints = task.fileHints && task.fileHints.length > 0;
   const hasRouteHints = task.routeHints && task.routeHints.length > 0;
+  const isCritical = task.priority === "CRITICAL";
 
   // For OPS/SELF_HEAL tasks without fileHints but with routeHints,
   // we can execute via API calls rather than code patches
   if (isNonPatchable && !hasFileHints && hasRouteHints) {
+    return executeRouteBasedTask(task);
+  }
+
+  // CRITICAL PRIORITY BYPASS: Allow CRITICAL tasks with routeHints to execute
+  // even if they have a different taskType and no fileHints
+  if (CRITICAL_PRIORITY_BYPASS && isCritical && !hasFileHints && hasRouteHints) {
+    console.log("[manual-task-executor] CRITICAL priority bypass - executing via routes", {
+      taskId: task.id,
+      taskType: task.taskType,
+      routeHints: task.routeHints,
+    });
     return executeRouteBasedTask(task);
   }
 

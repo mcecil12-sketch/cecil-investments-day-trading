@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { alpacaRequest, createOrder } from "@/lib/alpaca";
-import { redis } from "@/lib/redis";
+import { redis, saveCriticalTask } from "@/lib/redis";
 import { getCriticalTasks } from "@/lib/redis";
 import { recordAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
 import { requireAuth } from "@/lib/auth";
@@ -21,6 +21,11 @@ import {
   type BrokerPosition,
   type BrokerOrder,
 } from "@/lib/risk/protection-integrity";
+import {
+  verifyStopOrderDirect,
+  recoverUnprotectedTrade,
+  flattenUnprotectedPosition,
+} from "@/lib/risk/stop-verification";
 import {
   deriveSessionMeta,
   evaluatePendingEligibility,
@@ -2243,6 +2248,184 @@ export async function POST(req: Request) {
     const stopOrderId = stopChild?.id ?? null;
     const takeProfitOrderId = takeProfitChild?.id ?? null;
 
+    // ─── STRICT STOP VERIFICATION ─────────────────────────────────────
+    // Do NOT mark trade OPEN unless stop is verified active at broker
+    let stopVerified = false;
+    let verifiedStopOrderId = stopOrderId;
+    
+    if (stopOrderId) {
+      // Verify the stop leg is active (not just submitted)
+      const stopVerify = await verifyStopOrderDirect(stopOrderId);
+      stopVerified = stopVerify.active;
+      
+      console.log("[auto-entry] stop verification result", {
+        ticker,
+        tradeId,
+        stopOrderId,
+        verified: stopVerified,
+        status: stopVerify.status,
+        error: stopVerify.error,
+      });
+      
+      if (!stopVerified) {
+        // Stop leg exists but not active - attempt recovery
+        console.warn("[auto-entry] STOP NOT VERIFIED - attempting recovery", {
+          ticker,
+          tradeId,
+          stopOrderId,
+          status: stopVerify.status,
+        });
+        
+        // Try to create emergency stop
+        const recoveryResult = await recoverUnprotectedTrade({
+          symbol: ticker,
+          side: sideEnum,
+          qty,
+          avgEntryPrice: submitBasePrice,
+          preferredStopPrice: bracketStop,
+          tradeId,
+        });
+        
+        if (recoveryResult.ok && recoveryResult.stopOrderId) {
+          stopVerified = true;
+          verifiedStopOrderId = recoveryResult.stopOrderId;
+          console.log("[auto-entry] recovery stop created", {
+            ticker,
+            tradeId,
+            recoveryStopOrderId: recoveryResult.stopOrderId,
+          });
+          notes.push(`stop_recovered:${recoveryResult.stopOrderId}`);
+        } else {
+          console.error("[auto-entry] stop recovery FAILED", {
+            ticker,
+            tradeId,
+            reason: recoveryResult.reason,
+            detail: recoveryResult.detail,
+          });
+        }
+      }
+    } else {
+      // No stop order ID in bracket response - attempt recovery
+      console.error("[auto-entry] NO STOP ORDER ID in bracket response - attempting recovery", {
+        ticker,
+        tradeId,
+        orderId: order.id,
+        orderClass: (order as any).order_class,
+      });
+      
+      const recoveryResult = await recoverUnprotectedTrade({
+        symbol: ticker,
+        side: sideEnum,
+        qty,
+        avgEntryPrice: submitBasePrice,
+        preferredStopPrice: bracketStop,
+        tradeId,
+      });
+      
+      if (recoveryResult.ok && recoveryResult.stopOrderId) {
+        stopVerified = true;
+        verifiedStopOrderId = recoveryResult.stopOrderId;
+        console.log("[auto-entry] emergency stop created (no bracket stop)", {
+          ticker,
+          tradeId,
+          recoveryStopOrderId: recoveryResult.stopOrderId,
+        });
+        notes.push(`stop_created_recovery:${recoveryResult.stopOrderId}`);
+      }
+    }
+
+    // If stop still not verified, mark trade ERROR and attempt flatten
+    if (!stopVerified) {
+      console.error("[auto-entry] TRADE MARKED ERROR - missing stop protection", {
+        ticker,
+        tradeId,
+        stopOrderId,
+        orderId: order.id,
+      });
+      
+      // Log critical task for visibility
+      await saveCriticalTask({
+        incidentCode: "MISSING_STOP_AT_ENTRY",
+        symbol: ticker,
+        severity: "CRITICAL",
+        detail: `Trade ${tradeId} created without verified stop protection; stopOrderId=${stopOrderId}`,
+      }).catch((err) => console.error("[auto-entry] failed to log critical task", err));
+      
+      const errorTrade = {
+        ...trade,
+        quantity: qty,
+        status: "ERROR",
+        error: "missing_stop_protection",
+        submitToBroker: true,
+        brokerOrderId: order.id,
+        brokerStatus: (order as any).status,
+        brokerRaw: order,
+        alpacaOrderId: order.id,
+        alpacaStatus: (order as any).status,
+        stopOrderId,
+        takeProfitOrderId,
+        protectionStatus: "UNPROTECTED",
+        lastStopAppliedAt: startedAt,
+        updatedAt: startedAt,
+        executedAt: startedAt,
+      };
+      
+      trades[idx] = errorTrade;
+      await writeTrades(trades);
+      
+      await recordOutcome({
+        outcome: "FAIL",
+        reason: "missing_stop_protection",
+        ticker,
+        tradeId,
+        detail: `Stop verification failed; stopOrderId=${stopOrderId}`,
+        side: sideEnum === "LONG" ? "LONG" : "SHORT",
+      });
+      
+      await fireNotification({
+        type: "AUTO_ENTRY_FAILED",
+        tradeId,
+        ticker,
+        title: `CRITICAL: ${ticker} missing stop protection`,
+        message: `Trade executed but stop not verified - marked ERROR. Manual intervention required.`,
+        paper: true,
+        dedupeKey: `AUTO_ENTRY_MISSING_STOP:${tradeId}`,
+        dedupeTtlSec: 600,
+      });
+      
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "missing_stop_protection",
+          detail: "Trade executed but stop verification failed",
+          tradeId,
+          trade: errorTrade,
+          broker: {
+            id: order.id,
+            status: (order as any).status,
+            order_class: (order as any).order_class ?? "bracket",
+            stopOrderId,
+            takeProfitOrderId,
+            stopVerified: false,
+          },
+          market: { isOpen: marketOpen, timestamp: marketTimestamp },
+          openPositionsCount: brokerTruth.positionsCount,
+          maxOpenPositions: guardConfig.maxOpenPositions,
+          entriesToday: guardState.entriesToday,
+          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+          pendingCount: counts.pendingCount,
+          eligibleCount: counts.eligibleCount,
+          executedCount: counts.executed,
+          counts,
+          notes: notes.slice(0, 40),
+          guardrails: guardSummary,
+        },
+        { status: 500 }
+      );
+    }
+
+    // ─── STOP VERIFIED - Mark trade OPEN ──────────────────────────────
+
     const updated = {
       ...trade,
       quantity: qty,
@@ -2253,8 +2436,10 @@ export async function POST(req: Request) {
       brokerRaw: order,
       alpacaOrderId: order.id,
       alpacaStatus: (order as any).status,
-      stopOrderId,
+      stopOrderId: verifiedStopOrderId,
       takeProfitOrderId,
+      protectionStatus: "VERIFIED",
+      protectionVerifiedAt: startedAt,
       lastStopAppliedAt: startedAt,
       error: undefined,
       updatedAt: startedAt,
@@ -2308,8 +2493,9 @@ export async function POST(req: Request) {
           id: order.id,
           status: (order as any).status,
           order_class: (order as any).order_class ?? "bracket",
-          stopOrderId,
+          stopOrderId: verifiedStopOrderId,
           takeProfitOrderId,
+          stopVerified: true,
         },
         debug: dbg,
         market: { isOpen: marketOpen, timestamp: marketTimestamp },
