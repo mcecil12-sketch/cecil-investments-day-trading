@@ -962,6 +962,9 @@ export async function POST(req: Request) {
         }
 
         // Enhanced eligibility evaluation with new gates
+        // Allow query-param overrides for flat_trend and low_rel_vol gates
+        const skipFlatTrend = qp.get("skipFlatTrend") === "1";
+        const skipLowRelVol = qp.get("skipLowRelVol") === "1";
         const eligResult = evaluateSignalEligibility(
           signal.signalContext || null,
           signal.entryPrice,
@@ -969,7 +972,8 @@ export async function POST(req: Request) {
           { 
             staleAgeHours: freshHoursUsed,
             isMarketOpen,
-            // Note: skipFlatTrend and skipLowRelVol can be enabled via query params if needed
+            skipFlatTrend,
+            skipLowRelVol,
           }
         );
 
@@ -978,6 +982,30 @@ export async function POST(req: Request) {
           preGptSkippedIds.push(signal.id);
           result.preGptSkipped = (result.preGptSkipped ?? 0) + 1;
           result.persistedArchived = (result.persistedArchived ?? 0) + 1;
+
+          // Add diagnostic detail to response (cap at 15 samples to limit response size)
+          if (result.details.length < 15) {
+            const ctx = signal.signalContext;
+            result.details.push({
+              id: signal.id,
+              ticker: signal.ticker,
+              status: "ARCHIVED" as const,
+              skipReason: eligResult.reason,
+              error: eligResult.detail,
+              ...(ctx ? {
+                aiScore: null,
+                _diag: {
+                  relVolume: ctx.relVolume,
+                  trend: ctx.trend,
+                  trendSlopePct: ctx.trendSlopePct,
+                  avgVolume: ctx.avgVolume,
+                  barsUsed: ctx.barsUsed,
+                  side: signal.side,
+                  entryPrice: signal.entryPrice,
+                },
+              } as any : {}),
+            });
+          }
 
           // Track skip reasons by category
           switch (eligResult.reason) {
@@ -1499,6 +1527,7 @@ export async function POST(req: Request) {
       ...result,
       budgetMs,
       effectiveLimit: maxPerRunComputed,
+      eligibilityThresholds,
     };
     
     return NextResponse.json(response, {

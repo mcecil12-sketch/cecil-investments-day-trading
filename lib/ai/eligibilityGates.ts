@@ -20,8 +20,8 @@ const MAX_PRICE_ALLOWED = Number(process.env.MAX_PRICE ?? 500);
 const MIN_AVG_VOL_SHARES = Number(process.env.MIN_AVG_VOL_SHARES ?? 600);
 const MIN_AVG_DOLLAR_VOL = Number(process.env.MIN_AVG_DOLLAR_VOL ?? 300000);
 const MAX_SPREAD_PCT = Number(process.env.MAX_SPREAD_PCT ?? 0.5); // 0.5% = 50 bps
-const MIN_REL_VOL_REQUIRED = Number(process.env.MIN_REL_VOL ?? 1.2);
-const STALE_MARKET_HOURS_MINUTES = Number(process.env.STALE_MARKET_HOURS_MINUTES ?? 30);
+const MIN_REL_VOL_REQUIRED = Number(process.env.MIN_REL_VOL ?? 0.5);
+const STALE_MARKET_HOURS_MINUTES = Number(process.env.STALE_MARKET_HOURS_MINUTES ?? 90);
 
 export type SkipReason =
   | "insufficient_bars"
@@ -169,12 +169,14 @@ export function evaluateSignalEligibility(
   }
 
   // Gate 6: Flat trend rejection (weak/choppy setups)
+  // Skip if the signal already passed scanner pre-post gating (it had a valid preScore)
+  // or if caller explicitly requests skipFlatTrend
   const skipFlatCheck = options?.skipFlatTrend === true;
   if (!skipFlatCheck && context.trend === "FLAT") {
     return {
       eligible: false,
       reason: "flat_trend",
-      detail: "Trend is FLAT (no directional bias)",
+      detail: `Trend is FLAT (slopePct=${context.trendSlopePct?.toFixed(4) ?? "?"}, barsUsed=${context.barsUsed})`,
     };
   }
 

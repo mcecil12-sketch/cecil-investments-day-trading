@@ -48,9 +48,12 @@ function computeTrend(bars: AlpacaBar[]) {
   if (!first || !last || first <= 0) return { trend: "FLAT" as const, slopePct: 0 };
   const totalPct = (last - first) / first;
   const perBarPct = totalPct / (slice.length - 1);
+  // Env-backed threshold: default 0.03% per bar (was 0.06%).
+  // Over 20 bars this requires ~0.6% total move to qualify as UP/DOWN.
+  const trendThreshold = Number(process.env.TREND_SLOPE_THRESHOLD ?? 0.0003);
   let trend: SignalContext["trend"] = "FLAT";
-  if (perBarPct > 0.0006) trend = "UP";
-  else if (perBarPct < -0.0006) trend = "DOWN";
+  if (perBarPct > trendThreshold) trend = "UP";
+  else if (perBarPct < -trendThreshold) trend = "DOWN";
   return { trend, slopePct: perBarPct * 100 };
 }
 
@@ -65,7 +68,12 @@ function computeVolumes(bars: AlpacaBar[]) {
   if (!(avg > 0)) {
     return { avg, last, rel: 1.0, relNote: "relVol defaulted (avg volume <= 0)" };
   }
-  const rel = last / avg;
+  // Use rolling 5-bar average for relVolume instead of single last bar.
+  // Single-bar relVol is noisy for 1-minute bars — a single quiet bar kills the signal.
+  const recentWindow = Math.min(5, vols.length);
+  const recentSlice = vols.slice(-recentWindow);
+  const recentAvg = recentSlice.reduce((a, b) => a + b, 0) / recentSlice.length;
+  const rel = recentAvg / avg;
   return { avg, last, rel, relNote: null };
 }
 
