@@ -45,7 +45,11 @@ function isTightening(side: Side, currentStop: number, nextStop: number) {
 }
 
 async function cancelOrderId(orderId: string) {
+  console.warn("[stop-cancel] cancelOrderId called", { orderId, stack: new Error().stack });
   const resp = await alpacaRequest({ method: "DELETE", path: `/v2/orders/${encodeURIComponent(orderId)}` });
+  if (!resp.ok && resp.status !== 404) {
+    console.error("[stop-cancel] cancelOrderId failed", { orderId, status: resp.status, text: resp.text });
+  }
   return resp.ok || resp.status === 404;
 }
 

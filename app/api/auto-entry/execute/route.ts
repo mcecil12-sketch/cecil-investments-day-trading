@@ -560,7 +560,11 @@ async function listOpenOrders(symbol: string) {
 }
 
 async function cancelOrder(id: string) {
+  console.warn("[stop-cancel] cancelOrder called", { orderId: id, stack: new Error().stack });
   const resp = await alpacaRequest({ method: "DELETE", path: `/v2/orders/${id}` });
+  if (!resp.ok && resp.status !== 404) {
+    console.error("[stop-cancel] cancelOrder failed", { orderId: id, status: resp.status, text: resp.text });
+  }
   return resp.ok || resp.status === 404;
 }
 
@@ -579,6 +583,10 @@ async function cancelConflictingOrders(symbol: string, entrySide: "buy" | "sell"
     if (opposite && isStopOrMkt) {
       cancels.push(id);
     }
+  }
+
+  if (cancels.length > 0) {
+    console.warn("[stop-cancel] cancelConflictingOrders will cancel", { symbol, entrySide, cancels });
   }
 
   const results = [];
