@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { alpacaRequest, createOrder } from "@/lib/alpaca";
 import { redis, saveCriticalTask } from "@/lib/redis";
-import { getCriticalTasks } from "@/lib/redis";
+import { getCriticalTasks, partitionCriticalTasks } from "@/lib/redis";
 import { recordAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
 import { requireAuth } from "@/lib/auth";
 import { getGuardrailConfig, minutesSince } from "@/lib/autoEntry/guardrails";
@@ -1205,27 +1205,40 @@ export async function POST(req: Request) {
 
   // ─── Protection Integrity Gate ──────────────────────────────────────
   // Fail-closed: block new entries when unresolved critical incidents exist in Redis.
+  // Broker-flat awareness: if broker has 0 positions and 0 orders, stale/synthetic
+  // critical tasks from prior sessions should not block new entries.
   {
-    const unresolvedCritical = await getCriticalTasks().catch(() => []);
-    if (unresolvedCritical.length > 0) {
+    const brokerIsFlat = brokerTruth.positionsCount === 0 && brokerTruth.openOrdersCount === 0;
+    const allCritical = await getCriticalTasks().catch(() => []);
+    const { blocking: realBlocking } = partitionCriticalTasks(allCritical);
+    // When broker is flat, only block on tasks referencing symbols with live positions
+    const effectiveBlocking = brokerIsFlat
+      ? realBlocking.filter((t) => {
+          const sym = (t.symbol || "").toUpperCase();
+          return brokerTruth.positions.some((p) => (p.symbol || "").toUpperCase() === sym && Math.abs(p.qty) > 0);
+        })
+      : realBlocking;
+    if (effectiveBlocking.length > 0) {
       counts.skipped += 1;
-      const incidentSummary = unresolvedCritical
+      const incidentSummary = effectiveBlocking
         .slice(0, 5)
         .map((t) => `${t.incidentCode}:${t.symbol}`)
         .join(", ");
       await recordOutcome({
         outcome: "SKIP",
         reason: "PROTECTION_INTEGRITY_FAILED",
-        detail: `${unresolvedCritical.length} unresolved critical task(s): ${incidentSummary}`,
+        detail: `${effectiveBlocking.length} unresolved critical task(s): ${incidentSummary}`,
       });
       return NextResponse.json(
         {
           ok: true,
           skipped: true,
           reason: "PROTECTION_INTEGRITY_FAILED",
-          detail: `${unresolvedCritical.length} unresolved critical incident(s) in self-heal queue`,
-          unresolvedCriticalCount: unresolvedCritical.length,
+          detail: `${effectiveBlocking.length} unresolved critical incident(s) in self-heal queue`,
+          unresolvedCriticalCount: effectiveBlocking.length,
           unresolvedCriticalSummary: incidentSummary,
+          brokerIsFlat,
+          staleCriticalSkipped: allCritical.length - effectiveBlocking.length,
           market: { isOpen: marketOpen, timestamp: marketTimestamp },
           openPositionsCount: brokerTruth.positionsCount,
           maxOpenPositions: guardConfig.maxOpenPositions,
@@ -1245,7 +1258,10 @@ export async function POST(req: Request) {
 
   // ─── Protection Integrity Audit Gate ────────────────────────────────
   // Block new entries when existing open positions have critical protection gaps.
+  // Broker-flat: if broker has 0 positions + 0 orders, DB-only "open" trades are
+  // stale remnants, not live risk.  Skip the audit to avoid false BROKER_DB_MISMATCH.
   {
+    const brokerIsFlat = brokerTruth.positionsCount === 0 && brokerTruth.openOrdersCount === 0;
     const openTradesForAudit = trades
       .filter((t: any) => isOperationallyOpenTrade(t))
       .map((t: any) => ({
@@ -1257,7 +1273,7 @@ export async function POST(req: Request) {
         stopOrderId: t?.stopOrderId || t?.alpacaStopOrderId,
         protectionStatus: t?.protectionStatus,
       }));
-    if (openTradesForAudit.length > 0) {
+    if (openTradesForAudit.length > 0 && !brokerIsFlat) {
       const positions: BrokerPosition[] = Array.isArray(brokerTruth.positions) ? brokerTruth.positions : [];
       const orders: BrokerOrder[] = Array.isArray(brokerTruth.openOrders) ? brokerTruth.openOrders : [];
       const audit = auditProtectionIntegrity({

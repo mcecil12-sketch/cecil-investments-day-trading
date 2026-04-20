@@ -759,7 +759,7 @@ export async function GET(req: NextRequest) {
   }
 const aiSeedMode = mode === "ai-seed";
 const shortMode = mode === "short";
-const debugScan = req.headers.get("x-debug-scan") === "1";
+const debugScan = req.headers.get("x-debug-scan") === "1" || search.get("debug") === "1";
 
   // Skip short mode if not enabled
   if (shortMode && !ENABLE_SHORT_SCAN) {
@@ -1246,6 +1246,10 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
   let queuedSignals = 0;
   let candidatesSkippedDeduped = 0;
   let candidatesSkippedPrePostGate = 0;
+  let attemptedPosts = 0;
+  let postSuccessCount = 0;
+  let postFailureCount = 0;
+  const postFailureDetails: Array<{ ticker: string; status: number; error: string }> = [];
   const prePostGateReasons: Record<string, number> = {};
   const postDebug: any[] = [];
 
@@ -1311,6 +1315,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
       const payload = toOutgoing(candidate);
       const postUrl = `${baseUrl}/api/signals`;
       const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
+      attemptedPosts += 1;
       const res = await fetch(postUrl, {
         method: "POST",
         body: JSON.stringify(payload),
@@ -1333,21 +1338,26 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
           status: res.status,
           ok: res.ok,
           hasScannerToken: Boolean(inboundScannerToken),
+          hasVercelBypass: Boolean(bypassSecret),
           bodyHead: txt.slice(0, 240),
         });
       }
 
 
       if (!res.ok) {
+        postFailureCount += 1;
+        const errText = await res.text().catch(() => "");
+        postFailureDetails.push({ ticker: candidate.ticker, status: res.status, error: errText.slice(0, 200) });
         console.error(
           "[SCAN] Failed to POST signal",
           candidate.ticker,
           res.status,
-          await res.text()
+          errText,
         );
         continue;
       }
 
+      postSuccessCount += 1;
       postedCount += 1;
       posted.push(payload);
       if (aiSeedMode) {
@@ -1409,13 +1419,26 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
 
   const summarySnapshot = logSummary();
 
+  const skipReasons: Record<string, number> = {
+    ...(candidatesSkippedDeduped > 0 ? { dedupe: candidatesSkippedDeduped } : {}),
+    ...prePostGateReasons,
+    ...(postFailureCount > 0 ? { postFailed: postFailureCount } : {}),
+  };
+
   return NextResponse.json({
+    ok: true,
     ...result,
     scansRun: 1,
     candidatesFound: candidates.length,
+    candidatesEligibleToPost: topCandidates.length,
     candidatesPersisted: posted.length,
     candidatesSkippedDeduped,
     candidatesSkippedPrePostGate,
+    attemptedPosts,
+    postSuccessCount,
+    postFailureCount,
+    ...(postFailureDetails.length > 0 ? { postFailureDetails: postFailureDetails.slice(0, 10) } : {}),
+    skipReasons,
     prePostGateReasons,
     prePostGateConfig: getPrePostConfig(),
     capApplied,
