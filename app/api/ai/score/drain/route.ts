@@ -599,6 +599,7 @@ export async function POST(req: Request) {
     claimedThisRun?: number;
     contextHydrated?: number;
     contextHydrationFailed?: number;
+    softPassedWarnings?: number;
     sentToScorer?: number;
     persistedScored?: number;
     persistedError?: number;
@@ -1057,6 +1058,12 @@ export async function POST(req: Request) {
 
           finalizedIds.push(signal.id);
           continue;
+        }
+
+        // Track soft warnings (gates that would have blocked after-hours but are soft-passed during market open)
+        if (eligResult.eligible && eligResult.softWarnings?.length) {
+          result.softPassedWarnings = (result.softPassedWarnings ?? 0) + eligResult.softWarnings.length;
+          signal._softWarnings = eligResult.softWarnings;
         }
 
         // Compute and attach preScore for ranking

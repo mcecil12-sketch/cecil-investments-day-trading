@@ -37,13 +37,13 @@ export type SkipReason =
   | "stale_market_hours"; // Signal too old during market hours
 
 export type EligibilityResult =
-  | { eligible: true }
+  | { eligible: true; softWarnings?: string[] }
   | { eligible: false; reason: SkipReason; detail?: string };
 
 /**
  * Evaluate whether a signal meets minimum thresholds for AI scoring.
  * 
- * Checks (in order):
+ * Hard gates (always block):
  * 1. Context exists (not null/undefined)
  * 2. barsUsed >= MIN_BARS_REQUIRED (default 20)
  * 3. Staleness (configurable: market hours or general)
@@ -51,17 +51,13 @@ export type EligibilityResult =
  * 5. avgDollarVol >= MIN_AVG_DOLLAR_VOL (default 300000)
  * 6. price >= MIN_PRICE_REQUIRED (default 3)
  * 7. price <= MAX_PRICE_ALLOWED (default 500)
- * 8. relVolume >= MIN_REL_VOL_REQUIRED (default 1.2)
- * 9. trend !== "FLAT" (flat trend rejection)
- * 10. spread (if available) <= MAX_SPREAD_PCT
+ * 8. spread (if available) <= MAX_SPREAD_PCT
  * 
- * Returns early on first failure (order matters for diagnostics).
+ * Soft gates (block only when market is CLOSED; soft-pass during market open):
+ * - relVolume < MIN_REL_VOL_REQUIRED → soft warning during market hours
+ * - trend === "FLAT" → soft warning during market hours
  * 
- * @param context Signal context with bars, volume, and price data
- * @param entryPrice Entry price of the signal
- * @param createdAt ISO timestamp of signal creation (for staleness check)
- * @param options Configuration options
- * @returns Result indicating eligibility or reason for skipping
+ * Returns early on first hard failure.
  */
 export function evaluateSignalEligibility(
   context: SignalContext | null,
@@ -74,7 +70,9 @@ export function evaluateSignalEligibility(
     skipLowRelVol?: boolean;
   }
 ): EligibilityResult {
-  // Gate 0: Context must exist
+  const isMarketOpen = options?.isMarketOpen === true;
+
+  // Gate 0: Context must exist (HARD)
   if (!context) {
     return {
       eligible: false,
@@ -83,7 +81,7 @@ export function evaluateSignalEligibility(
     };
   }
 
-  // Gate 1: Bars used (context requirement)
+  // Gate 1: Bars used (HARD)
   if (!Number.isFinite(context.barsUsed)) {
     return {
       eligible: false,
@@ -100,7 +98,7 @@ export function evaluateSignalEligibility(
     };
   }
 
-  // Gate 1b: Staleness guard (live/recovery mode controlled by caller)
+  // Gate 1b: Staleness guard (HARD)
   if (typeof options?.staleAgeHours === "number" && isSignalStale(createdAt, options.staleAgeHours)) {
     return {
       eligible: false,
@@ -109,8 +107,8 @@ export function evaluateSignalEligibility(
     };
   }
 
-  // Gate 1c: Market-hours staleness (stricter during trading)
-  if (options?.isMarketOpen && isSignalStaleMarketHours(createdAt)) {
+  // Gate 1c: Market-hours staleness (HARD)
+  if (isMarketOpen && isSignalStaleMarketHours(createdAt)) {
     return {
       eligible: false,
       reason: "stale_market_hours",
@@ -118,7 +116,7 @@ export function evaluateSignalEligibility(
     };
   }
 
-  // Gate 2: Average share volume
+  // Gate 2: Average share volume (HARD)
   if (context.avgVolume == null || context.avgVolume < MIN_AVG_VOL_SHARES) {
     const avgVol = context.avgVolume ?? 0;
     return {
@@ -128,7 +126,7 @@ export function evaluateSignalEligibility(
     };
   }
 
-  // Gate 3: Average dollar volume
+  // Gate 3: Average dollar volume (HARD)
   if (Number.isFinite(entryPrice) && entryPrice > 0) {
     const avgDollarVol = context.avgVolume * entryPrice;
     if (avgDollarVol < MIN_AVG_DOLLAR_VOL) {
@@ -140,7 +138,7 @@ export function evaluateSignalEligibility(
     }
   }
 
-  // Gate 4: Minimum price (liquidity, slippage sanity)
+  // Gate 4: Minimum price (HARD)
   if (entryPrice < MIN_PRICE_REQUIRED) {
     return {
       eligible: false,
@@ -149,7 +147,7 @@ export function evaluateSignalEligibility(
     };
   }
 
-  // Gate 4b: Maximum price (capital efficiency, risk management)
+  // Gate 4b: Maximum price (HARD)
   if (entryPrice > MAX_PRICE_ALLOWED) {
     return {
       eligible: false,
@@ -158,29 +156,7 @@ export function evaluateSignalEligibility(
     };
   }
 
-  // Gate 5: Relative volume (market participation)
-  const skipRelVolCheck = options?.skipLowRelVol === true;
-  if (!skipRelVolCheck && context.relVolume != null && context.relVolume < MIN_REL_VOL_REQUIRED) {
-    return {
-      eligible: false,
-      reason: "low_rel_volume",
-      detail: `relVol ${context.relVolume.toFixed(2)} < ${MIN_REL_VOL_REQUIRED}`,
-    };
-  }
-
-  // Gate 6: Flat trend rejection (weak/choppy setups)
-  // Skip if the signal already passed scanner pre-post gating (it had a valid preScore)
-  // or if caller explicitly requests skipFlatTrend
-  const skipFlatCheck = options?.skipFlatTrend === true;
-  if (!skipFlatCheck && context.trend === "FLAT") {
-    return {
-      eligible: false,
-      reason: "flat_trend",
-      detail: `Trend is FLAT (slopePct=${context.trendSlopePct?.toFixed(4) ?? "?"}, barsUsed=${context.barsUsed})`,
-    };
-  }
-
-  // Gate 7: Spread sanity (if context includes spread data)
+  // Gate 7: Spread sanity (HARD, if context includes spread data)
   if (
     context &&
     typeof (context as any).spreadPct === "number" &&
@@ -193,7 +169,36 @@ export function evaluateSignalEligibility(
     };
   }
 
-  return { eligible: true };
+  // === SOFT GATES ===
+  // During live market hours, relVol and trend are soft warnings — let GPT decide.
+  // After hours / recovery mode, they remain hard skips to prevent junk from consuming quota.
+  const softWarnings: string[] = [];
+
+  // Gate 5: Relative volume — SOFT during market open, HARD when closed
+  const skipRelVolCheck = options?.skipLowRelVol === true;
+  if (!skipRelVolCheck && context.relVolume != null && context.relVolume < MIN_REL_VOL_REQUIRED) {
+    const detail = `relVol ${context.relVolume.toFixed(2)} < ${MIN_REL_VOL_REQUIRED}`;
+    if (isMarketOpen) {
+      // Soft pass: let GPT decide
+      softWarnings.push(`low_rel_volume: ${detail}`);
+    } else {
+      return { eligible: false, reason: "low_rel_volume", detail };
+    }
+  }
+
+  // Gate 6: Flat trend — SOFT during market open, HARD when closed
+  const skipFlatCheck = options?.skipFlatTrend === true;
+  if (!skipFlatCheck && context.trend === "FLAT") {
+    const detail = `Trend is FLAT (slopePct=${context.trendSlopePct?.toFixed(4) ?? "?"}, barsUsed=${context.barsUsed})`;
+    if (isMarketOpen) {
+      // Soft pass: let GPT decide
+      softWarnings.push(`flat_trend: ${detail}`);
+    } else {
+      return { eligible: false, reason: "flat_trend", detail };
+    }
+  }
+
+  return { eligible: true, softWarnings: softWarnings.length > 0 ? softWarnings : undefined };
 }
 
 /**
