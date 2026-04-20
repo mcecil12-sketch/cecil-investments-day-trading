@@ -48,6 +48,14 @@ interface CandidateSignal {
   reasoning?: string;
   source?: string;
   bias?: "SHORT_CANDIDATE"; // Tag for short scanning mode
+  // Metrics for computePreScore and prePostGating (populated by detect* functions)
+  relVol?: number;
+  distToVwapPct?: number;
+  vwapSlopePct?: number;
+  atrPct?: number;
+  spreadAbs?: number;
+  price?: number;
+  avgDollarVol?: number;
 }
 
 /**
@@ -561,6 +569,18 @@ function detectAiSeedCandidate(
   const stopPrice = entryPrice * 0.99;
   const targetPrice = entryPrice * 1.02;
   const features: PatternFeatures = { avgVol };
+
+  // Compute metrics for computePreScore and prePostGating
+  const vwap = computeVWAP(bars);
+  const relVol = avgVol > 0 ? last.v / avgVol : 0;
+  const distToVwapPct = vwap > 0 ? ((last.c - vwap) / vwap) * 100 : 0;
+  const avgDollarVol = avg(bars.map(b => Number(b.v ?? 0) * Number((b.vw ?? b.c ?? 0) || 0)));
+  const prev = bars.length >= 2 ? bars[bars.length - 2] : null;
+  const vwapSlopePct = prev ? ((last.c - prev.c) / prev.c) * 100 : 0;
+  const ranges = bars.slice(-20).map(b => b.h - b.l);
+  const atrPct = last.c > 0 ? (avg(ranges) / last.c) * 100 : 0;
+  const spreadAbs = last.h > 0 ? (last.h - last.l) / last.c : 0;
+
   return {
     ticker: symbol,
     side: "LONG",
@@ -573,6 +593,13 @@ function detectAiSeedCandidate(
     patternScore: scorePattern("AI_SEED", features),
     reasoning: "AI seed candidate based on liquidity.",
     source: "scan:ai-seed",
+    relVol,
+    distToVwapPct,
+    vwapSlopePct,
+    atrPct,
+    spreadAbs,
+    price: last.c,
+    avgDollarVol,
   };
 }
 
@@ -643,6 +670,12 @@ function detectShortCandidate(
   const stopPrice = entryPrice * 1.015; // 1.5% upside stop
   const targetPrice = entryPrice * 0.97; // 3% downside target
   const features: PatternFeatures = { avgVol };
+
+  // Compute metrics for computePreScore and prePostGating
+  const relVol = avgVol > 0 ? last.v / avgVol : 0;
+  const avgDollarVolCalc = avg(bars.map(b => Number(b.v ?? 0) * Number((b.vw ?? b.c ?? 0) || 0)));
+  const vwapSlopePct = bars.length >= 2 ? ((last.c - bars[bars.length - 2].c) / bars[bars.length - 2].c) * 100 : 0;
+  const spreadAbs = last.h > 0 ? (last.h - last.l) / last.c : 0;
   
   return {
     ticker: symbol,
@@ -657,6 +690,13 @@ function detectShortCandidate(
     reasoning: `Short candidate: ${signals} bearish signals (extended=${extended}, lowerHigh=${lowerHigh}, trendNeg=${trendNegative}, belowVwap=${belowVwap}).`,
     source: "scan:short",
     bias: "SHORT_CANDIDATE",
+    relVol,
+    distToVwapPct: distancePct,
+    vwapSlopePct,
+    atrPct,
+    spreadAbs,
+    price: last.c,
+    avgDollarVol: avgDollarVolCalc,
   };
 }
 
@@ -1239,11 +1279,11 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
         side: candidate.side,
         patternScore: candidate.patternScore,
         patternType: candidate.patternType,
-        relVol: (candidate as any).relVol,
-        avgDollarVol: (candidate as any).avgDollarVol,
-        spreadPct: (candidate as any).spreadPct,
-        vwapDistPct: (candidate as any).distToVwapPct,
-        atrPct: (candidate as any).atrPct,
+        relVol: candidate.relVol,
+        avgDollarVol: candidate.avgDollarVol,
+        spreadPct: candidate.spreadAbs, // spreadAbs on candidate maps to spreadPct on gate
+        vwapDistPct: candidate.distToVwapPct,
+        atrPct: candidate.atrPct,
         minutesSinceOpen: (candidate as any).minutesSinceOpen,
         preScore: (candidate as any).preScore,
       };
@@ -1270,6 +1310,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
       }
       const payload = toOutgoing(candidate);
       const postUrl = `${baseUrl}/api/signals`;
+      const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
       const res = await fetch(postUrl, {
         method: "POST",
         body: JSON.stringify(payload),
@@ -1281,6 +1322,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
           ...(inboundScannerToken ? { "x-scanner-token": inboundScannerToken } : {}),
           ...(scanSource ? { "x-scan-source": scanSource } : {}),
           ...(scanRunId ? { "x-scan-run-id": String(scanRunId) } : {}),
+          ...(bypassSecret ? { "x-vercel-protection-bypass": bypassSecret } : {}),
         },
       });
       if (debugScan) {
