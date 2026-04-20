@@ -193,7 +193,8 @@ async function enforceProtection(
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
-  const enforce = url.searchParams.get("enforce") === "1";
+  // Always enforce protection for live unprotected trades
+  const enforce = true;
 
   const [rawTrades, brokerTruth] = await Promise.all([
     readTrades<Record<string, any>>().catch(() => []),
@@ -301,11 +302,24 @@ export async function GET(req: Request) {
     }
   }
 
+
   let enforcement:
     | { repaired: string[]; flattened: string[]; failed: string[] }
     | undefined;
+  let observability: any = {};
   if (enforce && !audit.ok) {
     enforcement = await enforceProtection(audit, positions);
+    observability = {
+      unprotectedSymbols: audit.incidents.filter((i) => i.severity === "CRITICAL").map((i) => i.symbol),
+      repairAttempted: enforcement.repaired.length > 0,
+      repairSucceeded: enforcement.repaired.length > 0,
+      flattenAttempted: enforcement.flattened.length > 0,
+      flattenSucceeded: enforcement.flattened.length > 0,
+      repairFailed: enforcement.failed.length > 0,
+      repaired: enforcement.repaired,
+      flattened: enforcement.flattened,
+      failed: enforcement.failed,
+    };
   }
 
   return NextResponse.json({
@@ -323,5 +337,6 @@ export async function GET(req: Request) {
     details: audit.details,
     enforcement: enforcement || undefined,
     reconciliation: reconciliation.attempted ? reconciliation : undefined,
+    observability,
   });
 }

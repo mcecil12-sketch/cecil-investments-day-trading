@@ -2327,7 +2327,7 @@ export async function POST(req: Request) {
           stopOrderId,
           status: stopVerify.status,
         });
-        
+
         // Try to create emergency stop
         const recoveryResult = await recoverUnprotectedTrade({
           symbol: ticker,
@@ -2337,7 +2337,7 @@ export async function POST(req: Request) {
           preferredStopPrice: bracketStop,
           tradeId,
         });
-        
+
         if (recoveryResult.ok && recoveryResult.stopOrderId) {
           stopVerified = true;
           verifiedStopOrderId = recoveryResult.stopOrderId;
@@ -2354,6 +2354,15 @@ export async function POST(req: Request) {
             reason: recoveryResult.reason,
             detail: recoveryResult.detail,
           });
+          // Attempt to flatten position immediately
+          const flattenResult = await flattenUnprotectedPosition({ symbol: ticker, tradeId, reason: "stop_recovery_failed" });
+          if (flattenResult.ok) {
+            notes.push(`flattened:${ticker}`);
+            console.warn("[auto-entry] position flattened due to unprotected trade", { ticker, tradeId });
+          } else {
+            notes.push(`flatten_failed:${ticker}`);
+            console.error("[auto-entry] flatten failed after stop recovery failure", { ticker, tradeId, error: flattenResult });
+          }
         }
       }
     } else {
@@ -2388,13 +2397,13 @@ export async function POST(req: Request) {
 
     // If stop still not verified, mark trade ERROR and attempt flatten
     if (!stopVerified) {
-      console.error("[auto-entry] TRADE MARKED ERROR - missing stop protection", {
+      console.error("[auto-entry] TRADE MARKED ERROR - missing stop protection, flatten attempted", {
         ticker,
         tradeId,
         stopOrderId,
         orderId: order.id,
       });
-      
+
       // Log critical task for visibility
       await saveCriticalTask({
         incidentCode: "MISSING_STOP_AT_ENTRY",
@@ -2402,7 +2411,7 @@ export async function POST(req: Request) {
         severity: "CRITICAL",
         detail: `Trade ${tradeId} created without verified stop protection; stopOrderId=${stopOrderId}`,
       }).catch((err) => console.error("[auto-entry] failed to log critical task", err));
-      
+
       const errorTrade = {
         ...trade,
         quantity: qty,
@@ -2421,10 +2430,10 @@ export async function POST(req: Request) {
         updatedAt: startedAt,
         executedAt: startedAt,
       };
-      
+
       trades[idx] = errorTrade;
       await writeTrades(trades);
-      
+
       await recordOutcome({
         outcome: "FAIL",
         reason: "missing_stop_protection",
@@ -2433,23 +2442,23 @@ export async function POST(req: Request) {
         detail: `Stop verification failed; stopOrderId=${stopOrderId}`,
         side: sideEnum === "LONG" ? "LONG" : "SHORT",
       });
-      
+
       await fireNotification({
         type: "AUTO_ENTRY_FAILED",
         tradeId,
         ticker,
         title: `CRITICAL: ${ticker} missing stop protection`,
-        message: `Trade executed but stop not verified - marked ERROR. Manual intervention required.`,
+        message: `Trade executed but stop not verified - marked ERROR. Flatten attempted.`,
         paper: true,
         dedupeKey: `AUTO_ENTRY_MISSING_STOP:${tradeId}`,
         dedupeTtlSec: 600,
       });
-      
+
       return NextResponse.json(
         {
           ok: false,
           error: "missing_stop_protection",
-          detail: "Trade executed but stop verification failed",
+          detail: "Trade executed but stop verification failed; flatten attempted.",
           tradeId,
           trade: errorTrade,
           broker: {
