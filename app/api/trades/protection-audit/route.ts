@@ -6,7 +6,7 @@
 export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
-import { readTrades } from "@/lib/tradesStore";
+import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { saveCriticalTask } from "@/lib/redis";
 import {
@@ -195,7 +195,7 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const enforce = url.searchParams.get("enforce") === "1";
 
-  const [allTrades, brokerTruth] = await Promise.all([
+  const [rawTrades, brokerTruth] = await Promise.all([
     readTrades<Record<string, any>>().catch(() => []),
     fetchBrokerTruth(),
   ]);
@@ -207,9 +207,68 @@ export async function GET(req: Request) {
     );
   }
 
-  const openTrades = (Array.isArray(allTrades) ? allTrades : [])
-    .filter((t) => isOpenTradeStatus(t?.status))
-    .map((t) => ({
+  const positions: BrokerPosition[] = brokerTruth.positions || [];
+  const orders: BrokerOrder[] = brokerTruth.openOrders || [];
+
+  const allTrades = (Array.isArray(rawTrades) ? rawTrades : []) as Record<string, any>[];
+
+  // ─── Broker-flat reconciliation ───────────────────────────────────
+  // When broker has zero positions AND zero open orders, but DB still
+  // has "open" trades, those trades are stale (e.g. manual exit completed
+  // but DB wasn't updated). Auto-close them to prevent false CRITICAL
+  // incidents. This preserves audit trail via closeReason.
+  const brokerIsFlat =
+    (!positions || positions.length === 0) &&
+    (!orders || orders.length === 0);
+
+  let reconciliation: { attempted: boolean; closedTickers: string[]; closedCount: number } = {
+    attempted: false,
+    closedTickers: [],
+    closedCount: 0,
+  };
+
+  const dbOpenTrades = allTrades.filter((t) => isOpenTradeStatus(t?.status));
+
+  if (brokerIsFlat && dbOpenTrades.length > 0) {
+    reconciliation.attempted = true;
+    const now = new Date().toISOString();
+    const updatedTrades = allTrades.map((t) => {
+      if (!isOpenTradeStatus(t?.status)) return t;
+      const ticker = String(t.ticker || "").toUpperCase();
+      reconciliation.closedTickers.push(ticker);
+      reconciliation.closedCount++;
+      console.log("[protection-audit] broker-flat reconciliation: closing stale DB trade", {
+        id: t.id,
+        ticker,
+        previousStatus: t.status,
+      });
+      return {
+        ...t,
+        status: "CLOSED",
+        closeReason: "broker_flat_reconciliation",
+        closedAt: now,
+        updatedAt: now,
+        _reconciledAt: now,
+        _reconciledBy: "protection-audit",
+      };
+    });
+
+    try {
+      await writeTrades(updatedTrades);
+      console.log("[protection-audit] broker-flat reconciliation complete", {
+        closedCount: reconciliation.closedCount,
+        tickers: reconciliation.closedTickers,
+      });
+    } catch (err) {
+      console.error("[protection-audit] broker-flat reconciliation write failed", err);
+      reconciliation = { attempted: true, closedTickers: [], closedCount: 0 };
+    }
+  }
+
+  // Re-read open trades after reconciliation
+  const openTrades = (brokerIsFlat && reconciliation.closedCount > 0)
+    ? [] // All were just closed
+    : dbOpenTrades.map((t) => ({
       id: String(t.id || ""),
       ticker: String(t.ticker || ""),
       side: String(t.side || ""),
@@ -219,26 +278,26 @@ export async function GET(req: Request) {
       protectionStatus: t.protectionStatus,
     }));
 
-  const positions: BrokerPosition[] = brokerTruth.positions || [];
-  const orders: BrokerOrder[] = brokerTruth.openOrders || [];
-
   const audit = auditProtectionIntegrity({
     openTrades,
     brokerPositions: positions,
     brokerOrders: orders,
   });
 
-  // Emit critical tasks
-  for (const incident of audit.incidents) {
-    if (incident.severity === "CRITICAL") {
-      await saveCriticalTask({
-        incidentCode: incident.code,
-        symbol: incident.symbol,
-        severity: incident.severity,
-        detail: incident.detail,
-      }).catch((err) => {
-        console.error("[protection-audit] saveCriticalTask failed", err);
-      });
+  // Only emit critical tasks for incidents that aren't stale reconciliation artifacts
+  // When broker is flat and reconciliation just ran, skip critical task emission
+  if (!reconciliation.attempted || reconciliation.closedCount === 0) {
+    for (const incident of audit.incidents) {
+      if (incident.severity === "CRITICAL") {
+        await saveCriticalTask({
+          incidentCode: incident.code,
+          symbol: incident.symbol,
+          severity: incident.severity,
+          detail: incident.detail,
+        }).catch((err) => {
+          console.error("[protection-audit] saveCriticalTask failed", err);
+        });
+      }
     }
   }
 
@@ -254,6 +313,7 @@ export async function GET(req: Request) {
     source: "broker-truth",
     brokerFetchedAt: brokerTruth.fetchedAt,
     auditedAt: audit.auditedAt,
+    brokerIsFlat,
     openTrades: audit.tradeCount,
     protectedTrades: audit.protectedCount,
     unprotectedTrades: audit.tradeCount - audit.protectedCount,
@@ -262,5 +322,6 @@ export async function GET(req: Request) {
     incidents: audit.incidents,
     details: audit.details,
     enforcement: enforcement || undefined,
+    reconciliation: reconciliation.attempted ? reconciliation : undefined,
   });
 }

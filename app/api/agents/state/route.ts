@@ -17,7 +17,7 @@ import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
 import { redis } from "@/lib/redis";
 import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
 import type { EngineeringTask } from "@/lib/agents/types";
-import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask, getManualQueueDiagnostics } from "@/lib/agents/manual-action-queue";
+import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask, getTrulyActiveManualTask, getNextQueuedManualTask, getManualQueueDiagnostics } from "@/lib/agents/manual-action-queue";
 
 function executionVisibilityRank(task: EngineeringTask): number {
   const incidentRank = task.incidentId ? 0 : 100;
@@ -42,7 +42,7 @@ export async function GET(req: Request) {
     return unauthorizedAgentResponse(auth.error);
   }
 
-  const [snapshot, state, tasks, adaptiveState, latestExecRaw, manualTasks, manualCounts, activeManualTask, queueDiagnostics] = await Promise.all([
+  const [snapshot, state, tasks, adaptiveState, latestExecRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics] = await Promise.all([
     readAgentStateSnapshot(),
     ensureAgentState(),
     listEngineeringTasks(200).then((t) =>
@@ -53,6 +53,8 @@ export async function GET(req: Request) {
     listManualActionTasks({ limit: 10 }).catch(() => []),
     countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0, selectedCount: 0, selectableCount: 0, recoverableBlockedCount: 0, idleReason: "count_fetch_failed" as string | null })),
     getActiveManualTask().catch(() => null),
+    getTrulyActiveManualTask().catch(() => null),
+    getNextQueuedManualTask().catch(() => null),
     getManualQueueDiagnostics().catch(() => ({
       totalTasks: 0, openCount: 0, selectedCount: 0, inProgressCount: 0,
       blockedCount: 0, failedCount: 0, doneCount: 0, canceledCount: 0,
@@ -131,6 +133,44 @@ export async function GET(req: Request) {
     },
   };
 
+  // ─── Compute latestExecutionResult age & historical flag ──────────
+  const latestExecTimestamp: string | null = (() => {
+    if (!latestExec) return null;
+    // Try common timestamp fields
+    const ts = latestExec.timestamp ?? latestExec.executedAt ?? latestExec.resolvedAt;
+    if (typeof ts === "string") return ts;
+    return null;
+  })();
+  const latestExecAgeMinutes: number | null = (() => {
+    if (!latestExecTimestamp) return null;
+    const t = Date.parse(latestExecTimestamp);
+    if (!Number.isFinite(t)) return null;
+    return Math.round((Date.now() - t) / 60000);
+  })();
+  // Consider execution results older than 30 minutes as historical
+  const isLatestExecutionHistorical = latestExecAgeMinutes != null ? latestExecAgeMinutes > 30 : latestExec != null;
+
+  // ─── State reconciliation: detect and report inconsistencies ──────
+  // Use trulyActiveTask (IN_PROGRESS/SELECTED only) for display
+  // activeManualTask (includes OPEN+executionReady) still used for execution routing
+  const reconciledActiveTask = trulyActiveTask;
+  const stateConsistency = (() => {
+    const issues: string[] = [];
+    // Check: inProgressCount=0 but activeManualTask was showing an old task
+    if (manualCounts.inProgressCount === 0 && manualCounts.selectedCount === 0 && activeManualTask && !trulyActiveTask) {
+      issues.push("activeManualTask was showing queued OPEN task as active — corrected to null");
+    }
+    // Check: latestExecutionResult is stale
+    if (isLatestExecutionHistorical) {
+      const status = latestExec?.executionStatus ?? latestExec?.manualTaskStatus;
+      issues.push(`latestExecutionResult is historical (${latestExecAgeMinutes ?? "?"}m old, status=${status})`);
+    }
+    return {
+      consistent: issues.length === 0,
+      issues,
+    };
+  })();
+
   return NextResponse.json({
     ok: true,
     state: derivedState,
@@ -144,14 +184,22 @@ export async function GET(req: Request) {
       selectableCount: manualCounts.selectableCount ?? 0,
       recoverableBlockedCount: manualCounts.recoverableBlockedCount ?? 0,
       idleReason: manualCounts.idleReason ?? null,
-      activeManualTask: activeManualTask ? {
-        id: activeManualTask.id,
-        title: activeManualTask.title,
-        status: activeManualTask.status,
-        priority: activeManualTask.priority,
-        taskType: activeManualTask.taskType,
-        startedAt: activeManualTask.startedAt,
-        selectedAt: activeManualTask.selectedAt,
+      // Only show truly active tasks (IN_PROGRESS/SELECTED), not queued OPEN ones
+      activeManualTask: reconciledActiveTask ? {
+        id: reconciledActiveTask.id,
+        title: reconciledActiveTask.title,
+        status: reconciledActiveTask.status,
+        priority: reconciledActiveTask.priority,
+        taskType: reconciledActiveTask.taskType,
+        startedAt: reconciledActiveTask.startedAt,
+        selectedAt: reconciledActiveTask.selectedAt,
+      } : null,
+      // Show next queued task separately from active task
+      nextQueuedTask: nextQueuedTask && !reconciledActiveTask ? {
+        id: nextQueuedTask.id,
+        title: nextQueuedTask.title,
+        priority: nextQueuedTask.priority,
+        taskType: nextQueuedTask.taskType,
       } : null,
       nextTitles: manualTasks
         .filter((t) => t.status === "OPEN" || t.status === "SELECTED" || t.status === "IN_PROGRESS")
@@ -178,5 +226,13 @@ export async function GET(req: Request) {
         staleTaskIds: queueDiagnostics.staleTaskIds,
       },
     },
+    // ─── Execution result freshness ─────────────────────────────────
+    latestExecutionMeta: {
+      isHistorical: isLatestExecutionHistorical,
+      ageMinutes: latestExecAgeMinutes,
+      timestamp: latestExecTimestamp,
+      status: latestExec?.executionStatus ?? null,
+    },
+    stateReconciliation: stateConsistency,
   });
 }

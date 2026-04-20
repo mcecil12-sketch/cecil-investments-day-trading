@@ -65,6 +65,18 @@ type FunnelHealthResponse = {
     minsSinceLastSeed?: number | null;
     minsSinceLastExecute?: number | null;
   };
+  funnelFlowDiagnostics?: {
+    stoppedAt: string;
+    stoppedReason: string;
+    stages: Record<string, unknown>;
+    scanSkipsByMode: Record<string, number>;
+    scanRunsByMode: Record<string, number>;
+  };
+  brokerReconciliation?: {
+    brokerIsFlat: boolean;
+    staleMismatchTickers: string[];
+    message: string;
+  };
   error?: string;
   // DEBUG: Temporary field for attribution verification (can be removed later)
   _debug?: {
@@ -349,8 +361,14 @@ export async function GET() {
     // Protection Integrity Audit
     // -------------------------------------------------------------------------
     let protectionMissingTickers: string[] = [];
+    let brokerIsFlat = false;
+    let staleMismatchTickers: string[] = [];
     
     if (!brokerTruth.error) {
+      const brokerPositionsCount = brokerTruth.positionsCount ?? (brokerTruth.positions || []).length;
+      const brokerOrdersCount = brokerTruth.openOrdersCount ?? (brokerTruth.openOrders || []).length;
+      brokerIsFlat = brokerPositionsCount === 0 && brokerOrdersCount === 0;
+
       // Find all open trades
       const openTrades = (allTrades || [])
         .filter((t: any) => isOpenTradeStatus(t?.status))
@@ -370,11 +388,19 @@ export async function GET() {
           marketOpen,
         });
 
-        // Extract tickers with missing protection
+        // Distinguish stale mismatch (broker flat) from live protection issues
         const missingProtectionIncidents = audit.incidents.filter(
           (i) => i.code === "MISSING_STOP" || i.code === "BROKER_DB_MISMATCH"
         );
-        protectionMissingTickers = [...new Set(missingProtectionIncidents.map((i) => i.symbol))];
+
+        if (brokerIsFlat) {
+          // Broker is flat — these are stale DB records, not live risk
+          staleMismatchTickers = [...new Set(missingProtectionIncidents.map((i) => i.symbol))];
+          // Don't report as protection_missing — this is a reconciliation issue
+        } else {
+          // Broker has positions — these are real protection issues
+          protectionMissingTickers = [...new Set(missingProtectionIncidents.map((i) => i.symbol))];
+        }
       }
     }
 
@@ -402,6 +428,16 @@ export async function GET() {
       minsSinceLastExecute,
       protectionMissingTickers,
     });
+
+    // Add lower-severity incident for stale broker/DB mismatch (not live risk)
+    if (staleMismatchTickers.length > 0) {
+      incidents.push({
+        code: "STALE_BROKER_DB_MISMATCH",
+        severity: "LOW",
+        message: `${staleMismatchTickers.length} trade(s) in DB but broker is flat — needs reconciliation (not live risk): ${staleMismatchTickers.join(", ")}`,
+        context: { tickers: staleMismatchTickers, brokerIsFlat: true, count: staleMismatchTickers.length },
+      });
+    }
 
     // Count incident severities for scoring
     const criticalIncidents = incidents.filter((i) => i.severity === "CRITICAL").length;
@@ -471,6 +507,76 @@ export async function GET() {
         minsSinceLastSeed,
         minsSinceLastExecute,
       },
+      // ─── Market-open funnel flow diagnostics ────────────────────────
+      // Explains exactly where the funnel pipeline is stopping during market hours
+      ...(marketOpen ? {
+        funnelFlowDiagnostics: (() => {
+          const scansRun = num(funnelData.scansRun);
+          const scansSkipped = num(funnelData.scansSkipped);
+          const lastScanStatus = funnelData.lastScanStatus;
+          const signalsPosted = num(funnelData.signalsPosted);
+          const drainScored = num(funnelData.drainScored);
+
+          // Determine the bottleneck stage
+          type FlowStage = "scan" | "signal_post" | "scoring" | "qualification" | "seeding" | "execution" | "flowing";
+          let stoppedAt: FlowStage = "flowing";
+          let stoppedReason = "funnel is flowing normally";
+
+          if (scansRun === 0 && scansSkipped === 0) {
+            stoppedAt = "scan";
+            stoppedReason = "no scans have run today — cron/scheduler may not be triggering scans";
+          } else if (scansRun === 0 && scansSkipped > 0) {
+            stoppedAt = "scan";
+            stoppedReason = `${scansSkipped} scan(s) skipped, 0 completed — last skip status: ${lastScanStatus || "unknown"}. Scanner is running but skipping (check market clock, mode config)`;
+          } else if (scansRun > 0 && signalsPosted === 0) {
+            stoppedAt = "signal_post";
+            stoppedReason = `${scansRun} scan(s) ran but 0 signals posted — candidates may be rejected by pre-post gating or quality filters`;
+          } else if (signalsPosted > 0 && signalsReceived === 0) {
+            stoppedAt = "signal_post";
+            stoppedReason = `${signalsPosted} signals posted but 0 received in today's window — possible timestamp/ET-day mismatch`;
+          } else if (signalsReceived > 0 && scored === 0) {
+            stoppedAt = "scoring";
+            stoppedReason = `${signalsReceived} signals received but 0 scored — drain/scoring pipeline may not have run (drainScored=${drainScored})`;
+          } else if (scored > 0 && qualified === 0) {
+            stoppedAt = "qualification";
+            stoppedReason = `${scored} scored but 0 qualified — all scores may be below qualification threshold`;
+          } else if (qualified > 0 && seeded === 0) {
+            stoppedAt = "seeding";
+            stoppedReason = `${qualified} qualified but 0 seeded — seed-from-signals may not have run, or capacity/guardrails blocking`;
+          } else if (seeded > 0 && executed === 0) {
+            stoppedAt = "execution";
+            stoppedReason = `${seeded} seeded but 0 executed — execute route may not have fired, or bracket/liquidity checks failing`;
+          }
+
+          return {
+            stoppedAt,
+            stoppedReason,
+            stages: {
+              scansRun,
+              scansSkipped,
+              lastScanStatus: lastScanStatus || null,
+              lastScanMode: funnelData.lastScanMode || null,
+              signalsPosted,
+              signalsReceived,
+              drainScored,
+              scored,
+              qualified,
+              seeded,
+              executed,
+            },
+            scanSkipsByMode: funnelData.scanSkipsByMode ?? {},
+            scanRunsByMode: funnelData.scanRunsByMode ?? {},
+          };
+        })(),
+      } : {}),
+      // Broker/DB reconciliation status
+      ...(brokerIsFlat && staleMismatchTickers.length > 0 ? {
+        brokerReconciliation: {
+          brokerIsFlat: true,
+          staleMismatchTickers,
+          message: "Broker is flat but DB has open trades — needs reconciliation via /api/trades/protection-audit",
+        },
+      } : {}),
       // DEBUG: Temporary fields to verify source attribution
       _debug: {
         scope: dateET,

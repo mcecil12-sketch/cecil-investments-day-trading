@@ -628,6 +628,35 @@ export async function getActiveManualTask(): Promise<ManualActionTask | null> {
   return active[0] ?? null;
 }
 
+/**
+ * Return ONLY a task that is truly in-progress (IN_PROGRESS or SELECTED).
+ * OPEN tasks are queued work, not "active" in the operational sense.
+ * Use this for state display to avoid showing stale/queued tasks as active.
+ */
+export async function getTrulyActiveManualTask(): Promise<ManualActionTask | null> {
+  const tasks = await getAllTasks();
+  const inProgress = tasks
+    .filter((t) => t.status === "IN_PROGRESS" || t.status === "SELECTED")
+    .sort((a, b) => {
+      const statusRank: Record<string, number> = { IN_PROGRESS: 0, SELECTED: 1 };
+      return (statusRank[a.status] ?? 2) - (statusRank[b.status] ?? 2);
+    });
+  return inProgress[0] ?? null;
+}
+
+/** Peek at the next OPEN+executionReady task without counting it as "active". */
+export async function getNextQueuedManualTask(): Promise<ManualActionTask | null> {
+  const tasks = await getAllTasks();
+  const queued = tasks
+    .filter((t) => t.status === "OPEN" && t.executionReady)
+    .sort((a, b) => {
+      const pr = PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority];
+      if (pr !== 0) return pr;
+      return (a.createdAt || "").localeCompare(b.createdAt || "");
+    });
+  return queued[0] ?? null;
+}
+
 // ─── Failed/Blocked Task Cleanup ──────────────────────────────────────
 
 const FAILED_TASK_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours

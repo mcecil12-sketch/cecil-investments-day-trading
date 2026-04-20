@@ -132,7 +132,17 @@ export async function GET(req: Request) {
   // Broker-truth protection audit (fail-closed on broker error)
   let protectionAudit: AuditResult | null = null;
   let protectionCritical = false;
+  let brokerIsFlat = false;
+  let protectionIsStaleOnly = false;
   if (!brokerTruth.error) {
+    const brokerPosCount = typeof brokerTruth.positionsCount === "number"
+      ? brokerTruth.positionsCount
+      : Array.isArray(brokerTruth.positions) ? brokerTruth.positions.length : 0;
+    const brokerOrdCount = typeof brokerTruth.openOrdersCount === "number"
+      ? brokerTruth.openOrdersCount
+      : Array.isArray(brokerTruth.openOrders) ? brokerTruth.openOrders.length : 0;
+    brokerIsFlat = brokerPosCount === 0 && brokerOrdCount === 0;
+
     const auditTrades = openTrades.map((t: any) => ({
       id: String(t.id || ""),
       ticker: String(t.ticker || ""),
@@ -145,7 +155,15 @@ export async function GET(req: Request) {
       brokerPositions: brokerTruth.positions || [],
       brokerOrders: brokerTruth.openOrders || [],
     });
-    protectionCritical = !protectionAudit.ok;
+
+    // If broker is flat, DB mismatches are reconciliation issues, NOT live risk
+    if (!protectionAudit.ok && brokerIsFlat && openTrades.length > 0) {
+      // All incidents are stale mismatch — DB needs reconciliation, no live risk
+      protectionIsStaleOnly = true;
+      protectionCritical = false;
+    } else {
+      protectionCritical = !protectionAudit.ok;
+    }
   } else {
     // Fail-closed: if broker unavailable, assume critical when trades exist
     protectionCritical = openTrades.length > 0;
@@ -215,7 +233,7 @@ export async function GET(req: Request) {
     !marketOpen || (minsSinceLastScan != null && minsSinceLastScan <= SCAN_STALE_MINUTES);
 
   const scannerRunningWhenOpen =
-    !marketOpen || (String(lastScanStatus || "").toUpperCase() === "RUN");
+    !marketOpen || ["RUN", "SKIP"].includes(String(lastScanStatus || "").toUpperCase());
 
   const lastScoredAt = scoredToday.length
     ? scoredToday
@@ -299,7 +317,9 @@ export async function GET(req: Request) {
           : brokerTruth.error
             ? `broker_error: ${brokerTruth.error}; ${openTrades.length} open trade(s) unverifiable`
             : `CRITICAL: ${openTrades.length} open trade(s) without verified stop`
-        : `protected_open_trades=${openTrades.length}`,
+        : protectionIsStaleOnly
+          ? `broker_flat_stale_mismatch: ${openTrades.length} DB trade(s) need reconciliation (no live risk)`
+          : `protected_open_trades=${openTrades.length}`,
     },
   ];
 
@@ -309,6 +329,25 @@ export async function GET(req: Request) {
   return NextResponse.json({
     ok: true,
     ready,
+    // ─── Operational summary: single-glance system health ───────────
+    operationalSummary: {
+      brokerRisk: protectionCritical
+        ? "CRITICAL"
+        : protectionIsStaleOnly
+          ? "STALE_MISMATCH"
+          : "CLEAR",
+      queueHealth: marketOpen ? "ok" : "market_closed",
+      funnelFlow: !marketOpen
+        ? "market_closed"
+        : (effectiveFunnel?.scansRun ?? 0) > 0 && scoredToday.length > 0
+          ? "flowing"
+          : (effectiveFunnel?.scansRun ?? 0) > 0
+            ? "scanning_no_scores"
+            : (effectiveFunnel?.scansSkipped ?? 0) > 0
+              ? "scanning_but_skipping"
+              : "no_scans",
+      brokerIsFlat,
+    },
     timestamp: new Date().toISOString(),
     etDate: todayEt,
     market: {
@@ -387,6 +426,45 @@ export async function GET(req: Request) {
       wouldSkipMaxOpenPositions,
       brokerError: brokerTruth.error || null,
     },
+    // ─── Market-open funnel flow diagnostics ────────────────────────
+    funnelFlowDiagnostics: marketOpen ? (() => {
+      const scansRun = effectiveFunnel?.scansRun ?? 0;
+      const scansSkipped = effectiveFunnel?.scansSkipped ?? 0;
+      const scanStatus = lastScanStatus;
+      const signalsPostedCount = effectiveFunnel?.signalsPosted ?? 0;
+
+      let stoppedAt = "flowing";
+      let stoppedReason = "funnel is flowing normally";
+
+      if (scansRun === 0 && scansSkipped === 0) {
+        stoppedAt = "scan";
+        stoppedReason = "no scans have run today — cron/scheduler may not be triggering";
+      } else if (scansRun === 0 && scansSkipped > 0) {
+        stoppedAt = "scan";
+        stoppedReason = `${scansSkipped} scan(s) skipped (status=${scanStatus || "?"}) — scanner running but skipping`;
+      } else if (scansRun > 0 && signalsPostedCount === 0) {
+        stoppedAt = "signal_post";
+        stoppedReason = `${scansRun} scan(s) ran but 0 signals posted`;
+      } else if (signalsPostedCount > 0 && signalsToday.length === 0) {
+        stoppedAt = "signal_post";
+        stoppedReason = `${signalsPostedCount} posted but 0 found in today's window`;
+      } else if (signalsToday.length > 0 && scoredToday.length === 0) {
+        stoppedAt = "scoring";
+        stoppedReason = `${signalsToday.length} signals but 0 scored — drain may not have run`;
+      } else if (scoredToday.length > 0 && qualifiedToday.length === 0) {
+        stoppedAt = "qualification";
+        stoppedReason = `${scoredToday.length} scored but 0 qualified`;
+      }
+
+      return { stoppedAt, stoppedReason };
+    })() : null,
+    // ─── Broker/DB reconciliation awareness ─────────────────────────
+    brokerReconciliation: protectionIsStaleOnly ? {
+      brokerIsFlat,
+      staleMismatchCount: openTrades.length,
+      staleTickers: openTrades.slice(0, 5).map((t: any) => String(t.ticker || "").toUpperCase()),
+      message: "Broker is flat but DB has open trades — needs reconciliation, no live risk",
+    } : null,
     checks,
     reasons,
     mode: publicMode ? "public" : "authed",
