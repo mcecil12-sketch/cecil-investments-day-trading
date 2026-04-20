@@ -861,7 +861,7 @@ export async function POST(req: NextRequest) {
     // This ensures counts and active-task reflect recovered state.
     const manualCounts = await countOpenExecutionReadyManualTasks().catch(() => ({
       openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0, selectedCount: 0,
-      selectableCount: 0, recoverableBlockedCount: 0,
+      selectableCount: 0, recoverableBlockedCount: 0, idleReason: "count_fetch_failed" as string | null,
     }));
     const activeManualTask = await getActiveManualTask().catch(() => null);
     const hasActiveManualTask = activeManualTask !== null;
@@ -1141,7 +1141,16 @@ export async function POST(req: NextRequest) {
         patchApplied: false,
         manualTaskStatus: activeManualTask!.status,
         manualQueueCounts: manualCounts,
+        idleReason: manualCounts.idleReason ?? `manual_task_${activeManualTask!.id}_active_but_not_selectable`,
         staleRecovery: staleRecovery.attempted ? staleRecovery : undefined,
+        blockedRecovery: blockedRecovery ? {
+          attempted: blockedRecovery.attempted,
+          recoveredCount: blockedRecovery.recoveredCount,
+          enrichedCount: blockedRecovery.enrichedCount,
+          recoveredTaskIds: blockedRecovery.recoveredTaskIds,
+          fallbackHintsApplied: blockedRecovery.enrichedCount > 0,
+        } : null,
+        proactiveDiagnostics,
         executionPhases: [
           phaseResult("SELECT_TASK", "passed", "manual_queue_active_not_ready"),
         ],
@@ -1203,6 +1212,28 @@ export async function POST(req: NextRequest) {
 
     if (!task) {
       phases.push(phaseResult("SELECT_TASK", "passed", "no_eligible_tasks", selectStart));
+
+      // ─── Compute idleReason: why is nothing selectable? ─────────────
+      // Reload manual queue counts for the idle explanation (recovery already ran above)
+      const idleManualCounts = await countOpenExecutionReadyManualTasks().catch(() => ({
+        openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0,
+        selectedCount: 0, selectableCount: 0, recoverableBlockedCount: 0, idleReason: null as string | null,
+      }));
+      const latestExecRaw2 = redis ? await redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : null;
+      const previousExec = (() => {
+        if (!latestExecRaw2) return null;
+        try {
+          const parsed = typeof latestExecRaw2 === "string" ? JSON.parse(latestExecRaw2) : latestExecRaw2;
+          return typeof parsed === "object" && parsed !== null ? parsed as Record<string, unknown> : null;
+        } catch { return null; }
+      })();
+      const previousStatus = previousExec?.executionStatus as string | undefined;
+
+      let idleReason = idleManualCounts.idleReason ?? "no_engineering_or_manual_tasks_available";
+      if (previousStatus === "MANUAL_TASK_FAILED") {
+        idleReason = `previous_task_failed (${previousExec?.selectedTaskTitle ?? "unknown"}) — no remaining selectable work. ${idleReason}`;
+      }
+
       const noTaskResult: ExecutionStateMachineResult = {
         executionStatus: "NO_TASK",
         selectedSource: "none",
@@ -1216,7 +1247,17 @@ export async function POST(req: NextRequest) {
       const result = {
         ok: true,
         message: "No execution-ready tasks",
+        idleReason,
         ...noTaskResult,
+        manualQueueCounts: idleManualCounts,
+        proactiveDiagnostics,
+        blockedRecovery: blockedRecovery ? {
+          attempted: blockedRecovery.attempted,
+          recoveredCount: blockedRecovery.recoveredCount,
+          enrichedCount: blockedRecovery.enrichedCount,
+          recoveredTaskIds: blockedRecovery.recoveredTaskIds,
+          fallbackHintsApplied: blockedRecovery.enrichedCount > 0,
+        } : null,
         adaptiveGuardrails: adaptiveResult ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length } : null,
         ...buildLearningBlock(learningResult, remediationResult, verificationResult, ledgerSummary),
       };

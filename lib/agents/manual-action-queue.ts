@@ -373,6 +373,37 @@ export async function cancelManualActionTask(
   return canceled;
 }
 
+export interface TaskSelectability {
+  selectable: boolean;
+  reason: string;
+}
+
+/** Compute why a task is or is not selectable right now. */
+export function computeTaskSelectability(task: ManualActionTask): TaskSelectability {
+  if (task.status === "DONE" || task.status === "FAILED" || task.status === "CANCELED") {
+    return { selectable: false, reason: `terminal_status:${task.status}` };
+  }
+  if (task.status === "IN_PROGRESS") {
+    return { selectable: false, reason: "already_in_progress" };
+  }
+  if (task.status === "SELECTED") {
+    return { selectable: false, reason: "already_selected" };
+  }
+  if (task.status === "BLOCKED") {
+    if (canRecoverBlockedTask(task)) {
+      return { selectable: false, reason: "blocked_but_recoverable" };
+    }
+    return { selectable: false, reason: `blocked:${task.blockedReason || "unknown"}` };
+  }
+  if (task.status === "OPEN") {
+    if (!task.executionReady) {
+      return { selectable: false, reason: "not_execution_ready" };
+    }
+    return { selectable: true, reason: "open_and_execution_ready" };
+  }
+  return { selectable: false, reason: `unknown_status:${task.status}` };
+}
+
 export async function countOpenExecutionReadyManualTasks(): Promise<{
   openCount: number;
   executionReadyCount: number;
@@ -383,6 +414,8 @@ export async function countOpenExecutionReadyManualTasks(): Promise<{
   selectableCount: number;
   /** BLOCKED tasks that could potentially be recovered with fallback hints */
   recoverableBlockedCount: number;
+  /** Why the queue has no selectable work (null if selectable work exists) */
+  idleReason: string | null;
 }> {
   const tasks = await getAllTasks();
   const active = tasks.filter(
@@ -396,6 +429,24 @@ export async function countOpenExecutionReadyManualTasks(): Promise<{
     (t) => t.status === "OPEN" && t.executionReady === true,
   );
 
+  // Compute idle reason when nothing is selectable
+  let idleReason: string | null = null;
+  if (selectable.length === 0) {
+    if (recoverableBlocked.length > 0) {
+      idleReason = `${recoverableBlocked.length} blocked task(s) can be recovered with fallback hints — run recovery to promote`;
+    } else if (blocked.length > 0) {
+      idleReason = `${blocked.length} task(s) blocked with no recovery path available`;
+    } else if (active.some((t) => t.status === "IN_PROGRESS")) {
+      idleReason = "task already in progress";
+    } else if (active.some((t) => t.status === "SELECTED")) {
+      idleReason = "task already selected";
+    } else if (active.length > 0 && active.every((t) => !t.executionReady)) {
+      idleReason = "tasks exist but none are execution-ready";
+    } else if (active.length === 0) {
+      idleReason = "no active tasks in queue";
+    }
+  }
+
   return {
     openCount: active.filter((t) => t.status === "OPEN" || t.status === "SELECTED" || t.status === "IN_PROGRESS").length,
     executionReadyCount: active.filter((t) => t.executionReady && (t.status === "OPEN" || t.status === "SELECTED")).length,
@@ -404,6 +455,7 @@ export async function countOpenExecutionReadyManualTasks(): Promise<{
     selectedCount: active.filter((t) => t.status === "SELECTED").length,
     selectableCount: selectable.length,
     recoverableBlockedCount: recoverableBlocked.length,
+    idleReason,
   };
 }
 
@@ -552,7 +604,8 @@ export async function findDuplicateManualTask(
 ): Promise<ManualActionTask | null> {
   const tasks = await getAllTasks();
   const normalizedInput = normalizeTitle(title);
-  const activeStatuses: ManualActionStatus[] = ["OPEN", "SELECTED", "IN_PROGRESS"];
+  // Include BLOCKED to avoid duplicate spam — blocked tasks should be recovered, not re-created
+  const activeStatuses: ManualActionStatus[] = ["OPEN", "SELECTED", "IN_PROGRESS", "BLOCKED"];
 
   return tasks.find(
     (t) =>
@@ -659,11 +712,18 @@ const FALLBACK_HINTS_BY_TASK_TYPE: Record<ManualActionTaskType, { fileHints?: st
       "app/api/trades/protection-audit/route.ts",
       "app/api/auto-entry/execute/route.ts",
       "lib/risk/protection-integrity.ts",
+      "app/api/agents/queue/route.ts",
+      "app/api/agents/state/route.ts",
+      "app/api/agents/execute/route.ts",
+      "lib/agents/manual-action-queue.ts",
     ],
     routeHints: [
       "/api/trades/protection-audit",
       "/api/broker/positions",
       "/api/trades?view=operational",
+      "/api/agents/queue",
+      "/api/agents/state",
+      "/api/agents/execute",
     ],
   },
   SELF_HEAL: {
@@ -671,11 +731,15 @@ const FALLBACK_HINTS_BY_TASK_TYPE: Record<ManualActionTaskType, { fileHints?: st
       "app/api/funnel-health/route.ts",
       "app/api/readiness/route.ts",
       "lib/autoEntry/guardrails.ts",
+      "app/api/auto-entry/execute/route.ts",
+      "app/api/trades/protection-audit/route.ts",
     ],
     routeHints: [
       "/api/funnel-health",
       "/api/readiness",
       "/api/auto-entry/seed-from-signals",
+      "/api/auto-entry/execute",
+      "/api/trades/protection-audit",
     ],
   },
   BUGFIX: {
@@ -689,10 +753,13 @@ const FALLBACK_HINTS_BY_TASK_TYPE: Record<ManualActionTaskType, { fileHints?: st
     fileHints: [
       "app/api/ai/score/drain/route.ts",
       "lib/aiScoring.ts",
+      "app/api/signals/all/route.ts",
+      "app/api/readiness/route.ts",
     ],
     routeHints: [
       "/api/ai/score/drain",
       "/api/signals/all",
+      "/api/readiness",
     ],
   },
   SCANNER: {

@@ -51,7 +51,7 @@ export async function GET(req: Request) {
     readAdaptiveGuardrailState().catch(() => ({ actions: [], lastEvaluatedAt: null, evaluationSource: null })),
     redis ? redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
     listManualActionTasks({ limit: 10 }).catch(() => []),
-    countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0, selectedCount: 0 })),
+    countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0, selectedCount: 0, selectableCount: 0, recoverableBlockedCount: 0, idleReason: "count_fetch_failed" as string | null })),
     getActiveManualTask().catch(() => null),
     getManualQueueDiagnostics().catch(() => ({
       totalTasks: 0, openCount: 0, selectedCount: 0, inProgressCount: 0,
@@ -141,6 +141,9 @@ export async function GET(req: Request) {
       blockedCount: manualCounts.blockedCount,
       executionReadyCount: manualCounts.executionReadyCount,
       selectedCount: manualCounts.selectedCount,
+      selectableCount: manualCounts.selectableCount ?? 0,
+      recoverableBlockedCount: manualCounts.recoverableBlockedCount ?? 0,
+      idleReason: manualCounts.idleReason ?? null,
       activeManualTask: activeManualTask ? {
         id: activeManualTask.id,
         title: activeManualTask.title,

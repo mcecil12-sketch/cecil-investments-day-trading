@@ -8,8 +8,11 @@ import {
   countOpenExecutionReadyManualTasks,
   findDuplicateManualTask,
   canRecoverBlockedTask,
+  recoverBlockedTasksWithFallbackHints,
+  computeTaskSelectability,
   type ManualActionStatus,
   type ManualActionTaskInput,
+  type BlockedTaskRecoveryResult,
 } from "@/lib/agents/manual-action-queue";
 import { getCriticalTasks, partitionCriticalTasks } from "@/lib/redis";
 
@@ -26,7 +29,23 @@ export async function GET(req: NextRequest) {
     ? Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 50))
     : 50;
 
-  // Fetch both manual queue and critical tasks in parallel
+  // ─── Step 1: Run blocked task recovery BEFORE reading counts ──────
+  // This ensures recoverable BLOCKED tasks are promoted to OPEN so that
+  // selectableCount reflects actually-available work.
+  let recoveryResult: BlockedTaskRecoveryResult | null = null;
+  try {
+    recoveryResult = await recoverBlockedTasksWithFallbackHints(false);
+    if (recoveryResult.recoveredCount > 0) {
+      console.log(
+        `[QUEUE-GET] Blocked task recovery: ${recoveryResult.recoveredCount} tasks unblocked, ` +
+        `${recoveryResult.enrichedCount} enriched, recovered=[${recoveryResult.recoveredTaskIds}]`,
+      );
+    }
+  } catch (err) {
+    console.warn("[QUEUE-GET] Blocked task recovery failed (non-fatal):", err);
+  }
+
+  // ─── Step 2: Fetch both manual queue and critical tasks in parallel ─
   const [tasks, counts, criticalTasks] = await Promise.all([
     listManualActionTasks({
       status: status ?? undefined,
@@ -40,7 +59,13 @@ export async function GET(req: NextRequest) {
   // Partition critical tasks
   const { blocking: blockingCritical, synthetic: syntheticCritical } = partitionCriticalTasks(criticalTasks);
 
-  // Build diagnostic summary showing why executionReadyCount might be 0
+  // Annotate tasks with selectability
+  const annotatedTasks = tasks.map((t) => ({
+    ...t,
+    _selectability: computeTaskSelectability(t),
+  }));
+
+  // Build diagnostic summary
   const diagnostics = {
     manualQueue: {
       openCount: counts.openCount,
@@ -48,8 +73,9 @@ export async function GET(req: NextRequest) {
       inProgressCount: counts.inProgressCount,
       blockedCount: counts.blockedCount,
       selectedCount: counts.selectedCount,
-      selectableCount: counts.selectableCount ?? 0,
-      recoverableBlockedCount: counts.recoverableBlockedCount ?? 0,
+      selectableCount: counts.selectableCount,
+      recoverableBlockedCount: counts.recoverableBlockedCount,
+      idleReason: counts.idleReason,
     },
     criticalTasks: {
       total: criticalTasks.length,
@@ -60,22 +86,30 @@ export async function GET(req: NextRequest) {
     totalExecutionReady: counts.executionReadyCount + blockingCritical.length,
     // Explain why tasks might not be ready
     selectionExplanation:
-      counts.executionReadyCount > 0
-        ? "manual_queue_has_ready_tasks"
+      counts.selectableCount > 0
+        ? "manual_queue_has_selectable_tasks"
         : blockingCritical.length > 0
           ? "critical_tasks_available_but_manual_queue_empty"
-          : (counts.recoverableBlockedCount ?? 0) > 0
+          : counts.recoverableBlockedCount > 0
             ? "blocked_tasks_can_be_recovered_with_fallback_hints"
             : counts.blockedCount > 0
               ? "manual_tasks_exist_but_blocked_no_recovery_available"
               : counts.openCount > 0
                 ? "manual_tasks_exist_but_not_execution_ready"
                 : "no_work_available",
+    // Recovery applied this request
+    recoveryApplied: recoveryResult ? {
+      attempted: recoveryResult.attempted,
+      recoveredCount: recoveryResult.recoveredCount,
+      enrichedCount: recoveryResult.enrichedCount,
+      recoveredTaskIds: recoveryResult.recoveredTaskIds,
+      fallbackHintsApplied: recoveryResult.enrichedCount > 0,
+    } : null,
   };
 
   return NextResponse.json({
     ok: true,
-    tasks,
+    tasks: annotatedTasks,
     counts,
     criticalTaskCounts: diagnostics.criticalTasks,
     diagnostics,
