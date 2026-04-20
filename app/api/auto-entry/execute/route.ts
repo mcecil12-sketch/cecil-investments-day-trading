@@ -701,7 +701,12 @@ export async function POST(req: Request) {
     skipped: 0,
     replacementConsidered: 0,
     replacementExecuted: 0,
+    malformedPendingCount: 0,
+    malformedOpenCount: 0,
   };
+    // Track malformed trades for observability
+    const malformedPendingTrades: { id: string, reason: string, symbol?: string }[] = [];
+    const malformedOpenTrades: { id: string, reason: string, symbol?: string }[] = [];
   const notes: string[] = [];
   const guardConfig = getGuardrailConfig();
   const etDate = getEtDateString();
@@ -839,6 +844,7 @@ export async function POST(req: Request) {
         }
       }
 
+
       if (!eligibility.eligible) {
         if (eligibility.reason === "stale_trade" || eligibility.reason === "carryover_session") {
           trades[item.i] = {
@@ -871,6 +877,7 @@ export async function POST(req: Request) {
         tradesChanged = true;
         processed.add(item.i);
         notes.push(`${eligibility.reason}:${ticker}:${tradeId || "unknown"}`);
+        malformedPendingTrades.push({ id: tradeId, reason: eligibility.reason, symbol: ticker });
         continue;
       }
 
@@ -893,6 +900,7 @@ export async function POST(req: Request) {
         tradesChanged = true;
         processed.add(item.i);
         notes.push(`invalid_pending:${ticker}:${tradeId || "unknown"}`);
+        malformedPendingTrades.push({ id: tradeId, reason: "invalid_pending_missing_risk", symbol: ticker });
         continue;
       }
 
@@ -936,10 +944,20 @@ export async function POST(req: Request) {
     });
   }
 
+  // Count malformed open trades for observability
   const openPositions = trades.filter(
-    (t) =>
-      Boolean(t?.status === "OPEN") &&
-      (t?.source === "auto-entry" || t?.source === "AUTO")
+    (t) => {
+      const isOpen = Boolean(t?.status === "OPEN") && (t?.source === "auto-entry" || t?.source === "AUTO");
+      if (isOpen) {
+        // Check for malformed open trade (missing symbol, side, or required fields)
+        const malformed = !t?.ticker || !t?.side || !t?.entryPrice || !t?.stopPrice;
+        if (malformed) {
+          counts.malformedOpenCount += 1;
+          malformedOpenTrades.push({ id: String(t?.id || ""), reason: "missing_required_field", symbol: String(t?.ticker || "") });
+        }
+      }
+      return isOpen;
+    }
   ).length;
 
   let guardSummary = buildGuardSummary({
@@ -1224,6 +1242,8 @@ export async function POST(req: Request) {
         .slice(0, 5)
         .map((t) => `${t.incidentCode}:${t.symbol}`)
         .join(", ");
+      const blockerTradeIds = effectiveBlocking.map((t) => t.id || null).filter(Boolean);
+      const blockerSymbols = effectiveBlocking.map((t) => t.symbol || null).filter(Boolean);
       await recordOutcome({
         outcome: "SKIP",
         reason: "PROTECTION_INTEGRITY_FAILED",
@@ -1234,11 +1254,18 @@ export async function POST(req: Request) {
           ok: true,
           skipped: true,
           reason: "PROTECTION_INTEGRITY_FAILED",
+          integrityBlockerType: "critical_task",
+          integrityBlockerTradeIds: blockerTradeIds,
+          integrityBlockerSymbols: blockerSymbols,
           detail: `${effectiveBlocking.length} unresolved critical incident(s) in self-heal queue`,
           unresolvedCriticalCount: effectiveBlocking.length,
           unresolvedCriticalSummary: incidentSummary,
           brokerIsFlat,
           staleCriticalSkipped: allCritical.length - effectiveBlocking.length,
+          malformedPendingCount: malformedPendingTrades.length,
+          malformedOpenCount: malformedOpenTrades.length,
+          malformedPendingTrades,
+          malformedOpenTrades,
           market: { isOpen: marketOpen, timestamp: marketTimestamp },
           openPositionsCount: brokerTruth.positionsCount,
           maxOpenPositions: guardConfig.maxOpenPositions,
@@ -1285,6 +1312,8 @@ export async function POST(req: Request) {
       if (audit.criticalCount > 0) {
         const criticalIncidents = audit.incidents.filter((i) => i.severity === "CRITICAL");
         counts.skipped += 1;
+        const blockerTradeIds = criticalIncidents.map((i) => i.tradeId || null).filter(Boolean);
+        const blockerSymbols = criticalIncidents.map((i) => i.symbol || null).filter(Boolean);
         await recordOutcome({
           outcome: "SKIP",
           reason: "PROTECTION_INTEGRITY_FAILED",
@@ -1295,12 +1324,19 @@ export async function POST(req: Request) {
             ok: true,
             skipped: true,
             reason: "PROTECTION_INTEGRITY_FAILED",
+            integrityBlockerType: "protection_audit",
+            integrityBlockerTradeIds: blockerTradeIds,
+            integrityBlockerSymbols: blockerSymbols,
             detail: `${audit.criticalCount} critical protection incidents on existing positions`,
             protectionAudit: {
               criticalCount: audit.criticalCount,
               incidentCount: audit.incidentCount,
               incidents: criticalIncidents.slice(0, 10),
             },
+            malformedPendingCount: malformedPendingTrades.length,
+            malformedOpenCount: malformedOpenTrades.length,
+            malformedPendingTrades,
+            malformedOpenTrades,
             market: { isOpen: marketOpen, timestamp: marketTimestamp },
             openPositionsCount: brokerTruth.positionsCount,
             maxOpenPositions: guardConfig.maxOpenPositions,
