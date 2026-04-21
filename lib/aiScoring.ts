@@ -580,10 +580,10 @@ function evaluateLongQuality(params: {
     adjustedScore -= 0.8;
     reasons.push("downtrend_long_contradiction");
   } else {
-    // UP trend — weak slope is a minor signal, not a major structural flaw
+    // UP trend — weak slope is a very minor signal, trim only slightly
     const slope = Math.abs(context.trendSlopePct || 0);
     if (slope < 0.02) {
-      adjustedScore -= 0.10;
+      adjustedScore -= 0.05;
       reasons.push("weak_uptrend_slope");
     }
   }
@@ -603,9 +603,9 @@ function evaluateLongQuality(params: {
       // At or above VWAP: ideal for LONG
       vwapQuality = priceVsVwap > 1.0 ? 0.65 : 0.85;
     } else {
-      // Below VWAP in non-uptrend: dip-buy risk
+      // Below VWAP in non-uptrend: dip-buy risk, minor penalty
       vwapQuality = 0.35;
-      adjustedScore -= 0.3;
+      adjustedScore -= 0.15;
       reasons.push("entry_below_vwap_no_reclaim");
     }
   }
@@ -619,12 +619,14 @@ function evaluateLongQuality(params: {
     } else if (context.relVolume >= 0.9) {
       participationQuality = 0.7;
     } else if (context.relVolume >= 0.65) {
+      // Mediocre but not light volume: small trim only — relVol 0.65-0.9 is normal intraday
       participationQuality = 0.45;
-      adjustedScore -= 0.35;
+      adjustedScore -= 0.15;
       reasons.push("mediocre_volume_participation");
     } else {
+      // Light volume: meaningful concern but not disqualifying alone
       participationQuality = 0.2;
-      adjustedScore -= 0.55;
+      adjustedScore -= 0.30;
       reasons.push("light_volume_participation");
     }
   }
@@ -817,8 +819,8 @@ function evaluateShortQuality(params: {
   // ===== TREND SLOPE ASSESSMENT =====
   const trendSlopeAbs = Math.abs(context.trendSlopePct || 0);
   if (context.trend === "DOWN" && trendSlopeAbs < 0.03) {
-    // Weak downtrend slope
-    adjustedScore -= 0.3;
+    // Weak downtrend slope: minor caution (was -0.3, too large to stack with other penalties)
+    adjustedScore -= 0.15;
     reasons.push("weak_downtrend_slope");
   }
 
@@ -832,9 +834,9 @@ function evaluateShortQuality(params: {
     } else if (context.relVolume >= 0.7) {
       participationQuality = 0.5;
     } else {
-      // Light volume
+      // Light volume on SHORT: meaningful penalty but not disqualifying alone
       participationQuality = 0.3;
-      adjustedScore -= 0.4;
+      adjustedScore -= 0.25;
       reasons.push("light_volume_participation");
     }
   }
