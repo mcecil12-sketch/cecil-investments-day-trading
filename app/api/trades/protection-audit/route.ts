@@ -335,6 +335,8 @@ export async function GET(req: Request) {
     const diagArr: any[] = (enforcement as any).diagnostics ?? [];
     observability = {
       unprotectedSymbols: audit.incidents.filter((i) => i.severity === "CRITICAL").map((i) => i.symbol),
+      orphanBrokerPositions: audit.unmatchedBrokerPositions,
+      protectionBlockerSymbols: audit.protectionBlockerSymbols,
       stopRepairAttempted: diagArr.some((d) => d.stopRepairAttempted),
       stopRepairSucceeded: enforcement.repaired.length > 0,
       flattenAttempted: diagArr.some((d) => d.flattenAttempted),
@@ -356,9 +358,16 @@ export async function GET(req: Request) {
     brokerFetchedAt: brokerTruth.fetchedAt,
     auditedAt: audit.auditedAt,
     brokerIsFlat,
+    // ── Broker-position coverage ──
+    brokerPositionCount: audit.brokerPositionCount,
+    matchedTradeCount: audit.matchedTradeCount,
+    unmatchedBrokerPositions: audit.unmatchedBrokerPositions,
+    unmatchedSymbols: audit.unmatchedBrokerPositions,
+    protectionBlockerSymbols: audit.protectionBlockerSymbols,
+    // ── Counts ──
     openTrades: audit.tradeCount,
     protectedTrades: audit.protectedCount,
-    unprotectedTrades: audit.tradeCount - audit.protectedCount,
+    unprotectedTrades: audit.tradeCount - audit.protectedCount + audit.unmatchedBrokerPositions.length,
     criticalCount: audit.criticalCount,
     incidentCount: audit.incidentCount,
     incidents: audit.incidents,

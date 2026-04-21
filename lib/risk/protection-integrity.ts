@@ -76,17 +76,29 @@ export type TradeAuditDetail = {
   activeStopId?: string;
   activeStopTif?: string;
   incidents: ProtectionIncident[];
+  /** true when broker has a live position but no matching DB open trade exists */
+  isOrphan?: boolean;
 };
 
 export type AuditResult = {
   ok: boolean;
   auditedAt: string;
+  /** Number of DB open trades audited */
   tradeCount: number;
   protectedCount: number;
   incidentCount: number;
   criticalCount: number;
   incidents: ProtectionIncident[];
   details: TradeAuditDetail[];
+  // ── Broker-position coverage fields ──
+  /** Total live broker positions with qty > 0 */
+  brokerPositionCount: number;
+  /** DB open trades that matched a broker position by symbol */
+  matchedTradeCount: number;
+  /** Broker positions with no matching DB open trade (orphans) */
+  unmatchedBrokerPositions: string[];
+  /** Combined list of symbols requiring attention (unprotected or orphan) */
+  protectionBlockerSymbols: string[];
 };
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -143,7 +155,12 @@ export function auditProtectionIntegrity(opts: {
   const details: TradeAuditDetail[] = [];
   let protectedCount = 0;
 
+  // Track which broker-position symbols are covered by a DB open trade
+  const openTradeSymbols = new Set<string>();
+
   for (const trade of openTrades) {
+    const sym = normalizeTicker(trade.ticker);
+    if (sym) openTradeSymbols.add(sym);
     const symbol = normalizeTicker(trade.ticker);
     const side = normalizeTradeSide(trade.side);
     const brokerPos = posBySymbol.get(symbol);
@@ -236,7 +253,96 @@ export function auditProtectionIntegrity(opts: {
     allIncidents.push(...tradeIncidents);
   }
 
+  // ─── Pass 2: Orphan broker positions ──────────────────────────────
+  // Any broker position with qty > 0 that has NO matching DB open trade is
+  // operationally invisible to the DB-driven audit above.  Catch them here
+  // so they can never silently escape protection accounting.
+  const unmatchedBrokerPositions: string[] = [];
+
+  for (const pos of brokerPositions) {
+    const symbol = normalizeTicker(pos.symbol);
+    if (!symbol) continue;
+    const brokerQty = parseQty(pos.qty);
+    if (brokerQty === 0) continue;
+    if (openTradeSymbols.has(symbol)) continue; // already covered in Pass 1
+
+    unmatchedBrokerPositions.push(symbol);
+
+    const symbolOrders = ordersBySymbol.get(symbol) || [];
+    // Infer side from signed qty: Alpaca returns negative qty for shorts
+    const rawQty = Number(pos.qty ?? 0);
+    const posSide: "LONG" | "SHORT" = rawQty < 0 ? "SHORT" : "LONG";
+
+    const found = findProtectiveStopOrder({
+      ticker: symbol,
+      tradeSide: posSide,
+      openOrders: symbolOrders,
+    });
+    const activeStop = found ? symbolOrders.find((o) => o.id === found.id) : undefined;
+
+    const orphanIncidents: ProtectionIncident[] = [];
+
+    orphanIncidents.push({
+      code: "BROKER_DB_MISMATCH",
+      severity: "CRITICAL",
+      tradeId: `orphan:${symbol}`,
+      symbol,
+      detail: `Broker has ${brokerQty} share(s) of ${symbol} (${posSide}) but no matching OPEN DB trade. avg_entry=${
+        pos.avg_entry_price ?? "?"
+      }`,
+    });
+
+    if (!activeStop) {
+      orphanIncidents.push({
+        code: "MISSING_STOP",
+        severity: "CRITICAL",
+        tradeId: `orphan:${symbol}`,
+        symbol,
+        detail: `Orphan broker position ${symbol} has no active protective stop`,
+      });
+    } else {
+      const tif = (activeStop.time_in_force || "").toLowerCase();
+      if (tif === "day") {
+        orphanIncidents.push({
+          code: "STOP_DAY_TIF",
+          severity: dayTifSeverity(marketOpen),
+          tradeId: `orphan:${symbol}`,
+          symbol,
+          detail: `Orphan stop order ${activeStop.id} has time_in_force=day`,
+        });
+      }
+    }
+
+    allIncidents.push(...orphanIncidents);
+    // Orphans are never counted as "protected" — they lack an operational trade record
+    details.push({
+      tradeId: `orphan:${symbol}`,
+      symbol,
+      side: posSide,
+      hasBrokerPosition: true,
+      brokerQty,
+      hasActiveStop: !!activeStop,
+      activeStopId: activeStop?.id,
+      activeStopTif: activeStop?.time_in_force,
+      incidents: orphanIncidents,
+      isOrphan: true,
+    });
+  }
+
   const criticalCount = allIncidents.filter((i) => i.severity === "CRITICAL").length;
+
+  // Symbols that need operational attention right now
+  const protectionBlockerSymbols = Array.from(
+    new Set(
+      allIncidents
+        .filter((i) => i.severity === "CRITICAL")
+        .map((i) => i.symbol)
+    )
+  );
+
+  const brokerPositionCount = Array.from(posBySymbol.values()).filter(
+    (p) => parseQty(p.qty) > 0
+  ).length;
 
   return {
     ok: criticalCount === 0,
@@ -247,5 +353,9 @@ export function auditProtectionIntegrity(opts: {
     criticalCount,
     incidents: allIncidents,
     details,
+    brokerPositionCount,
+    matchedTradeCount: openTradeSymbols.size,
+    unmatchedBrokerPositions,
+    protectionBlockerSymbols,
   };
 }
