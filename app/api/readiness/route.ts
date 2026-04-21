@@ -353,7 +353,8 @@ export async function GET(req: Request) {
     },
     {
       name: "protection_integrity",
-      ok: publicMode ? true : !protectionCritical,
+      // NOTE: Never bypassed by publicMode — broker safety is always real.
+      ok: !protectionCritical,
       detail: protectionCritical
         ? unprotectedBrokerPositions.length > 0
           ? `CRITICAL: ${unprotectedBrokerPositions.length} broker position(s) without stop [${unprotectedBrokerPositions.slice(0, 8).join(",")}]`
@@ -368,7 +369,9 @@ export async function GET(req: Request) {
               : `CRITICAL: ${openTrades.length} open trade(s) without verified stop`
         : protectionIsStaleOnly
           ? `broker_flat_stale_mismatch: ${openTrades.length} DB trade(s) need reconciliation (no live risk)`
-          : `protected_open_trades=${openTrades.length}`,
+          : protectionAudit?.protectedOrphanSymbols?.length
+            ? `ok; protected_open_trades=${openTrades.length}; protected_orphans_need_reconciliation=[${protectionAudit.protectedOrphanSymbols.join(",")}]`
+            : `ok; protected_open_trades=${openTrades.length}`,
     },
   ];
 
@@ -386,6 +389,7 @@ export async function GET(req: Request) {
           ? "STALE_MISMATCH"
           : "CLEAR",
       unprotectedBrokerPositions: unprotectedBrokerPositions.length > 0 ? unprotectedBrokerPositions : undefined,
+      protectedOrphanSymbols: protectionAudit?.protectedOrphanSymbols?.length ? protectionAudit.protectedOrphanSymbols : undefined,
       queueHealth: marketOpen ? "ok" : "market_closed",
       funnelFlow: !marketOpen
         ? "market_closed"

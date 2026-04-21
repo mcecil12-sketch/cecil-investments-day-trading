@@ -363,6 +363,7 @@ export async function GET(req: Request) {
     matchedTradeCount: audit.matchedTradeCount,
     unmatchedBrokerPositions: audit.unmatchedBrokerPositions,
     unmatchedSymbols: audit.unmatchedBrokerPositions,
+    protectedOrphanSymbols: audit.protectedOrphanSymbols,
     protectionBlockerSymbols: audit.protectionBlockerSymbols,
     // ── Counts ──
     openTrades: audit.tradeCount,

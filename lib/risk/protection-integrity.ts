@@ -78,6 +78,11 @@ export type TradeAuditDetail = {
   incidents: ProtectionIncident[];
   /** true when broker has a live position but no matching DB open trade exists */
   isOrphan?: boolean;
+  /**
+   * "protected"  — orphan with an active stop (WARN only, stop risk is managed)
+   * "unprotected" — orphan with no active stop (CRITICAL, position is naked)
+   */
+  orphanType?: "protected" | "unprotected";
 };
 
 export type AuditResult = {
@@ -97,7 +102,9 @@ export type AuditResult = {
   matchedTradeCount: number;
   /** Broker positions with no matching DB open trade (orphans) */
   unmatchedBrokerPositions: string[];
-  /** Combined list of symbols requiring attention (unprotected or orphan) */
+  /** Orphan positions that have a stop in place — reconciliation needed but not a protection emergency */
+  protectedOrphanSymbols: string[];
+  /** Combined list of symbols requiring urgent attention (unprotected or orphan-without-stop) */
   protectionBlockerSymbols: string[];
 };
 
@@ -281,15 +288,19 @@ export function auditProtectionIntegrity(opts: {
     const activeStop = found ? symbolOrders.find((o) => o.id === found.id) : undefined;
 
     const orphanIncidents: ProtectionIncident[] = [];
+    const orphanType: "protected" | "unprotected" = activeStop ? "protected" : "unprotected";
 
+    // Protected orphan: stop IS in place, but no DB trade record.
+    // Severity is WARN (stop risk managed); operator should reconcile DB but no emergency.
+    // Unprotected orphan: no stop, position is naked — always CRITICAL.
     orphanIncidents.push({
       code: "BROKER_DB_MISMATCH",
-      severity: "CRITICAL",
+      severity: activeStop ? "WARN" : "CRITICAL",
       tradeId: `orphan:${symbol}`,
       symbol,
-      detail: `Broker has ${brokerQty} share(s) of ${symbol} (${posSide}) but no matching OPEN DB trade. avg_entry=${
-        pos.avg_entry_price ?? "?"
-      }`,
+      detail: activeStop
+        ? `Protected orphan: ${brokerQty} share(s) ${symbol} (${posSide}) has stop ${activeStop.id} but no OPEN DB trade. avg_entry=${pos.avg_entry_price ?? "?"}`
+        : `Unprotected orphan: ${brokerQty} share(s) ${symbol} (${posSide}) has NO stop and no OPEN DB trade. avg_entry=${pos.avg_entry_price ?? "?"}`,
     });
 
     if (!activeStop) {
@@ -298,7 +309,7 @@ export function auditProtectionIntegrity(opts: {
         severity: "CRITICAL",
         tradeId: `orphan:${symbol}`,
         symbol,
-        detail: `Orphan broker position ${symbol} has no active protective stop`,
+        detail: `Unprotected orphan broker position ${symbol} has no active protective stop`,
       });
     } else {
       const tif = (activeStop.time_in_force || "").toLowerCase();
@@ -314,7 +325,6 @@ export function auditProtectionIntegrity(opts: {
     }
 
     allIncidents.push(...orphanIncidents);
-    // Orphans are never counted as "protected" — they lack an operational trade record
     details.push({
       tradeId: `orphan:${symbol}`,
       symbol,
@@ -326,12 +336,13 @@ export function auditProtectionIntegrity(opts: {
       activeStopTif: activeStop?.time_in_force,
       incidents: orphanIncidents,
       isOrphan: true,
+      orphanType,
     });
   }
 
   const criticalCount = allIncidents.filter((i) => i.severity === "CRITICAL").length;
 
-  // Symbols that need operational attention right now
+  // Symbols with CRITICAL incidents (urgent: no stop protection)
   const protectionBlockerSymbols = Array.from(
     new Set(
       allIncidents
@@ -339,6 +350,11 @@ export function auditProtectionIntegrity(opts: {
         .map((i) => i.symbol)
     )
   );
+
+  // Protected orphans: stop is in place, DB reconciliation needed but not urgent
+  const protectedOrphanSymbols = details
+    .filter((d) => d.isOrphan && d.orphanType === "protected")
+    .map((d) => d.symbol);
 
   const brokerPositionCount = Array.from(posBySymbol.values()).filter(
     (p) => parseQty(p.qty) > 0
@@ -356,6 +372,7 @@ export function auditProtectionIntegrity(opts: {
     brokerPositionCount,
     matchedTradeCount: openTradeSymbols.size,
     unmatchedBrokerPositions,
+    protectedOrphanSymbols,
     protectionBlockerSymbols,
   };
 }
