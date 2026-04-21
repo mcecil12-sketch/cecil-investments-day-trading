@@ -353,9 +353,9 @@ export function formatAiSummary(grade: AiGrade, score: number) {
 
 const MIN_BARS_FOR_AI = Number(process.env.MIN_BARS_FOR_AI ?? 20);
 const MIN_AVG_DOLLAR_VOL_HARD = Number(process.env.MIN_AVG_DOLLAR_VOL_HARD ?? 300000);
-const MIN_LONG_SCORE = Number(process.env.MIN_LONG_SCORE ?? 7.5);
-const MIN_SHORT_SCORE = Number(process.env.MIN_SHORT_SCORE ?? 7.5);
-const MIN_EDGE = Number(process.env.MIN_EDGE ?? 0.7);
+const MIN_LONG_SCORE = Number(process.env.MIN_LONG_SCORE ?? 7.0);
+const MIN_SHORT_SCORE = Number(process.env.MIN_SHORT_SCORE ?? 6.8);
+const MIN_EDGE = Number(process.env.MIN_EDGE ?? 0.5);
 const AI_SCORING_RETRY_MAX = Number(process.env.AI_SCORING_RETRY_MAX ?? 4);
 const AI_SCORING_BREAKER_ENABLED = String(process.env.AI_SCORING_BREAKER_ENABLED ?? "1") === "1";
 
@@ -713,7 +713,7 @@ function evaluateLongQuality(params: {
   // 1. DOWN trend: prefer SHORT when shortScore can survive SHORT quality gates (>= 7.0)
   // 2. Weak LONG + bearish structure: LONG fell below threshold AND short is genuinely competitive
   // Threshold for weakLong raised from 6.5 → 7.0 so promoted shorts can clear quality evaluation.
-  const downTrendPrefersShort = context.trend === "DOWN" && rawShortScore >= 7.0;
+  const downTrendPrefersShort = context.trend === "DOWN" && rawShortScore >= 6.8;
   // Require bearish structure evidence to avoid promoting shorts without conviction
   const hasBearishStructureEvidence =
     sl.includes("lower high") ||
@@ -723,7 +723,7 @@ function evaluateLongQuality(params: {
     context.trend === "DOWN";
   const weakLongPrefersShort =
     adjustedScore < minQualifyScore &&
-    rawShortScore >= 7.0 &&
+    rawShortScore >= 6.5 &&
     hasBearishStructureEvidence &&
     rawShortScore >= rawScore - 1.0;
   const shortPreferred = downTrendPrefersShort || weakLongPrefersShort;

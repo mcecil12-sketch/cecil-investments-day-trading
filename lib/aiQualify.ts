@@ -38,7 +38,7 @@ function envGrade(name: string, fallback: AiGrade): AiGrade {
 }
 
 export function qualifyByScore(score: number): boolean {
-  const min = envNum("AI_MIN_SCORE_TO_QUALIFY", 7.0);
+  const min = envNum("AI_MIN_SCORE_TO_QUALIFY", 6.8);
   return Number.isFinite(score) && score >= min;
 }
 
