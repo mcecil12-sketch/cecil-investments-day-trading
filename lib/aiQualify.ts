@@ -38,7 +38,7 @@ function envGrade(name: string, fallback: AiGrade): AiGrade {
 }
 
 export function qualifyByScore(score: number): boolean {
-  const min = envNum("AI_MIN_SCORE_TO_QUALIFY", 6.8);
+  const min = envNum("AI_MIN_SCORE_TO_QUALIFY", 6.5);
   return Number.isFinite(score) && score >= min;
 }
 
@@ -47,8 +47,13 @@ export function qualifyByGrade(grade: AiGrade): boolean {
   return gradeRank[grade] >= gradeRank[min];
 }
 
+/**
+ * Single source of truth for the minimum score to qualify.
+ * Both qualifyByScore and aiScoring.ts must use this same default.
+ * Default 6.5: allows decent setups through after realistic penalty stack.
+ */
 export function minScoreToQualify() {
-  return envNum("AI_MIN_SCORE_TO_QUALIFY", 7.0);
+  return envNum("AI_MIN_SCORE_TO_QUALIFY", 6.5);
 }
 
 /**

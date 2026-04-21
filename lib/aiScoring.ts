@@ -104,6 +104,8 @@ export type ScoredSignal = RawSignal & {
   // Direction competition
   longVsShortEdge?: number | null;
   shortPreferred?: boolean | null;
+  // Qualification observability: why did this pass/fail and why did direction stay/flip
+  qualifyDiagnostic?: string | null;
   // Scorer version tag for smoke-test confirmation
   _scorerVersion?: string;
 };
@@ -555,15 +557,8 @@ function evaluateLongQuality(params: {
   const reasons: string[] = [];
   const diagnostics: LongQualityDiagnostics = {};
 
-  // No context = no structural adjustments
+  // No context = no structural adjustments; no speculative penalty
   if (!context) {
-    // Conservative default: borderline LONGs without context get a small uncertainty penalty.
-    // This prevents signals processed when market-data is unavailable from slipping through
-    // with full raw scores (context build failures are common after hours/on timeouts).
-    if (rawScore >= 6.5 && rawScore < 7.5) {
-      adjustedScore -= 0.3;
-      reasons.push("no_context_conservative");
-    }
     return { adjustedScore, diagnostics, penaltyReasons: reasons, shortPreferred: false };
   }
 
@@ -629,7 +624,7 @@ function evaluateLongQuality(params: {
     } else {
       // Light volume: meaningful concern but not disqualifying alone
       participationQuality = 0.2;
-      adjustedScore -= 0.30;
+      adjustedScore -= 0.20;   // reduced from -0.30 to prevent runaway stacking
       reasons.push("light_volume_participation");
     }
   }
@@ -661,47 +656,14 @@ function evaluateLongQuality(params: {
   if (hasContinuationStructure) continuationQuality = 0.85;
   diagnostics.continuationQuality = continuationQuality;
 
-  // ===== COMPOUND WEAK-C PENALTY =====
-  // C-tier (7.0-7.5) with both flat/weak trend AND mediocre volume: extra penalty.
-  // Only fires when flat/down-trend was NOT already applied; prevents double-penalizing.
-  const inCTier = rawScore >= 7.0 && rawScore < 7.5;
-  const isStructurallyWeak =
-    (context.trend === "FLAT" || context.trend === "DOWN") &&
-    (context.relVolume == null || context.relVolume < 0.8);
-  const trendAlreadyPenalized =
-    reasons.includes("flat_trend_long") || reasons.includes("downtrend_long_contradiction");
-  if (inCTier && isStructurallyWeak && !trendAlreadyPenalized) {
-    adjustedScore -= 0.35;
-    reasons.push("compound_weak_c_penalty");
-  }
-
-  // ===== HARD GATE A: WEAK RANGE LONGS (flat/down trend) =====
-  // 6.0-7.2 raw score with flat or down trend → force below qualification threshold.
-  // These are "trying to qualify" longs with no bullish trend to support them.
-  const inWeakRange = rawScore >= 6.0 && rawScore < 7.2;
-  if (inWeakRange && (context.trend === "FLAT" || context.trend === "DOWN")) {
-    const hardCap = minQualifyScore - 0.11; // 6.89 when minQualify = 7.0
-    if (adjustedScore > hardCap) {
-      adjustedScore = hardCap;
-      reasons.push("hard_gate_flat_trend_weak_range");
-    }
-  }
-
-  // ===== HARD GATE B: MEAN-REVERSION WITH WEAK VOLUME =====
-  // 6.5-7.5 raw score with mean-reversion framing AND mediocre volume → hard reject.
-  // Exempt: UP trend + price at/above VWAP (acceptable VWAP context with bullish trend).
-  if (
-    rawScore >= 6.5 &&
-    rawScore < 7.5 &&
-    hasMeanReversionFrame &&
-    (context.relVolume == null || context.relVolume < 0.9) &&
-    !(context.trend === "UP" && priceVsVwap !== null && priceVsVwap > 0)
-  ) {
-    const hardCap = minQualifyScore - 0.11;
-    if (adjustedScore > hardCap) {
-      adjustedScore = hardCap;
-      reasons.push("hard_gate_mean_reversion_weak_vol");
-    }
+  // ===== TOTAL ADJUSTMENT CAP =====
+  // Prevent runaway penalty stacking: no signal should lose more than 0.65 from quality
+  // evaluation alone. This ensures a 7.0 AI score can still clear a 6.5 threshold even
+  // with multiple structural concerns (the AI's own rubric already priced them in).
+  const minAllowedByPenaltyCap = rawScore - 0.65;
+  if (adjustedScore < minAllowedByPenaltyCap) {
+    adjustedScore = minAllowedByPenaltyCap;
+    reasons.push("penalty_cap_applied");
   }
 
   // ===== FINAL CLAMP =====
@@ -709,23 +671,26 @@ function evaluateLongQuality(params: {
   diagnostics.longPenaltyReasons = reasons;
 
   // ===== SHORT-PREFERRED REDIRECT CHECK =====
-  // Two triggers for SHORT promotion:
-  // 1. DOWN trend: prefer SHORT when shortScore can survive SHORT quality gates (>= 7.0)
-  // 2. Weak LONG + bearish structure: LONG fell below threshold AND short is genuinely competitive
-  // Threshold for weakLong raised from 6.5 → 7.0 so promoted shorts can clear quality evaluation.
-  const downTrendPrefersShort = context.trend === "DOWN" && rawShortScore >= 6.8;
-  // Require bearish structure evidence to avoid promoting shorts without conviction
+  // Signals that arrive with side="LONG" can still pivot to SHORT here when:
+  //   1. Trend is DOWN and the AI gave shortScore a decent floor (>= 6.0), OR
+  //   2. The LONG setup collapsed below qualify threshold AND the short side is competitive
+  // Bearish structure evidence broadened to catch flat+below-VWAP cases that lack
+  // keyword signals (common intraday when AI summary is terse).
+  const downTrendPrefersShort = context.trend === "DOWN" && rawShortScore >= 6.0;
   const hasBearishStructureEvidence =
     sl.includes("lower high") ||
     sl.includes("rejection") ||
     sl.includes("breakdown") ||
     sl.includes("reversal") ||
-    context.trend === "DOWN";
+    sl.includes("bearish") ||
+    sl.includes("downside") ||
+    context.trend === "DOWN" ||
+    (context.trend === "FLAT" && priceVsVwap !== null && priceVsVwap < -0.3); // flat + below VWAP
   const weakLongPrefersShort =
     adjustedScore < minQualifyScore &&
-    rawShortScore >= 6.5 &&
+    rawShortScore >= 6.0 &&          // floor: AI still needs a real short score
     hasBearishStructureEvidence &&
-    rawShortScore >= rawScore - 1.0;
+    rawShortScore >= rawScore - 1.5; // short must be within 1.5 pts of long raw
   const shortPreferred = downTrendPrefersShort || weakLongPrefersShort;
 
   return { adjustedScore, diagnostics, penaltyReasons: reasons, shortPreferred };
@@ -1468,6 +1433,37 @@ Return ONLY valid JSON:
   const _grade: AiGrade = gradeFromScore(winnerScore);
   const _direction: "LONG" | "SHORT" | "NONE" = bestDirection;
 
+  // ===== QUALIFY DIAGNOSTIC =====
+  // Compact one-line diagnostic explaining final score, direction choice, and qualify outcome.
+  // Surfaces in /api/signals/all as qualifyDiagnostic field for live debugging.
+  const qualifyBand = winnerScore >= 8.5 ? "A" : winnerScore >= 7.5 ? "B" : winnerScore >= 6.5 ? "C" : "REJECT";
+  const directionNote = shortPreferredByQuality
+    ? `promoted→SHORT(rawShort:${shortScore.toFixed(2)})`
+    : bestDirection === "LONG"
+    ? `stayed→LONG(rawShort:${shortScore.toFixed(2)}<floor|noBearishEvidence)`
+    : bestDirection === "SHORT"
+    ? `edgeWon→SHORT`
+    : `NONE`;
+  const qualifyNote = isQualified ? "QUALIFIED" : `REJECT(score:${winnerScore.toFixed(2)}<threshold:${MIN_QUALIFY_SCORE.toFixed(2)})`;
+  const qualifyDiagnostic = `${qualifyNote}|dir:${directionNote}|finalScore:${winnerScore.toFixed(2)}|rawLong:${longScore.toFixed(2)}|rawShort:${shortScore.toFixed(2)}|band:${qualifyBand}|trend:${ctx?.trend ?? "?"}|relVol:${ctx?.relVolume?.toFixed(2) ?? "?"}`;
+
+  // Log qualify decision for live debugging
+  console.log("[aiScoring:qualify]", {
+    ticker: signal.ticker,
+    direction: _direction,
+    finalScore: winnerScore.toFixed(2),
+    rawLong: longScore.toFixed(2),
+    rawShort: shortScore.toFixed(2),
+    qualified: isQualified,
+    threshold: MIN_QUALIFY_SCORE,
+    band: qualifyBand,
+    shortPreferred: shortPreferredByQuality,
+    trend: ctx?.trend,
+    relVol: ctx?.relVolume,
+    longPenalties: longDiagnostics?.longPenaltyReasons ?? [],
+    shortPenalties: shortDiagnostics?.shortPenaltyReasons ?? [],
+  });
+
   const result: ScoredSignal = {
     ...signal,
     aiScore: winnerScore,
@@ -1496,8 +1492,10 @@ Return ONLY valid JSON:
     // Direction competition
     longVsShortEdge: edge,
     shortPreferred: shortPreferredByQuality,
+    // Qualify observability
+    qualifyDiagnostic,
     // Smoke-test sentinel: confirms Patch 2 scorer path is active
-    _scorerVersion: "patch2-v1",
+    _scorerVersion: "patch2-v2",
   };
 
   if (bestDirection === "LONG") {
