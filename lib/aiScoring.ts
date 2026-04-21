@@ -90,20 +90,22 @@ export type ScoredSignal = RawSignal & {
   shortDiagnostics?: ShortQualityDiagnostics;
   longDiagnostics?: LongQualityDiagnostics;
   // Actionability ranking (1-10, higher = prioritize for capital allocation)
-  actionabilityRank?: number;
+  actionabilityRank?: number | null;
   // Setup frame classification
-  setupFrame?: "continuation" | "mean_reversion" | "dip_buy" | "breakout" | "reversal" | "unknown";
+  setupFrame?: "continuation" | "mean_reversion" | "dip_buy" | "breakout" | "reversal" | "unknown" | null;
   // Explainability buckets
-  vwapBucket?: "well_above" | "above" | "near" | "below" | "well_below";
-  trendBucket?: "strong_up" | "weak_up" | "flat" | "weak_down" | "strong_down";
-  relVolBucket?: "strong" | "normal" | "mediocre" | "light";
-  liquidityBucket?: "high" | "medium" | "low";
+  vwapBucket?: "well_above" | "above" | "near" | "below" | "well_below" | null;
+  trendBucket?: "strong_up" | "weak_up" | "flat" | "weak_down" | "strong_down" | null;
+  relVolBucket?: "strong" | "normal" | "mediocre" | "light" | null;
+  liquidityBucket?: "high" | "medium" | "low" | null;
   // Market posture bias
-  postureBiasApplied?: boolean;
-  postureBias?: number;
+  postureBiasApplied?: boolean | null;
+  postureBias?: number | null;
   // Direction competition
-  longVsShortEdge?: number;
-  shortPreferred?: boolean;
+  longVsShortEdge?: number | null;
+  shortPreferred?: boolean | null;
+  // Scorer version tag for smoke-test confirmation
+  _scorerVersion?: string;
 };
 
 type ModelResponse = {
@@ -1463,6 +1465,8 @@ Return ONLY valid JSON:
     // Direction competition
     longVsShortEdge: edge,
     shortPreferred: shortPreferredByQuality,
+    // Smoke-test sentinel: confirms Patch 2 scorer path is active
+    _scorerVersion: "patch2-v1",
   };
 
   if (bestDirection === "LONG") {

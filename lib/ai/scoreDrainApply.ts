@@ -198,6 +198,23 @@ export function applyScoreSuccess(signal: any, scored: any, nowIso: string) {
   signal.longScore = scored.longScore ?? signal.longScore ?? null;
   signal.shortScore = scored.shortScore ?? signal.shortScore ?? null;
 
+  // Smoke-test sentinel: forward scorer version tag
+  if (scored._scorerVersion) signal._scorerVersion = scored._scorerVersion;
+
+  // Persist Patch-2 actionability / posture / direction-competition fields
+  signal.actionabilityRank = typeof scored.actionabilityRank === "number" ? scored.actionabilityRank : signal.actionabilityRank ?? null;
+  signal.shortPreferred = typeof scored.shortPreferred === "boolean" ? scored.shortPreferred : signal.shortPreferred ?? null;
+  signal.longVsShortEdge = typeof scored.longVsShortEdge === "number" ? scored.longVsShortEdge : signal.longVsShortEdge ?? null;
+  signal.postureBiasApplied = typeof scored.postureBiasApplied === "boolean" ? scored.postureBiasApplied : signal.postureBiasApplied ?? null;
+  signal.postureBias = typeof scored.postureBias === "number" ? scored.postureBias : signal.postureBias ?? null;
+
+  // Persist explainability bucketing fields
+  if (scored.setupFrame != null)     signal.setupFrame    = scored.setupFrame;
+  if (scored.vwapBucket != null)     signal.vwapBucket    = scored.vwapBucket;
+  if (scored.trendBucket != null)    signal.trendBucket   = scored.trendBucket;
+  if (scored.relVolBucket != null)   signal.relVolBucket  = scored.relVolBucket;
+  if (scored.liquidityBucket != null)signal.liquidityBucket = scored.liquidityBucket;
+
   // Compute direction from available context (may be null if unclear)
   signal.direction = computeSignalDirection(signal);
 

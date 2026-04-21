@@ -56,7 +56,24 @@ export type StoredSignal = {
   longScore?: number | null; // Score for LONG hypothesis
   shortScore?: number | null; // Score for SHORT hypothesis
   bestDirection?: "LONG" | "SHORT" | "NONE"; // AI's evaluation of best direction
-  
+
+  // Patch 2: Actionability / direction-competition / posture fields
+  actionabilityRank?: number | null;
+  shortPreferred?: boolean | null;
+  longVsShortEdge?: number | null;
+  postureBiasApplied?: boolean | null;
+  postureBias?: number | null;
+
+  // Patch 2: Explainability bucketing fields
+  setupFrame?: "continuation" | "mean_reversion" | "dip_buy" | "breakout" | "reversal" | "unknown" | null;
+  vwapBucket?: "well_above" | "above" | "near" | "below" | "well_below" | null;
+  trendBucket?: "strong_up" | "weak_up" | "flat" | "weak_down" | "strong_down" | null;
+  relVolBucket?: "strong" | "normal" | "mediocre" | "light" | null;
+  liquidityBucket?: "high" | "medium" | "low" | null;
+
+  // Smoke-test sentinel
+  _scorerVersion?: string;
+
   // Context enrichment (from buildSignalContext)
   signalContext?: SignalContext;
 };

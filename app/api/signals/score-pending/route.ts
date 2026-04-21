@@ -96,6 +96,7 @@ export async function POST(req: Request) {
         volumeScore: (s as any).volumeScore,
         catalystScore: (s as any).catalystScore,
         reasoning: s.reasoning,
+        signalContext: (s as any).signalContext,
       };
 
       const scoredResult = await scoreSignalWithAI(raw);

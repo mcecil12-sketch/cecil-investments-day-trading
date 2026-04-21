@@ -161,6 +161,7 @@ async function scoreWithTimeout(
         id: signal.id,
         ticker: signal.ticker,
         side: signal.side,
+        direction: signal.direction,
         entryPrice: signal.entryPrice,
         stopPrice: signal.stopPrice || 0,
         targetPrice: signal.targetPrice || 0,
@@ -168,6 +169,14 @@ async function scoreWithTimeout(
         source: signal.source || "DRAIN",
         createdAt: signal.createdAt,
         reasoning: signal.reasoning,
+        vwap: signal.vwap,
+        pullbackPct: signal.pullbackPct,
+        trendScore: signal.trendScore,
+        liquidityScore: signal.liquidityScore,
+        playbookScore: signal.playbookScore,
+        volumeScore: signal.volumeScore,
+        catalystScore: signal.catalystScore,
+        signalContext: signal.signalContext,
       }),
       new Promise<{ ok: false; error: string; reason: string }>((_, reject) =>
         setTimeout(
