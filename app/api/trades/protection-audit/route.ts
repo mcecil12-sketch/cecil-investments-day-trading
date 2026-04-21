@@ -21,10 +21,16 @@ import {
   isOpenTradeStatus,
   normalizeTicker,
 } from "@/lib/trades/protection";
-import { alpacaHeaders, tradingUrl } from "@/lib/alpaca";
+import { createOrder } from "@/lib/alpaca";
+import { forceFlattenPosition } from "@/lib/broker/forceFlattenPosition";
+import { verifyStopAtBroker } from "@/lib/risk/stop-verification";
 
 // ─── Enforce helpers ────────────────────────────────────────────────
 
+/**
+ * Place an emergency protective stop directly via the broker API.
+ * Returns the order id on success.
+ */
 async function submitRepairStop(opts: {
   symbol: string;
   qty: number;
@@ -32,42 +38,17 @@ async function submitRepairStop(opts: {
   stopPrice: number;
 }): Promise<{ ok: boolean; orderId?: string; error?: string }> {
   try {
-    const resp = await fetch(tradingUrl("/v2/orders"), {
-      method: "POST",
-      headers: { ...alpacaHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({
-        symbol: opts.symbol,
-        qty: String(opts.qty),
-        side: opts.side,
-        type: "stop",
-        stop_price: String(opts.stopPrice),
-        time_in_force: "gtc",
-      }),
+    const order = await createOrder({
+      symbol: opts.symbol,
+      qty: String(opts.qty),
+      side: opts.side,
+      type: "stop",
+      stop_price: String(opts.stopPrice),
+      time_in_force: "gtc",
     });
-    if (!resp.ok) {
-      const text = await resp.text();
-      return { ok: false, error: `${resp.status}: ${text}` };
-    }
-    const order = await resp.json();
-    return { ok: true, orderId: order.id };
-  } catch (err: any) {
-    return { ok: false, error: err?.message || String(err) };
-  }
-}
-
-async function flattenPosition(
-  symbol: string,
-): Promise<{ ok: boolean; error?: string }> {
-  try {
-    const resp = await fetch(
-      tradingUrl(`/v2/positions/${encodeURIComponent(symbol)}`),
-      { method: "DELETE", headers: alpacaHeaders() },
-    );
-    if (!resp.ok) {
-      const text = await resp.text();
-      return { ok: false, error: `${resp.status}: ${text}` };
-    }
-    return { ok: true };
+    const id = String((order as any)?.id || "");
+    if (!id) return { ok: false, error: "stop order returned without id" };
+    return { ok: true, orderId: id };
   } catch (err: any) {
     return { ok: false, error: err?.message || String(err) };
   }
@@ -100,18 +81,31 @@ async function enforceProtection(
     );
     if (!needsRepair) continue;
 
+    const diag: Record<string, any> = {
+      symbol: detail.symbol,
+      stopRepairAttempted: false,
+      stopRepairSucceeded: false,
+      stopVerified: false,
+      flattenAttempted: false,
+      flattenSucceeded: false,
+      cancelOrdersAttempted: false,
+      cancelOrdersSucceeded: false,
+      brokerPositionExistsAfter: null,
+      finalResolution: "failed" as "protected" | "flattened" | "failed",
+      stopRepairError: null as string | null,
+    };
+
     const pos = posBySymbol.get(detail.symbol);
-    let diag: { symbol: string; stopVerified: boolean; stopRepairAttempted: boolean; stopRepairSucceeded: boolean; flattenTriggered: boolean; stopRepairError: string | null } = { symbol: detail.symbol, stopVerified: false, stopRepairAttempted: false, stopRepairSucceeded: false, flattenTriggered: false, stopRepairError: null };
     if (!pos) {
-      failed.push(detail.symbol);
       diag.stopRepairError = "no_broker_position";
+      failed.push(detail.symbol);
       diagnostics.push(diag);
       continue;
     }
     const brokerQty = parseQty(pos.qty);
     if (brokerQty <= 0) {
-      failed.push(detail.symbol);
       diag.stopRepairError = "zero_broker_qty";
+      failed.push(detail.symbol);
       diagnostics.push(diag);
       continue;
     }
@@ -119,10 +113,11 @@ async function enforceProtection(
     const posSide =
       String(pos.side || "").toLowerCase() === "short" ? "short" : "long";
     const stopSide: "buy" | "sell" = posSide === "long" ? "sell" : "buy";
+    const tradeSide: "LONG" | "SHORT" = posSide === "long" ? "LONG" : "SHORT";
     const entryPrice = Number(pos.avg_entry_price ?? 0);
     if (!entryPrice) {
-      failed.push(detail.symbol);
       diag.stopRepairError = "missing_entry_price";
+      failed.push(detail.symbol);
       diagnostics.push(diag);
       continue;
     }
@@ -133,6 +128,7 @@ async function enforceProtection(
         ? Math.round(entryPrice * 0.98 * 100) / 100
         : Math.round(entryPrice * 1.02 * 100) / 100;
 
+    // ── A. Attempt stop repair directly via broker ──────────────────
     diag.stopRepairAttempted = true;
     const result = await submitRepairStop({
       symbol: detail.symbol,
@@ -141,49 +137,75 @@ async function enforceProtection(
       stopPrice,
     });
 
-    if (result.ok) {
-      repaired.push(detail.symbol);
-      diag.stopRepairSucceeded = true;
-      diag.stopVerified = true;
-      console.log("[protection-audit] repaired stop", {
+    if (result.ok && result.orderId) {
+      // Verify the stop is actually active at broker before claiming success
+      const verify = await verifyStopAtBroker({
         symbol: detail.symbol,
-        qty: brokerQty,
-        stopPrice,
-        orderId: result.orderId,
+        side: tradeSide,
+        stopOrderId: result.orderId,
       });
-    } else {
-      // Always flatten on repair fail
-      diag.stopRepairError = result.error ?? null;
-      diag.flattenTriggered = true;
-      console.error("[protection-audit] repair failed, flattening", {
-        symbol: detail.symbol,
-        error: result.error,
-      });
-      const flatResult = await flattenPosition(detail.symbol);
-      if (flatResult.ok) {
-        flattened.push(detail.symbol);
-        console.log("[protection-audit] flattened", { symbol: detail.symbol });
-        await saveCriticalTask({
-          incidentCode: "STOP_REPAIR_FAILED",
+      if (verify.verified) {
+        diag.stopRepairSucceeded = true;
+        diag.stopVerified = true;
+        diag.finalResolution = "protected";
+        repaired.push(detail.symbol);
+        console.log("[protection-audit] stop repair verified", {
           symbol: detail.symbol,
-          severity: "CRITICAL",
-          detail: `Repair failed: ${result.error}; position flattened`,
-        }).catch(() => {});
-      } else {
-        failed.push(detail.symbol);
-        diag.stopRepairError += `; flatten also failed: ${flatResult.error}`;
-        console.error("[protection-audit] flatten failed", {
-          symbol: detail.symbol,
-          error: flatResult.error,
+          qty: brokerQty,
+          stopPrice,
+          orderId: result.orderId,
         });
-        await saveCriticalTask({
-          incidentCode: "FLATTEN_FAILED",
-          symbol: detail.symbol,
-          severity: "CRITICAL",
-          detail: `Repair failed: ${result.error}; flatten also failed: ${flatResult.error}`,
-        }).catch(() => {});
+        diagnostics.push(diag);
+        continue;
       }
+      // Order created but not yet active — treat as repair failure
+      diag.stopRepairError = `stop placed but not verified active (status=${verify.stopStatus ?? "unknown"})`;
+    } else {
+      diag.stopRepairError = result.error ?? "stop_order_failed";
     }
+
+    // ── B. Repair failed → force flatten (cancels orders first) ────
+    diag.flattenAttempted = true;
+    console.error("[protection-audit] repair failed, force-flattening", {
+      symbol: detail.symbol,
+      error: diag.stopRepairError,
+    });
+
+    const flatResult = await forceFlattenPosition(detail.symbol);
+    diag.cancelOrdersAttempted = flatResult.diagnostics.cancelOrdersAttempted;
+    diag.cancelOrdersSucceeded = flatResult.diagnostics.cancelOrdersSucceeded;
+    diag.flattenSucceeded = flatResult.ok;
+    diag.brokerPositionExistsAfter = flatResult.diagnostics.brokerPositionExistsAfter;
+
+    if (flatResult.ok) {
+      diag.finalResolution = "flattened";
+      flattened.push(detail.symbol);
+      console.log("[protection-audit] force-flattened", { symbol: detail.symbol });
+      await saveCriticalTask({
+        incidentCode: "STOP_REPAIR_FAILED",
+        symbol: detail.symbol,
+        severity: "CRITICAL",
+        detail: `Repair failed: ${diag.stopRepairError}; position force-flattened`,
+      }).catch(() => {});
+    } else {
+      diag.finalResolution = "failed";
+      diag.stopRepairError =
+        (diag.stopRepairError ? diag.stopRepairError + "; " : "") +
+        `flatten failed at step=${flatResult.step}: ${flatResult.error ?? "unknown"}`;
+      failed.push(detail.symbol);
+      console.error("[protection-audit] CRITICAL: force-flatten failed", {
+        symbol: detail.symbol,
+        step: flatResult.step,
+        error: flatResult.error,
+      });
+      await saveCriticalTask({
+        incidentCode: "FLATTEN_FAILED",
+        symbol: detail.symbol,
+        severity: "CRITICAL",
+        detail: `Repair failed AND flatten failed: ${diag.stopRepairError}`,
+      }).catch(() => {});
+    }
+
     diagnostics.push(diag);
   }
 
@@ -310,16 +332,21 @@ export async function GET(req: Request) {
   let observability: any = {};
   if (enforce && !audit.ok) {
     enforcement = await enforceProtection(audit, positions);
+    const diagArr: any[] = (enforcement as any).diagnostics ?? [];
     observability = {
       unprotectedSymbols: audit.incidents.filter((i) => i.severity === "CRITICAL").map((i) => i.symbol),
-      repairAttempted: enforcement.repaired.length > 0,
-      repairSucceeded: enforcement.repaired.length > 0,
-      flattenAttempted: enforcement.flattened.length > 0,
+      stopRepairAttempted: diagArr.some((d) => d.stopRepairAttempted),
+      stopRepairSucceeded: enforcement.repaired.length > 0,
+      flattenAttempted: diagArr.some((d) => d.flattenAttempted),
       flattenSucceeded: enforcement.flattened.length > 0,
+      cancelOrdersAttempted: diagArr.some((d) => d.cancelOrdersAttempted),
+      cancelOrdersSucceeded: diagArr.some((d) => d.cancelOrdersSucceeded),
       repairFailed: enforcement.failed.length > 0,
       repaired: enforcement.repaired,
       flattened: enforcement.flattened,
       failed: enforcement.failed,
+      finalResolutions: diagArr.map((d) => ({ symbol: d.symbol, finalResolution: d.finalResolution })),
+      details: diagArr,
     };
   }
 

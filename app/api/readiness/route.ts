@@ -134,35 +134,82 @@ export async function GET(req: Request) {
   let protectionCritical = false;
   let brokerIsFlat = false;
   let protectionIsStaleOnly = false;
+  // Positions unprotected at broker level (independent of DB trades)
+  let unprotectedBrokerPositions: string[] = [];
   if (!brokerTruth.error) {
-    const brokerPosCount = typeof brokerTruth.positionsCount === "number"
-      ? brokerTruth.positionsCount
-      : Array.isArray(brokerTruth.positions) ? brokerTruth.positions.length : 0;
-    const brokerOrdCount = typeof brokerTruth.openOrdersCount === "number"
-      ? brokerTruth.openOrdersCount
-      : Array.isArray(brokerTruth.openOrders) ? brokerTruth.openOrders.length : 0;
-    brokerIsFlat = brokerPosCount === 0 && brokerOrdCount === 0;
+    const brokerPositions = Array.isArray(brokerTruth.positions) ? brokerTruth.positions : [];
+    const brokerOrders = Array.isArray(brokerTruth.openOrders) ? brokerTruth.openOrders : [];
+    brokerIsFlat = brokerPositions.length === 0 && brokerOrders.length === 0;
 
-    const auditTrades = openTrades.map((t: any) => ({
-      id: String(t.id || ""),
-      ticker: String(t.ticker || ""),
-      side: String(t.side || ""),
-      status: String(t.status || ""),
-      stopOrderId: t.stopOrderId || t.alpacaStopOrderId,
-    }));
-    protectionAudit = auditProtectionIntegrity({
-      openTrades: auditTrades,
-      brokerPositions: brokerTruth.positions || [],
-      brokerOrders: brokerTruth.openOrders || [],
-    });
+    // PRIMARY CHECK: iterate every live broker position and verify it has an
+    // active protective stop order.  This is broker-truth-only — does NOT
+    // rely on DB trades so orphaned positions are always caught.
+    for (const pos of brokerPositions) {
+      const sym = String(pos.symbol || "").toUpperCase();
+      if (!sym) continue;
+      const rawQty = Number(pos.qty ?? 0);
+      const qty = Math.abs(rawQty);
+      if (qty === 0) continue;
 
-    // If broker is flat, DB mismatches are reconciliation issues, NOT live risk
-    if (!protectionAudit.ok && brokerIsFlat && openTrades.length > 0) {
-      // All incidents are stale mismatch — DB needs reconciliation, no live risk
-      protectionIsStaleOnly = true;
-      protectionCritical = false;
-    } else {
+      const posSide = rawQty < 0 ? "SHORT" : "LONG";
+      // A protective stop for a LONG is a sell-stop; for a SHORT it is a buy-stop
+      const protectiveSide = posSide === "LONG" ? "sell" : "buy";
+
+      const hasStop = brokerOrders.some((o: any) => {
+        if (String(o.symbol || "").toUpperCase() !== sym) return false;
+        const oType = String(o.type || "").toLowerCase();
+        const oSide = String(o.side || "").toLowerCase();
+        const oStatus = String(o.status || "").toLowerCase();
+        const isStopType = oType === "stop" || oType === "stop_limit" || oType === "trailing_stop";
+        const isActiveSide = oSide === protectiveSide;
+        const isActive = ["new", "accepted", "pending", "held"].includes(oStatus);
+        return isStopType && isActiveSide && isActive;
+      });
+
+      if (!hasStop) {
+        unprotectedBrokerPositions.push(sym);
+      }
+    }
+
+    if (unprotectedBrokerPositions.length > 0) {
+      // Live broker positions are unprotected — this is always critical
+      protectionCritical = true;
+      protectionIsStaleOnly = false;
+    } else if (!brokerIsFlat) {
+      // All broker positions have stops — run DB audit for supplemental detail
+      const auditTrades = openTrades.map((t: any) => ({
+        id: String(t.id || ""),
+        ticker: String(t.ticker || ""),
+        side: String(t.side || ""),
+        status: String(t.status || ""),
+        stopOrderId: t.stopOrderId || t.alpacaStopOrderId,
+      }));
+      protectionAudit = auditProtectionIntegrity({
+        openTrades: auditTrades,
+        brokerPositions,
+        brokerOrders,
+      });
+      // DB incidents that don't correspond to live broker positions are stale
       protectionCritical = !protectionAudit.ok;
+      protectionIsStaleOnly = !protectionAudit.ok && brokerIsFlat;
+    } else {
+      // Broker is flat — any DB incidents are stale reconciliation issues
+      if (openTrades.length > 0) {
+        const auditTrades = openTrades.map((t: any) => ({
+          id: String(t.id || ""),
+          ticker: String(t.ticker || ""),
+          side: String(t.side || ""),
+          status: String(t.status || ""),
+          stopOrderId: t.stopOrderId || t.alpacaStopOrderId,
+        }));
+        protectionAudit = auditProtectionIntegrity({
+          openTrades: auditTrades,
+          brokerPositions,
+          brokerOrders,
+        });
+        protectionIsStaleOnly = true;
+        protectionCritical = false;
+      }
     }
   } else {
     // Fail-closed: if broker unavailable, assume critical when trades exist
@@ -308,15 +355,17 @@ export async function GET(req: Request) {
       name: "protection_integrity",
       ok: publicMode ? true : !protectionCritical,
       detail: protectionCritical
-        ? protectionAudit
-          ? `CRITICAL: ${protectionAudit.criticalCount} incident(s) [${protectionAudit.incidents
-              .filter((i) => i.severity === "CRITICAL")
-              .map((i) => `${i.symbol}:${i.code}`)
-              .slice(0, 8)
-              .join(",")}]`
-          : brokerTruth.error
-            ? `broker_error: ${brokerTruth.error}; ${openTrades.length} open trade(s) unverifiable`
-            : `CRITICAL: ${openTrades.length} open trade(s) without verified stop`
+        ? unprotectedBrokerPositions.length > 0
+          ? `CRITICAL: ${unprotectedBrokerPositions.length} broker position(s) without stop [${unprotectedBrokerPositions.slice(0, 8).join(",")}]`
+          : protectionAudit
+            ? `CRITICAL: ${protectionAudit.criticalCount} incident(s) [${protectionAudit.incidents
+                .filter((i) => i.severity === "CRITICAL")
+                .map((i) => `${i.symbol}:${i.code}`)
+                .slice(0, 8)
+                .join(",")}]`
+            : brokerTruth.error
+              ? `broker_error: ${brokerTruth.error}; ${openTrades.length} open trade(s) unverifiable`
+              : `CRITICAL: ${openTrades.length} open trade(s) without verified stop`
         : protectionIsStaleOnly
           ? `broker_flat_stale_mismatch: ${openTrades.length} DB trade(s) need reconciliation (no live risk)`
           : `protected_open_trades=${openTrades.length}`,
@@ -336,6 +385,7 @@ export async function GET(req: Request) {
         : protectionIsStaleOnly
           ? "STALE_MISMATCH"
           : "CLEAR",
+      unprotectedBrokerPositions: unprotectedBrokerPositions.length > 0 ? unprotectedBrokerPositions : undefined,
       queueHealth: marketOpen ? "ok" : "market_closed",
       funnelFlow: !marketOpen
         ? "market_closed"
