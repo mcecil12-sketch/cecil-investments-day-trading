@@ -305,7 +305,9 @@ export async function POST(req: Request) {
       score: safeScore,
       grade: gradeCandidate,
       reasoning: placeholder.reasoning ?? safeSummary,
-      shownInApp: true,
+      // Use scored.qualified (reflects Patch 2 adjusted score); default false if absent
+      qualified: typeof scored.qualified === "boolean" ? scored.qualified : false,
+      shownInApp: typeof scored.qualified === "boolean" ? scored.qualified : false,
       tradePlan,
       direction: side === "LONG" || side === "SHORT" ? side : finalSignal.direction,
       aiDirection: normalizeAiDirectionForStorage(scored.aiDirection),

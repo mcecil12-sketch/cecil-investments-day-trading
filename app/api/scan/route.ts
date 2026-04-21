@@ -134,10 +134,14 @@ const ENABLE_SHORT_SCAN = String(process.env.ENABLE_SHORT_SCAN ?? "0") === "1";
   const AI_SEED_GPT_LIMIT = Number(process.env.AI_SEED_GPT_LIMIT ?? 60);
   const AI_SEED_PRESCORE_MIN = Number(process.env.AI_SEED_PRESCORE_MIN ?? 0);
 
-const AI_SEED_MIN_REL_VOL = 0.3;
+const AI_SEED_MIN_REL_VOL = Number(process.env.AI_SEED_MIN_REL_VOL ?? 0.3);
 const MIN_RANGE_PCT = Number(process.env.MIN_RANGE_PCT ?? 0.05);
-const AI_SEED_MAX_VWAP_DISTANCE = 2;
-const AI_SEED_MIN_TREND_DELTA = -0.005;
+// How far (%) price may be from session VWAP and still be considered.
+// Default 5% to accept stocks in any trending market; override via env.
+const AI_SEED_MAX_VWAP_DISTANCE = Number(process.env.AI_SEED_MAX_VWAP_DIST ?? 5);
+// Minimum 1-bar price delta (as fraction of prev close).
+// -0.02 = allow up to -2% in last bar before rejecting (was -0.005 = -0.5%, too tight).
+const AI_SEED_MIN_TREND_DELTA = Number(process.env.AI_SEED_MIN_TREND_DELTA ?? -0.02);
 const MIN_AVG_VOL_SHARES = Number(process.env.MIN_AVG_VOL_SHARES ?? 600);
 const MIN_AVG_DOLLAR_VOL = Number(process.env.MIN_AVG_DOLLAR_VOL ?? 500_000);
 const AI_SEED_SCAN_MIN_BARS = Math.max(
@@ -1387,6 +1391,17 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
           seenTickers: aiSeedTracker.seenTickers,
           rejectCounts: aiSeedTracker.counts,
           rejectSamples: aiSeedTracker.samples,
+          totals,
+          gates: {
+            AI_SEED_SCAN_MIN_BARS,
+            AI_SEED_SCAN_MIN_DOLLAR_VOL,
+            MIN_AVG_VOL_SHARES,
+            AI_SEED_MIN_REL_VOL,
+            AI_SEED_MAX_VWAP_DISTANCE,
+            AI_SEED_MIN_TREND_DELTA,
+            AI_SEED_PRESCORE_MIN,
+            AI_SEED_GPT_LIMIT,
+          },
         }
       : null;
 

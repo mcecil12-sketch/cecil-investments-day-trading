@@ -35,6 +35,20 @@ function normalizeSignal(s: any) {
     bestDirection: s.bestDirection ?? null,
     longScore: s.longScore ?? null,
     shortScore: s.shortScore ?? null,
+    // Patch 2: actionability / direction-competition / posture fields
+    actionabilityRank: s.actionabilityRank ?? null,
+    shortPreferred: s.shortPreferred ?? null,
+    longVsShortEdge: s.longVsShortEdge ?? null,
+    postureBiasApplied: s.postureBiasApplied ?? null,
+    postureBias: s.postureBias ?? null,
+    // Patch 2: explainability bucketing
+    setupFrame: s.setupFrame ?? null,
+    vwapBucket: s.vwapBucket ?? null,
+    trendBucket: s.trendBucket ?? null,
+    relVolBucket: s.relVolBucket ?? null,
+    liquidityBucket: s.liquidityBucket ?? null,
+    // Scorer version sentinel
+    _scorerVersion: s._scorerVersion ?? null,
   };
 }
 
