@@ -60,6 +60,15 @@ export type ShortQualityDiagnostics = {
   shortPenaltyReasons?: string[]; // array of reason codes for penalty application
 };
 
+// Long-specific quality diagnostics
+export type LongQualityDiagnostics = {
+  longTrendQuality?: number; // 0-1.0: how clean/confident is the bullish trend
+  vwapAlignmentQuality?: number; // 0-1.0: how well entry aligns with VWAP thesis
+  participationQuality?: number; // 0-1.0: volume/liquidity confirmation
+  continuationQuality?: number; // 0-1.0: quality of bullish continuation structure
+  longPenaltyReasons?: string[]; // array of reason codes for penalty application
+};
+
 export type ScoredSignal = RawSignal & {
   aiScore: number | null; // 0–10, numeric (finalScore)
   aiGrade: AiGrade | null;
@@ -77,8 +86,24 @@ export type ScoredSignal = RawSignal & {
   longScore?: number | null; // 0-10 score for LONG hypothesis
   shortScore?: number | null; // 0-10 score for SHORT hypothesis
   bestDirection?: "LONG" | "SHORT" | "NONE";
-  // Short-quality diagnostics (populated for SHORT signals)
+  // Quality diagnostics
   shortDiagnostics?: ShortQualityDiagnostics;
+  longDiagnostics?: LongQualityDiagnostics;
+  // Actionability ranking (1-10, higher = prioritize for capital allocation)
+  actionabilityRank?: number;
+  // Setup frame classification
+  setupFrame?: "continuation" | "mean_reversion" | "dip_buy" | "breakout" | "reversal" | "unknown";
+  // Explainability buckets
+  vwapBucket?: "well_above" | "above" | "near" | "below" | "well_below";
+  trendBucket?: "strong_up" | "weak_up" | "flat" | "weak_down" | "strong_down";
+  relVolBucket?: "strong" | "normal" | "mediocre" | "light";
+  liquidityBucket?: "high" | "medium" | "low";
+  // Market posture bias
+  postureBiasApplied?: boolean;
+  postureBias?: number;
+  // Direction competition
+  longVsShortEdge?: number;
+  shortPreferred?: boolean;
 };
 
 type ModelResponse = {
@@ -337,6 +362,314 @@ const BREAKER_KEY = "ai:breaker:v1";
 const BREAKER_ERROR_THRESHOLD = 10; // errors in window
 const BREAKER_WINDOW_SEC = 120; // 2 minutes
 const BREAKER_OPEN_TTL_SEC = 120; // 2 minutes
+
+// ===== EXPLAINABILITY CLASSIFIERS =====
+
+function classifyVwapBucket(
+  entryPrice: number,
+  vwap: number | null | undefined
+): "well_above" | "above" | "near" | "below" | "well_below" {
+  if (!vwap || vwap <= 0) return "near";
+  const pct = ((entryPrice - vwap) / vwap) * 100;
+  if (pct > 1.5) return "well_above";
+  if (pct > 0.3) return "above";
+  if (pct > -0.3) return "near";
+  if (pct > -1.5) return "below";
+  return "well_below";
+}
+
+function classifyTrendBucket(
+  trend: string | undefined
+): "strong_up" | "weak_up" | "flat" | "weak_down" | "strong_down" {
+  if (!trend) return "flat";
+  const t = trend.toUpperCase();
+  if (t === "UP") return "strong_up";
+  if (t === "DOWN") return "strong_down";
+  return "flat";
+}
+
+function classifyRelVolBucket(
+  relVolume: number | null | undefined
+): "strong" | "normal" | "mediocre" | "light" {
+  if (relVolume == null) return "normal";
+  if (relVolume >= 1.3) return "strong";
+  if (relVolume >= 0.9) return "normal";
+  if (relVolume >= 0.65) return "mediocre";
+  return "light";
+}
+
+function classifyLiquidityBucket(
+  avgVolume: number | null | undefined,
+  price: number
+): "high" | "medium" | "low" {
+  if (avgVolume == null) return "medium";
+  const notional = avgVolume * price;
+  if (notional >= 50_000_000) return "high";
+  if (notional >= 5_000_000) return "medium";
+  return "low";
+}
+
+function classifySetupFrame(
+  direction: "LONG" | "SHORT" | "NONE",
+  context: SignalContext | null,
+  summary: string
+): "continuation" | "mean_reversion" | "dip_buy" | "breakout" | "reversal" | "unknown" {
+  if (direction === "NONE") return "unknown";
+  const sl = (summary || "").toLowerCase();
+
+  if (
+    sl.includes("breakout") ||
+    sl.includes("break out") ||
+    sl.includes("new high") ||
+    sl.includes("new low")
+  ) {
+    return "breakout";
+  }
+
+  if (
+    sl.includes("reversal") ||
+    sl.includes("reversing") ||
+    sl.includes("rejection") ||
+    sl.includes("overextended")
+  ) {
+    return "reversal";
+  }
+
+  if (direction === "LONG" && (sl.includes("dip") || sl.includes("bounce") || sl.includes("support hold"))) {
+    return "dip_buy";
+  }
+
+  if (
+    sl.includes("mean reversion") ||
+    sl.includes("mean-reversion") ||
+    sl.includes("revert") ||
+    sl.includes("oversold") ||
+    sl.includes("overbought")
+  ) {
+    return "mean_reversion";
+  }
+
+  if (context) {
+    const trendAligned =
+      (direction === "LONG" && context.trend === "UP") ||
+      (direction === "SHORT" && context.trend === "DOWN");
+    if (trendAligned) return "continuation";
+  }
+
+  return "unknown";
+}
+
+/**
+ * Compute actionability rank 1-10 for capital rotation prioritization.
+ * Higher = more actionable (deploy capital here first).
+ */
+function computeActionabilityRank(
+  adjustedScore: number,
+  setupFrame: "continuation" | "mean_reversion" | "dip_buy" | "breakout" | "reversal" | "unknown",
+  direction: "LONG" | "SHORT" | "NONE",
+  context: SignalContext | null,
+  entryPrice: number
+): number {
+  // Base from tier
+  let rank: number;
+  if (adjustedScore >= 8.5) rank = 8;
+  else if (adjustedScore >= 7.5) rank = 6;
+  else if (adjustedScore >= 7.0) rank = 4;
+  else rank = 2;
+
+  // Setup frame modifier
+  if (setupFrame === "continuation") rank += 2;
+  else if (setupFrame === "breakout") rank += 1;
+  else if (setupFrame === "dip_buy" || setupFrame === "mean_reversion") rank -= 1;
+
+  // Volume/participation modifier
+  if (context?.relVolume != null) {
+    if (context.relVolume >= 1.3) rank += 1;
+    else if (context.relVolume < 0.65) rank -= 1;
+  }
+
+  // VWAP alignment modifier
+  if (context?.vwap && context.vwap > 0) {
+    const pct = ((entryPrice - context.vwap) / context.vwap) * 100;
+    const aligned =
+      (direction === "LONG" && pct > 0.1) || (direction === "SHORT" && pct < -0.1);
+    if (aligned) rank += 1;
+    else rank -= 1;
+  }
+
+  // Flat trend LONG penalty
+  if (direction === "LONG" && context?.trend === "FLAT") rank -= 2;
+  else if (direction === "SHORT" && context?.trend === "UP") rank -= 2;
+
+  return Math.max(1, Math.min(10, rank));
+}
+
+/**
+ * Apply market posture bias to the winner score.
+ * Reads MARKET_POSTURE env: "risk_on" | "risk_off" | "neutral" (default).
+ * Returns a bias in range [-0.3, +0.3].
+ */
+function getMarketPostureBias(direction: "LONG" | "SHORT" | "NONE", score: number): number {
+  const posture = (process.env.MARKET_POSTURE || "neutral").toLowerCase();
+  if (posture === "neutral" || direction === "NONE") return 0;
+
+  let bias = 0;
+
+  if (posture === "risk_off") {
+    // Penalize marginal longs, help marginal shorts
+    if (direction === "LONG" && score >= 6.5 && score < 7.5) bias = -0.2;
+    if (direction === "SHORT" && score >= 6.5 && score < 7.5) bias = +0.2;
+  } else if (posture === "risk_on") {
+    // Boost solid longs, penalize marginal shorts
+    if (direction === "LONG" && score >= 7.0 && score < 8.5) bias = +0.15;
+    if (direction === "SHORT" && score >= 6.5 && score < 7.5) bias = -0.2;
+  }
+
+  return Math.max(-0.3, Math.min(0.3, bias));
+}
+
+/**
+ * Evaluate LONG-specific quality factors and apply penalties for weak setups.
+ * Returns: { adjustedScore, diagnostics, penaltyReasons, shortPreferred }
+ */
+function evaluateLongQuality(params: {
+  rawScore: number;
+  rawShortScore: number;
+  summary: string;
+  context: SignalContext | null;
+  entryPrice: number;
+  stopPrice: number;
+  targetPrice: number;
+  reasoning?: string;
+  minQualifyScore: number;
+}): {
+  adjustedScore: number;
+  diagnostics: LongQualityDiagnostics;
+  penaltyReasons: string[];
+  shortPreferred: boolean;
+} {
+  const { rawScore, rawShortScore, summary, context, entryPrice, reasoning, minQualifyScore } = params;
+  let adjustedScore = rawScore;
+  const reasons: string[] = [];
+  const diagnostics: LongQualityDiagnostics = {};
+
+  // No context = no structural adjustments
+  if (!context) {
+    return { adjustedScore, diagnostics, penaltyReasons: reasons, shortPreferred: false };
+  }
+
+  // ===== TREND QUALITY =====
+  const trendQuality =
+    context.trend === "UP" ? 0.85 : context.trend === "FLAT" ? 0.35 : 0.1;
+  diagnostics.longTrendQuality = trendQuality;
+
+  if (context.trend === "FLAT") {
+    adjustedScore -= 0.6;
+    reasons.push("flat_trend_long");
+  } else if (context.trend === "DOWN") {
+    adjustedScore -= 0.8;
+    reasons.push("downtrend_long_contradiction");
+  } else {
+    // UP trend — check for weak slope
+    const slope = Math.abs(context.trendSlopePct || 0);
+    if (slope < 0.02) {
+      adjustedScore -= 0.25;
+      reasons.push("weak_uptrend_slope");
+    }
+  }
+
+  // ===== VWAP ALIGNMENT =====
+  let vwapQuality = 0.5;
+  const priceVsVwap =
+    context.vwap && context.vwap > 0
+      ? ((entryPrice - context.vwap) / context.vwap) * 100
+      : null;
+
+  if (priceVsVwap !== null) {
+    if (context.trend === "UP" && priceVsVwap < 0) {
+      // Pullback into VWAP in uptrend — valid entry, no penalty
+      vwapQuality = 0.75;
+    } else if (priceVsVwap >= 0) {
+      // At or above VWAP: ideal for LONG
+      vwapQuality = priceVsVwap > 1.0 ? 0.65 : 0.85;
+    } else {
+      // Below VWAP in non-uptrend: dip-buy risk
+      vwapQuality = 0.35;
+      adjustedScore -= 0.3;
+      reasons.push("entry_below_vwap_no_reclaim");
+    }
+  }
+  diagnostics.vwapAlignmentQuality = vwapQuality;
+
+  // ===== PARTICIPATION / VOLUME =====
+  let participationQuality = 0.6;
+  if (context.relVolume != null) {
+    if (context.relVolume >= 1.3) {
+      participationQuality = 0.9;
+    } else if (context.relVolume >= 0.9) {
+      participationQuality = 0.7;
+    } else if (context.relVolume >= 0.65) {
+      participationQuality = 0.45;
+      adjustedScore -= 0.35;
+      reasons.push("mediocre_volume_participation");
+    } else {
+      participationQuality = 0.2;
+      adjustedScore -= 0.55;
+      reasons.push("light_volume_participation");
+    }
+  }
+  diagnostics.participationQuality = participationQuality;
+
+  // ===== MEAN-REVERSION / DIP-BUY FRAMING =====
+  const sl = (summary || "").toLowerCase() + " " + (reasoning || "").toLowerCase();
+  const hasMeanReversionFrame =
+    sl.includes("dip") ||
+    sl.includes("bounce") ||
+    sl.includes("mean reversion") ||
+    sl.includes("mean-reversion") ||
+    sl.includes("oversold") ||
+    sl.includes("counter-trend");
+
+  if (hasMeanReversionFrame) {
+    adjustedScore -= 0.2;
+    reasons.push("mean_reversion_framing");
+  }
+
+  // ===== CONTINUATION STRUCTURE =====
+  let continuationQuality = 0.5;
+  const hasContinuationStructure =
+    sl.includes("continuation") ||
+    sl.includes("pullback to support") ||
+    sl.includes("bull flag") ||
+    sl.includes("higher high") ||
+    sl.includes("breakout");
+  if (hasContinuationStructure) continuationQuality = 0.85;
+  diagnostics.continuationQuality = continuationQuality;
+
+  // ===== COMPOUND WEAK-C PENALTY =====
+  // C-tier (7.0-7.5) with both flat/weak trend AND mediocre volume: extra penalty
+  const inCTier = rawScore >= 7.0 && rawScore < 7.5;
+  const isStructurallyWeak =
+    (context.trend === "FLAT" || context.trend === "DOWN") &&
+    (context.relVolume == null || context.relVolume < 0.8);
+  if (inCTier && isStructurallyWeak) {
+    adjustedScore -= 0.35;
+    reasons.push("compound_weak_c_penalty");
+  }
+
+  // ===== FINAL CLAMP =====
+  adjustedScore = Math.max(0, Math.min(10, adjustedScore));
+  diagnostics.longPenaltyReasons = reasons;
+
+  // ===== SHORT-PREFERRED REDIRECT CHECK =====
+  // If LONG dropped below threshold but SHORT is competitive, recommend SHORT
+  const shortPreferred =
+    adjustedScore < minQualifyScore &&
+    rawShortScore >= rawScore - 0.5 &&
+    rawShortScore >= 6.5;
+
+  return { adjustedScore, diagnostics, penaltyReasons: reasons, shortPreferred };
+}
 
 /**
  * Evaluate SHORT-specific quality factors and determine penalties/adjustments
@@ -952,6 +1285,45 @@ Return ONLY valid JSON:
     }
   }
   
+  // ===== APPLY LONG-SPECIFIC QUALITY PENALTIES =====
+  let longDiagnostics: LongQualityDiagnostics | undefined;
+  let shortPreferredByQuality = false;
+  if (bestDirection === "LONG") {
+    const longQualityResult = evaluateLongQuality({
+      rawScore: winnerScore,
+      rawShortScore: shortScore,
+      summary: _summary,
+      context: signal.signalContext || null,
+      entryPrice: signal.entryPrice,
+      stopPrice: signal.stopPrice,
+      targetPrice: signal.targetPrice,
+      reasoning: signal.reasoning,
+      minQualifyScore: MIN_QUALIFY_SCORE,
+    });
+
+    winnerScore = longQualityResult.adjustedScore;
+    longDiagnostics = longQualityResult.diagnostics;
+    shortPreferredByQuality = longQualityResult.shortPreferred;
+
+    if (longQualityResult.penaltyReasons.length > 0) {
+      const penaltyNote = `(long-quality penalties: ${longQualityResult.penaltyReasons.join(", ")})`;
+      _summary = `${_summary} ${penaltyNote}`;
+    }
+
+    // ===== SHORT PROMOTION =====
+    // If LONG fell below threshold but SHORT is competitive, promote SHORT
+    if (shortPreferredByQuality) {
+      bestDirection = "SHORT";
+      winnerScore = shortScore;
+      _summary = `${shortSummary} [Promoted from LONG: long-quality made SHORT preferable]`;
+    } else {
+      // Re-check qualification after LONG penalties
+      if (hasExplicitSide) {
+        isQualified = winnerScore >= MIN_QUALIFY_SCORE;
+      }
+    }
+  }
+
   // ===== APPLY SHORT-SPECIFIC QUALITY PENALTIES =====
   let shortDiagnostics: ShortQualityDiagnostics | undefined;
   if (bestDirection === "SHORT") {
@@ -978,13 +1350,38 @@ Return ONLY valid JSON:
     }
     
     // Recalculate qualification after applying SHORT penalties
-    if (hasExplicitSide) {
-      // For explicit SHORT signals, re-check qualification threshold
+    if (hasExplicitSide || shortPreferredByQuality) {
       isQualified = winnerScore >= MIN_QUALIFY_SCORE;
     }
     // For neutral signals, bestDirection evaluation already handles qualification via MIN_SHORT_SCORE gate
   }
-  
+
+  // ===== APPLY MARKET POSTURE BIAS =====
+  let postureBias = 0;
+  let postureBiasApplied = false;
+  if (bestDirection !== "NONE") {
+    postureBias = getMarketPostureBias(bestDirection, winnerScore);
+    if (postureBias !== 0) {
+      winnerScore = Math.max(0, Math.min(10, winnerScore + postureBias));
+      postureBiasApplied = true;
+      if (hasExplicitSide) {
+        isQualified = winnerScore >= MIN_QUALIFY_SCORE;
+      }
+    }
+  }
+
+  // ===== COMPUTE EXPLAINABILITY FIELDS =====
+  const ctx = signal.signalContext || null;
+  const vwapBucket = classifyVwapBucket(signal.entryPrice, ctx?.vwap);
+  const trendBucket = classifyTrendBucket(ctx?.trend);
+  const relVolBucket = classifyRelVolBucket(ctx?.relVolume);
+  const liquidityBucket = classifyLiquidityBucket(ctx?.avgVolume, signal.entryPrice);
+  const setupFrame = classifySetupFrame(bestDirection, ctx, _summary);
+  const actionabilityRank =
+    bestDirection !== "NONE"
+      ? computeActionabilityRank(winnerScore, setupFrame, bestDirection, ctx, signal.entryPrice)
+      : 1;
+
   const _grade: AiGrade = gradeFromScore(winnerScore);
   const _direction: "LONG" | "SHORT" | "NONE" = bestDirection;
 
@@ -1000,8 +1397,22 @@ Return ONLY valid JSON:
     longScore,
     shortScore,
     bestDirection,
-    // Short-quality diagnostics
+    // Quality diagnostics
     shortDiagnostics,
+    longDiagnostics,
+    // Explainability fields
+    actionabilityRank,
+    setupFrame,
+    vwapBucket,
+    trendBucket,
+    relVolBucket,
+    liquidityBucket,
+    // Market posture
+    postureBiasApplied,
+    postureBias: postureBiasApplied ? postureBias : undefined,
+    // Direction competition
+    longVsShortEdge: edge,
+    shortPreferred: shortPreferredByQuality,
   };
 
   if (bestDirection === "LONG") {
@@ -1012,7 +1423,7 @@ Return ONLY valid JSON:
     await bumpTodayFunnel({ aiDirectionNone: 1 }).catch(console.warn);
   }
 
-  // Log with SHORT diagnostics if applicable
+  // Log with quality diagnostics
   const logData: any = {
     ticker: result.ticker,
     score: winnerScore,
@@ -1023,10 +1434,20 @@ Return ONLY valid JSON:
     confidence,
     bestDirection,
     edge,
+    setupFrame,
+    actionabilityRank,
+    vwapBucket,
+    trendBucket,
+    relVolBucket,
+    postureBiasApplied,
+    shortPreferred: shortPreferredByQuality,
   };
   
   if (shortDiagnostics) {
     logData.shortDiagnostics = shortDiagnostics;
+  }
+  if (longDiagnostics) {
+    logData.longDiagnostics = longDiagnostics;
   }
   
   console.log("[aiScoring] Result:", logData);
