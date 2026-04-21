@@ -573,8 +573,9 @@ function evaluateLongQuality(params: {
   diagnostics.longTrendQuality = trendQuality;
 
   if (context.trend === "FLAT") {
-    // Reduced from -0.6: flat trend is a meaningful concern but shouldn't kill 7.5+ raw signals
-    adjustedScore -= 0.4;
+    // Strong relVolume partially offsets flat trend concern; reduce penalty when participation is high
+    const flatLongPenalty = (context.relVolume ?? 0) >= 1.3 ? -0.2 : -0.4;
+    adjustedScore += flatLongPenalty;
     reasons.push("flat_trend_long");
   } else if (context.trend === "DOWN") {
     adjustedScore -= 0.8;
@@ -619,10 +620,12 @@ function evaluateLongQuality(params: {
     } else if (context.relVolume >= 0.9) {
       participationQuality = 0.7;
     } else if (context.relVolume >= 0.65) {
-      // Mediocre but not light volume: small trim only — relVol 0.65-0.9 is normal intraday
+      // Mediocre volume: only trim when trend is not UP — uptrend context offsets weak participation
       participationQuality = 0.45;
-      adjustedScore -= 0.15;
-      reasons.push("mediocre_volume_participation");
+      if (context.trend !== "UP") {
+        adjustedScore -= 0.15;
+        reasons.push("mediocre_volume_participation");
+      }
     } else {
       // Light volume: meaningful concern but not disqualifying alone
       participationQuality = 0.2;
@@ -686,12 +689,13 @@ function evaluateLongQuality(params: {
 
   // ===== HARD GATE B: MEAN-REVERSION WITH WEAK VOLUME =====
   // 6.5-7.5 raw score with mean-reversion framing AND mediocre volume → hard reject.
-  // These are exactly the "weak flat longs" masking as valid entries.
+  // Exempt: UP trend + price at/above VWAP (acceptable VWAP context with bullish trend).
   if (
     rawScore >= 6.5 &&
     rawScore < 7.5 &&
     hasMeanReversionFrame &&
-    (context.relVolume == null || context.relVolume < 0.9)
+    (context.relVolume == null || context.relVolume < 0.9) &&
+    !(context.trend === "UP" && priceVsVwap !== null && priceVsVwap > 0)
   ) {
     const hardCap = minQualifyScore - 0.11;
     if (adjustedScore > hardCap) {
@@ -707,12 +711,20 @@ function evaluateLongQuality(params: {
   // ===== SHORT-PREFERRED REDIRECT CHECK =====
   // Two triggers for SHORT promotion:
   // 1. DOWN trend: prefer SHORT when shortScore can survive SHORT quality gates (>= 7.0)
-  // 2. Weak LONG: LONG fell below threshold AND short is genuinely competitive (>= 6.5, within 1.0 pts)
-  // Thresholds raised vs original so promoted shorts actually survive quality evaluation.
+  // 2. Weak LONG + bearish structure: LONG fell below threshold AND short is genuinely competitive
+  // Threshold for weakLong raised from 6.5 → 7.0 so promoted shorts can clear quality evaluation.
   const downTrendPrefersShort = context.trend === "DOWN" && rawShortScore >= 7.0;
+  // Require bearish structure evidence to avoid promoting shorts without conviction
+  const hasBearishStructureEvidence =
+    sl.includes("lower high") ||
+    sl.includes("rejection") ||
+    sl.includes("breakdown") ||
+    sl.includes("reversal") ||
+    context.trend === "DOWN";
   const weakLongPrefersShort =
     adjustedScore < minQualifyScore &&
-    rawShortScore >= 6.5 &&
+    rawShortScore >= 7.0 &&
+    hasBearishStructureEvidence &&
     rawShortScore >= rawScore - 1.0;
   const shortPreferred = downTrendPrefersShort || weakLongPrefersShort;
 
@@ -750,9 +762,20 @@ function evaluateShortQuality(params: {
   const trendQuality = context.trend === "DOWN" ? 0.9 : context.trend === "FLAT" ? 0.3 : 0.1;
   diagnostics.shortTrendQuality = trendQuality;
 
+  // Pre-compute bearish structure: used by trend penalty and structure section below
+  const combinedTextForStructure =
+    (summary || "").toLowerCase() + " " + (reasoning || "").toLowerCase();
+  const hasBearishStructure =
+    combinedTextForStructure.includes("lower high") ||
+    combinedTextForStructure.includes("rejection") ||
+    combinedTextForStructure.includes("breakdown") ||
+    combinedTextForStructure.includes("failed") ||
+    combinedTextForStructure.includes("reversal");
+
   if (context.trend === "FLAT") {
-    // FLAT trend SHORT: harsh penalty
-    adjustedScore -= 1.0;
+    // Bearish structure partially redeems flat-trend shorts; reduce penalty when present
+    const flatShortPenalty = hasBearishStructure ? -0.6 : -1.0;
+    adjustedScore += flatShortPenalty;
     reasons.push("flat_trend_short");
   } else if (context.trend !== "DOWN") {
     // Uptrend SHORT: very harsh penalty
@@ -817,12 +840,11 @@ function evaluateShortQuality(params: {
   }
 
   // ===== TREND SLOPE ASSESSMENT =====
+  // Slope check removed from penalty path: AI score already reflects trend strength; the
+  // -0.15 mechanical knock-on was consistently pushing borderline DOWN-trend shorts below
+  // the 7.0 qualification floor. Log slope for diagnostics only.
   const trendSlopeAbs = Math.abs(context.trendSlopePct || 0);
-  if (context.trend === "DOWN" && trendSlopeAbs < 0.03) {
-    // Weak downtrend slope: minor caution (was -0.3, too large to stack with other penalties)
-    adjustedScore -= 0.15;
-    reasons.push("weak_downtrend_slope");
-  }
+  void trendSlopeAbs; // retained for potential future use
 
   // ===== PARTICIPATION / VOLUME ASSESSMENT =====
   let participationQuality = 0.6; // default neutral
@@ -851,14 +873,9 @@ function evaluateShortQuality(params: {
 
   // ===== BEARISH STRUCTURE ASSESSMENT =====
   let bearishStructureQuality = 0.6; // default, improved by AI summary quality
-  // Check if summary mentions "lower highs", "rejection", "reversal", "breakdown"
+  // Re-use pre-computed hasBearishStructure from above (trend penalty section)
   const summaryLowerCase = (summary || "").toLowerCase();
-  const hasStructure =
-    summaryLowerCase.includes("lower high") ||
-    summaryLowerCase.includes("rejection") ||
-    summaryLowerCase.includes("breakdown") ||
-    summaryLowerCase.includes("failed") ||
-    summaryLowerCase.includes("reversal");
+  const hasStructure = hasBearishStructure;
 
   if (hasStructure) {
     bearishStructureQuality = 0.8;
