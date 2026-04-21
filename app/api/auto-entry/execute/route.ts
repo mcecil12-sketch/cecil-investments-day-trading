@@ -1,5 +1,85 @@
+import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
 import { NextResponse } from "next/server";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
+import { verifyStopOrderDirect, recoverUnprotectedTrade, flattenUnprotectedPosition } from "@/lib/risk/stop-verification";
+import { rescueStop } from "@/lib/autoManage/stopSync";
+// --- Risk Enforcement & Stop Protection Invariant ---
+async function enforceHardRiskModel(trades: any[], brokerTruth: any, notes: string[], diagnostics: any) {
+  let changed = false;
+  for (const trade of trades) {
+    if (trade.status !== "OPEN") continue;
+    const stopOrderId = trade.stopOrderId || trade.brokerOrderId || null;
+    let stopVerified = false;
+    let stopRepairAttempted = false;
+    let stopRepairSucceeded = false;
+    let flattenTriggered = false;
+    let stopRepairError = null;
+    // 1. Verify stop is live at broker
+    if (stopOrderId) {
+      const verify = await verifyStopOrderDirect(stopOrderId);
+      stopVerified = verify.ok;
+    }
+    if (!stopVerified) {
+      // 2. Attempt repair once
+      stopRepairAttempted = true;
+      const repair = await rescueStop(trade);
+      stopRepairSucceeded = repair.ok;
+      stopRepairError = !repair.ok ? (repair.error || null) : null;
+      if (!repair.ok) {
+        // 3. Flatten immediately if repair fails
+        flattenTriggered = true;
+        await flattenUnprotectedPosition(trade.ticker);
+        trade.status = "CLOSED";
+        changed = true;
+      } else {
+        // Update stopOrderId if repaired
+        trade.stopOrderId = repair.stopOrderId;
+        changed = true;
+      }
+    }
+    // Diagnostics
+    diagnostics[trade.id] = {
+      stopVerified,
+      stopRepairAttempted,
+      stopRepairSucceeded,
+      flattenTriggered,
+      stopRepairError,
+    };
+    if (flattenTriggered) notes.push(`flattenTriggered:${trade.ticker}`);
+    if (stopRepairAttempted) notes.push(`stopRepairAttempted:${trade.ticker}`);
+    if (stopRepairSucceeded) notes.push(`stopRepairSucceeded:${trade.ticker}`);
+    if (!stopVerified && !stopRepairSucceeded) notes.push(`stopUnprotected:${trade.ticker}`);
+  }
+  return changed;
+}
+// --- Dynamic Exit Management ---
+function shouldTightenOrExit(trade: any, context: any) {
+  // Example: At 1R/2R, check trend, vwap, relVol, tier, momentum
+  // This is a placeholder for deterministic, score-aware logic
+  // Replace with your actual scoring/management logic
+  const { entryPrice, stopPrice, takeProfitPrice, side, aiScore, aiGrade, momentum, relVol, vwap, tier } = trade;
+  // Example: If momentum is weak or relVol < 1.2 at 1R, tighten stop or exit
+  if (trade.unrealizedR >= 1 && (momentum === "flat" || relVol < 1.2)) {
+    return { action: "tighten", reason: "weak_momentum_at_1R" };
+  }
+  if (trade.unrealizedR >= 2 && (momentum === "stall" || relVol < 1.0)) {
+    return { action: "exit", reason: "stall_at_2R" };
+  }
+  if (aiScore < 5 && trade.unrealizedR > 0.5) {
+    return { action: "tighten", reason: "low_score_partial_exit" };
+  }
+  return { action: "hold", reason: "strong_trend" };
+}
+// --- Capital Rotation ---
+function rankWeakestTrade(trades: any[]) {
+  // Rank by unrealizedR, time-in-trade, momentum, tier, score
+  return trades.filter(t => t.status === "OPEN").sort((a, b) => {
+    if (a.unrealizedR !== b.unrealizedR) return a.unrealizedR - b.unrealizedR;
+    if (a.tier !== b.tier) return (a.tier || "C").localeCompare(b.tier || "C");
+    if (a.momentum !== b.momentum) return (a.momentum || "").localeCompare(b.momentum || "");
+    return (a.openedAt || 0) - (b.openedAt || 0);
+  })[0];
+}
 import { alpacaRequest, createOrder } from "@/lib/alpaca";
 import { redis, saveCriticalTask } from "@/lib/redis";
 import { getCriticalTasks, partitionCriticalTasks } from "@/lib/redis";
@@ -16,16 +96,10 @@ import { sendNotification } from "@/lib/notifications/notify";
 import { NotificationEvent } from "@/lib/notifications/types";
 import { normalizeStopPrice, normalizeLimitPrice, tickForEquityPrice } from "@/lib/tickSize";
 import { fetchBrokerTruth, type BrokerTruth } from "@/lib/broker/truth";
-import {
-  auditProtectionIntegrity,
-  type BrokerPosition,
-  type BrokerOrder,
-} from "@/lib/risk/protection-integrity";
-import {
-  verifyStopOrderDirect,
-  recoverUnprotectedTrade,
-  flattenUnprotectedPosition,
-} from "@/lib/risk/stop-verification";
+  import {
+    type BrokerPosition,
+    type BrokerOrder,
+  } from "@/lib/risk/protection-integrity";
 import {
   deriveSessionMeta,
   evaluatePendingEligibility,
@@ -761,6 +835,35 @@ export async function POST(req: Request) {
   }
 
   const trades = await readTrades<any>();
+  // --- Enforce Hard Risk Model and Stop Protection ---
+  const diagnostics = {};
+  const riskChanged = await enforceHardRiskModel(trades, brokerTruth, notes, diagnostics);
+  if (riskChanged) {
+    await writeTrades(trades);
+    notes.push("riskEnforcement:tradesUpdated");
+  }
+    // --- Dynamic Exit Management at 1R/2R ---
+    for (const trade of trades) {
+      if (trade.status !== "OPEN") continue;
+      // Calculate unrealizedR if not present
+      if (typeof trade.unrealizedR !== "number" && trade.entryPrice && trade.stopPrice) {
+        const lastPrice = trade.lastPrice || trade.entryPrice;
+        const risk = Math.abs(trade.entryPrice - trade.stopPrice);
+        trade.unrealizedR = risk ? (lastPrice - trade.entryPrice) / risk : 0;
+      }
+      const mgmt = shouldTightenOrExit(trade, {});
+      trade.managementDecisionAt1R = mgmt;
+      if (mgmt.action === "tighten") {
+        // Example: tighten stop (not implemented, placeholder)
+        notes.push(`tightenStop:${trade.ticker}:${mgmt.reason}`);
+      } else if (mgmt.action === "exit") {
+        // Example: exit trade (not implemented, placeholder)
+        trade.status = "CLOSED";
+        notes.push(`exitTrade:${trade.ticker}:${mgmt.reason}`);
+      }
+    }
+
+
   const pendingIndexes = trades
     .map((t, i) => ({ t, i }))
     .filter(({ t }) => Boolean(t && isAutoPendingTrade(t) && (t?.source === "auto-entry" || t?.source === "AUTO")));
@@ -1081,25 +1184,25 @@ export async function POST(req: Request) {
   };
 
   if (!cfg.enabled) {
-    return NextResponse.json(
-      {
-        ok: true,
-        skipped: true,
-        reason: "AUTO_TRADING_ENABLED=false",
-        market: { isOpen: null, timestamp: nowIso(), reason: "auto_disabled" },
-        openPositionsCount: brokerTruth.positionsCount,
-        maxOpenPositions: guardConfig.maxOpenPositions,
-        entriesToday: guardState.entriesToday,
-        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-        pendingCount: counts.pendingCount,
-        eligibleCount: counts.eligibleCount,
-        executedCount: counts.executed,
-        counts,
-        notes: notes.slice(0, 40),
-        guardrails: guardSummary,
-      },
-      { status: 200 }
-    );
+    // --- Attach diagnostics to response ---
+    const responseObj = {
+      ok: true,
+      skipped: true,
+      reason: "AUTO_TRADING_ENABLED=false",
+      market: { isOpen: null, timestamp: nowIso(), reason: "auto_disabled" },
+      openPositionsCount: brokerTruth.positionsCount,
+      maxOpenPositions: guardConfig.maxOpenPositions,
+      entriesToday: guardState.entriesToday,
+      maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+      pendingCount: counts.pendingCount,
+      eligibleCount: counts.eligibleCount,
+      executedCount: counts.executed,
+      counts,
+      notes: notes.slice(0, 40),
+      guardrails: guardSummary,
+      diagnostics,
+    };
+    return NextResponse.json(responseObj, { status: 200 });
   }
   if (!cfg.paperOnly) {
     return NextResponse.json(

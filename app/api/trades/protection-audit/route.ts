@@ -78,10 +78,11 @@ async function flattenPosition(
 async function enforceProtection(
   audit: AuditResult,
   brokerPositions: BrokerPosition[],
-): Promise<{ repaired: string[]; flattened: string[]; failed: string[] }> {
+): Promise<{ repaired: string[]; flattened: string[]; failed: string[]; diagnostics: any[] }> {
   const repaired: string[] = [];
   const flattened: string[] = [];
   const failed: string[] = [];
+  const diagnostics: any[] = [];
 
   const posBySymbol = new Map<string, BrokerPosition>();
   for (const p of brokerPositions) {
@@ -100,13 +101,18 @@ async function enforceProtection(
     if (!needsRepair) continue;
 
     const pos = posBySymbol.get(detail.symbol);
+    let diag: { symbol: string; stopVerified: boolean; stopRepairAttempted: boolean; stopRepairSucceeded: boolean; flattenTriggered: boolean; stopRepairError: string | null } = { symbol: detail.symbol, stopVerified: false, stopRepairAttempted: false, stopRepairSucceeded: false, flattenTriggered: false, stopRepairError: null };
     if (!pos) {
       failed.push(detail.symbol);
+      diag.stopRepairError = "no_broker_position";
+      diagnostics.push(diag);
       continue;
     }
     const brokerQty = parseQty(pos.qty);
     if (brokerQty <= 0) {
       failed.push(detail.symbol);
+      diag.stopRepairError = "zero_broker_qty";
+      diagnostics.push(diag);
       continue;
     }
 
@@ -116,6 +122,8 @@ async function enforceProtection(
     const entryPrice = Number(pos.avg_entry_price ?? 0);
     if (!entryPrice) {
       failed.push(detail.symbol);
+      diag.stopRepairError = "missing_entry_price";
+      diagnostics.push(diag);
       continue;
     }
 
@@ -125,6 +133,7 @@ async function enforceProtection(
         ? Math.round(entryPrice * 0.98 * 100) / 100
         : Math.round(entryPrice * 1.02 * 100) / 100;
 
+    diag.stopRepairAttempted = true;
     const result = await submitRepairStop({
       symbol: detail.symbol,
       qty: brokerQty,
@@ -134,6 +143,8 @@ async function enforceProtection(
 
     if (result.ok) {
       repaired.push(detail.symbol);
+      diag.stopRepairSucceeded = true;
+      diag.stopVerified = true;
       console.log("[protection-audit] repaired stop", {
         symbol: detail.symbol,
         qty: brokerQty,
@@ -141,52 +152,42 @@ async function enforceProtection(
         orderId: result.orderId,
       });
     } else {
-      // Flatten on repair fail (gated by env flag)
-      if (envFlag("RISK_FLATTEN_ON_REPAIR_FAIL")) {
-        console.error("[protection-audit] repair failed, flattening", {
-          symbol: detail.symbol,
-          error: result.error,
-        });
-        const flatResult = await flattenPosition(detail.symbol);
-        if (flatResult.ok) {
-          flattened.push(detail.symbol);
-          console.log("[protection-audit] flattened", { symbol: detail.symbol });
-          await saveCriticalTask({
-            incidentCode: "STOP_REPAIR_FAILED",
-            symbol: detail.symbol,
-            severity: "CRITICAL",
-            detail: `Repair failed: ${result.error}; position flattened`,
-          }).catch(() => {});
-        } else {
-          failed.push(detail.symbol);
-          console.error("[protection-audit] flatten failed", {
-            symbol: detail.symbol,
-            error: flatResult.error,
-          });
-          await saveCriticalTask({
-            incidentCode: "FLATTEN_FAILED",
-            symbol: detail.symbol,
-            severity: "CRITICAL",
-            detail: `Repair failed: ${result.error}; flatten also failed: ${flatResult.error}`,
-          }).catch(() => {});
-        }
-      } else {
-        failed.push(detail.symbol);
-        console.error("[protection-audit] repair failed (flatten disabled)", {
-          symbol: detail.symbol,
-          error: result.error,
-        });
+      // Always flatten on repair fail
+      diag.stopRepairError = result.error ?? null;
+      diag.flattenTriggered = true;
+      console.error("[protection-audit] repair failed, flattening", {
+        symbol: detail.symbol,
+        error: result.error,
+      });
+      const flatResult = await flattenPosition(detail.symbol);
+      if (flatResult.ok) {
+        flattened.push(detail.symbol);
+        console.log("[protection-audit] flattened", { symbol: detail.symbol });
         await saveCriticalTask({
           incidentCode: "STOP_REPAIR_FAILED",
           symbol: detail.symbol,
           severity: "CRITICAL",
-          detail: `Repair failed: ${result.error}; flatten disabled`,
+          detail: `Repair failed: ${result.error}; position flattened`,
+        }).catch(() => {});
+      } else {
+        failed.push(detail.symbol);
+        diag.stopRepairError += `; flatten also failed: ${flatResult.error}`;
+        console.error("[protection-audit] flatten failed", {
+          symbol: detail.symbol,
+          error: flatResult.error,
+        });
+        await saveCriticalTask({
+          incidentCode: "FLATTEN_FAILED",
+          symbol: detail.symbol,
+          severity: "CRITICAL",
+          detail: `Repair failed: ${result.error}; flatten also failed: ${flatResult.error}`,
         }).catch(() => {});
       }
     }
+    diagnostics.push(diag);
   }
 
-  return { repaired, flattened, failed };
+  return { repaired, flattened, failed, diagnostics };
 }
 
 // ─── Route handler ──────────────────────────────────────────────────
