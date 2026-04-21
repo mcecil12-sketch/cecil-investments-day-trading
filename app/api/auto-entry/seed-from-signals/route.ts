@@ -167,6 +167,7 @@ type QualifiedCandidate = {
   createdAt: string;
   shortPenalty: number;
   effectiveScore: number;
+  actionabilityRank: number; // 1-10 from aiScoring, higher = more actionable
 };
 
 /**
@@ -195,6 +196,10 @@ function dedupeCandidates(candidates: QualifiedCandidate[]): {
       if (b.effectiveScore !== a.effectiveScore) {
         return b.effectiveScore - a.effectiveScore;
       }
+      // Secondary: actionability rank (continuation/breakout above mean-reversion)
+      if (b.actionabilityRank !== a.actionabilityRank) {
+        return b.actionabilityRank - a.actionabilityRank;
+      }
       // Tie-breaker: newest signal first
       const aTime = new Date(a.createdAt).getTime() || 0;
       const bTime = new Date(b.createdAt).getTime() || 0;
@@ -206,8 +211,12 @@ function dedupeCandidates(candidates: QualifiedCandidate[]): {
     collapsedCount += group.length - 1;
   }
 
-  // Final sort by effectiveScore DESC for consistent ordering
-  unique.sort((a, b) => b.effectiveScore - a.effectiveScore);
+  // Final sort: primary by effectiveScore; within 0.3 points, prefer higher actionabilityRank
+  unique.sort((a, b) => {
+    const scoreDiff = b.effectiveScore - a.effectiveScore;
+    if (Math.abs(scoreDiff) > 0.3) return scoreDiff;
+    return b.actionabilityRank - a.actionabilityRank;
+  });
 
   return { unique, collapsedCount };
 }
@@ -516,6 +525,7 @@ export async function POST(req: NextRequest) {
 
     // Calculate effective score (aiScore - shortPenalty for shorts)
     const effectiveScore = aiScore - shortPenalty;
+    const actionabilityRank = getNum(s, ["actionabilityRank"]) ?? 5;
 
     const createdAt = String(s?.createdAt || s?.updatedAt || new Date().toISOString());
 
@@ -532,6 +542,7 @@ export async function POST(req: NextRequest) {
       createdAt,
       shortPenalty,
       effectiveScore,
+      actionabilityRank,
     });
   }
 

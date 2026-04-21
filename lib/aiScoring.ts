@@ -555,6 +555,13 @@ function evaluateLongQuality(params: {
 
   // No context = no structural adjustments
   if (!context) {
+    // Conservative default: borderline LONGs without context get a small uncertainty penalty.
+    // This prevents signals processed when market-data is unavailable from slipping through
+    // with full raw scores (context build failures are common after hours/on timeouts).
+    if (rawScore >= 6.5 && rawScore < 7.5) {
+      adjustedScore -= 0.3;
+      reasons.push("no_context_conservative");
+    }
     return { adjustedScore, diagnostics, penaltyReasons: reasons, shortPreferred: false };
   }
 
@@ -657,16 +664,48 @@ function evaluateLongQuality(params: {
     reasons.push("compound_weak_c_penalty");
   }
 
+  // ===== HARD GATE A: WEAK RANGE LONGS (flat/down trend) =====
+  // 6.0-7.2 raw score with flat or down trend → force below qualification threshold.
+  // These are "trying to qualify" longs with no bullish trend to support them.
+  const inWeakRange = rawScore >= 6.0 && rawScore < 7.2;
+  if (inWeakRange && (context.trend === "FLAT" || context.trend === "DOWN")) {
+    const hardCap = minQualifyScore - 0.11; // 6.89 when minQualify = 7.0
+    if (adjustedScore > hardCap) {
+      adjustedScore = hardCap;
+      reasons.push("hard_gate_flat_trend_weak_range");
+    }
+  }
+
+  // ===== HARD GATE B: MEAN-REVERSION WITH WEAK VOLUME =====
+  // 6.5-7.5 raw score with mean-reversion framing AND mediocre volume → hard reject.
+  // These are exactly the "weak flat longs" masking as valid entries.
+  if (
+    rawScore >= 6.5 &&
+    rawScore < 7.5 &&
+    hasMeanReversionFrame &&
+    (context.relVolume == null || context.relVolume < 0.9)
+  ) {
+    const hardCap = minQualifyScore - 0.11;
+    if (adjustedScore > hardCap) {
+      adjustedScore = hardCap;
+      reasons.push("hard_gate_mean_reversion_weak_vol");
+    }
+  }
+
   // ===== FINAL CLAMP =====
   adjustedScore = Math.max(0, Math.min(10, adjustedScore));
   diagnostics.longPenaltyReasons = reasons;
 
   // ===== SHORT-PREFERRED REDIRECT CHECK =====
-  // If LONG dropped below threshold but SHORT is competitive, recommend SHORT
-  const shortPreferred =
+  // Two triggers for SHORT promotion:
+  // 1. DOWN trend: always prefer SHORT when shortScore is decent (trend contradicts LONG)
+  // 2. Weak LONG: if LONG fell below threshold AND short is within 1.5 points
+  const downTrendPrefersShort = context.trend === "DOWN" && rawShortScore >= 6.0;
+  const weakLongPrefersShort =
     adjustedScore < minQualifyScore &&
-    rawShortScore >= rawScore - 0.5 &&
-    rawShortScore >= 6.5;
+    rawShortScore >= 5.5 &&
+    rawShortScore >= rawScore - 1.5;
+  const shortPreferred = downTrendPrefersShort || weakLongPrefersShort;
 
   return { adjustedScore, diagnostics, penaltyReasons: reasons, shortPreferred };
 }
@@ -969,6 +1008,17 @@ SHORT setups must meet HIGHER standards than LONG setups to score well. Apply th
 - Shorts with weak participation: max 7.0.
 - Shorts with flat trend: max 6.5-6.8.
 - Shorts without strong extension from recent range: max 6.8.
+
+** LONG SCORING STANDARDS — TIGHTEN AGAINST WEAK SETUPS **
+Strong LONG requires: UP trend + entry at or above VWAP + relVolume >= 1.0 + continuation or breakout structure.
+Apply these gates when scoring LONGs:
+- FLAT trend LONG: max score 7.0 unless the breakout structure is very clean and volume confirms. Most flat-trend longs should score 6.0-6.8.
+- DOWN trend LONG (buying against the trend): max 6.5. Very unusual to score higher.
+- LONG entry well below VWAP without clear reclaim thesis: max 6.8.
+- Mean-reversion / dip-buy / bounce framing (oversold, "holding support", counter-trend): max 7.0. Require volume confirmation and uptrend for higher.
+- relVolume < 0.9 (mediocre participation): cap at 7.2. relVolume < 0.7 (light): cap at 6.8.
+- C-tier attempt (6.5-7.5) with flat trend AND relVolume < 1.0: absolute maximum 6.9.
+These are firm floors/caps: override only if the structure is clearly exceptional.
 
 - Return ONLY a compact JSON object with fields:
   {"longScore": number, "shortScore": number, "longSummary": string, "shortSummary": string, "chosenDirection": "LONG"|"SHORT"|"NONE", "confidence": number}.
@@ -1317,10 +1367,10 @@ Return ONLY valid JSON:
       winnerScore = shortScore;
       _summary = `${shortSummary} [Promoted from LONG: long-quality made SHORT preferable]`;
     } else {
-      // Re-check qualification after LONG penalties
-      if (hasExplicitSide) {
-        isQualified = winnerScore >= MIN_QUALIFY_SCORE;
-      }
+      // Always re-check qualification after LONG quality penalties.
+      // BUG FIX: Mode 2 (neutral) signals previously kept isQualified=true even after
+      // quality penalties dropped winnerScore below threshold.
+      isQualified = winnerScore >= MIN_QUALIFY_SCORE;
     }
   }
 
