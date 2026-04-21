@@ -573,16 +573,17 @@ function evaluateLongQuality(params: {
   diagnostics.longTrendQuality = trendQuality;
 
   if (context.trend === "FLAT") {
-    adjustedScore -= 0.6;
+    // Reduced from -0.6: flat trend is a meaningful concern but shouldn't kill 7.5+ raw signals
+    adjustedScore -= 0.4;
     reasons.push("flat_trend_long");
   } else if (context.trend === "DOWN") {
     adjustedScore -= 0.8;
     reasons.push("downtrend_long_contradiction");
   } else {
-    // UP trend — check for weak slope
+    // UP trend — weak slope is a minor signal, not a major structural flaw
     const slope = Math.abs(context.trendSlopePct || 0);
     if (slope < 0.02) {
-      adjustedScore -= 0.25;
+      adjustedScore -= 0.10;
       reasons.push("weak_uptrend_slope");
     }
   }
@@ -656,12 +657,15 @@ function evaluateLongQuality(params: {
   diagnostics.continuationQuality = continuationQuality;
 
   // ===== COMPOUND WEAK-C PENALTY =====
-  // C-tier (7.0-7.5) with both flat/weak trend AND mediocre volume: extra penalty
+  // C-tier (7.0-7.5) with both flat/weak trend AND mediocre volume: extra penalty.
+  // Only fires when flat/down-trend was NOT already applied; prevents double-penalizing.
   const inCTier = rawScore >= 7.0 && rawScore < 7.5;
   const isStructurallyWeak =
     (context.trend === "FLAT" || context.trend === "DOWN") &&
     (context.relVolume == null || context.relVolume < 0.8);
-  if (inCTier && isStructurallyWeak) {
+  const trendAlreadyPenalized =
+    reasons.includes("flat_trend_long") || reasons.includes("downtrend_long_contradiction");
+  if (inCTier && isStructurallyWeak && !trendAlreadyPenalized) {
     adjustedScore -= 0.35;
     reasons.push("compound_weak_c_penalty");
   }
@@ -700,13 +704,14 @@ function evaluateLongQuality(params: {
 
   // ===== SHORT-PREFERRED REDIRECT CHECK =====
   // Two triggers for SHORT promotion:
-  // 1. DOWN trend: always prefer SHORT when shortScore is decent (trend contradicts LONG)
-  // 2. Weak LONG: if LONG fell below threshold AND short is within 1.5 points
-  const downTrendPrefersShort = context.trend === "DOWN" && rawShortScore >= 6.0;
+  // 1. DOWN trend: prefer SHORT when shortScore can survive SHORT quality gates (>= 7.0)
+  // 2. Weak LONG: LONG fell below threshold AND short is genuinely competitive (>= 6.5, within 1.0 pts)
+  // Thresholds raised vs original so promoted shorts actually survive quality evaluation.
+  const downTrendPrefersShort = context.trend === "DOWN" && rawShortScore >= 7.0;
   const weakLongPrefersShort =
     adjustedScore < minQualifyScore &&
-    rawShortScore >= 5.5 &&
-    rawShortScore >= rawScore - 1.5;
+    rawShortScore >= 6.5 &&
+    rawShortScore >= rawScore - 1.0;
   const shortPreferred = downTrendPrefersShort || weakLongPrefersShort;
 
   return { adjustedScore, diagnostics, penaltyReasons: reasons, shortPreferred };
@@ -770,13 +775,20 @@ function evaluateShortQuality(params: {
       vwapQuality = 0.65;
       diagnostics.vwapAlignmentQuality = vwapQuality;
     } else if (priceVsVwap < 0.5) {
-      // Near VWAP: mediocre
-      vwapQuality = 0.4;
-      diagnostics.vwapAlignmentQuality = vwapQuality;
-      adjustedScore -= 0.4;
-      reasons.push("entry_at_or_above_vwap");
+      // Near VWAP: valid SHORT entry when trend is DOWN (VWAP rejection setup);
+      // otherwise mediocre since entry lacks clear rejection from above.
+      if (context.trend === "DOWN") {
+        vwapQuality = 0.6; // Acceptable: shorting VWAP rejection in downtrend
+        diagnostics.vwapAlignmentQuality = vwapQuality;
+        // No penalty: DOWN trend + near VWAP = classic rejection short
+      } else {
+        vwapQuality = 0.4;
+        diagnostics.vwapAlignmentQuality = vwapQuality;
+        adjustedScore -= 0.4;
+        reasons.push("entry_at_or_above_vwap");
+      }
     } else {
-      // Above VWAP: bad for SHORT
+      // > 0.5% above VWAP: bad for SHORT (chasing extended move above VWAP)
       vwapQuality = 0.1;
       diagnostics.vwapAlignmentQuality = vwapQuality;
       adjustedScore -= 1.5;
