@@ -38,7 +38,7 @@ function envGrade(name: string, fallback: AiGrade): AiGrade {
 }
 
 export function qualifyByScore(score: number): boolean {
-  const min = envNum("AI_MIN_SCORE_TO_QUALIFY", 5.5);
+  const min = envNum("AI_MIN_SCORE_TO_QUALIFY", 6.5);
   return Number.isFinite(score) && score >= min;
 }
 
@@ -50,11 +50,10 @@ export function qualifyByGrade(grade: AiGrade): boolean {
 /**
  * Single source of truth for the minimum score to qualify.
  * Both qualifyByScore and aiScoring.ts must use this same default.
- * Default 5.5: calibrated to actual live AI score distribution (clusters 5.0–6.5).
- * Weak flat mean-reversion longs still fail via quality penalties; valid setups pass.
+ * Default 6.5: allows decent setups through after realistic penalty stack.
  */
 export function minScoreToQualify() {
-  return envNum("AI_MIN_SCORE_TO_QUALIFY", 5.5);
+  return envNum("AI_MIN_SCORE_TO_QUALIFY", 6.5);
 }
 
 /**
@@ -66,9 +65,9 @@ export function minScoreToQualify() {
  */
 export function getQualificationTier(score: number): QualificationTier {
   if (!Number.isFinite(score)) return "REJECT";
-  if (score >= 8.0) return "A";
-  if (score >= 6.5) return "B";
-  if (score >= 5.5) return "C";
+  if (score >= 8.5) return "A";
+  if (score >= 7.5) return "B";
+  if (score >= 7.0) return "C";
   return "REJECT";
 }
 
@@ -78,10 +77,10 @@ export function getQualificationTier(score: number): QualificationTier {
  */
 export function getTierThresholds() {
   return {
-    A: { min: 8.0, max: 10.0, description: "Elite, high-conviction" },
-    B: { min: 6.5, max: 7.99, description: "Good, solid setups" },
-    C: { min: 5.5, max: 6.49, description: "Qualified, minimum threshold" },
-    REJECT: { min: 0, max: 5.49, description: "Not qualified for auto-entry" },
+    A: { min: 8.5, max: 10.0, description: "Elite, high-conviction" },
+    B: { min: 7.5, max: 8.49, description: "Good, solid setups" },
+    C: { min: 7.0, max: 7.49, description: "Qualified, minimum threshold" },
+    REJECT: { min: 0, max: 6.99, description: "Not qualified for auto-entry" },
   };
 }
 

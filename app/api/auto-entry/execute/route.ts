@@ -785,6 +785,9 @@ export async function POST(req: Request) {
     replacementExecuted: 0,
     malformedPendingCount: 0,
     malformedOpenCount: 0,
+    carryoverEvaluatedCount: 0,
+    carryoverExecutedCount: 0,
+    carryoverArchivedCount: 0,
   };
     // Track malformed trades for observability
     const malformedPendingTrades: { id: string, reason: string, symbol?: string }[] = [];
@@ -901,6 +904,11 @@ export async function POST(req: Request) {
     byTickerPending.set(ticker, arr);
   }
 
+  // Track carryover candidates for post-loop revalidation
+  const carryoverCandidatesByTicker = new Map<string, Array<{ t: any; i: number }>>();
+  const tickersWithEligibleTrade = new Set<string>();
+  const carryoverEligibleIndexSet = new Set<number>();
+
   for (const [ticker, group] of byTickerPending.entries()) {
     const sorted = [...group].sort((a, b) => byNewestCreatedAtDesc(a.t, b.t));
     const processed = new Set<number>();
@@ -957,7 +965,7 @@ export async function POST(req: Request) {
 
 
       if (!eligibility.eligible) {
-        if (eligibility.reason === "stale_trade" || eligibility.reason === "carryover_session") {
+        if (eligibility.reason === "stale_trade") {
           trades[item.i] = {
             ...trades[item.i],
             status: "ARCHIVED",
@@ -971,7 +979,33 @@ export async function POST(req: Request) {
           counts.skipped += 1;
           tradesChanged = true;
           processed.add(item.i);
-          notes.push(`${eligibility.reason}:${ticker}:${tradeId || "unknown"}`);
+          notes.push(`stale_trade:${ticker}:${tradeId || "unknown"}`);
+          continue;
+        }
+
+        if (eligibility.reason === "carryover_session") {
+          // Skip if already executed at broker (idempotency)
+          if (item.t?.brokerOrderId) {
+            trades[item.i] = {
+              ...trades[item.i],
+              status: "ARCHIVED",
+              autoEntryStatus: "AUTO_ARCHIVED",
+              reason: "duplicate_auto_pending",
+              error: undefined,
+              closedAt: trades[item.i]?.closedAt || nowForPending,
+              updatedAt: nowForPending,
+            };
+            counts.duplicatesArchived += 1;
+            counts.skipped += 1;
+            tradesChanged = true;
+            processed.add(item.i);
+            continue;
+          }
+          // Defer archiving — collect for revalidation after session loop
+          const arr = carryoverCandidatesByTicker.get(ticker) || [];
+          arr.push(item);
+          carryoverCandidatesByTicker.set(ticker, arr);
+          processed.add(item.i); // prevent duplicate_auto_pending archiving
           continue;
         }
 
@@ -1016,6 +1050,7 @@ export async function POST(req: Request) {
       }
 
       selectedIndex = item.i;
+      tickersWithEligibleTrade.add(ticker);
       processed.add(item.i);
       eligibleIndexes.push(item.i);
       break;
@@ -1024,6 +1059,125 @@ export async function POST(req: Request) {
     if (selectedIndex != null) {
       for (const item of sorted) {
         if (processed.has(item.i)) continue;
+        trades[item.i] = {
+          ...trades[item.i],
+          status: "ARCHIVED",
+          autoEntryStatus: "AUTO_ARCHIVED",
+          reason: "duplicate_auto_pending",
+          error: undefined,
+          closedAt: trades[item.i]?.closedAt || nowForPending,
+          updatedAt: nowForPending,
+        };
+        counts.duplicatesArchived += 1;
+        counts.skipped += 1;
+        tradesChanged = true;
+      }
+    }
+  }
+
+  // ─── Carryover Revalidation ──────────────────────────────────────────────
+  // For trades from a prior session, revalidate against current market conditions.
+  // If valid → include in eligible execution set.
+  // If invalid → archive with reason "invalid_after_revalidation".
+  for (const [carryoverTicker, candidates] of carryoverCandidatesByTicker.entries()) {
+    counts.carryoverEvaluatedCount += candidates.length;
+
+    // If a current-session trade was already selected for this ticker, archive carryover as duplicates
+    if (tickersWithEligibleTrade.has(carryoverTicker)) {
+      for (const item of candidates) {
+        trades[item.i] = {
+          ...trades[item.i],
+          status: "ARCHIVED",
+          autoEntryStatus: "AUTO_ARCHIVED",
+          reason: "invalid_after_revalidation",
+          error: undefined,
+          closedAt: trades[item.i]?.closedAt || nowForPending,
+          updatedAt: nowForPending,
+        };
+        counts.carryoverArchivedCount += 1;
+        counts.skipped += 1;
+        tradesChanged = true;
+        notes.push(`carryover_revalidated:${carryoverTicker}:archived`);
+      }
+      continue;
+    }
+
+    // Sort by newest first
+    const carryoverSorted = [...candidates].sort((a, b) => byNewestCreatedAtDesc(a.t, b.t));
+
+    // Fetch current market quote once per ticker
+    let carryoverQuote: QuoteLike | null = null;
+    try {
+      carryoverQuote = await fetchQuoteForSymbol(carryoverTicker);
+    } catch {
+      // quote unavailable — price-drift check will be skipped
+    }
+
+    let carryoverSelectedForTicker = false;
+    for (const item of carryoverSorted) {
+      const tradeId = String(item.t?.id || "");
+
+      // Skip if already executed at broker (idempotency)
+      if (item.t?.brokerOrderId) {
+        notes.push(`carryover_revalidated:${carryoverTicker}:skip_already_executed`);
+        continue;
+      }
+
+      // Validate required fields and stop direction
+      if (!hasValidPendingRisk(item.t)) {
+        trades[item.i] = {
+          ...trades[item.i],
+          status: "ARCHIVED",
+          autoEntryStatus: "AUTO_ARCHIVED",
+          reason: "invalid_after_revalidation",
+          error: undefined,
+          closedAt: trades[item.i]?.closedAt || nowForPending,
+          updatedAt: nowForPending,
+        };
+        counts.carryoverArchivedCount += 1;
+        counts.skipped += 1;
+        tradesChanged = true;
+        notes.push(`carryover_revalidated:${carryoverTicker}:archived`);
+        continue;
+      }
+
+      // Validate price drift against current market
+      if (carryoverQuote) {
+        const currentPrice =
+          carryoverQuote.last ??
+          carryoverQuote.mid ??
+          (carryoverQuote.bid && carryoverQuote.ask
+            ? (carryoverQuote.bid + carryoverQuote.ask) / 2
+            : null);
+        if (currentPrice && currentPrice > 0) {
+          const driftReason = checkPriceDrift(currentPrice, safeNum(item.t.entryPrice, 0), safeNum(item.t.stopPrice, 0));
+          if (driftReason) {
+            trades[item.i] = {
+              ...trades[item.i],
+              status: "ARCHIVED",
+              autoEntryStatus: "AUTO_ARCHIVED",
+              reason: "invalid_after_revalidation",
+              error: undefined,
+              closedAt: trades[item.i]?.closedAt || nowForPending,
+              updatedAt: nowForPending,
+            };
+            counts.carryoverArchivedCount += 1;
+            counts.skipped += 1;
+            tradesChanged = true;
+            notes.push(`carryover_revalidated:${carryoverTicker}:archived`);
+            continue;
+          }
+        }
+      }
+
+      // Trade passed revalidation
+      if (!carryoverSelectedForTicker) {
+        carryoverSelectedForTicker = true;
+        carryoverEligibleIndexSet.add(item.i);
+        eligibleIndexes.push(item.i);
+        notes.push(`carryover_revalidated:${carryoverTicker}:executed`);
+      } else {
+        // Archive extra carryover candidates for same ticker as duplicates
         trades[item.i] = {
           ...trades[item.i],
           status: "ARCHIVED",
@@ -1568,6 +1722,9 @@ export async function POST(req: Request) {
         pendingCount: counts.pendingCount,
         eligibleCount: counts.eligibleCount,
         executedCount: counts.executed,
+        carryoverEvaluatedCount: counts.carryoverEvaluatedCount,
+        carryoverExecutedCount: counts.carryoverExecutedCount,
+        carryoverArchivedCount: counts.carryoverArchivedCount,
         counts,
         notes: notes.slice(0, 40),
         guardrails: guardSummary,
@@ -2630,6 +2787,9 @@ export async function POST(req: Request) {
     trades[idx] = updated;
     await writeTrades(trades);
     counts.executed += 1;
+    if (carryoverEligibleIndexSet.has(idx)) {
+      counts.carryoverExecutedCount += 1;
+    }
 
     await guardrailsStore.bumpEntry(etDate, ticker);
     guardSummary.entriesToday += 1;
@@ -2678,6 +2838,9 @@ export async function POST(req: Request) {
         pendingCount: counts.pendingCount,
         eligibleCount: counts.eligibleCount,
         executedCount: counts.executed,
+        carryoverEvaluatedCount: counts.carryoverEvaluatedCount,
+        carryoverExecutedCount: counts.carryoverExecutedCount,
+        carryoverArchivedCount: counts.carryoverArchivedCount,
         counts,
         notes: notes.slice(0, 40),
         guardrails: guardSummary,
