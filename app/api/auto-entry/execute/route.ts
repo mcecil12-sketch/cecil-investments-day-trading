@@ -2079,8 +2079,87 @@ export async function POST(req: Request) {
   const targetPriceRaw = safeNum(trade.takeProfitPrice ?? trade.targetPrice, 0);
   const targetPrice = targetPriceRaw > 0 ? targetPriceRaw : null;
 
-  if (!ticker || (side !== "LONG" && side !== "SHORT") || entryPrice <= 0 || stopPrice <= 0) {
-    return NextResponse.json({ ok: false, error: "trade missing ticker/side/entryPrice/stopPrice", tradeId }, { status: 400 });
+  // ─── HARD VALIDATION: All three fields must be present ─────────────
+  // DO NOT fallback to % calculation. Missing fields = ERROR.
+  if (!entryPrice || !stopPrice || !targetPrice) {
+    const now = nowIso();
+    trades[idx] = {
+      ...trade,
+      status: "ERROR",
+      autoEntryStatus: "AUTO_ERROR",
+      reason: "missing_trade_plan",
+      error: "missing_trade_plan",
+      errorDetails: {
+        entryPrice: trade.entryPrice ?? null,
+        stopPrice: trade.stopPrice ?? null,
+        targetPrice: trade.takeProfitPrice ?? trade.targetPrice ?? null,
+      },
+      updatedAt: now,
+    };
+    await writeTrades(trades);
+    counts.invalidMarked += 1;
+    counts.skipped += 1;
+    await recordOutcome({ outcome: "FAIL", reason: "missing_trade_plan", ticker, tradeId });
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "missing_trade_plan",
+        detail: "Trade is missing entryPrice, stopPrice, or targetPrice — no fallback % calculation allowed",
+        tradeId,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
+      { status: 422 }
+    );
+  }
+
+  // ─── HARD DIRECTIONAL VALIDATION ───────────────────────────────────
+  // LONG: stop < entry < target
+  // SHORT: target < entry < stop
+  const sideEnum: Side = side === "LONG" ? "LONG" : "SHORT";
+  const tradePlanValid =
+    sideEnum === "LONG"
+      ? stopPrice < entryPrice && targetPrice > entryPrice
+      : stopPrice > entryPrice && targetPrice < entryPrice;
+
+  if (!tradePlanValid) {
+    const validationFailure =
+      sideEnum === "LONG"
+        ? `LONG requires stopPrice(${stopPrice}) < entryPrice(${entryPrice}) < targetPrice(${targetPrice})`
+        : `SHORT requires targetPrice(${targetPrice}) < entryPrice(${entryPrice}) < stopPrice(${stopPrice})`;
+    const now = nowIso();
+    trades[idx] = {
+      ...trade,
+      status: "ERROR",
+      autoEntryStatus: "AUTO_ERROR",
+      reason: "missing_trade_plan",
+      error: "missing_trade_plan",
+      errorDetails: { entryPrice, stopPrice, targetPrice, side: sideEnum, validationFailure },
+      updatedAt: now,
+    };
+    await writeTrades(trades);
+    counts.invalidMarked += 1;
+    counts.skipped += 1;
+    await recordOutcome({ outcome: "FAIL", reason: "missing_trade_plan", ticker, tradeId });
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "missing_trade_plan",
+        detail: validationFailure,
+        tradeId,
+        market: { isOpen: marketOpen, timestamp: marketTimestamp },
+        counts,
+        notes: notes.slice(0, 40),
+        guardrails: guardSummary,
+      },
+      { status: 422 }
+    );
+  }
+
+  if (!ticker || (side !== "LONG" && side !== "SHORT")) {
+    return NextResponse.json({ ok: false, error: "trade missing ticker/side", tradeId }, { status: 400 });
   }
 
   const lockKey = `lock:auto-entry:${ticker}`;
@@ -2175,60 +2254,65 @@ export async function POST(req: Request) {
   const sideDirection = side === "LONG" ? "buy" : "sell";
   const redisLockKey = `lock:auto-entry:${ticker}`;
   const startedAt = nowIso();
-  const sideEnum: Side = side === "LONG" ? "LONG" : "SHORT";
 
+  // ─── SINGLE SOURCE OF TRUTH ─────────────────────────────────────────
+  // Fetch live quote ONLY for price drift detection — NOT for computing prices.
+  // All bracket prices come exclusively from the stored trade plan.
   const quote = await fetchQuoteForSymbol(ticker);
   const decision = resolveDecisionPrice({ seedEntryPrice: entryPrice, quote });
-  const basePriceForValidation =
+
+  const decisionPriceForDrift =
     Number.isFinite(decision.decisionPrice) && decision.decisionPrice > 0
-      ? Number(decision.decisionPrice)
-      : Number(entryPrice);
+      ? decision.decisionPrice
+      : null;
 
-  const computedBasePrice = Number(basePriceForValidation.toFixed(4));
-  const submitBasePrice = Number(basePriceForValidation.toFixed(2));
-  const stopDistance = Math.abs(entryPrice - stopPrice);
-  const rr = 1;
-
-  const tpRaw = sideEnum === "LONG"
-    ? submitBasePrice + stopDistance * rr
-    : submitBasePrice - stopDistance * rr;
-
-  let tp = Math.round(tpRaw * 100) / 100;
-  let bracketStop = Math.round((sideEnum === "LONG" ? submitBasePrice - stopDistance : submitBasePrice + stopDistance) * 100) / 100;
-
-  const bracketGuard = ensureBracketLegsValid({
-    side: sideEnum,
-    basePrice: submitBasePrice,
-    takeProfitLimit: tp,
-    stopLossStop: bracketStop,
-  });
-  tp = bracketGuard.takeProfitLimit;
-  bracketStop = bracketGuard.stopLossStop;
-
-  const TP_MIN_OFFSET_FORCE = 0.50;
-  if (sideEnum === "LONG") {
-    const minTp = Number((submitBasePrice + TP_MIN_OFFSET_FORCE).toFixed(2));
-    if (tp < minTp) tp = minTp;
-  } else {
-    const maxTp = Number((submitBasePrice - TP_MIN_OFFSET_FORCE).toFixed(2));
-    if (tp > maxTp) tp = maxTp;
+  // Price drift guard: if the live market has moved too far from the planned entry,
+  // skip this trade. Do NOT recalculate and place at the wrong price.
+  if (decisionPriceForDrift) {
+    const driftReason = checkPriceDrift(decisionPriceForDrift, entryPrice, stopPrice);
+    if (driftReason) {
+      counts.skipped += 1;
+      await recordOutcome({ outcome: "SKIP", reason: driftReason, ticker, tradeId });
+      return NextResponse.json(
+        {
+          ok: true,
+          skipped: true,
+          reason: driftReason,
+          detail: `Live price ${decisionPriceForDrift.toFixed(2)} drifted from planned entry ${entryPrice.toFixed(2)} — order not placed`,
+          tradeId,
+          market: { isOpen: marketOpen, timestamp: marketTimestamp },
+          counts,
+          notes: notes.slice(0, 40),
+          guardrails: guardSummary,
+        },
+        { status: 200 }
+      );
+    }
   }
 
-  if (sideDirection === "buy") {
-    const minTpAbs = Number((submitBasePrice + AUTO_ENTRY_TP_MIN_ABS).toFixed(2));
-    if (tp < minTpAbs) tp = minTpAbs;
-  } else {
-    const maxTpAbs = Number((submitBasePrice - AUTO_ENTRY_TP_MIN_ABS).toFixed(2));
-    if (tp > maxTpAbs) tp = maxTpAbs;
-  }
-
-  tp = Number(tp.toFixed(2));
-  bracketStop = Number(bracketStop.toFixed(2));
+  // submitBasePrice = trade plan entry price. NEVER the live quote.
+  // tp and bracketStop = trade plan values directly. NO recalculation.
+  const submitBasePrice = Number(entryPrice.toFixed(2));
+  const computedBasePrice = submitBasePrice;
+  let tp = Number(targetPrice.toFixed(2));
+  let bracketStop = Number(stopPrice.toFixed(2));
 
   const initialStopCheck = stopValidationSummary({
     side: sideEnum,
     base: submitBasePrice,
     stop: bracketStop,
+  });
+
+  // Log execution payload for observability (requirement: log source)
+  console.log("[auto-entry] execution payload (single source of truth)", {
+    symbol: ticker,
+    entryPrice,
+    stopPrice: bracketStop,
+    targetPrice: tp,
+    source: "signal_trade_plan",
+    decisionPriceForDrift,
+    sideEnum,
+    qty,
   });
 
   const dbg: any = {
@@ -2237,13 +2321,13 @@ export async function POST(req: Request) {
     entryPrice,
     stopPrice,
     targetPrice,
+    source: "signal_trade_plan",
     quote,
     decisionPrice: decision.decisionPrice,
     decisionSource: decision.source,
+    decisionPriceForDrift,
     computedBasePrice,
-    basePriceForValidation,
     submitBasePrice,
-    stopDistance,
     originalTargetPrice: targetPrice,
     stopValidationComparison: initialStopCheck.comparison,
     stopValidationPassed: initialStopCheck.passed,
