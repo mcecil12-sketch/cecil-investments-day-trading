@@ -10,9 +10,9 @@ import { minScoreToQualify } from "@/lib/aiQualify";
 
 function dynamicMinScore(sessionMinutes: number) {
   const m = Number.isFinite(sessionMinutes) ? sessionMinutes : 60;
-  if (m <= 15) return { c: 6.3, b: 7.2, a: 8.4 };
-  if (m <= 90) return { c: 6.5, b: 7.5, a: 8.5 };
-  return { c: 6.8, b: 7.8, a: 8.7 };
+  if (m <= 15) return { c: 5.5, b: 6.5, a: 8.0 };
+  if (m <= 90) return { c: 5.5, b: 6.5, a: 8.0 };
+  return { c: 6.0, b: 7.0, a: 8.5 };
 }
 
 function tierFromScore(score: number, mins: {c:number;b:number;a:number}) {
@@ -106,6 +106,9 @@ export type ScoredSignal = RawSignal & {
   shortPreferred?: boolean | null;
   // Qualification observability: why did this pass/fail and why did direction stay/flip
   qualifyDiagnostic?: string | null;
+  // Decision observability: explicit policy name and reason for final direction choice
+  finalDecisionReason?: string | null;
+  finalDirectionPolicyUsed?: string | null;
   // Scorer version tag for smoke-test confirmation
   _scorerVersion?: string;
 };
@@ -657,10 +660,10 @@ function evaluateLongQuality(params: {
   diagnostics.continuationQuality = continuationQuality;
 
   // ===== TOTAL ADJUSTMENT CAP =====
-  // Prevent runaway penalty stacking: no signal should lose more than 0.65 from quality
-  // evaluation alone. This ensures a 7.0 AI score can still clear a 6.5 threshold even
-  // with multiple structural concerns (the AI's own rubric already priced them in).
-  const minAllowedByPenaltyCap = rawScore - 0.65;
+  // Prevent runaway penalty stacking: no signal should lose more than 0.45 from quality
+  // evaluation alone. Reduced from 0.65 to preserve more score headroom for valid setups
+  // whose raw score already reflects the AI's own structural judgment.
+  const minAllowedByPenaltyCap = rawScore - 0.45;
   if (adjustedScore < minAllowedByPenaltyCap) {
     adjustedScore = minAllowedByPenaltyCap;
     reasons.push("penalty_cap_applied");
@@ -672,11 +675,13 @@ function evaluateLongQuality(params: {
 
   // ===== SHORT-PREFERRED REDIRECT CHECK =====
   // Signals that arrive with side="LONG" can still pivot to SHORT here when:
-  //   1. Trend is DOWN and the AI gave shortScore a decent floor (>= 6.0), OR
+  //   1. Trend is DOWN and the AI gave shortScore a real floor (>= 4.5), OR
   //   2. The LONG setup collapsed below qualify threshold AND the short side is competitive
   // Bearish structure evidence broadened to catch flat+below-VWAP cases that lack
   // keyword signals (common intraday when AI summary is terse).
-  const downTrendPrefersShort = context.trend === "DOWN" && rawShortScore >= 6.0;
+  // NOTE: The absolute floor was lowered from 6.0 → 4.5 because live AI scores cluster
+  // in 5.0–6.5 range; the relative check (rawScore - 1.5) is the real constraint.
+  const downTrendPrefersShort = context.trend === "DOWN" && rawShortScore >= 4.5;
   const hasBearishStructureEvidence =
     sl.includes("lower high") ||
     sl.includes("rejection") ||
@@ -688,7 +693,7 @@ function evaluateLongQuality(params: {
     (context.trend === "FLAT" && priceVsVwap !== null && priceVsVwap < -0.3); // flat + below VWAP
   const weakLongPrefersShort =
     adjustedScore < minQualifyScore &&
-    rawShortScore >= 6.0 &&          // floor: AI still needs a real short score
+    rawShortScore >= 4.5 &&          // floor: short needs a real AI score (not near-zero noise)
     hasBearishStructureEvidence &&
     rawShortScore >= rawScore - 1.5; // short must be within 1.5 pts of long raw
   const shortPreferred = downTrendPrefersShort || weakLongPrefersShort;
@@ -1272,136 +1277,160 @@ Return ONLY valid JSON:
   }
 
   const edge = Math.abs(longScore - shortScore);
-  const MIN_QUALIFY_SCORE = minScoreToQualify(); // Get the qualification threshold
-  
+  const MIN_QUALIFY_SCORE = minScoreToQualify();
+
+  // Pre-compute context for use in direction decision and explainability below
+  const ctx = signal.signalContext || null;
+  const pvwapFinal = ctx?.vwap && ctx.vwap > 0
+    ? ((signal.entryPrice - ctx.vwap) / ctx.vwap) * 100
+    : null;
+
   let bestDirection: "LONG" | "SHORT" | "NONE" = "NONE";
   let winnerScore = 0;
   let _summary = "";
   let isQualified = false;
-  
-  // Check if signal has explicit side (LONG or SHORT)
-  const hasExplicitSide = signal.side === "LONG" || signal.side === "SHORT";
-  
-  if (hasExplicitSide) {
-    // Mode 1: Explicit directional signal - force direction to match side
-    bestDirection = signal.side as "LONG" | "SHORT";
-    winnerScore = bestDirection === "LONG" ? longScore : shortScore;
-    
-    // Qualify based on score threshold only (not edge gate)
-    isQualified = winnerScore >= MIN_QUALIFY_SCORE;
-    
-    // Build diagnostic summary showing both scores
-    const oppositeScore = bestDirection === "LONG" ? shortScore : longScore;
-    const oppositeDir = bestDirection === "LONG" ? "SHORT" : "LONG";
-    
-    if (isQualified) {
-      // Use the directional summary from AI
-      const baseSummary = bestDirection === "LONG" ? longSummary : shortSummary;
-      _summary = `${baseSummary} [Diagnostic: ${bestDirection} ${winnerScore.toFixed(2)} vs ${oppositeDir} ${oppositeScore.toFixed(2)}, edge ${edge.toFixed(2)}]`;
-    } else {
-      // Failed qualification
-      _summary = `${bestDirection} signal: score ${winnerScore.toFixed(2)} < min ${MIN_QUALIFY_SCORE.toFixed(2)}. [Diagnostic: ${oppositeDir} ${oppositeScore.toFixed(2)}, edge ${edge.toFixed(2)}]`;
-    }
-  } else {
-    // Mode 2: Neutral signal - use directional edge competition gate
-    if (longScore >= MIN_LONG_SCORE && longScore > shortScore && edge >= MIN_EDGE) {
-      bestDirection = "LONG";
-    } else if (shortScore >= MIN_SHORT_SCORE && shortScore > longScore && edge >= MIN_EDGE) {
-      bestDirection = "SHORT";
-    }
-    
-    winnerScore = bestDirection === "LONG" ? longScore :
-                  bestDirection === "SHORT" ? shortScore :
-                  0;
-    
-    isQualified = bestDirection !== "NONE";
-    
-    if (bestDirection === "LONG") {
-      _summary = longSummary;
-    } else if (bestDirection === "SHORT") {
-      _summary = shortSummary;
-    } else {
-      // Failed edge gate - show detailed diagnostic
-      const maxScore = Math.max(longScore, shortScore);
-      const failReasons = [];
-      if (longScore < MIN_LONG_SCORE && shortScore < MIN_SHORT_SCORE) {
-        failReasons.push(`both scores below threshold (LONG ${longScore.toFixed(2)} < ${MIN_LONG_SCORE.toFixed(2)}, SHORT ${shortScore.toFixed(2)} < ${MIN_SHORT_SCORE.toFixed(2)})`);
-      } else if (edge < MIN_EDGE) {
-        failReasons.push(`edge ${edge.toFixed(2)} < min ${MIN_EDGE.toFixed(2)}`);
-      }
-      _summary = `No qualified directional edge. LONG ${longScore.toFixed(2)} vs SHORT ${shortScore.toFixed(2)}, edge ${edge.toFixed(2)}. Failed: ${failReasons.join(", ")}.`;
-    }
-  }
-  
-  // ===== APPLY LONG-SPECIFIC QUALITY PENALTIES =====
-  let longDiagnostics: LongQualityDiagnostics | undefined;
   let shortPreferredByQuality = false;
-  if (bestDirection === "LONG") {
-    const longQualityResult = evaluateLongQuality({
-      rawScore: winnerScore,
-      rawShortScore: shortScore,
-      summary: _summary,
-      context: signal.signalContext || null,
-      entryPrice: signal.entryPrice,
-      stopPrice: signal.stopPrice,
-      targetPrice: signal.targetPrice,
-      reasoning: signal.reasoning,
-      minQualifyScore: MIN_QUALIFY_SCORE,
-    });
-
-    winnerScore = longQualityResult.adjustedScore;
-    longDiagnostics = longQualityResult.diagnostics;
-    shortPreferredByQuality = longQualityResult.shortPreferred;
-
-    if (longQualityResult.penaltyReasons.length > 0) {
-      const penaltyNote = `(long-quality penalties: ${longQualityResult.penaltyReasons.join(", ")})`;
-      _summary = `${_summary} ${penaltyNote}`;
-    }
-
-    // ===== SHORT PROMOTION =====
-    // If LONG fell below threshold but SHORT is competitive, promote SHORT
-    if (shortPreferredByQuality) {
-      bestDirection = "SHORT";
-      winnerScore = shortScore;
-      _summary = `${shortSummary} [Promoted from LONG: long-quality made SHORT preferable]`;
-    } else {
-      // Always re-check qualification after LONG quality penalties.
-      // BUG FIX: Mode 2 (neutral) signals previously kept isQualified=true even after
-      // quality penalties dropped winnerScore below threshold.
-      isQualified = winnerScore >= MIN_QUALIFY_SCORE;
-    }
-  }
-
-  // ===== APPLY SHORT-SPECIFIC QUALITY PENALTIES =====
+  let finalDecisionReason = "";
+  let finalDirectionPolicyUsed = "";
+  let longDiagnostics: LongQualityDiagnostics | undefined;
   let shortDiagnostics: ShortQualityDiagnostics | undefined;
-  if (bestDirection === "SHORT") {
-    const shortQualityResult = evaluateShortQuality({
-      rawScore: winnerScore,
-      summary: _summary,
-      context: signal.signalContext || null,
-      entryPrice: signal.entryPrice,
-      stopPrice: signal.stopPrice,
-      targetPrice: signal.targetPrice,
-      reasoning: signal.reasoning,
-    });
-    
-    winnerScore = shortQualityResult.adjustedScore;
-    // Keep valid scored SHORT outcomes above zero after penalty-only adjustments.
-    winnerScore = Math.max(1.0, winnerScore);
-    shortDiagnostics = shortQualityResult.diagnostics;
-    shortDiagnostics.shortPenaltyReasons = shortQualityResult.penaltyReasons;
-    
-    // Update summary to include penalty info if penalties were applied
-    if (shortQualityResult.penaltyReasons.length > 0) {
-      const penaltyNote = `(penalties: ${shortQualityResult.penaltyReasons.join(", ")})`;
-      _summary = `${_summary} ${penaltyNote}`;
+
+  // ===== QUALIFICATION THRESHOLDS =====
+  // SHORT gets a slightly lower bar to allow bearish setups to qualify.
+  // These are derived from MIN_QUALIFY_SCORE (env: AI_MIN_SCORE_TO_QUALIFY, default 5.5).
+  const LONG_QUAL = MIN_QUALIFY_SCORE;
+  const SHORT_QUAL = Math.max(MIN_QUALIFY_SCORE - 0.5, 4.5);
+
+  // ===== EVALUATE BOTH DIRECTIONS INDEPENDENTLY =====
+  // Always evaluate both sides before deciding direction.
+  // This eliminates the dead zone where a weak LONG stays LONG by default
+  // because short failed a too-high absolute floor check.
+  const longQualResult = evaluateLongQuality({
+    rawScore: longScore,
+    rawShortScore: shortScore,
+    summary: longSummary,
+    context: ctx,
+    entryPrice: signal.entryPrice,
+    stopPrice: signal.stopPrice,
+    targetPrice: signal.targetPrice,
+    reasoning: signal.reasoning,
+    minQualifyScore: LONG_QUAL,
+  });
+  const adjustedLong = longQualResult.adjustedScore;
+  longDiagnostics = longQualResult.diagnostics;
+
+  const shortQualResult = evaluateShortQuality({
+    rawScore: shortScore,
+    summary: shortSummary,
+    context: ctx,
+    entryPrice: signal.entryPrice,
+    stopPrice: signal.stopPrice,
+    targetPrice: signal.targetPrice,
+    reasoning: signal.reasoning,
+  });
+  shortDiagnostics = shortQualResult.diagnostics;
+  shortDiagnostics.shortPenaltyReasons = shortQualResult.penaltyReasons;
+  const adjustedShort = Math.max(1.0, shortQualResult.adjustedScore);
+
+  // ===== BEARISH CONTEXT DETECTION =====
+  // Combine structural context with the expanded bearish-evidence check from evaluateLongQuality.
+  // longQualResult.shortPreferred already detects keyword signals (lower high, rejection, etc.)
+  const bearishContextPresent = !!(
+    ctx?.trend === "DOWN" ||
+    (ctx?.trend === "FLAT" && pvwapFinal !== null && pvwapFinal < -0.3) ||
+    longQualResult.shortPreferred
+  );
+
+  // ===== EXPLICIT FINAL DIRECTION DECISION POLICY =====
+  // Rule-based: does NOT silently leave weak LONG setups as LONG by default.
+  // Each case is named for observability via finalDirectionPolicyUsed / finalDecisionReason.
+  if (signal.side === "SHORT") {
+    // Scanner classified this as SHORT → respect that designation, just apply quality
+    bestDirection = "SHORT";
+    winnerScore = adjustedShort;
+    finalDecisionReason = `scanner_designated_short(adjShort:${adjustedShort.toFixed(2)})`;
+    finalDirectionPolicyUsed = "scanner_short";
+    _summary = shortSummary || longSummary;
+    if (shortQualResult.penaltyReasons.length > 0) {
+      _summary += ` (short-quality penalties: ${shortQualResult.penaltyReasons.join(", ")})`;
     }
-    
-    // Recalculate qualification after applying SHORT penalties
-    if (hasExplicitSide || shortPreferredByQuality) {
-      isQualified = winnerScore >= MIN_QUALIFY_SCORE;
+    isQualified = adjustedShort >= SHORT_QUAL;
+
+  } else {
+    // signal.side === "LONG": apply full bidirectional direction competition policy
+    const longClear = adjustedLong >= LONG_QUAL;
+    const shortViable = adjustedShort >= SHORT_QUAL;
+    const shortWinsRaw = shortScore > longScore;
+    const shortRawCompetitive = shortScore >= longScore - 1.5;
+
+    if (longClear && !bearishContextPresent && !shortWinsRaw) {
+      // CASE A: Long above threshold, no competing bearish signal, short not outscoring → LONG
+      bestDirection = "LONG";
+      winnerScore = adjustedLong;
+      finalDecisionReason = "long_clear_no_bearish_context";
+      finalDirectionPolicyUsed = "long_dominant";
+      _summary = longSummary;
+      if (longQualResult.penaltyReasons.length > 0) {
+        _summary += ` (long-quality penalties: ${longQualResult.penaltyReasons.join(", ")})`;
+      }
+
+    } else if (!longClear && shortViable && (bearishContextPresent || shortWinsRaw)) {
+      // CASE B: Long failed threshold + short viable + (bearish context OR raw short outscores) → SHORT
+      bestDirection = "SHORT";
+      winnerScore = adjustedShort;
+      shortPreferredByQuality = true;
+      finalDecisionReason = `weak_long_short_flip(adjLong:${adjustedLong.toFixed(2)},adjShort:${adjustedShort.toFixed(2)},bearish:${bearishContextPresent})`;
+      finalDirectionPolicyUsed = "short_rescue_flip";
+      _summary = `${shortSummary} [Flipped to SHORT: ${finalDecisionReason}]`;
+      if (shortQualResult.penaltyReasons.length > 0) {
+        _summary += ` (short-quality penalties: ${shortQualResult.penaltyReasons.join(", ")})`;
+      }
+
+    } else if (longClear && bearishContextPresent && shortViable && adjustedShort > adjustedLong) {
+      // CASE C: Long qualifies but short outscores adjusted-long in bearish context → SHORT
+      bestDirection = "SHORT";
+      winnerScore = adjustedShort;
+      shortPreferredByQuality = true;
+      finalDecisionReason = "short_outscores_long_bearish_context";
+      finalDirectionPolicyUsed = "bearish_context_flip";
+      _summary = `${shortSummary} [Flipped to SHORT: bearish context, short outscores adjusted long]`;
+      if (shortQualResult.penaltyReasons.length > 0) {
+        _summary += ` (short-quality penalties: ${shortQualResult.penaltyReasons.join(", ")})`;
+      }
+
+    } else if (!longClear && shortViable && shortRawCompetitive) {
+      // CASE D: Long below threshold, short viable and raw-competitive (within 1.5) → SHORT
+      bestDirection = "SHORT";
+      winnerScore = adjustedShort;
+      shortPreferredByQuality = true;
+      finalDecisionReason = `long_below_threshold_short_competitive(adjLong:${adjustedLong.toFixed(2)},adjShort:${adjustedShort.toFixed(2)},rawEdge:${(longScore - shortScore).toFixed(2)})`;
+      finalDirectionPolicyUsed = "short_competitive_win";
+      _summary = `${shortSummary} [Flipped to SHORT: long below threshold, short competitive]`;
+      if (shortQualResult.penaltyReasons.length > 0) {
+        _summary += ` (short-quality penalties: ${shortQualResult.penaltyReasons.join(", ")})`;
+      }
+
+    } else if (longClear) {
+      // CASE E: Long above threshold, short not competitive enough to flip → LONG
+      bestDirection = "LONG";
+      winnerScore = adjustedLong;
+      finalDecisionReason = `long_above_threshold_short_not_competitive(adjLong:${adjustedLong.toFixed(2)},shortViable:${shortViable},bearish:${bearishContextPresent})`;
+      finalDirectionPolicyUsed = "long_default";
+      _summary = longSummary;
+      if (longQualResult.penaltyReasons.length > 0) {
+        _summary += ` (long-quality penalties: ${longQualResult.penaltyReasons.join(", ")})`;
+      }
+
+    } else {
+      // CASE F: Both sides below threshold → REJECT
+      bestDirection = "NONE";
+      winnerScore = Math.max(adjustedLong, adjustedShort);
+      finalDecisionReason = `both_below_threshold(adjLong:${adjustedLong.toFixed(2)},adjShort:${adjustedShort.toFixed(2)},longThresh:${LONG_QUAL.toFixed(1)},shortThresh:${SHORT_QUAL.toFixed(1)})`;
+      finalDirectionPolicyUsed = "reject_both";
+      _summary = `Rejected: ${finalDecisionReason}. Raw scores: LONG ${longScore.toFixed(2)}, SHORT ${shortScore.toFixed(2)}.`;
     }
-    // For neutral signals, bestDirection evaluation already handles qualification via MIN_SHORT_SCORE gate
+
+    isQualified = bestDirection !== "NONE";
   }
 
   // ===== APPLY MARKET POSTURE BIAS =====
@@ -1412,14 +1441,13 @@ Return ONLY valid JSON:
     if (postureBias !== 0) {
       winnerScore = Math.max(0, Math.min(10, winnerScore + postureBias));
       postureBiasApplied = true;
-      if (hasExplicitSide) {
-        isQualified = winnerScore >= MIN_QUALIFY_SCORE;
-      }
+      // Always re-check qualification after posture bias adjustment
+      isQualified = winnerScore >= MIN_QUALIFY_SCORE;
     }
   }
 
   // ===== COMPUTE EXPLAINABILITY FIELDS =====
-  const ctx = signal.signalContext || null;
+  // ctx already declared above (moved up for direction decision use)
   const vwapBucket = classifyVwapBucket(signal.entryPrice, ctx?.vwap);
   const trendBucket = classifyTrendBucket(ctx?.trend);
   const relVolBucket = classifyRelVolBucket(ctx?.relVolume);
@@ -1436,28 +1464,27 @@ Return ONLY valid JSON:
   // ===== QUALIFY DIAGNOSTIC =====
   // Compact one-line diagnostic explaining final score, direction choice, and qualify outcome.
   // Surfaces in /api/signals/all as qualifyDiagnostic field for live debugging.
-  const qualifyBand = winnerScore >= 8.5 ? "A" : winnerScore >= 7.5 ? "B" : winnerScore >= 6.5 ? "C" : "REJECT";
-  const directionNote = shortPreferredByQuality
-    ? `promoted→SHORT(rawShort:${shortScore.toFixed(2)})`
-    : bestDirection === "LONG"
-    ? `stayed→LONG(rawShort:${shortScore.toFixed(2)}<floor|noBearishEvidence)`
-    : bestDirection === "SHORT"
-    ? `edgeWon→SHORT`
-    : `NONE`;
+  const qualifyBand = winnerScore >= 8.0 ? "A" : winnerScore >= 6.5 ? "B" : winnerScore >= 5.5 ? "C" : "REJECT";
   const qualifyNote = isQualified ? "QUALIFIED" : `REJECT(score:${winnerScore.toFixed(2)}<threshold:${MIN_QUALIFY_SCORE.toFixed(2)})`;
-  const qualifyDiagnostic = `${qualifyNote}|dir:${directionNote}|finalScore:${winnerScore.toFixed(2)}|rawLong:${longScore.toFixed(2)}|rawShort:${shortScore.toFixed(2)}|band:${qualifyBand}|trend:${ctx?.trend ?? "?"}|relVol:${ctx?.relVolume?.toFixed(2) ?? "?"}`;
+  const qualifyDiagnostic = `${qualifyNote}|policy:${finalDirectionPolicyUsed}|reason:${finalDecisionReason}|dir:${bestDirection}|finalScore:${winnerScore.toFixed(2)}|adjLong:${adjustedLong.toFixed(2)}|adjShort:${adjustedShort.toFixed(2)}|rawLong:${longScore.toFixed(2)}|rawShort:${shortScore.toFixed(2)}|band:${qualifyBand}|trend:${ctx?.trend ?? "?"}|relVol:${ctx?.relVolume?.toFixed(2) ?? "?"}`;
 
   // Log qualify decision for live debugging
   console.log("[aiScoring:qualify]", {
     ticker: signal.ticker,
     direction: _direction,
     finalScore: winnerScore.toFixed(2),
+    adjustedLong: adjustedLong.toFixed(2),
+    adjustedShort: adjustedShort.toFixed(2),
     rawLong: longScore.toFixed(2),
     rawShort: shortScore.toFixed(2),
     qualified: isQualified,
     threshold: MIN_QUALIFY_SCORE,
+    shortQualThreshold: SHORT_QUAL,
     band: qualifyBand,
     shortPreferred: shortPreferredByQuality,
+    bearishContext: bearishContextPresent,
+    finalDirectionPolicyUsed,
+    finalDecisionReason,
     trend: ctx?.trend,
     relVol: ctx?.relVolume,
     longPenalties: longDiagnostics?.longPenaltyReasons ?? [],
@@ -1494,8 +1521,11 @@ Return ONLY valid JSON:
     shortPreferred: shortPreferredByQuality,
     // Qualify observability
     qualifyDiagnostic,
-    // Smoke-test sentinel: confirms Patch 2 scorer path is active
-    _scorerVersion: "patch2-v2",
+    // Decision observability: explicit policy and reason for final direction choice
+    finalDecisionReason,
+    finalDirectionPolicyUsed,
+    // Smoke-test sentinel: confirms v3 decisive-direction scorer path is active
+    _scorerVersion: "v3-decisive-direction",
   };
 
   if (bestDirection === "LONG") {
