@@ -12,6 +12,7 @@ import {
   auditProtectionIntegrity,
   type AuditResult,
 } from "@/lib/risk/protection-integrity";
+import { fetchAlpacaClockSafe } from "@/lib/alpacaClock";
 
 import { readSignals } from "@/lib/jsonDb";
 import { readTodayFunnel } from "@/lib/funnelRedis";
@@ -21,53 +22,6 @@ type Check = {
   ok: boolean;
   detail?: string;
 };
-
-async function fetchAlpacaClock(): Promise<
-  | { ok: true; is_open: boolean; timestamp?: string; next_open?: string; next_close?: string }
-  | { ok: false; error: string; status?: number }
-> {
-  const base =
-    process.env.ALPACA_BASE_URL ||
-    process.env.ALPACA_TRADING_BASE_URL ||
-    "https://paper-api.alpaca.markets";
-
-  const key =
-    process.env.ALPACA_API_KEY ||
-    process.env.ALPACA_API_KEY_ID ||
-    process.env.ALPACA_KEY_ID ||
-    "";
-
-  const secret =
-    process.env.ALPACA_API_SECRET ||
-    process.env.ALPACA_API_SECRET_KEY ||
-    process.env.ALPACA_SECRET_KEY ||
-    "";
-
-  if (!key || !secret) {
-    return { ok: false, error: "missing_alpaca_keys" };
-  }
-
-  const resp = await fetch(`${base.replace(/\/$/, "")}/v2/clock`, {
-    headers: {
-      "APCA-API-KEY-ID": key,
-      "APCA-API-SECRET-KEY": secret,
-    },
-    cache: "no-store",
-  });
-
-  if (!resp.ok) {
-    return { ok: false, error: "alpaca_clock_failed", status: resp.status };
-  }
-
-  const json = await resp.json();
-  return {
-    ok: true,
-    is_open: Boolean(json?.is_open),
-    timestamp: json?.timestamp,
-    next_open: json?.next_open,
-    next_close: json?.next_close,
-  };
-}
 
 export async function GET(req: Request) {
   const authed = await requireAuth(req);
@@ -267,7 +221,7 @@ export async function GET(req: Request) {
 
   const aiStatus = (aiHealth?.status || "").toString();
 
-  const clock = await fetchAlpacaClock();
+  const clock = await fetchAlpacaClockSafe();
   const marketStatus = clock.ok ? (clock.is_open ? "OPEN" : "CLOSED") : "UNKNOWN";
 
   const marketOpen = marketStatus.toUpperCase() === "OPEN";

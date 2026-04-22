@@ -2,7 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { headers } from "next/headers";
 import { AlpacaBar, fetchRecentBars } from "@/lib/alpaca";
-import { fetchAlpacaClock } from "@/lib/alpacaClock";
+import { fetchAlpacaClockSafe } from "@/lib/alpacaClock";
 import { bumpScanRun, bumpScanSkip, bumpTodayFunnel } from "@/lib/funnelRedis";
 import { redis } from "@/lib/redis";
 import {
@@ -25,6 +25,10 @@ type PatternType =
   | "SHORT_CANDIDATE";
 
 type Side = "LONG" | "SHORT";
+
+type ScanStatus = "RUN" | "SKIP";
+type ScanSkipReason = "SKIP_MARKET_CLOSED" | "SKIP_GUARDRAIL";
+type ScanRunOutcome = "RUN_EMPTY_UNIVERSE" | "RUN_NO_ELIGIBLE_CANDIDATES" | "RUN_POSTED_SIGNALS";
 
 interface PatternFeatures {
   vwapDistancePct?: number;
@@ -732,15 +736,46 @@ export async function GET(req: NextRequest) {
       ? "short"
       : "vwap"; // default/alias for vwap
   const force = search.get("force") === "1";
+  const aiSeedMode = mode === "ai-seed";
+  const shortMode = mode === "short";
+  const debugScan = req.headers.get("x-debug-scan") === "1" || search.get("debug") === "1";
 
-  let marketClock: { is_open?: boolean; next_open?: string | null; next_close?: string | null } | null = null;
-  try {
-    marketClock = await fetchAlpacaClock();
-  } catch (err) {
+  const emptyRunDiagnostics = {
+    universeCount: 0,
+    candidateCount: 0,
+    candidatesFound: 0,
+    candidatesEligibleToPost: 0,
+    attemptedPosts: 0,
+    postSuccessCount: 0,
+    postFailureCount: 0,
+    skipReasons: {} as Record<string, number>,
+    rejectBuckets: {} as Record<string, number>,
+  };
+
+  const clockResult = await fetchAlpacaClockSafe().catch((err) => {
     console.warn("[scan] unable to fetch market clock", err);
-  }
+    return { ok: false as const, error: "alpaca_clock_failed" };
+  });
+  const marketClock = clockResult.ok
+    ? {
+        is_open: clockResult.is_open,
+        timestamp: clockResult.timestamp ?? null,
+        next_open: clockResult.next_open ?? null,
+        next_close: clockResult.next_close ?? null,
+      }
+    : null;
+  const marketOpen = clockResult.ok ? Boolean(clockResult.is_open) : null;
 
-  if (marketClock?.is_open === false && !force) {
+  if (marketOpen === false && !force) {
+    console.log("[scan] skip", {
+      mode,
+      status: "SKIP",
+      skipReason: "SKIP_MARKET_CLOSED",
+      reason: "market_closed",
+      marketOpen,
+      scanSource,
+      scanRunId,
+    });
     try {
       await bumpScanSkip(mode, {
         source: scanSource,
@@ -753,20 +788,49 @@ export async function GET(req: NextRequest) {
     return NextResponse.json(
       {
         ok: true,
+        status: "SKIP" as ScanStatus,
         skipped: true,
+        skipReason: "SKIP_MARKET_CLOSED" as ScanSkipReason,
         reason: "market_closed",
         mode,
         clock: marketClock,
+        marketOpen,
+        earlyReturnTriggered: true,
+        diagnostics: emptyRunDiagnostics,
+        ...(debugScan
+          ? {
+              debug: {
+                status: "SKIP",
+                skipReason: "SKIP_MARKET_CLOSED",
+                marketOpen,
+                universeCount: 0,
+                candidateCount: 0,
+                candidatesEligibleToPost: 0,
+                attemptedPosts: 0,
+                postSuccessCount: 0,
+                postFailureCount: 0,
+                rejectBuckets: {},
+                skipBuckets: {},
+                earlyReturnTriggered: true,
+              },
+            }
+          : {}),
       },
       { headers: { "Cache-Control": "no-store" } }
     );
   }
-const aiSeedMode = mode === "ai-seed";
-const shortMode = mode === "short";
-const debugScan = req.headers.get("x-debug-scan") === "1" || search.get("debug") === "1";
 
   // Skip short mode if not enabled
   if (shortMode && !ENABLE_SHORT_SCAN) {
+    console.log("[scan] skip", {
+      mode,
+      status: "SKIP",
+      skipReason: "SKIP_GUARDRAIL",
+      reason: "short_scan_disabled",
+      marketOpen,
+      scanSource,
+      scanRunId,
+    });
     try {
       await bumpScanSkip(mode, {
         source: scanSource,
@@ -779,9 +843,32 @@ const debugScan = req.headers.get("x-debug-scan") === "1" || search.get("debug")
     return NextResponse.json(
       {
         ok: true,
+        status: "SKIP" as ScanStatus,
         skipped: true,
+        skipReason: "SKIP_GUARDRAIL" as ScanSkipReason,
         reason: "short_scan_disabled",
         mode,
+        marketOpen,
+        earlyReturnTriggered: true,
+        diagnostics: emptyRunDiagnostics,
+        ...(debugScan
+          ? {
+              debug: {
+                status: "SKIP",
+                skipReason: "SKIP_GUARDRAIL",
+                marketOpen,
+                universeCount: 0,
+                candidateCount: 0,
+                candidatesEligibleToPost: 0,
+                attemptedPosts: 0,
+                postSuccessCount: 0,
+                postFailureCount: 0,
+                rejectBuckets: {},
+                skipBuckets: {},
+                earlyReturnTriggered: true,
+              },
+            }
+          : {}),
       },
       { headers: { "Cache-Control": "no-store" } }
     );
@@ -937,50 +1024,7 @@ const logSummary = () => {
   return summary;
 };
 
-  // Fetch Alpaca market clock for all modes (needed for minutesSinceOpen computation)
-  let clock: any = null;
-  try {
-    const clockUrl = `${ALPACA_BASE_URL.replace(/\/+$/, "")}/v2/clock`;
-    clock = await fetch(clockUrl, {
-      headers: {
-        "APCA-API-KEY-ID": ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-      },
-      cache: "no-store",
-    })
-      .then((r) => (r.ok ? r.json() : null))
-      .catch(() => null);
-  } catch (e) {
-    // Ignore clock fetch errors, proceed with null clock
-  }
-
-  if (aiSeedMode) {
-    // Market-aware: don’t run ai-seed off-hours when minute bars go thin
-    
-    if ((clock && clock.is_open === false) && !(debugScan && (search.get("force") === "1"))) {
-      try {
-        await bumpScanSkip(mode, {
-          source: scanSource,
-          runId: scanRunId,
-        });
-      } catch (err) {
-        console.log("[funnel] bump scansSkipped failed (non-fatal)", err);
-      }
-      reject("market", "marketClosed", "market closed (skip)");
-      const summarySnapshot = logSummary();
-      const skipPayload: Record<string, any> = {
-        status: "ok",
-        mode,
-        marketClosed: true,
-        note: "ai-seed skipped: market closed (avoid false volumeTooLow after-hours)",
-        clock,
-      };
-      if (debugScan && summarySnapshot) {
-        skipPayload.debugSummary = summarySnapshot;
-      }
-      return NextResponse.json(skipPayload, { headers: { "Cache-Control": "no-store" } });
-    }
-  }
+  const clock = marketClock;
 
   await bumpScanRun(mode, {
     source: scanSource,
@@ -1190,7 +1234,6 @@ const logSummary = () => {
   // Sort by pattern strength and take top N, dropping zero/negative scores
   // Three-state market status: true (open), false (closed), null (unknown/clock failed)
   // Only return 999 sentinel if definitively closed; treat unknown as open to avoid false SKIPs
-  const marketOpen = clock?.is_open === true ? true : (clock ? false : null);
   const minutesSinceOpen = minutesSinceOpenFromBars(candidates as any, clock, marketOpen);
   const openingMode = minutesSinceOpen <= AI_SEED_OPENING_MINUTES;
 
@@ -1374,10 +1417,20 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     }
   }
 
+  const status: ScanStatus = "RUN";
+  const runOutcome: ScanRunOutcome =
+    slicedUniverse.length === 0
+      ? "RUN_EMPTY_UNIVERSE"
+      : postSuccessCount > 0
+      ? "RUN_POSTED_SIGNALS"
+      : "RUN_NO_ELIGIBLE_CANDIDATES";
+
   const result = {
-    status: "ok",
+    status,
     mode,
+    outcome: runOutcome,
     universeSize: universe.length,
+    universeCount: slicedUniverse.length,
     scannedCount: slicedUniverse.length,
     candidateCount: candidates.length,
     postedCount,
@@ -1440,9 +1493,54 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     ...(postFailureCount > 0 ? { postFailed: postFailureCount } : {}),
   };
 
+  const diagnostics = {
+    universeCount: slicedUniverse.length,
+    candidateCount: candidates.length,
+    candidatesFound: candidates.length,
+    candidatesEligibleToPost: topCandidates.length,
+    attemptedPosts,
+    postSuccessCount,
+    postFailureCount,
+    skipReasons,
+    rejectBuckets: aiSeedMode ? aiSeedTracker.counts : {},
+  };
+
+  const debugDetails = {
+    marketOpen,
+    skipReason: null,
+    status,
+    universeCount: slicedUniverse.length,
+    candidateCount: candidates.length,
+    candidatesEligibleToPost: topCandidates.length,
+    attemptedPosts,
+    postSuccessCount,
+    postFailureCount,
+    rejectBuckets: aiSeedMode ? aiSeedTracker.counts : {},
+    skipBuckets: skipReasons,
+    earlyReturnTriggered: false,
+  };
+
+  console.log("[scan] run", {
+    mode,
+    status,
+    outcome: runOutcome,
+    marketOpen,
+    universeCount: slicedUniverse.length,
+    candidateCount: candidates.length,
+    candidatesEligibleToPost: topCandidates.length,
+    attemptedPosts,
+    postSuccessCount,
+    postFailureCount,
+    scanSource,
+    scanRunId,
+  });
+
   return NextResponse.json({
     ok: true,
     ...result,
+    marketOpen,
+    skipReason: null,
+    earlyReturnTriggered: false,
     scansRun: 1,
     candidatesFound: candidates.length,
     candidatesEligibleToPost: topCandidates.length,
@@ -1454,6 +1552,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     postFailureCount,
     ...(postFailureDetails.length > 0 ? { postFailureDetails: postFailureDetails.slice(0, 10) } : {}),
     skipReasons,
+    diagnostics,
     prePostGateReasons,
     prePostGateConfig: getPrePostConfig(),
     capApplied,
@@ -1463,59 +1562,12 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     signalsPosted: posted.length,
     gptQueued: posted.length,
     aiSeedDebug,
+    ...(debugScan ? { debug: debugDetails } : {}),
     ...(debugScan ? { postDebug } : {}),
     ...(debugScan && summarySnapshot ? { debugSummary: summarySnapshot } : {}),
   });
 }
 
 export async function POST(req: NextRequest) {
-  const url = new URL(req.url);
-  const search = url.searchParams;
-  const force = search.get("force") === "1";
-  const scanSource = req.headers.get("x-scan-source") ?? "unknown";
-  const scanRunId = req.headers.get("x-scan-run-id") ?? null;
-
-  const rawMode = (search.get("mode") || "").toLowerCase();
-  const mode: ScanMode =
-    rawMode === "breakout"
-      ? "breakout"
-      : rawMode === "compression" || rawMode === "nr7"
-      ? "compression"
-      : rawMode === "premarket" || rawMode === "premarket-vwap"
-      ? "premarket-vwap"
-      : rawMode === "ai-seed"
-      ? "ai-seed"
-      : rawMode === "short"
-      ? "short"
-      : "vwap";
-
-  let marketClock: { is_open?: boolean; next_open?: string | null; next_close?: string | null } | null = null;
-  try {
-    marketClock = await fetchAlpacaClock();
-  } catch (err) {
-    console.warn("[scan] unable to fetch market clock", err);
-  }
-
-  if (marketClock?.is_open === false && !force) {
-    try {
-      await bumpScanSkip(mode, {
-        source: scanSource,
-        runId: scanRunId,
-        status: "SKIP",
-      });
-    } catch (err) {
-      console.log("[funnel] bump scansSkipped failed (non-fatal)", err);
-    }
-    return NextResponse.json(
-      {
-        ok: true,
-        skipped: true,
-        reason: "market_closed",
-        mode,
-        clock: marketClock,
-      },
-      { headers: { "Cache-Control": "no-store" } }
-    );
-  }
   return GET(req);
 }
