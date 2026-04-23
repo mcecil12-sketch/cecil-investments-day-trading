@@ -3,6 +3,7 @@ import { alpacaRequest } from "@/lib/alpaca";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { redis } from "@/lib/redis";
 import { nowETDate } from "@/lib/performance/time";
+import { selectCanonicalOpenTrades } from "@/lib/trades/canonicalOpenBySymbol";
 
 type AlpacaPosition = { symbol: string };
 type AlpacaOrder = {
@@ -169,6 +170,48 @@ export async function POST(req: NextRequest) {
 
     if (changed) updated++;
   }
+
+  // ── Ghost-duplicate cleanup pass ─────────────────────────────────────────
+  // After status updates, archive any ghost OPEN duplicates for the same ticker
+  // so they don't cause false PROTECTION_MISSING in downstream checks.
+  const nowIsoDedup = new Date().toISOString();
+  const { ghosts: syncGhosts, diagnostics: syncDupDiag } = selectCanonicalOpenTrades(trades);
+  let syncArchivedGhosts = 0;
+
+  for (const ghost of syncGhosts) {
+    // Only act on records that are still operationally open after the sync pass
+    const status = String((ghost as any)?.status ?? "").toUpperCase();
+    if (status === "ARCHIVED" || status === "CLOSED" || status === "ERROR") continue;
+
+    const canonicalId = (ghost as any)._canonicalId;
+    Object.assign(ghost, {
+      status: "ARCHIVED",
+      closedAt: nowIsoDedup,
+      updatedAt: nowIsoDedup,
+      closeReason: "superseded_by_canonical_open_trade",
+      duplicateOfTradeId: canonicalId,
+      alpacaStatus: null,
+      brokerStatus: null,
+      note: ((ghost as any)?.note || "") +
+        ` [broker-sync archived: ghost duplicate superseded by ${canonicalId}]`,
+    });
+    syncArchivedGhosts++;
+    updated++;
+  }
+
+  if (syncDupDiag.length > 0) {
+    console.log("[sync-broker-state] archived ghost OPEN duplicates", {
+      groups: syncDupDiag.map((d) => ({
+        ticker: d.ticker,
+        canonical: d.canonicalId,
+        source: d.canonicalSource,
+        ghosts: d.ghostCount,
+        ghostIds: d.ghostIds,
+      })),
+      totalArchived: syncArchivedGhosts,
+    });
+  }
+  // ── end ghost-duplicate cleanup ───────────────────────────────────────────
 
   await writeTrades(trades);
 

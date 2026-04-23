@@ -10,6 +10,7 @@ import { readSignals } from "@/lib/jsonDb";
 import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
 import { isOpenTradeStatus } from "@/lib/trades/protection";
 import { getSignalTimestampMs } from "@/lib/signals/since";
+import { selectCanonicalOpenTrades } from "@/lib/trades/canonicalOpenBySymbol";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -369,12 +370,29 @@ export async function GET() {
       const brokerOrdersCount = brokerTruth.openOrdersCount ?? (brokerTruth.openOrders || []).length;
       brokerIsFlat = brokerPositionsCount === 0 && brokerOrdersCount === 0;
 
-      // Find all open trades
-      const openTrades = (allTrades || [])
+      // Deduplicate: when multiple OPEN records exist for the same broker position,
+      // audit only the canonical (richest-metadata) trade so ghost duplicates lacking
+      // stopOrderId do not trigger false PROTECTION_MISSING incidents.
+      const { canonical: canonicalMap, diagnostics: dupDiag } = selectCanonicalOpenTrades(allTrades || []);
+
+      if (dupDiag.length > 0) {
+        console.warn("[funnel-health] duplicate OPEN trades detected — protection audit using canonical only", {
+          duplicateGroups: dupDiag.map((d) => ({
+            ticker: d.ticker,
+            canonical: d.canonicalId,
+            source: d.canonicalSource,
+            richness: d.canonicalRichness,
+            ghostCount: d.ghostCount,
+            ghostIds: d.ghostIds,
+          })),
+        });
+      }
+
+      const openTrades = Array.from(canonicalMap.values())
         .filter((t: any) => isOpenTradeStatus(t?.status))
         .map((t: any) => ({
           id: String(t.id || ""),
-          ticker: String(t.ticker || ""),
+          ticker: String((t?.symbol ?? t.ticker) || ""),
           side: String(t.side || ""),
           status: String(t.status || ""),
           stopOrderId: t.stopOrderId || t.alpacaStopOrderId,

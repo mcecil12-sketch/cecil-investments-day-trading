@@ -289,16 +289,35 @@ export async function GET(req: Request) {
     }
 
     // Map quantity fields
-    const serialized = trades.map((trade) => ({
-      ...trade,
-      // Canonical symbol field: symbol is authoritative, ticker is legacy alias
-      symbol: (trade as any).symbol ?? (trade as any).ticker ?? null,
-      qty: mapQty(trade),
-      filledQty: mapFilledQty(trade),
-      avgFillPrice: mapAvgFillPrice(trade),
-      normalizedStatus: normalizedOperationalStatus(trade),
-      operationallyActive: isOperationallyActiveTrade(trade),
-    }));
+    const serialized = trades.map((trade) => {
+      const t = trade as any;
+      // AI shape consistency: top-level aiScore is authoritative.
+      // If nested ai object has score=0 but aiScore is non-zero, mirror the top-level value.
+      let aiShape: Record<string, any> | undefined = undefined;
+      if (t?.ai && typeof t.ai === "object") {
+        const topScore = Number.isFinite(Number(t.aiScore)) ? Number(t.aiScore) : null;
+        const nestedScore = Number.isFinite(Number(t.ai.score)) ? Number(t.ai.score) : null;
+        const finalScore = topScore ?? nestedScore;
+        aiShape = {
+          ...t.ai,
+          score: finalScore,
+          grade: t.ai.grade ?? t.aiGrade ?? null,
+          tier: t.ai.tier ?? t.tier ?? null,
+        };
+      }
+
+      return {
+        ...trade,
+        // Canonical symbol field: symbol is authoritative, ticker is legacy alias
+        symbol: t.symbol ?? t.ticker ?? null,
+        qty: mapQty(trade),
+        filledQty: mapFilledQty(trade),
+        avgFillPrice: mapAvgFillPrice(trade),
+        normalizedStatus: normalizedOperationalStatus(trade),
+        operationallyActive: isOperationallyActiveTrade(trade),
+        ...(aiShape !== undefined ? { ai: aiShape } : {}),
+      };
+    });
 
     return NextResponse.json({
       ok: true,

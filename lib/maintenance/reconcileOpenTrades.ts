@@ -3,6 +3,7 @@ import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { recordReconcile } from "@/lib/maintenance/reconcileTelemetry";
 import { isOperationallyOpenTrade } from "@/lib/trades/operational";
+import { selectCanonicalOpenTrades } from "@/lib/trades/canonicalOpenBySymbol";
 
 const POSITION_OPEN_OVERRIDES_CANCELED_v1 = true;
 
@@ -1007,6 +1008,76 @@ export async function reconcileOpenTrades(
     }
 
     checkDeadline();
+
+    // ── All-source ghost duplicate pass ──────────────────────────────────────
+    // The prior safety-net pass only targets broker_backfill sources.
+    // This broader pass handles any combination of sources (AUTO vs manual,
+    // broker_backfill vs AUTO-ENTRY, etc.) using the richness-based canonical
+    // selector so we never block on ghost duplicates that lack protection metadata.
+    const { ghosts: allSourceGhosts, diagnostics: ghostDiag } = selectCanonicalOpenTrades(trades);
+
+    let cleanedAllSourceGhosts = 0;
+    const cleanedAllSourceGhostIds: string[] = [];
+
+    for (const ghost of allSourceGhosts) {
+      // Skip trades already archived by earlier passes
+      if (!isOperationallyOpenTrade(ghost)) continue;
+
+      const ticker = String(ghost?.symbol ?? ghost?.ticker ?? "").toUpperCase();
+      const canonicalId = (ghost as any)._canonicalId;
+
+      if (!dryRun) {
+        Object.assign(ghost, {
+          status: "ARCHIVED",
+          closedAt: nowIso,
+          updatedAt: nowIso,
+          closeReason: "superseded_by_canonical_open_trade",
+          duplicateOfTradeId: canonicalId,
+          alpacaStatus: null,
+          brokerStatus: null,
+          note: (ghost?.note || "") +
+            ` [Archived: superseded by canonical OPEN trade ${canonicalId}]`,
+        });
+      }
+
+      cleanedAllSourceGhosts += 1;
+      if (cleanedAllSourceGhostIds.length < 20) cleanedAllSourceGhostIds.push(String(ghost.id));
+
+      console.log(
+        `[reconcile] archived ghost duplicate OPEN trade — all-source pass (source=${runSource}, id=${runId})`,
+        {
+          ticker,
+          tradeId: ghost.id,
+          tradeSource: ghost?.source,
+          canonicalId,
+          dryRun,
+        }
+      );
+    }
+
+    if (ghostDiag.length > 0) {
+      console.log(
+        `[reconcile] all-source ghost dedup complete (source=${runSource}, id=${runId})`,
+        {
+          groups: ghostDiag.map((d) => ({
+            ticker: d.ticker,
+            canonical: d.canonicalId,
+            source: d.canonicalSource,
+            richness: d.canonicalRichness,
+            ghosts: d.ghostCount,
+            ghostIds: d.ghostIds,
+          })),
+          totalArchivedNow: cleanedAllSourceGhosts,
+        }
+      );
+    }
+
+    // Merge count into cleanedDuplicateBackfill for reporting (backward-compat)
+    cleanedDuplicateBackfill += cleanedAllSourceGhosts;
+    if (cleanedAllSourceGhostIds.length > 0) {
+      cleanedDuplicateBackfillIds.push(...cleanedAllSourceGhostIds.slice(0, Math.max(0, 10 - cleanedDuplicateBackfillIds.length)));
+    }
+    // ── end all-source ghost pass ─────────────────────────────────────────────
 
     if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0 || cleanedPending > 0 || cleanedStaleBackfill > 0 || cleanedDuplicateBackfill > 0)) {
       await writeTrades(trades);
