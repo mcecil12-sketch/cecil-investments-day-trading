@@ -88,7 +88,7 @@ import { requireAuth } from "@/lib/auth";
 import { getGuardrailConfig, minutesSince } from "@/lib/autoEntry/guardrails";
 import { getAutoConfig, tierForScore, riskMultForTier } from "@/lib/autoEntry/config";
 import { getAutoManageConfig } from "@/lib/autoManage/config";
-import { resolveDecisionPrice, computeBracket, type QuoteLike, type Side } from "@/lib/autoEntry/pricing";
+import { resolveDecisionPrice, type QuoteLike, type Side } from "@/lib/autoEntry/pricing";
 import { withRedisLock } from "@/lib/locks";
 import { fetchAlpacaClock } from "@/lib/alpacaClock";
 import * as guardrailsStore from "@/lib/autoEntry/guardrailsStore";
@@ -141,30 +141,6 @@ async function bumpAutoEntryFunnelSafe(fields: Record<string, number | undefined
   } catch (err) {
     console.log("[funnel] auto-entry bump failed (non-fatal)", err);
   }
-}
-
-function ensureBracketLegsValid(params: {
-  side: "LONG" | "SHORT";
-  basePrice: number;
-  takeProfitLimit: number;
-  stopLossStop: number;
-}) {
-  const { side, basePrice } = params;
-  let tp = Number(params.takeProfitLimit);
-  let sl = Number(params.stopLossStop);
-
-  const base = Number(basePrice);
-  const min = 0.01;
-
-  if (side === "LONG") {
-    if (!(tp >= base + min)) tp = Number((base + min).toFixed(2));
-    if (!(sl <= base - min)) sl = Number((base - min).toFixed(2));
-  } else {
-    if (!(tp <= base - min)) tp = Number((base - min).toFixed(2));
-    if (!(sl >= base + min)) sl = Number((base + min).toFixed(2));
-  }
-
-  return { takeProfitLimit: tp, stopLossStop: sl };
 }
 
 function isAlpacaInvalidStopVsBase(err: any) {
@@ -407,24 +383,10 @@ function validateAndRepairBracket(params: {
   
   const tpIsValid = isLong ? (tp >= minTpLong) : (tp <= maxTpShort);
   
+  // NO repair allowed — persisted targetPrice must be valid after tick normalization.
+  // If it's not valid, fail fast. Do NOT recalculate from risk multiples.
   if (!tpIsValid) {
-    // Try to repair TP using risk multiple
-    const stopDist = Math.abs(roundedBase - stop);
-    if (stopDist < tick) {
-      return { valid: false, tp, stop, reason: "stop_distance_too_small" };
-    }
-    
-    const repairedTp = isLong 
-      ? roundUp(roundedBase + 2 * stopDist)
-      : roundDown(roundedBase - 2 * stopDist);
-    
-    // Check if repaired TP is now valid
-    const repairedTpValid = isLong ? (repairedTp >= minTpLong) : (repairedTp <= maxTpShort);
-    if (!repairedTpValid) {
-      return { valid: false, tp: repairedTp, stop, reason: "invalid_bracket_prices_unrepairable" };
-    }
-    
-    return { valid: true, tp: repairedTp, stop, reason: "bracket_repaired_with_risk_multiple" };
+    return { valid: false, tp, stop, reason: "tp_invalid_after_tick_normalization" };
   }
   
   return { valid: true, tp, stop };
@@ -2087,8 +2049,8 @@ export async function POST(req: Request) {
       ...trade,
       status: "ERROR",
       autoEntryStatus: "AUTO_ERROR",
-      reason: "missing_trade_plan",
-      error: "missing_trade_plan",
+      reason: "INVALID_TRADE_PLAN_MISSING_VALUES",
+      error: "INVALID_TRADE_PLAN_MISSING_VALUES",
       errorDetails: {
         entryPrice: trade.entryPrice ?? null,
         stopPrice: trade.stopPrice ?? null,
@@ -2099,11 +2061,11 @@ export async function POST(req: Request) {
     await writeTrades(trades);
     counts.invalidMarked += 1;
     counts.skipped += 1;
-    await recordOutcome({ outcome: "FAIL", reason: "missing_trade_plan", ticker, tradeId });
+    await recordOutcome({ outcome: "FAIL", reason: "INVALID_TRADE_PLAN_MISSING_VALUES", ticker, tradeId });
     return NextResponse.json(
       {
         ok: false,
-        error: "missing_trade_plan",
+        error: "INVALID_TRADE_PLAN_MISSING_VALUES",
         detail: "Trade is missing entryPrice, stopPrice, or targetPrice — no fallback % calculation allowed",
         tradeId,
         market: { isOpen: marketOpen, timestamp: marketTimestamp },
@@ -2134,19 +2096,19 @@ export async function POST(req: Request) {
       ...trade,
       status: "ERROR",
       autoEntryStatus: "AUTO_ERROR",
-      reason: "missing_trade_plan",
-      error: "missing_trade_plan",
+      reason: "INVALID_TRADE_PLAN_STRUCTURE",
+      error: "INVALID_TRADE_PLAN_STRUCTURE",
       errorDetails: { entryPrice, stopPrice, targetPrice, side: sideEnum, validationFailure },
       updatedAt: now,
     };
     await writeTrades(trades);
     counts.invalidMarked += 1;
     counts.skipped += 1;
-    await recordOutcome({ outcome: "FAIL", reason: "missing_trade_plan", ticker, tradeId });
+    await recordOutcome({ outcome: "FAIL", reason: "INVALID_TRADE_PLAN_STRUCTURE", ticker, tradeId });
     return NextResponse.json(
       {
         ok: false,
-        error: "missing_trade_plan",
+        error: "INVALID_TRADE_PLAN_STRUCTURE",
         detail: validationFailure,
         tradeId,
         market: { isOpen: marketOpen, timestamp: marketTimestamp },
@@ -2303,13 +2265,18 @@ export async function POST(req: Request) {
     stop: bracketStop,
   });
 
-  // Log execution payload for observability (requirement: log source)
-  console.log("[auto-entry] execution payload (single source of truth)", {
+  // Log execution plan — SINGLE SOURCE OF TRUTH
+  console.log("EXECUTION_PLAN", {
+    tradeId: trade.id,
     symbol: ticker,
-    entryPrice,
-    stopPrice: bracketStop,
-    targetPrice: tp,
-    source: "signal_trade_plan",
+    entryPrice: trade.entryPrice,
+    stopPrice: trade.stopPrice,
+    targetPrice: trade.takeProfitPrice ?? trade.targetPrice,
+    source: "persisted_trade",
+  });
+
+  // Additional diagnostics (non-normative)
+  console.log("[auto-entry] execution diagnostics", {
     decisionPriceForDrift,
     sideEnum,
     qty,
@@ -2321,7 +2288,7 @@ export async function POST(req: Request) {
     entryPrice,
     stopPrice,
     targetPrice,
-    source: "signal_trade_plan",
+    source: "persisted_trade",
     quote,
     decisionPrice: decision.decisionPrice,
     decisionSource: decision.source,
@@ -2888,16 +2855,15 @@ export async function POST(req: Request) {
       tier,
       paper: true,
       title: `Auto entry placed ${ticker}`,
-      message: `Submitted ${qty} ${ticker} ${sideDirection} @ ${entryPrice.toFixed(
-        2
-      )} stop ${bracketStop.toFixed(2)} tp ${tp.toFixed(2)}`,
+      message: `Submitted ${qty} ${ticker} ${sideDirection} @ ${trade.entryPrice.toFixed(2)} stop ${trade.stopPrice.toFixed(2)} tp ${(trade.takeProfitPrice ?? trade.targetPrice).toFixed(2)}`,
       dedupeKey: `AUTO_ENTRY_PLACED:${tradeId}`,
       dedupeTtlSec: 600,
       meta: {
         score,
         riskDollars,
-        takeProfit: tp,
-        stop: bracketStop,
+        takeProfit: trade.takeProfitPrice ?? trade.targetPrice,
+        stop: trade.stopPrice,
+        source: "persisted_trade",
       },
     });
 

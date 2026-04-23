@@ -475,7 +475,7 @@ export async function POST(req: NextRequest) {
     const targetPrice = getNum(s, ["targetPrice", "takeProfitPrice", "ai.targetPrice", "ai.takeProfitPrice"]);
 
     if (entryPrice == null || stopPrice == null || targetPrice == null) {
-      skipped.push({ symbol, reason: "missing_required_prices" });
+      skipped.push({ symbol, reason: "INVALID_SIGNAL_PLAN_MISSING_VALUES" });
       continue;
     }
 
@@ -629,7 +629,7 @@ export async function POST(req: NextRequest) {
   const belowMinScoreSkippedCount = (skipReasonCounts["below_minScore"] ?? 0) + 
                                     (skipReasonCounts["below_overlay_adjusted_minScore"] ?? 0);
   const missingDirectionSkippedCount = (skipReasonCounts["missing_direction"] ?? 0);
-  const missingPricesSkippedCount = (skipReasonCounts["missing_required_prices"] ?? 0);
+  const missingPricesSkippedCount = (skipReasonCounts["INVALID_SIGNAL_PLAN_MISSING_VALUES"] ?? 0);
   const tierDisabledSkippedCount = (skipReasonCounts["tier_c_disabled"] ?? 0);
   const overlayGradeSkippedCount = (skipReasonCounts["overlay_grade_excluded"] ?? 0);
   const shortWeakStructureSkippedCount = (skipReasonCounts["short_weak_structure"] ?? 0);
