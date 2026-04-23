@@ -213,6 +213,23 @@ export async function GET(req: Request) {
 
     if (viewParam === "operational") {
       trades = trades.filter((trade) => isOperationallyActiveTrade(trade));
+
+      // Deduplicate by ticker: show only the canonical record when multiple OPEN trades
+      // exist for the same broker position (e.g. AUTO trade + ghost broker_backfill).
+      const canonicalMap = new Map<string, TradeRecord>();
+      for (const t of trades) {
+        const sym = String((t as any).symbol ?? t.ticker ?? "").toUpperCase();
+        if (!sym) { canonicalMap.set(t.id, t); continue; }
+        const existing = canonicalMap.get(sym);
+        if (!existing) { canonicalMap.set(sym, t); continue; }
+        const richness = (x: any) =>
+          (x?.signalId ? 8 : 0) +
+          (x?.source === "AUTO" || x?.source === "AUTO-ENTRY" ? 4 : 0) +
+          ((x?.stopOrderId || x?.alpacaStopOrderId) ? 2 : 0) +
+          (x?.aiScore ? 1 : 0);
+        if (richness(t) > richness(existing)) canonicalMap.set(sym, t);
+      }
+      trades = Array.from(canonicalMap.values());
     }
 
     // Apply sorting by createdAt

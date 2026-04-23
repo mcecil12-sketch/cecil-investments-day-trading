@@ -791,6 +791,22 @@ export async function reconcileOpenTrades(
 
     checkDeadline();
 
+    // Pre-build canonical AUTO OPEN tickers set — prevents creating ghost broker_backfill duplicates
+    // when an executed AUTO trade already owns the broker position.
+    const autoOpenTickers = new Set<string>();
+    for (const t of trades) {
+      if (t?.status === "OPEN" && (t?.source === "AUTO" || t?.source === "AUTO-ENTRY")) {
+        const ticker = up(t.ticker);
+        if (ticker) autoOpenTickers.add(ticker);
+      }
+    }
+
+    // Duplicate-cleanup counters declared here so both the backfill loop and post-loop
+    // safety-net pass can use them without re-declaration.
+    let cleanedDuplicateBackfill = 0;
+    const cleanedDuplicateBackfillIds: string[] = [];
+    const cleanedDuplicateBackfillTickers: string[] = [];
+
     // Backfill: Create or reuse DB trades for broker positions
     let backfilled = 0;
     const backfilledTickers: string[] = [];
@@ -807,6 +823,34 @@ export async function reconcileOpenTrades(
       );
 
       if (allBackfillsForTicker.length > 0) {
+        // If a canonical AUTO OPEN trade already owns this position, archive all backfills immediately.
+        if (autoOpenTickers.has(posTicker)) {
+          for (const bf of allBackfillsForTicker) {
+            if (bf.status === "ARCHIVED" || bf.status === "CLOSED") continue;
+            if (!dryRun) {
+              Object.assign(bf, {
+                status: "ARCHIVED",
+                closedAt: nowIso,
+                updatedAt: nowIso,
+                closeReason: "duplicate_broker_backfill",
+                alpacaStatus: null,
+                brokerStatus: null,
+                note: (bf?.note || "") + " [Archived: canonical AUTO OPEN trade owns this position]",
+              });
+            }
+            cleanedDuplicateBackfill += 1;
+            if (cleanedDuplicateBackfillIds.length < 10) cleanedDuplicateBackfillIds.push(bf.id);
+            if (!cleanedDuplicateBackfillTickers.includes(posTicker) && cleanedDuplicateBackfillTickers.length < 10) {
+              cleanedDuplicateBackfillTickers.push(posTicker);
+            }
+            console.log(
+              `[reconcile] archived existing broker_backfill — canonical AUTO owns position (source=${runSource}, id=${runId})`,
+              { ticker: posTicker, tradeId: bf.id, dryRun }
+            );
+          }
+          continue; // canonical AUTO is authoritative — skip backfill reuse/creation
+        }
+
         // Pick the best one to keep: prefer OPEN, then newest by updatedAt
         const toKeep = allBackfillsForTicker.sort((a, b) => {
           if (a.status === "OPEN" && b.status !== "OPEN") return -1;
@@ -876,6 +920,14 @@ export async function reconcileOpenTrades(
         continue; // Reused existing, no new backfill
       }
 
+      // Skip creation when a canonical AUTO OPEN trade already covers this broker position.
+      if (autoOpenTickers.has(posTicker)) {
+        console.log(
+          `[reconcile] skipping backfill for ${posTicker}: canonical AUTO OPEN trade already exists (source=${runSource}, id=${runId})`
+        );
+        continue;
+      }
+
       // No existing broker_backfill row, create new one
       const newTrade: any = {
         id: crypto.randomUUID(),
@@ -920,21 +972,9 @@ export async function reconcileOpenTrades(
 
     checkDeadline();
 
-    // Clean duplicate OPEN broker_backfill rows when AUTO trade exists for same ticker
-    let cleanedDuplicateBackfill = 0;
-    const cleanedDuplicateBackfillIds: string[] = [];
-    const cleanedDuplicateBackfillTickers: string[] = [];
-
-    // Build map of tickers with OPEN AUTO trades
-    const autoOpenTickers = new Set<string>();
-    for (const t of trades) {
-      if (t?.status === "OPEN" && (t?.source === "AUTO" || t?.source === "AUTO-ENTRY")) {
-        const ticker = up(t.ticker);
-        if (ticker) autoOpenTickers.add(ticker);
-      }
-    }
-
-    // Archive any OPEN broker_backfill rows for tickers that have AUTO trades
+    // Safety-net pass: archive any remaining OPEN broker_backfill rows for tickers that have AUTO trades.
+    // autoOpenTickers, cleanedDuplicateBackfill, cleanedDuplicateBackfillIds, cleanedDuplicateBackfillTickers
+    // are all pre-declared above the backfill loop.
     for (const t of trades) {
       if (t?.source === "broker_backfill" && t?.status === "OPEN" && t?.ticker) {
         const ticker = up(t.ticker);

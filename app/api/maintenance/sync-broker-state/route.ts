@@ -72,14 +72,10 @@ export async function POST(req: NextRequest) {
     return timestamp >= sinceIso;
   });
 
-  const positions = (await alpacaRequest({ method: "GET", path: "/v2/positions" }))
-    .text
-    ? JSON.parse((await alpacaRequest({ method: "GET", path: "/v2/positions" })).text || "[]")
-    : [];
-  const openOrders = (await alpacaRequest({ method: "GET", path: "/v2/orders?status=open&limit=500" }))
-    .text
-    ? JSON.parse((await alpacaRequest({ method: "GET", path: "/v2/orders?status=open&limit=500" })).text || "[]")
-    : [];
+  const positionsResp = await alpacaRequest({ method: "GET", path: "/v2/positions" });
+  const positions = positionsResp.text ? JSON.parse(positionsResp.text || "[]") : [];
+  const ordersResp = await alpacaRequest({ method: "GET", path: "/v2/orders?status=open&limit=500" });
+  const openOrders = ordersResp.text ? JSON.parse(ordersResp.text || "[]") : [];
 
   const posSet = new Set((positions ?? []).map((p: AlpacaPosition) => p.symbol));
   const openOrderById = new Map<string, AlpacaOrder>();

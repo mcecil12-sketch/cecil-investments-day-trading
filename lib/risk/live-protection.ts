@@ -204,17 +204,48 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
       };
     }
 
-    const openTradesForAudit: AuditTrade[] = trades
-      .filter((t) => isOperationallyOpenTrade(t))
-      .map((t) => ({
-        id: String(t?.id || ""),
-        ticker: String(t?.symbol ?? t?.ticker ?? "").toUpperCase(),
-        side: String(t?.side || "LONG").toUpperCase(),
-        status: String(t?.status || ""),
-        qty: Number(t?.size ?? t?.qty ?? 0),
-        stopOrderId: t?.stopOrderId ?? t?.alpacaStopOrderId,
-        protectionStatus: t?.protectionStatus,
-      }));
+    // Deduplicate by ticker before auditing. When multiple OPEN records exist for the same
+    // broker position (e.g. a rich AUTO trade + a ghost broker_backfill placeholder), only
+    // the canonical record should be audited. Ghost duplicates must not trigger false MISSING_STOP.
+    const canonicalTradeByTicker = new Map<string, Record<string, any>>();
+    for (const t of trades) {
+      if (!isOperationallyOpenTrade(t)) continue;
+      const sym = String(t?.symbol ?? t?.ticker ?? "").toUpperCase();
+      if (!sym) continue;
+      const existing = canonicalTradeByTicker.get(sym);
+      if (!existing) {
+        canonicalTradeByTicker.set(sym, t);
+        continue;
+      }
+      // Prefer richest record: signalId > AUTO source > stopOrderId > aiScore
+      const richness = (x: Record<string, any>) =>
+        (x?.signalId ? 8 : 0) +
+        (x?.source === "AUTO" || x?.source === "AUTO-ENTRY" ? 4 : 0) +
+        ((x?.stopOrderId || x?.alpacaStopOrderId) ? 2 : 0) +
+        (x?.aiScore ? 1 : 0);
+      if (richness(t) > richness(existing)) {
+        canonicalTradeByTicker.set(sym, t);
+      }
+    }
+
+    const rawOpenCount = trades.filter((t) => isOperationallyOpenTrade(t)).length;
+    if (rawOpenCount > canonicalTradeByTicker.size) {
+      console.log("[live-protection] deduplicated open trades for audit", {
+        rawOpenCount,
+        canonicalCount: canonicalTradeByTicker.size,
+        droppedGhosts: rawOpenCount - canonicalTradeByTicker.size,
+      });
+    }
+
+    const openTradesForAudit: AuditTrade[] = Array.from(canonicalTradeByTicker.values()).map((t) => ({
+      id: String(t?.id || ""),
+      ticker: String(t?.symbol ?? t?.ticker ?? "").toUpperCase(),
+      side: String(t?.side || "LONG").toUpperCase(),
+      status: String(t?.status || ""),
+      qty: Number(t?.size ?? t?.qty ?? 0),
+      stopOrderId: t?.stopOrderId ?? t?.alpacaStopOrderId,
+      protectionStatus: t?.protectionStatus,
+    }));
 
     if (openTradesForAudit.length === 0) {
       return {
