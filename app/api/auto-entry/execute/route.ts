@@ -1299,6 +1299,23 @@ export async function POST(req: Request) {
     }));
   };
 
+  // ─── Run-block attribution helper ────────────────────────────────────────
+  // When a run-level guard prevents all execution (e.g., protection_integrity_failed,
+  // max_entries_per_day), stamps each eligible AUTO_PENDING trade with a durable
+  // skip reason so operators and funnel-health can explain seeded→executed dropoff.
+  // Returns true if any trades were mutated (caller must call writeTrades).
+  function stampEligibleSkip(skipReason: string): boolean {
+    const now = nowIso();
+    let changed = false;
+    for (const i of eligibleIndexes) {
+      const t = trades[i];
+      if (!t) continue;
+      trades[i] = { ...t, executeAttemptedAt: now, executeSkipReason: skipReason, updatedAt: now };
+      changed = true;
+    }
+    return changed;
+  }
+
   if (!cfg.enabled) {
     // --- Attach diagnostics to response ---
     const responseObj = {
@@ -1368,6 +1385,7 @@ export async function POST(req: Request) {
   if (!marketOpen) {
     counts.skipped += 1;
     await recordOutcome({ outcome: "SKIP", reason: "market_closed" });
+    if (stampEligibleSkip("market_closed")) await writeTrades(trades);
     return NextResponse.json(
       {
         ok: true,
@@ -1482,6 +1500,7 @@ export async function POST(req: Request) {
         reason: "PROTECTION_INTEGRITY_FAILED",
         detail: liveProtection.summary,
       });
+      if (stampEligibleSkip("protection_integrity_failed")) await writeTrades(trades);
 
       return NextResponse.json(
         {
@@ -1534,6 +1553,7 @@ export async function POST(req: Request) {
   if (guardState.entriesToday >= guardConfig.maxEntriesPerDay) {
     counts.skipped += 1;
     await recordOutcome({ outcome: "SKIP", reason: "max_entries_per_day" });
+    if (stampEligibleSkip("max_entries_per_day")) await writeTrades(trades);
     return NextResponse.json(
       {
         ok: true,
@@ -1592,6 +1612,7 @@ export async function POST(req: Request) {
     guardSummary.cooldownRemainingMin = minsRemaining;
     counts.skipped += 1;
     await recordOutcome({ outcome: "SKIP", reason: "cooldown_after_loss" });
+    if (stampEligibleSkip("cooldown_after_loss")) await writeTrades(trades);
     return NextResponse.json(
       {
         ok: true,
@@ -1651,6 +1672,8 @@ export async function POST(req: Request) {
     const normalizedSide = side === "BUY" ? "LONG" : side === "SELL" ? "SHORT" : side;
     if (suppressedSides.includes(normalizedSide)) {
       counts.skipped += 1;
+      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "adaptive_side_suppressed", updatedAt: nowIso() };
+      await writeTrades(trades);
       await recordOutcome({
         outcome: "SKIP",
         reason: "adaptive_side_suppressed",
@@ -1693,6 +1716,8 @@ export async function POST(req: Request) {
 
     if (!gradeAllowed) {
       counts.skipped += 1;
+      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "overlay_grade_excluded", updatedAt: nowIso() };
+      await writeTrades(trades);
       await recordOutcome({
         outcome: "SKIP",
         reason: "overlay_grade_excluded",
@@ -1957,6 +1982,8 @@ export async function POST(req: Request) {
   if (sinceTicker != null && sinceTicker < guardConfig.tickerCooldownMin) {
     const minsRemaining = Math.ceil(guardConfig.tickerCooldownMin - sinceTicker);
     counts.skipped += 1;
+    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "ticker_cooldown", updatedAt: nowIso() };
+    await writeTrades(trades);
     await recordOutcome({ outcome: "SKIP", reason: "ticker_cooldown", ticker });
     return NextResponse.json(
       {
@@ -2130,6 +2157,8 @@ export async function POST(req: Request) {
   }
   if (open.orders.length > 0) {
     counts.skipped += 1;
+    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "open_order_exists", updatedAt: nowIso() };
+    await writeTrades(trades);
     await recordOutcome({ outcome: "SKIP", reason: "open_order_exists", ticker, tradeId });
     return NextResponse.json(
       {
@@ -2181,6 +2210,8 @@ export async function POST(req: Request) {
     const driftReason = checkPriceDrift(decisionPriceForDrift, entryPrice, stopPrice);
     if (driftReason) {
       counts.skipped += 1;
+      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: driftReason, updatedAt: nowIso() };
+      await writeTrades(trades);
       await recordOutcome({ outcome: "SKIP", reason: driftReason, ticker, tradeId });
       return NextResponse.json(
         {
