@@ -186,6 +186,9 @@ async function markTradeValidationSkipped(tradeId: string, reason: string, detai
       validationSkips: Number.isFinite(previousSkips) ? previousSkips + 1 : 1,
       validationDetails: detail ?? t?.validationDetails,
       updatedAt: now,
+      executeAttemptedAt: now,
+      executeOutcome: "INVALIDATED",
+      executeReason: reason,
     };
   });
   if (updated) await writeTrades(next);
@@ -894,6 +897,9 @@ export async function POST(req: Request) {
               error: "rescore_failed",
               updatedAt: nowForPending,
               rescoredAt: nowForPending,
+              executeAttemptedAt: nowForPending,
+              executeOutcome: "MALFORMED",
+              executeReason: "rescore_failed",
             };
             counts.invalidMarked += 1;
             counts.skipped += 1;
@@ -915,6 +921,9 @@ export async function POST(req: Request) {
             error: "rescore_failed",
             updatedAt: nowForPending,
             rescoredAt: nowForPending,
+            executeAttemptedAt: nowForPending,
+            executeOutcome: "MALFORMED",
+            executeReason: "rescore_failed",
           };
           counts.invalidMarked += 1;
           counts.skipped += 1;
@@ -936,6 +945,9 @@ export async function POST(req: Request) {
             error: undefined,
             closedAt: trades[item.i]?.closedAt || nowForPending,
             updatedAt: nowForPending,
+            executeAttemptedAt: nowForPending,
+            executeOutcome: "SKIPPED_EXPIRED",
+            executeReason: "stale_trade",
           };
           counts.staleArchived += 1;
           counts.skipped += 1;
@@ -956,6 +968,9 @@ export async function POST(req: Request) {
               error: undefined,
               closedAt: trades[item.i]?.closedAt || nowForPending,
               updatedAt: nowForPending,
+              executeAttemptedAt: nowForPending,
+              executeOutcome: "SKIPPED_DUPLICATE",
+              executeReason: "already_executed_carryover",
             };
             counts.duplicatesArchived += 1;
             counts.skipped += 1;
@@ -978,6 +993,9 @@ export async function POST(req: Request) {
           reason: eligibility.reason,
           error: eligibility.reason,
           updatedAt: nowForPending,
+          executeAttemptedAt: nowForPending,
+          executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE",
+          executeReason: eligibility.reason,
         };
         counts.invalidMarked += 1;
         counts.skipped += 1;
@@ -1001,6 +1019,9 @@ export async function POST(req: Request) {
             takeProfitPrice: workingTrade?.takeProfitPrice ?? workingTrade?.targetPrice ?? null,
           },
           updatedAt: nowForPending,
+          executeAttemptedAt: nowForPending,
+          executeOutcome: "MALFORMED",
+          executeReason: "invalid_pending_missing_risk",
         };
         counts.invalidMarked += 1;
         counts.skipped += 1;
@@ -1029,6 +1050,9 @@ export async function POST(req: Request) {
           error: undefined,
           closedAt: trades[item.i]?.closedAt || nowForPending,
           updatedAt: nowForPending,
+          executeAttemptedAt: nowForPending,
+          executeOutcome: "SKIPPED_DUPLICATE",
+          executeReason: "duplicate_auto_pending",
         };
         counts.duplicatesArchived += 1;
         counts.skipped += 1;
@@ -1055,6 +1079,9 @@ export async function POST(req: Request) {
           error: undefined,
           closedAt: trades[item.i]?.closedAt || nowForPending,
           updatedAt: nowForPending,
+          executeAttemptedAt: nowForPending,
+          executeOutcome: "SKIPPED_DUPLICATE",
+          executeReason: "superseded_by_current_session_trade",
         };
         counts.carryoverArchivedCount += 1;
         counts.skipped += 1;
@@ -1095,6 +1122,9 @@ export async function POST(req: Request) {
           error: undefined,
           closedAt: trades[item.i]?.closedAt || nowForPending,
           updatedAt: nowForPending,
+          executeAttemptedAt: nowForPending,
+          executeOutcome: "INVALIDATED",
+          executeReason: "invalid_risk_structure_on_revalidation",
         };
         counts.carryoverArchivedCount += 1;
         counts.skipped += 1;
@@ -1122,6 +1152,9 @@ export async function POST(req: Request) {
               error: undefined,
               closedAt: trades[item.i]?.closedAt || nowForPending,
               updatedAt: nowForPending,
+              executeAttemptedAt: nowForPending,
+              executeOutcome: "SKIPPED_PRICE_DRIFT",
+              executeReason: driftReason,
             };
             counts.carryoverArchivedCount += 1;
             counts.skipped += 1;
@@ -1148,6 +1181,9 @@ export async function POST(req: Request) {
           error: undefined,
           closedAt: trades[item.i]?.closedAt || nowForPending,
           updatedAt: nowForPending,
+          executeAttemptedAt: nowForPending,
+          executeOutcome: "SKIPPED_DUPLICATE",
+          executeReason: "duplicate_carryover_for_same_ticker",
         };
         counts.duplicatesArchived += 1;
         counts.skipped += 1;
@@ -1300,17 +1336,23 @@ export async function POST(req: Request) {
   };
 
   // ─── Run-block attribution helper ────────────────────────────────────────
-  // When a run-level guard prevents all execution (e.g., protection_integrity_failed,
-  // max_entries_per_day), stamps each eligible AUTO_PENDING trade with a durable
-  // skip reason so operators and funnel-health can explain seeded→executed dropoff.
-  // Returns true if any trades were mutated (caller must call writeTrades).
+  // When a run-level guard prevents all execution, stamps each eligible AUTO_PENDING
+  // trade with durable executeOutcome/executeReason so funnel-health can explain
+  // seeded→executed dropoff. Returns true if any trades were mutated.
+  function skipReasonToOutcome(reason: string): string {
+    if (reason === "market_closed") return "SKIPPED_MARKET_CLOSED";
+    if (reason === "protection_integrity_failed" || reason === "PROTECTION_INTEGRITY_FAILED") return "SKIPPED_PROTECTION_BLOCK";
+    if (reason === "max_entries_per_day" || reason === "overlay_max_entries_override" || reason === "cooldown_after_loss") return "SKIPPED_CAPACITY";
+    return "SKIPPED_NO_LONGER_ELIGIBLE";
+  }
   function stampEligibleSkip(skipReason: string): boolean {
     const now = nowIso();
+    const outcome = skipReasonToOutcome(skipReason);
     let changed = false;
     for (const i of eligibleIndexes) {
       const t = trades[i];
       if (!t) continue;
-      trades[i] = { ...t, executeAttemptedAt: now, executeSkipReason: skipReason, updatedAt: now };
+      trades[i] = { ...t, executeAttemptedAt: now, executeSkipReason: skipReason, executeOutcome: outcome, executeReason: skipReason, updatedAt: now };
       changed = true;
     }
     return changed;
@@ -1579,6 +1621,7 @@ export async function POST(req: Request) {
   if (overlay.maxEntriesOverride != null && guardState.entriesToday >= overlay.maxEntriesOverride) {
     counts.skipped += 1;
     await recordOutcome({ outcome: "SKIP", reason: "overlay_max_entries_override" });
+    if (stampEligibleSkip("overlay_max_entries_override")) await writeTrades(trades);
     return NextResponse.json(
       {
         ok: true,
@@ -1672,7 +1715,7 @@ export async function POST(req: Request) {
     const normalizedSide = side === "BUY" ? "LONG" : side === "SELL" ? "SHORT" : side;
     if (suppressedSides.includes(normalizedSide)) {
       counts.skipped += 1;
-      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "adaptive_side_suppressed", updatedAt: nowIso() };
+      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "adaptive_side_suppressed", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "adaptive_side_suppressed", updatedAt: nowIso() };
       await writeTrades(trades);
       await recordOutcome({
         outcome: "SKIP",
@@ -1716,7 +1759,7 @@ export async function POST(req: Request) {
 
     if (!gradeAllowed) {
       counts.skipped += 1;
-      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "overlay_grade_excluded", updatedAt: nowIso() };
+      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "overlay_grade_excluded", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "overlay_grade_excluded", updatedAt: nowIso() };
       await writeTrades(trades);
       await recordOutcome({
         outcome: "SKIP",
@@ -1766,6 +1809,8 @@ export async function POST(req: Request) {
       if (tradeScore < effectiveTierMin) {
         const adjSource = adaptiveScoreAdj !== 0 ? ` + adaptive ${adaptiveScoreAdj}` : "";
         counts.skipped += 1;
+        trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "overlay_score_below_adjusted_threshold", updatedAt: nowIso() };
+        await writeTrades(trades);
         await recordOutcome({
           outcome: "SKIP",
           reason: "overlay_score_below_adjusted_threshold",
@@ -1852,6 +1897,8 @@ export async function POST(req: Request) {
       replacement: replacementPlan,
     });
     await recordOutcome({ outcome: "SKIP", reason: "max_open_positions", ticker, tradeId: String(trade?.id || ""), detail });
+    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_CAPACITY", executeReason: "max_open_positions", updatedAt: nowIso() };
+    await writeTrades(trades);
     return NextResponse.json(
       {
         ok: true,
@@ -1892,6 +1939,8 @@ export async function POST(req: Request) {
         tradeId: String(trade?.id || ""),
         detail: JSON.stringify({ replacement: replacementPlan, weakestTradeFound: Boolean(weakestTrade), weakestTicker, weakestQty }),
       });
+      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_CAPACITY", executeReason: "replacement_close_unavailable", updatedAt: nowIso() };
+      await writeTrades(trades);
       return NextResponse.json(
         {
           ok: true,
@@ -1954,6 +2003,8 @@ export async function POST(req: Request) {
         tradeId: String(trade?.id || ""),
         detail: String(replacementErr?.message || replacementErr || "replacement_close_submit_failed"),
       });
+      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "ERROR", executeReason: "replacement_close_submit_failed", updatedAt: nowIso() };
+      await writeTrades(trades);
       return NextResponse.json(
         {
           ok: false,
@@ -1982,7 +2033,7 @@ export async function POST(req: Request) {
   if (sinceTicker != null && sinceTicker < guardConfig.tickerCooldownMin) {
     const minsRemaining = Math.ceil(guardConfig.tickerCooldownMin - sinceTicker);
     counts.skipped += 1;
-    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "ticker_cooldown", updatedAt: nowIso() };
+    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "ticker_cooldown", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "ticker_cooldown", updatedAt: nowIso() };
     await writeTrades(trades);
     await recordOutcome({ outcome: "SKIP", reason: "ticker_cooldown", ticker });
     return NextResponse.json(
@@ -2031,6 +2082,9 @@ export async function POST(req: Request) {
         targetPrice: trade.takeProfitPrice ?? trade.targetPrice ?? null,
       },
       updatedAt: now,
+      executeAttemptedAt: now,
+      executeOutcome: "MALFORMED",
+      executeReason: "INVALID_TRADE_PLAN_MISSING_VALUES",
     };
     await writeTrades(trades);
     counts.invalidMarked += 1;
@@ -2074,6 +2128,9 @@ export async function POST(req: Request) {
       error: "INVALID_TRADE_PLAN_STRUCTURE",
       errorDetails: { entryPrice, stopPrice, targetPrice, side: sideEnum, validationFailure },
       updatedAt: now,
+      executeAttemptedAt: now,
+      executeOutcome: "MALFORMED",
+      executeReason: "INVALID_TRADE_PLAN_STRUCTURE",
     };
     await writeTrades(trades);
     counts.invalidMarked += 1;
@@ -2102,6 +2159,8 @@ export async function POST(req: Request) {
   const locked = await setnxLock(lockKey, 60 * 10);
   if (!locked) {
     counts.skipped += 1;
+    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "already_locked", updatedAt: nowIso() };
+    await writeTrades(trades);
     await recordOutcome({ outcome: "SKIP", reason: "already_locked", ticker, tradeId });
     return NextResponse.json(
       {
@@ -2127,6 +2186,8 @@ export async function POST(req: Request) {
 
   const open = await hasOpenOrdersForSymbol(ticker);
   if (!open.ok) {
+    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "ERROR", executeReason: "broker_open_orders_lookup_failed", updatedAt: nowIso() };
+    await writeTrades(trades);
     await recordOutcome({
       outcome: "FAIL",
       reason: "broker_open_orders_lookup_failed",
@@ -2157,7 +2218,7 @@ export async function POST(req: Request) {
   }
   if (open.orders.length > 0) {
     counts.skipped += 1;
-    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "open_order_exists", updatedAt: nowIso() };
+    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "open_order_exists", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "open_order_exists", updatedAt: nowIso() };
     await writeTrades(trades);
     await recordOutcome({ outcome: "SKIP", reason: "open_order_exists", ticker, tradeId });
     return NextResponse.json(
@@ -2210,7 +2271,7 @@ export async function POST(req: Request) {
     const driftReason = checkPriceDrift(decisionPriceForDrift, entryPrice, stopPrice);
     if (driftReason) {
       counts.skipped += 1;
-      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: driftReason, updatedAt: nowIso() };
+      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: driftReason, executeOutcome: "SKIPPED_PRICE_DRIFT", executeReason: driftReason, updatedAt: nowIso() };
       await writeTrades(trades);
       await recordOutcome({ outcome: "SKIP", reason: driftReason, ticker, tradeId });
       return NextResponse.json(
@@ -2517,6 +2578,10 @@ export async function POST(req: Request) {
   });
 
   if (!lock.ok) {
+    const lockOutcome = lock.error === "LOCKED" ? "SKIPPED_NO_LONGER_ELIGIBLE" : "ERROR";
+    const lockReason = lock.error === "LOCKED" ? "already_locked" : "alpaca_lock_error";
+    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: lockOutcome, executeReason: lockReason, updatedAt: nowIso() };
+    await writeTrades(trades);
     if (lock.error === "LOCKED") {
       counts.skipped += 1;
       await recordOutcome({ outcome: "SKIP", reason: "already_locked", ticker, tradeId });
@@ -2726,6 +2791,9 @@ export async function POST(req: Request) {
         lastStopAppliedAt: startedAt,
         updatedAt: startedAt,
         executedAt: startedAt,
+        executeAttemptedAt: startedAt,
+        executeOutcome: "ERROR",
+        executeReason: "missing_stop_protection",
       };
 
       trades[idx] = errorTrade;
@@ -2803,6 +2871,9 @@ export async function POST(req: Request) {
       updatedAt: startedAt,
       executedAt: startedAt,
       openedAt: startedAt,
+      executeAttemptedAt: startedAt,
+      executeOutcome: "EXECUTED",
+      executeReason: "placed",
       ai: {
         ...(trade.ai || {}),
         score,
@@ -2884,6 +2955,9 @@ export async function POST(req: Request) {
       status: "ERROR",
       error: message,
       updatedAt: startedAt,
+      executeAttemptedAt: startedAt,
+      executeOutcome: "ERROR",
+      executeReason: message.slice(0, 120),
     };
     trades[idx] = updated;
     await writeTrades(trades);

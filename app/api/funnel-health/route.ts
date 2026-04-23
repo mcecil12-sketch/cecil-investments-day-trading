@@ -361,21 +361,23 @@ export async function GET() {
       (t?.status === "OPEN" || t?.status === "CLOSED" || t?.status === "HIT" || t?.status === "STOPPED")
     ).length;
 
-    // SEEDED_BUT_NOT_EXECUTED: AUTO_PENDING trades that the execute route attempted
-    // and stamped with a skip reason — explains seeded→executed dropoff
+    // SEEDED_BUT_NOT_EXECUTED: trades that execute evaluated and set a non-EXECUTED/PENDING outcome
+    // This covers trades regardless of current status (ARCHIVED, ERROR, still AUTO_PENDING)
     const seededButNotExecuted = todayTrades.filter((t: any) =>
       (t?.source === "AUTO" || t?.source === "auto-entry") &&
-      t?.status === "AUTO_PENDING" &&
-      Boolean(t?.executeSkipReason)
+      t?.executeOutcome != null &&
+      t?.executeOutcome !== "EXECUTED" &&
+      t?.executeOutcome !== "PENDING"
     ).length;
 
-    // Breakdown of skip reasons for seeded-but-not-executed trades
+    // Breakdown of executeOutcome values for seeded-but-not-executed trades
     const executeSkipReasonBreakdown: Record<string, number> = {};
     for (const t of todayTrades) {
-      if (!t?.executeSkipReason) continue;
+      if (!t?.executeOutcome) continue;
+      if (t.executeOutcome === "EXECUTED" || t.executeOutcome === "PENDING") continue;
       if (t?.source !== "AUTO" && t?.source !== "auto-entry") continue;
-      const reason = String(t.executeSkipReason);
-      executeSkipReasonBreakdown[reason] = (executeSkipReasonBreakdown[reason] ?? 0) + 1;
+      const outcome = String(t.executeOutcome);
+      executeSkipReasonBreakdown[outcome] = (executeSkipReasonBreakdown[outcome] ?? 0) + 1;
     }
 
     // -------------------------------------------------------------------------

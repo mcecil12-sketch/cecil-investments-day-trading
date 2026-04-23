@@ -631,6 +631,10 @@ export async function POST(req: NextRequest) {
         summary: "",
       },
       autoEntryStatus: "AUTO_PENDING",
+      // Execution attribution: set at creation so every seeded trade is traceable
+      seededAt: now,
+      executeOutcome: "PENDING",
+      executeReason: null as null,
       // Phase 3c: Track short penalty for debugging
       ...(c.side === "SHORT" && c.shortPenalty > 0 ? { shortPenalty: c.shortPenalty } : {}),
     };
