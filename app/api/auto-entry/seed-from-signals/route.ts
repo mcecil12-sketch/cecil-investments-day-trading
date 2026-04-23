@@ -567,12 +567,44 @@ export async function POST(req: NextRequest) {
 
   // Create trades for selected candidates
   for (const c of candidatesToSeed) {
+    // ── Seed-time validation: reject malformed candidates before creating ──
+    const missingField = !c.symbol
+      ? "symbol"
+      : !c.side
+        ? "side"
+        : !(c.entryPrice > 0)
+          ? "entryPrice"
+          : !(c.stopPrice > 0)
+            ? "stopPrice"
+            : !(c.targetPrice > 0)
+              ? "targetPrice"
+              : !(c.aiScore >= 0)
+                ? "aiScore"
+                : !c.tier
+                  ? "tier"
+                  : !c.signalId
+                    ? "signalId"
+                    : null;
+
+    if (missingField) {
+      console.warn("[seed-from-signals] skipping malformed candidate", {
+        missingField,
+        symbol: c.symbol,
+        side: c.side,
+        signalId: c.signalId,
+      });
+      skipped.push({ symbol: c.symbol, reason: `missing_required_field_${missingField}` });
+      continue;
+    }
+
     const now = new Date().toISOString();
     const sessionMeta = deriveSessionMeta(now);
     const scoredAt = String(c.signal?.scoredAt || c.signal?.updatedAt || c.createdAt || now);
 
     const trade = {
       id: crypto.randomUUID(),
+      // symbol is canonical; ticker kept for backward compat
+      symbol: c.symbol,
       ticker: c.symbol,
       side: c.side,
       entryPrice: c.entryPrice,
@@ -590,6 +622,14 @@ export async function POST(req: NextRequest) {
       signalId: c.signalId,
       aiScore: c.aiScore,
       tier: c.tier,
+      // Normalize nested ai object to mirror top-level aiScore
+      ai: {
+        score: c.aiScore,
+        tier: c.tier,
+        grade: null as string | null,
+        qualified: c.aiScore > 0,
+        summary: "",
+      },
       autoEntryStatus: "AUTO_PENDING",
       // Phase 3c: Track short penalty for debugging
       ...(c.side === "SHORT" && c.shortPenalty > 0 ? { shortPenalty: c.shortPenalty } : {}),

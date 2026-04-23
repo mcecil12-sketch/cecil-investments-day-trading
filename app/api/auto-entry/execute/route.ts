@@ -1,4 +1,4 @@
-import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
+import { evaluateCurrentProtectionIntegrity } from "@/lib/risk/live-protection";
 import { NextResponse } from "next/server";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { verifyStopOrderDirect, recoverUnprotectedTrade, flattenUnprotectedPosition } from "@/lib/risk/stop-verification";
@@ -82,7 +82,6 @@ function rankWeakestTrade(trades: any[]) {
 }
 import { alpacaRequest, createOrder } from "@/lib/alpaca";
 import { redis, saveCriticalTask } from "@/lib/redis";
-import { getCriticalTasks, partitionCriticalTasks } from "@/lib/redis";
 import { recordAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
 import { requireAuth } from "@/lib/auth";
 import { getGuardrailConfig, minutesSince } from "@/lib/autoEntry/guardrails";
@@ -96,10 +95,6 @@ import { sendNotification } from "@/lib/notifications/notify";
 import { NotificationEvent } from "@/lib/notifications/types";
 import { normalizeStopPrice, normalizeLimitPrice, tickForEquityPrice } from "@/lib/tickSize";
 import { fetchBrokerTruth, type BrokerTruth } from "@/lib/broker/truth";
-  import {
-    type BrokerPosition,
-    type BrokerOrder,
-  } from "@/lib/risk/protection-integrity";
 import {
   deriveSessionMeta,
   evaluatePendingEligibility,
@@ -287,21 +282,26 @@ async function tryRescoreTrade(trade: any) {
     return { ok: false as const };
   }
 
+  // Authoritative score: prefer freshly scored value, then existing aiScore, then null
+  const canonicalScore = Number.isFinite(score) ? score : (trade?.aiScore ?? null);
+  const canonicalGrade = grade || trade?.aiGrade || null;
+
   const now = new Date().toISOString();
   return {
     ok: true as const,
     patch: {
-      aiScore: Number.isFinite(score) ? score : trade?.aiScore ?? null,
-      aiGrade: grade || trade?.aiGrade || null,
+      aiScore: canonicalScore,
+      aiGrade: canonicalGrade,
       qualified: scored?.qualified === true,
       bestDirection,
       aiSummary: summary || trade?.aiSummary || "",
       rescoredAt: now,
       updatedAt: now,
+      // ai nested object MUST mirror top-level aiScore — never contradict
       ai: {
         ...(trade?.ai || {}),
-        score: Number.isFinite(score) ? score : trade?.ai?.score ?? null,
-        grade: grade || trade?.ai?.grade || null,
+        score: canonicalScore,
+        grade: canonicalGrade,
         qualified: scored?.qualified === true,
         bestDirection,
         summary: summary || trade?.ai?.summary || "",
@@ -1448,47 +1448,58 @@ export async function POST(req: Request) {
     );
   }
 
-  // ─── Protection Integrity Gate ──────────────────────────────────────
-  // Fail-closed: block new entries when unresolved critical incidents exist in Redis.
-  // Broker-flat awareness: if broker has 0 positions and 0 orders, stale/synthetic
-  // critical tasks from prior sessions should not block new entries.
+  // ─── Protection Integrity Gate (state-based) ─────────────────────────────
+  // Evaluates current live risk using broker-truth reconciliation.
+  // Stale historical incidents are auto-retired before blocking decisions.
+  // Auto-heal is attempted for any genuine live blockers before returning an error.
+  // Execution is blocked ONLY by current, unresolved, broker-confirmed risk.
   {
-    const brokerIsFlat = brokerTruth.positionsCount === 0 && brokerTruth.openOrdersCount === 0;
-    const allCritical = await getCriticalTasks().catch(() => []);
-    const { blocking: realBlocking } = partitionCriticalTasks(allCritical);
-    // When broker is flat, only block on tasks referencing symbols with live positions
-    const effectiveBlocking = brokerIsFlat
-      ? realBlocking.filter((t) => {
-          const sym = (t.symbol || "").toUpperCase();
-          return brokerTruth.positions.some((p) => (p.symbol || "").toUpperCase() === sym && Math.abs(p.qty) > 0);
-        })
-      : realBlocking;
-    if (effectiveBlocking.length > 0) {
+    const liveProtection = await evaluateCurrentProtectionIntegrity({
+      brokerTruth,
+      trades,
+      attemptRepairs: true,
+    });
+
+    console.log("[execute] protection-integrity eval", {
+      ok: liveProtection.ok,
+      summary: liveProtection.summary,
+      liveBlockers: liveProtection.liveBlockers.length,
+      retiredStale: liveProtection.retiredStale.length,
+      repaired: liveProtection.repaired.length,
+    });
+
+    if (!liveProtection.ok) {
       counts.skipped += 1;
-      const incidentSummary = effectiveBlocking
+      const blockerSymbols = liveProtection.liveBlockers.map((b) => b.symbol).filter(Boolean);
+      const blockerTradeIds = liveProtection.liveBlockers.map((b) => b.tradeId ?? null).filter(Boolean);
+      const incidentSummary = liveProtection.liveBlockers
         .slice(0, 5)
-        .map((t) => `${t.incidentCode}:${t.symbol}`)
+        .map((b) => `${b.blockerCode}:${b.symbol}`)
         .join(", ");
-      const blockerTradeIds = effectiveBlocking.map((t) => t.id || null).filter(Boolean);
-      const blockerSymbols = effectiveBlocking.map((t) => t.symbol || null).filter(Boolean);
+
       await recordOutcome({
         outcome: "SKIP",
         reason: "PROTECTION_INTEGRITY_FAILED",
-        detail: `${effectiveBlocking.length} unresolved critical task(s): ${incidentSummary}`,
+        detail: liveProtection.summary,
       });
+
       return NextResponse.json(
         {
           ok: true,
           skipped: true,
           reason: "PROTECTION_INTEGRITY_FAILED",
-          integrityBlockerType: "critical_task",
-          integrityBlockerTradeIds: blockerTradeIds,
+          integrityBlockerType: "live_risk",
           integrityBlockerSymbols: blockerSymbols,
-          detail: `${effectiveBlocking.length} unresolved critical incident(s) in self-heal queue`,
-          unresolvedCriticalCount: effectiveBlocking.length,
-          unresolvedCriticalSummary: incidentSummary,
-          brokerIsFlat,
-          staleCriticalSkipped: allCritical.length - effectiveBlocking.length,
+          integrityBlockerTradeIds: blockerTradeIds,
+          detail: liveProtection.summary,
+          // ── Diagnostic fields for agents ──
+          liveBlockers: liveProtection.liveBlockers,
+          retiredStale: liveProtection.retiredStale,
+          repairAttempts: liveProtection.repairAttempts,
+          repaired: liveProtection.repaired,
+          currentBrokerTruthSummary: liveProtection.brokerTruthSummary,
+          currentDbTruthSummary: liveProtection.dbTruthSummary,
+          incidentSummary,
           malformedPendingCount: malformedPendingTrades.length,
           malformedOpenCount: malformedOpenTrades.length,
           malformedPendingTrades,
@@ -1508,77 +1519,13 @@ export async function POST(req: Request) {
         { status: 200 },
       );
     }
-  }
 
-  // ─── Protection Integrity Audit Gate ────────────────────────────────
-  // Block new entries when existing open positions have critical protection gaps.
-  // Broker-flat: if broker has 0 positions + 0 orders, DB-only "open" trades are
-  // stale remnants, not live risk.  Skip the audit to avoid false BROKER_DB_MISMATCH.
-  {
-    const brokerIsFlat = brokerTruth.positionsCount === 0 && brokerTruth.openOrdersCount === 0;
-    const openTradesForAudit = trades
-      .filter((t: any) => isOperationallyOpenTrade(t))
-      .map((t: any) => ({
-        id: String(t?.id || ""),
-        ticker: String(t?.ticker || "").toUpperCase(),
-        side: String(t?.side || "LONG").toUpperCase(),
-        status: String(t?.status || ""),
-        qty: Number(t?.size || t?.qty || 0),
-        stopOrderId: t?.stopOrderId || t?.alpacaStopOrderId,
-        protectionStatus: t?.protectionStatus,
-      }));
-    if (openTradesForAudit.length > 0 && !brokerIsFlat) {
-      const positions: BrokerPosition[] = Array.isArray(brokerTruth.positions) ? brokerTruth.positions : [];
-      const orders: BrokerOrder[] = Array.isArray(brokerTruth.openOrders) ? brokerTruth.openOrders : [];
-      const audit = auditProtectionIntegrity({
-        openTrades: openTradesForAudit,
-        brokerPositions: positions,
-        brokerOrders: orders,
-        marketOpen,
-      });
-      if (audit.criticalCount > 0) {
-        const criticalIncidents = audit.incidents.filter((i) => i.severity === "CRITICAL");
-        counts.skipped += 1;
-        const blockerTradeIds = criticalIncidents.map((i) => i.tradeId || null).filter(Boolean);
-        const blockerSymbols = criticalIncidents.map((i) => i.symbol || null).filter(Boolean);
-        await recordOutcome({
-          outcome: "SKIP",
-          reason: "PROTECTION_INTEGRITY_FAILED",
-          detail: `${audit.criticalCount} critical: ${criticalIncidents.map((i) => `${i.code}:${i.symbol}`).join(", ")}`,
-        });
-        return NextResponse.json(
-          {
-            ok: true,
-            skipped: true,
-            reason: "PROTECTION_INTEGRITY_FAILED",
-            integrityBlockerType: "protection_audit",
-            integrityBlockerTradeIds: blockerTradeIds,
-            integrityBlockerSymbols: blockerSymbols,
-            detail: `${audit.criticalCount} critical protection incidents on existing positions`,
-            protectionAudit: {
-              criticalCount: audit.criticalCount,
-              incidentCount: audit.incidentCount,
-              incidents: criticalIncidents.slice(0, 10),
-            },
-            malformedPendingCount: malformedPendingTrades.length,
-            malformedOpenCount: malformedOpenTrades.length,
-            malformedPendingTrades,
-            malformedOpenTrades,
-            market: { isOpen: marketOpen, timestamp: marketTimestamp },
-            openPositionsCount: brokerTruth.positionsCount,
-            maxOpenPositions: guardConfig.maxOpenPositions,
-            entriesToday: guardState.entriesToday,
-            maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-            pendingCount: counts.pendingCount,
-            eligibleCount: counts.eligibleCount,
-            executedCount: counts.executed,
-            counts,
-            notes: notes.slice(0, 40),
-            guardrails: guardSummary,
-          },
-          { status: 200 },
-        );
-      }
+    // Log retirements and repairs for observability even when not blocking
+    if (liveProtection.retiredStale.length > 0) {
+      notes.push(`integrity_stale_retired:${liveProtection.retiredStale.length}`);
+    }
+    if (liveProtection.repaired.length > 0) {
+      notes.push(`integrity_repaired:${liveProtection.repaired.length}`);
     }
   }
 

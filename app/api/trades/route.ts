@@ -274,6 +274,8 @@ export async function GET(req: Request) {
     // Map quantity fields
     const serialized = trades.map((trade) => ({
       ...trade,
+      // Canonical symbol field: symbol is authoritative, ticker is legacy alias
+      symbol: (trade as any).symbol ?? (trade as any).ticker ?? null,
       qty: mapQty(trade),
       filledQty: mapFilledQty(trade),
       avgFillPrice: mapAvgFillPrice(trade),

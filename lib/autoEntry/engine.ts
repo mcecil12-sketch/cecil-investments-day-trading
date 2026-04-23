@@ -144,22 +144,27 @@ async function tryRescoreTrade(trade: AnyTrade) {
     return { ok: false as const };
   }
 
+  // Authoritative score: prefer freshly scored value, then existing aiScore, then null
+  const canonicalScore = Number.isFinite(score) ? score : (trade?.aiScore ?? null);
+  const canonicalGrade = grade || trade?.aiGrade || null;
+
   const now = new Date().toISOString();
 
   return {
     ok: true as const,
     patch: {
-      aiScore: Number.isFinite(score) ? score : trade?.aiScore ?? null,
-      aiGrade: grade || trade?.aiGrade || null,
+      aiScore: canonicalScore,
+      aiGrade: canonicalGrade,
       qualified: scored?.qualified === true,
       bestDirection,
       aiSummary: summary || trade?.aiSummary || "",
       rescoredAt: now,
       updatedAt: now,
+      // ai nested object MUST mirror top-level aiScore — never contradict
       ai: {
         ...(trade?.ai || {}),
-        score: Number.isFinite(score) ? score : trade?.ai?.score ?? null,
-        grade: grade || trade?.ai?.grade || null,
+        score: canonicalScore,
+        grade: canonicalGrade,
         qualified: scored?.qualified === true,
         bestDirection,
         summary: summary || trade?.ai?.summary || "",

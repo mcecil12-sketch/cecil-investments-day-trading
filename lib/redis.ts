@@ -130,6 +130,25 @@ export async function resolveCriticalTask(id: string): Promise<boolean> {
   const task = await redis.hget<CriticalTask>(CRITICAL_TASKS_KEY, id);
   if (!task) return false;
   task.resolvedAt = new Date().toISOString();
+  task.status = "resolved";
+  await redis.hset(CRITICAL_TASKS_KEY, { [id]: task });
+  return true;
+}
+
+/**
+ * Auto-retire a stale critical task (broker truth no longer matches the incident).
+ * Preserved in audit trail but excluded from future getCriticalTasks() results.
+ *
+ * Status "stale" is handled by getCriticalTasks() — stale tasks are filtered out
+ * automatically so they never block execution.
+ */
+export async function retireStaleCriticalTask(id: string, reason: string): Promise<boolean> {
+  if (!redis) return false;
+  const task = await redis.hget<CriticalTask>(CRITICAL_TASKS_KEY, id);
+  if (!task) return false;
+  task.status = "stale";
+  task.resolvedAt = new Date().toISOString();
+  task.resolutionReason = reason;
   await redis.hset(CRITICAL_TASKS_KEY, { [id]: task });
   return true;
 }
