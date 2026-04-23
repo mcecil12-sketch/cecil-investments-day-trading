@@ -22,7 +22,7 @@ export type BrokerTruth = {
     unrealized_pl?: string | number;
     unrealized_plpc?: string | number;
   }>;
-  openOrders: Array<{ id: string; symbol: string; side: string; status: string; type?: string; order_class?: string; client_order_id?: string }>;
+  openOrders: Array<{ id: string; symbol: string; side: string; status: string; type?: string; stop_price?: string | number; order_class?: string; client_order_id?: string }>;
   error?: string;
 };
 
@@ -30,11 +30,12 @@ export type BrokerTruth = {
  * Fetch broker truth from Alpaca: positions and open orders.
  * Safe: handles timeouts, try/catch, and caches for 45-60 seconds.
  */
-export async function fetchBrokerTruth(): Promise<BrokerTruth> {
+export async function fetchBrokerTruth(opts?: { forceRefresh?: boolean }): Promise<BrokerTruth> {
   const now = new Date().toISOString();
-  
-  // Try to get from cache first
-  if (redis) {
+  const forceRefresh = opts?.forceRefresh ?? false;
+
+  // Try to get from cache first (unless force refresh is requested)
+  if (!forceRefresh && redis) {
     try {
       const cached = await redis.get<BrokerTruth>(BROKER_TRUTH_CACHE_KEY);
       if (cached) {
@@ -148,7 +149,7 @@ async function fetchPositions(): Promise<
  * Fetch open orders from Alpaca GET /v2/orders?status=open
  */
 async function fetchOpenOrders(): Promise<
-  | { ok: true; data: Array<{ id: string; symbol: string; side: string; status: string; type?: string; order_class?: string; client_order_id?: string }> }
+  | { ok: true; data: Array<{ id: string; symbol: string; side: string; status: string; type?: string; stop_price?: string | number; order_class?: string; client_order_id?: string }> }
   | { ok: false; error: string }
 > {
   try {
@@ -174,6 +175,7 @@ async function fetchOpenOrders(): Promise<
             side: String(o.side || ""),
             status: String(o.status || ""),
             type: String(o.type || ""),
+            stop_price: o.stop_price ?? undefined,
             order_class: String(o.order_class || ""),
             client_order_id: String(o.client_order_id || ""),
           }))

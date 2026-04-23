@@ -9,7 +9,7 @@
  * Execution is blocked ONLY by current live risk — not by old incidents.
  */
 
-import { fetchBrokerTruth, type BrokerTruth } from "@/lib/broker/truth";
+import { fetchBrokerTruth, clearBrokerTruthCache, type BrokerTruth } from "@/lib/broker/truth";
 import {
   getCriticalTasks,
   partitionCriticalTasks,
@@ -25,6 +25,7 @@ import {
 } from "@/lib/risk/protection-integrity";
 import { recoverUnprotectedTrades } from "@/lib/risk/protection-recover";
 import { isOperationallyOpenTrade } from "@/lib/trades/operational";
+import { evaluateTradeProtectionNow } from "@/lib/risk/protection-truth";
 
 // ─── Exported Types ──────────────────────────────────────────────────
 
@@ -66,8 +67,17 @@ function brokerHasActiveStop(brokerTruth: BrokerTruth, symbol: string): boolean 
   return brokerTruth.openOrders.some(
     (o) =>
       String(o.symbol || "").toUpperCase() === sym &&
-      ["stop", "stop_limit"].includes(String(o.type || "").toLowerCase()) &&
-      ["new", "accepted", "pending", "held"].includes(String(o.status || "").toLowerCase()),
+      // Comprehensive stop-type detection: stop, stop_limit, trailing_stop
+      ["stop", "stop_limit", "trailing_stop"].includes(String(o.type || "").toLowerCase()) &&
+      // All Alpaca statuses that mean the order is alive (including pending_new for new bracket legs)
+      [
+        "new",
+        "accepted",
+        "pending_new",
+        "pending_replace",
+        "accepted_for_bidding",
+        "held",
+      ].includes(String(o.status || "").toLowerCase()),
   );
 }
 
@@ -268,16 +278,49 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
       ? brokerTruth.openOrders
       : [];
 
-    const audit = auditProtectionIntegrity({
-      openTrades: openTradesForAudit,
-      brokerPositions: positions,
-      brokerOrders: orders,
-    });
+    // ── Per-trade current-truth check (primary) ─────────────────────────
+    // Use evaluateTradeProtectionNow so historical protectionStatus never
+    // overrides what the broker actually has right now.
+    const tradeProtectionDetails: ReturnType<typeof evaluateTradeProtectionNow>[] = [];
+    const genuinelyUnprotected: typeof openTradesForAudit = [];
 
-    if (audit.criticalCount === 0) {
-      console.log("[live-protection] live audit: all positions protected", {
-        tradeCount: audit.tradeCount,
-        protectedCount: audit.protectedCount,
+    for (const t of openTradesForAudit) {
+      const tradeFull = canonicalTradeByTicker.get(t.ticker) ?? t;
+      const protNow = evaluateTradeProtectionNow(tradeFull, positions, orders);
+      tradeProtectionDetails.push(protNow);
+
+      if (!protNow.brokerPositionExists) {
+        // No broker position — skip (reconciliation issue, not protection emergency)
+        continue;
+      }
+
+      if (protNow.isCurrentlyProtected) {
+        console.log("[live-protection] live audit: position protected by broker truth", {
+          symbol: protNow.symbol,
+          tradeId: protNow.tradeId,
+          reason: protNow.reason,
+          activeStopOrderId: protNow.activeStopOrderId,
+          historicalStatus: protNow.historicalProtectionStatus,
+        });
+        continue;
+      }
+
+      // Genuinely unprotected: broker position exists but no active stop
+      genuinelyUnprotected.push(t);
+      console.warn("[live-protection] live audit: position UNPROTECTED", {
+        symbol: protNow.symbol,
+        tradeId: protNow.tradeId,
+        reason: protNow.reason,
+        stopOrderIdPresent: protNow.stopOrderIdPresent,
+        historicalStatus: protNow.historicalProtectionStatus,
+      });
+    }
+
+    if (genuinelyUnprotected.length === 0) {
+      const protectedCount = tradeProtectionDetails.filter((d) => d.isCurrentlyProtected || !d.brokerPositionExists).length;
+      console.log("[live-protection] live audit: all positions protected (evaluateTradeProtectionNow)", {
+        checked: tradeProtectionDetails.length,
+        protectedCount,
       });
       return {
         ok: true,
@@ -292,9 +335,69 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
       };
     }
 
+    // Some trades appear unprotected with the current (possibly cached) broker truth.
+    // Force-refresh to rule out stale 45-second cache before triggering repair.
+    console.log("[live-protection] apparent unprotected trades — force-refreshing broker truth for accurate check", {
+      count: genuinelyUnprotected.length,
+      symbols: genuinelyUnprotected.map((t) => t.ticker),
+    });
+    await clearBrokerTruthCache();
+    const freshTruth = await fetchBrokerTruth();
+    const freshPositions: BrokerPosition[] = Array.isArray(freshTruth.positions)
+      ? freshTruth.positions : [];
+    const freshOrders: BrokerOrder[] = Array.isArray(freshTruth.openOrders)
+      ? freshTruth.openOrders : [];
+
+    const stillUnprotectedAfterFresh: typeof openTradesForAudit = [];
+    for (const t of genuinelyUnprotected) {
+      const tradeFull = canonicalTradeByTicker.get(t.ticker) ?? t;
+      const freshProtNow = evaluateTradeProtectionNow(tradeFull, freshPositions, freshOrders);
+      if (freshProtNow.isCurrentlyProtected) {
+        console.log("[live-protection] stale cache confirmed: fresh broker truth shows stop IS in place", {
+          symbol: freshProtNow.symbol,
+          tradeId: freshProtNow.tradeId,
+          reason: freshProtNow.reason,
+          activeStopOrderId: freshProtNow.activeStopOrderId,
+        });
+      } else {
+        stillUnprotectedAfterFresh.push(t);
+        console.warn("[live-protection] confirmed unprotected after fresh broker check", {
+          symbol: freshProtNow.symbol,
+          tradeId: freshProtNow.tradeId,
+          reason: freshProtNow.reason,
+        });
+      }
+    }
+
+    if (stillUnprotectedAfterFresh.length === 0) {
+      return {
+        ok: true,
+        evaluatedAt: now,
+        liveBlockers: [],
+        retiredStale: [],
+        repaired: [],
+        repairAttempts: [],
+        summary: "all_positions_protected_after_fresh_broker_check",
+        brokerTruthSummary: {
+          positionsCount: freshTruth.positionsCount,
+          openOrdersCount: freshTruth.openOrdersCount,
+          error: freshTruth.error,
+        },
+        dbTruthSummary,
+      };
+    }
+
+    // Confirmed unprotected — run the full auditProtectionIntegrity for structured incident list
+    const audit = auditProtectionIntegrity({
+      openTrades: stillUnprotectedAfterFresh,
+      brokerPositions: freshPositions,
+      brokerOrders: freshOrders,
+    });
+
     // Live audit found critical incidents — attempt repair before blocking
-    console.log("[live-protection] live audit critical incidents found", {
+    console.log("[live-protection] confirmed unprotected trades — attempting repair", {
       criticalCount: audit.criticalCount,
+      symbols: stillUnprotectedAfterFresh.map((t) => t.ticker),
     });
 
     if (attemptRepairs) {
@@ -314,15 +417,13 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
         });
         if (d.stopRepairSucceeded) {
           repaired.push({ symbol: d.symbol, tradeId: d.tradeId, how: "stop_repair" });
-          console.log("[live-protection] stale blocker: stop repaired", {
-            symbol: d.symbol,
-            tradeId: d.tradeId,
+          console.log("[live-protection] repair succeeded: stop placed", {
+            symbol: d.symbol, tradeId: d.tradeId,
           });
         } else if (d.flattenSucceeded) {
           repaired.push({ symbol: d.symbol, tradeId: d.tradeId, how: "flatten" });
-          console.log("[live-protection] stale blocker: position flattened", {
-            symbol: d.symbol,
-            tradeId: d.tradeId,
+          console.log("[live-protection] repair: position flattened to resolve exposure", {
+            symbol: d.symbol, tradeId: d.tradeId,
           });
         }
       }
@@ -352,8 +453,8 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
         repairAttempted: attemptRepairs,
         repairSucceeded: false,
         brokerSnapshot: {
-          hasPosition: brokerHasPosition(brokerTruth, inc.symbol),
-          hasActiveStop: brokerHasActiveStop(brokerTruth, inc.symbol),
+          hasPosition: brokerHasPosition(freshTruth, inc.symbol),
+          hasActiveStop: brokerHasActiveStop(freshTruth, inc.symbol),
         },
         nextAction: "manual_intervention_required",
         detail: inc.detail,
@@ -459,7 +560,120 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
     };
   }
 
-  // ── Step 4: Attempt repair for live blockers ─────────────────────
+  // ── Fresh-broker-truth check before escalating ───────────────────────────
+  // Historical incidents evaluated against the potentially-cached broker truth
+  // can be stale (45-second TTL). Before treating them as "live blockers" and
+  // running repair, force-refresh the cache and re-evaluate each blocker.
+  // This handles the common case where a repair previously failed but the stop
+  // is now present (e.g. bracket leg became active while cache was stale).
+  {
+    console.log("[live-protection] Path B: force-refreshing broker truth before confirming live blockers", {
+      tentativeLiveBlockerCount: liveBlockers.length,
+      symbols: liveBlockers.map((b) => b.symbol),
+    });
+
+    await clearBrokerTruthCache();
+    const freshTruth = await fetchBrokerTruth();
+
+    const confirmedLiveBlockers: LiveBlocker[] = [];
+
+    for (const b of liveBlockers) {
+      // Find the corresponding critical task
+      const task = realBlocking.find((t) => String(t.symbol || "").toUpperCase() === b.symbol);
+
+      const freshHasPos = brokerHasPosition(freshTruth, b.symbol);
+      const freshHasStop = brokerHasActiveStop(freshTruth, b.symbol);
+
+      // Also run evaluateTradeProtectionNow for the canonical trade (if available)
+      const canonicalTrade = trades.find(
+        (t) =>
+          isOperationallyOpenTrade(t) &&
+          String(t?.symbol ?? t?.ticker ?? "").toUpperCase() === b.symbol,
+      );
+      const freshProtNow = canonicalTrade
+        ? evaluateTradeProtectionNow(
+            canonicalTrade,
+            freshTruth.positions,
+            freshTruth.openOrders,
+          )
+        : null;
+
+      const tradeActuallyProtected = freshProtNow?.isCurrentlyProtected ?? (!freshHasPos || freshHasStop);
+
+      if (tradeActuallyProtected) {
+        // Incident is stale — position either gone or stop now in place
+        console.log(
+          "[live-protection] Path B fresh-check: incident now stale — retiring",
+          {
+            symbol: b.symbol,
+            code: b.blockerCode,
+            freshHasPos,
+            freshHasStop,
+            freshProtNowReason: freshProtNow?.reason,
+            activeStopOrderId: freshProtNow?.activeStopOrderId,
+          },
+        );
+        if (task) {
+          try {
+            await retireStaleCriticalTask(
+              task.id,
+              `fresh_broker_check_stale: ${b.blockerCode} on ${b.symbol} — stop now confirmed`,
+            );
+            retiredStale.push({
+              id: task.id,
+              code: task.incidentCode,
+              symbol: b.symbol,
+              reason: "fresh_broker_check_confirmed_protected",
+            });
+          } catch (err) {
+            console.warn("[live-protection] retire stale task failed (fresh check)", { id: task?.id, err });
+          }
+        }
+      } else {
+        // Confirmed live with fresh truth
+        console.warn(
+          "[live-protection] Path B fresh-check: blocker confirmed live with fresh broker truth",
+          {
+            symbol: b.symbol,
+            code: b.blockerCode,
+            freshHasPos,
+            freshHasStop,
+            freshProtNowReason: freshProtNow?.reason,
+          },
+        );
+        confirmedLiveBlockers.push({
+          ...b,
+          brokerSnapshot: {
+            hasPosition: freshHasPos,
+            hasActiveStop: freshHasStop,
+            positionsCount: freshTruth.positionsCount,
+            freshCheckedAt: new Date().toISOString(),
+          },
+        });
+      }
+    }
+
+    // Replace liveBlockers with only the fresh-confirmed ones
+    liveBlockers.length = 0;
+    liveBlockers.push(...confirmedLiveBlockers);
+  }
+
+  if (liveBlockers.length === 0) {
+    console.log("[live-protection] all Path B blockers resolved by fresh broker truth check", {
+      retiredCount: retiredStale.length,
+    });
+    return {
+      ok: true,
+      evaluatedAt: now,
+      liveBlockers: [],
+      retiredStale,
+      repaired,
+      repairAttempts,
+      summary: `${retiredStale.length} blocker(s) retired by fresh broker check; none live`,
+      brokerTruthSummary,
+      dbTruthSummary,
+    };
+  }
   if (attemptRepairs) {
     console.log("[live-protection] live blockers found from historical incidents; attempting repair", {
       count: liveBlockers.length,

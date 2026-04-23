@@ -407,8 +407,10 @@ export async function GET() {
         });
 
         // Distinguish stale mismatch (broker flat) from live protection issues
+        // BROKER_DB_MISMATCH = trade in DB but no broker position (reconciliation issue, NOT stop protection)
+        // Only MISSING_STOP represents a live stop-protection emergency
         const missingProtectionIncidents = audit.incidents.filter(
-          (i) => i.code === "MISSING_STOP" || i.code === "BROKER_DB_MISMATCH"
+          (i) => i.code === "MISSING_STOP"
         );
 
         if (brokerIsFlat) {

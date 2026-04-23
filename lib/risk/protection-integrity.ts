@@ -10,6 +10,7 @@ import {
   findProtectiveStopOrder,
   type ProtectionStatus,
 } from "@/lib/trades/protection";
+import { evaluateTradeProtectionNow } from "@/lib/risk/protection-truth";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -187,9 +188,34 @@ export function auditProtectionIntegrity(opts: {
       });
     }
 
-    // 2) Find active protective stop
+    // 2) Evaluate current protection using broker truth as PRIMARY.
+    //    Historical protectionStatus on the trade record is treated as diagnostics only
+    //    and NEVER causes a false MISSING_STOP when broker confirms a valid stop.
+    const protNow = evaluateTradeProtectionNow(
+      { ...trade, ticker: symbol },
+      brokerPositions,
+      brokerOrders as any[],
+    );
+
+    if (protNow.historicalProtectionStatus &&
+        ["REPAIR_FAILED", "STOP_REPAIR_FAILED", "MISSING_STOP"].includes(protNow.historicalProtectionStatus) &&
+        protNow.isCurrentlyProtected) {
+      console.log(
+        "[protection-integrity] stale DB status IGNORED: broker confirms active stop",
+        {
+          symbol,
+          tradeId: trade.id,
+          historicalStatus: protNow.historicalProtectionStatus,
+          activeStopOrderId: protNow.activeStopOrderId,
+          reason: protNow.reason,
+        },
+      );
+    }
+
+    // For DAY TIF and qty-mismatch checks we still need the raw activeStop object.
+    // Re-derive it from the broker orders using findProtectiveStopOrder for compatibility.
     let activeStop: BrokerOrder | undefined;
-    if (side) {
+    if (side && brokerQty > 0) {
       const found = findProtectiveStopOrder({
         ticker: symbol,
         tradeSide: side,
@@ -200,7 +226,7 @@ export function auditProtectionIntegrity(opts: {
       }
     }
 
-    if (!activeStop && brokerQty > 0) {
+    if (!protNow.isCurrentlyProtected && brokerQty > 0) {
       const trackedId = trade.stopOrderId;
       tradeIncidents.push({
         code: "MISSING_STOP",

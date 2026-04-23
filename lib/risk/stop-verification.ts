@@ -69,7 +69,8 @@ export async function verifyStopAtBroker(params: {
     const trackedOrder = symbolOrders.find((o) => o.id === stopOrderId);
     if (trackedOrder) {
       const status = (trackedOrder.status || "").toLowerCase();
-      const isActive = status === "pending" || status === "accepted" || status === "held" || status === "new";
+      // Use the full set of active statuses — Alpaca uses pending_new, not just pending
+      const isActive = ["new", "accepted", "pending_new", "pending_replace", "held", "accepted_for_bidding"].includes(status);
       if (isActive) {
         console.log("[stop-verify] tracked stop verified active", { ticker, stopOrderId, status });
         return {
@@ -86,7 +87,7 @@ export async function verifyStopAtBroker(params: {
     console.log("[stop-verify] tracked stopOrderId not in open orders, scanning all orders", { ticker, stopOrderId });
   }
 
-  // Check 2: Scan all open orders for a protective stop
+  // Check 2: Scan all open orders for a protective stop (pass stop_price for fallback detection)
   const protectiveStop = findProtectiveStopOrder({
     ticker,
     tradeSide: side,
@@ -96,7 +97,7 @@ export async function verifyStopAtBroker(params: {
       side: o.side,
       type: o.type || "",
       status: o.status,
-      stop_price: undefined, // We don't have this from broker truth, but findProtectiveStopOrder checks type/side
+      stop_price: (o as any).stop_price, // pass through from broker truth
     })),
   });
 

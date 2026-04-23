@@ -1,9 +1,10 @@
 import { readTrades, writeTrades } from "@/lib/tradesStore";
-import { fetchBrokerTruth } from "@/lib/broker/truth";
+import { fetchBrokerTruth, clearBrokerTruthCache } from "@/lib/broker/truth";
 import { verifyStopAtBroker } from "@/lib/risk/stop-verification";
 import { recoverUnprotectedTrade } from "@/lib/risk/stop-verification";
 import { forceFlattenPosition } from "@/lib/broker/forceFlattenPosition";
 import { saveCriticalTask } from "@/lib/redis";
+import { evaluateTradeProtectionNow } from "@/lib/risk/protection-truth";
 
 export type TradeRecoveryDiagnostic = {
   tradeId: string;
@@ -35,6 +36,8 @@ export type ProtectionRecoveryResult = {
 
 export async function recoverUnprotectedTrades(): Promise<ProtectionRecoveryResult> {
   const trades = await readTrades();
+  // Force-refresh broker truth so we always evaluate against current state, not stale cache
+  await clearBrokerTruthCache();
   const brokerTruth = await fetchBrokerTruth();
   const openPositions = Array.isArray(brokerTruth.positions) ? brokerTruth.positions : [];
 
@@ -55,10 +58,27 @@ export async function recoverUnprotectedTrades(): Promise<ProtectionRecoveryResu
     );
     if (!brokerPos) continue;
 
-    // Check whether a protective stop already exists
-    const stopOrderId = trade.stopOrderId || trade.alpacaStopOrderId || null;
-    const verify = await verifyStopAtBroker({ symbol, side: trade.side, stopOrderId, brokerTruth });
-    if (verify.verified) continue;
+    // Check whether a protective stop currently exists at broker (broker truth is primary).
+    // Using evaluateTradeProtectionNow ensures historical protectionStatus values like
+    // REPAIR_FAILED never cause a false "unprotected" determination when the broker
+    // already has a valid active stop in place (e.g. bracket leg that became active).
+    const protNow = evaluateTradeProtectionNow(
+      trade,
+      openPositions,
+      brokerTruth.openOrders || [],
+    );
+
+    if (protNow.isCurrentlyProtected) {
+      console.log("[protection-recover] trade is currently protected — skipping", {
+        symbol,
+        tradeId: trade.id,
+        reason: protNow.reason,
+        activeStopOrderId: protNow.activeStopOrderId,
+        historicalStatus: protNow.historicalProtectionStatus,
+        trackedStopConfirmed: protNow.trackedStopConfirmed,
+      });
+      continue;
+    }
 
     // ── Unprotected trade found ──────────────────────────────────
     repairAttempted = true;
