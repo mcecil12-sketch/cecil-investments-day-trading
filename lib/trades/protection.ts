@@ -6,7 +6,19 @@ export type ProtectionStatus =
   | "REPAIRING"
   | "REPAIRED"
   | "REPAIR_FAILED"
-  | "FLATTENED";
+  | "RECOVERED"
+  | "FLATTENED"
+  // ── Emergency flatten lifecycle states ──────────────────────────────────
+  /** Repair failed; flatten not yet started — position is unprotected. */
+  | "FLATTEN_PENDING"
+  /** Emergency close order submitted and active at broker. */
+  | "FLATTEN_IN_PROGRESS"
+  /** Emergency close order partially filled; residual exposure remains. */
+  | "FLATTEN_PARTIALLY_FILLED"
+  /** Emergency close order failed/rejected; position still unprotected. */
+  | "FLATTEN_FAILED"
+  /** Position confirmed flat by broker — emergency exit complete. */
+  | "EMERGENCY_EXIT_COMPLETE";
 
 export const UNPROTECTED_PROTECTION_STATUSES = new Set<ProtectionStatus>([
   "MISSING_STOP",
@@ -14,6 +26,11 @@ export const UNPROTECTED_PROTECTION_STATUSES = new Set<ProtectionStatus>([
   "STOP_CANCELED",
   "REPAIRING",
   "REPAIR_FAILED",
+  // In-flight flatten states: position still exists, execution must stay blocked
+  "FLATTEN_PENDING",
+  "FLATTEN_IN_PROGRESS",
+  "FLATTEN_PARTIALLY_FILLED",
+  "FLATTEN_FAILED",
 ]);
 
 export type ProtectionIssueCode =

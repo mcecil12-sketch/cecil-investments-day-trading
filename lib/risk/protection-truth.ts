@@ -112,6 +112,29 @@ export type TradeProtectionNow = {
    * Only set when opts.allowFlattenIfPreviousRepairFailed = true.
    */
   shouldFlatten: boolean;
+
+  // ── Emergency flatten lifecycle (when shouldFlatten or repair is already underway) ─
+  /**
+   * True if there is an active market close order on the closing side.
+   * When true, callers MUST NOT submit another close order (prevents double-ordering).
+   */
+  activeCloseOrderDetected: boolean;
+  /** The order ID of the active emergency close order, if found. */
+  activeCloseOrderId?: string;
+  /** Alpaca status of the active emergency close order (e.g. partially_filled, new). */
+  activeCloseOrderStatus?: string;
+  /** Number of shares that have already filled in the close order. */
+  closeOrderFilledQty: number;
+  /** Current broker position qty (absolute value). 0 if no position. */
+  brokerPositionQty: number;
+  /**
+   * Derived flatten lifecycle state for diagnostics.
+   * "none"                    — not in flatten mode (position is protected or no position)
+   * "FLATTEN_IN_PROGRESS"     — close order active and working
+   * "FLATTEN_PARTIALLY_FILLED" — close order partially filled, residual remains
+   * "EMERGENCY_EXIT_COMPLETE" — position is flat (qty = 0)
+   */
+  flattenLifecycleState: "none" | "FLATTEN_IN_PROGRESS" | "FLATTEN_PARTIALLY_FILLED" | "EMERGENCY_EXIT_COMPLETE";
 };
 
 // ─── Core function ───────────────────────────────────────────────────────────
@@ -158,6 +181,10 @@ export function evaluateTradeProtectionNow(
       reason: "no_broker_position",
       shouldRepair: false,
       shouldFlatten: false,
+      activeCloseOrderDetected: false,
+      closeOrderFilledQty: 0,
+      brokerPositionQty: 0,
+      flattenLifecycleState: "EMERGENCY_EXIT_COMPLETE",
       historicalProtectionStatus,
     };
   }
@@ -290,6 +317,48 @@ export function evaluateTradeProtectionNow(
   const shouldFlatten =
     shouldRepair && prevRepairFailed && (opts.allowFlattenIfPreviousRepairFailed ?? false);
 
+  // ── 11. Emergency flatten close-order detection ───────────────────
+  // Detect any active market close order (sell for LONG, buy for SHORT).
+  // When present, callers MUST NOT submit another flatten order.
+  const expectedCloseSide = side === "SHORT" ? "buy" : "sell";
+  const ACTIVE_CLOSE_ORDER_STATUSES = new Set([
+    "new", "accepted", "pending_new", "pending_replace",
+    "accepted_for_bidding", "partially_filled", "held",
+  ]);
+
+  let activeCloseOrderDetected = false;
+  let activeCloseOrderId: string | undefined;
+  let activeCloseOrderStatus: string | undefined;
+  let closeOrderFilledQty = 0;
+
+  for (const order of symbolOrders) {
+    const orderSide = String(order.side ?? "").toLowerCase();
+    const orderType = String(order.type ?? "").toLowerCase();
+    const orderStatus = String(order.status ?? "").toLowerCase();
+    if (
+      orderSide === expectedCloseSide &&
+      (orderType === "market") &&
+      ACTIVE_CLOSE_ORDER_STATUSES.has(orderStatus)
+    ) {
+      activeCloseOrderDetected = true;
+      activeCloseOrderId = order.id;
+      activeCloseOrderStatus = orderStatus;
+      closeOrderFilledQty = Math.abs(Number(order.filled_qty ?? order.qty_filled ?? 0));
+      break;
+    }
+  }
+
+  // ── 12. Derive flatten lifecycle state ────────────────────────────
+  const brokerPositionQty = Math.abs(Number(brokerPos?.qty ?? 0));
+  let flattenLifecycleState: TradeProtectionNow["flattenLifecycleState"] = "none";
+  if (!brokerPositionExists) {
+    flattenLifecycleState = "EMERGENCY_EXIT_COMPLETE";
+  } else if (activeCloseOrderDetected) {
+    flattenLifecycleState = activeCloseOrderStatus === "partially_filled"
+      ? "FLATTEN_PARTIALLY_FILLED"
+      : "FLATTEN_IN_PROGRESS";
+  }
+
   return {
     tradeId: String(trade?.id ?? ""),
     symbol: sym,
@@ -307,5 +376,11 @@ export function evaluateTradeProtectionNow(
     shouldRepair,
     shouldFlatten,
     historicalProtectionStatus,
+    activeCloseOrderDetected,
+    activeCloseOrderId,
+    activeCloseOrderStatus,
+    closeOrderFilledQty,
+    brokerPositionQty,
+    flattenLifecycleState,
   };
 }

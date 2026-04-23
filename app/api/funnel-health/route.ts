@@ -11,6 +11,7 @@ import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
 import { isOpenTradeStatus } from "@/lib/trades/protection";
 import { getSignalTimestampMs } from "@/lib/signals/since";
 import { selectCanonicalOpenTrades } from "@/lib/trades/canonicalOpenBySymbol";
+import { evaluateTradeProtectionNow } from "@/lib/risk/protection-truth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -77,6 +78,25 @@ type FunnelHealthResponse = {
     brokerIsFlat: boolean;
     staleMismatchTickers: string[];
     message: string;
+  };
+  /** Per-trade flatten lifecycle diagnostics for operator/agent visibility */
+  protectionDetail?: {
+    tickers: string[];
+    perTrade: Array<{
+      tradeId: string;
+      symbol: string;
+      isCurrentlyProtected: boolean;
+      brokerPositionExists: boolean;
+      brokerStopDetected: boolean;
+      activeCloseOrderDetected: boolean;
+      activeCloseOrderId?: string;
+      activeCloseOrderStatus?: string;
+      brokerPositionQty: number;
+      residualQty: number;
+      flattenLifecycleState: string;
+      recoveryState: string;
+      nextAction: string;
+    }>;
   };
   error?: string;
   // DEBUG: Temporary field for attribution verification (can be removed later)
@@ -364,6 +384,7 @@ export async function GET() {
     let protectionMissingTickers: string[] = [];
     let brokerIsFlat = false;
     let staleMismatchTickers: string[] = [];
+    let protectionDetail: FunnelHealthResponse["protectionDetail"] | undefined;
     
     if (!brokerTruth.error) {
       const brokerPositionsCount = brokerTruth.positionsCount ?? (brokerTruth.positions || []).length;
@@ -420,6 +441,57 @@ export async function GET() {
         } else {
           // Broker has positions — these are real protection issues
           protectionMissingTickers = [...new Set(missingProtectionIncidents.map((i) => i.symbol))];
+        }
+
+        // ── Per-trade flatten lifecycle diagnostics ─────────────────────
+        // Evaluate each open trade with evaluateTradeProtectionNow to get the
+        // full protection + flatten lifecycle state for operator/agent visibility.
+        const perTradeDetail = Array.from(canonicalMap.values())
+          .filter((t: any) => isOpenTradeStatus(t?.status))
+          .map((trade: any) => {
+            const protNow = evaluateTradeProtectionNow(
+              trade,
+              brokerTruth.positions || [],
+              brokerTruth.openOrders || [],
+            );
+            const inFlattenMode =
+              protNow.flattenLifecycleState === "FLATTEN_IN_PROGRESS" ||
+              protNow.flattenLifecycleState === "FLATTEN_PARTIALLY_FILLED";
+            const nextAction = !protNow.brokerPositionExists
+              ? "no_broker_position_reconcile_db"
+              : protNow.isCurrentlyProtected
+                ? "none_position_protected"
+                : inFlattenMode
+                  ? "monitoring_close_order"
+                  : protNow.shouldFlatten
+                    ? "trigger_emergency_flatten"
+                    : "trigger_stop_repair";
+            return {
+              tradeId: protNow.tradeId,
+              symbol: protNow.symbol,
+              isCurrentlyProtected: protNow.isCurrentlyProtected,
+              brokerPositionExists: protNow.brokerPositionExists,
+              brokerStopDetected: protNow.brokerStopDetected,
+              activeCloseOrderDetected: protNow.activeCloseOrderDetected,
+              activeCloseOrderId: protNow.activeCloseOrderId,
+              activeCloseOrderStatus: protNow.activeCloseOrderStatus,
+              brokerPositionQty: protNow.brokerPositionQty,
+              residualQty: protNow.brokerPositionQty,
+              flattenLifecycleState: protNow.flattenLifecycleState,
+              recoveryState: protNow.historicalProtectionStatus ?? "none",
+              nextAction,
+            };
+          });
+
+        // Only include protectionDetail when there are unprotected trades or flatten-in-progress
+        const hasIssues = perTradeDetail.some(
+          (d) => !d.isCurrentlyProtected && d.brokerPositionExists,
+        );
+        if (hasIssues) {
+          protectionDetail = {
+            tickers: protectionMissingTickers,
+            perTrade: perTradeDetail,
+          };
         }
       }
     }
@@ -597,6 +669,8 @@ export async function GET() {
           message: "Broker is flat but DB has open trades — needs reconciliation via /api/trades/protection-audit",
         },
       } : {}),
+      // Per-trade flatten lifecycle diagnostics (only present when there are issues)
+      ...(protectionDetail ? { protectionDetail } : {}),
       // DEBUG: Temporary fields to verify source attribution
       _debug: {
         scope: dateET,

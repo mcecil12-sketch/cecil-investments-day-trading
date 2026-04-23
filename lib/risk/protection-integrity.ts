@@ -55,6 +55,12 @@ export type IncidentCode =
   | "STOP_DAY_TIF"
   | "BROKER_DB_MISMATCH"
   | "STOP_REPAIR_FAILED"
+  // ── Emergency flatten lifecycle incident codes ──────────────────────
+  /** Emergency close order submitted and active; position still open. */
+  | "FLATTEN_IN_PROGRESS"
+  /** Emergency close order partially filled; residual exposure remains. */
+  | "FLATTEN_PARTIALLY_FILLED"
+  /** Emergency close order failed/rejected; unprotected position remains. */
   | "FLATTEN_FAILED";
 
 export type Severity = "CRITICAL" | "WARN" | "INFO";

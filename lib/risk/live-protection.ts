@@ -26,6 +26,7 @@ import {
 import { recoverUnprotectedTrades } from "@/lib/risk/protection-recover";
 import { isOperationallyOpenTrade } from "@/lib/trades/operational";
 import { evaluateTradeProtectionNow } from "@/lib/risk/protection-truth";
+import { retireFlattenIncidents } from "@/lib/risk/emergency-flatten-engine";
 
 // ─── Exported Types ──────────────────────────────────────────────────
 
@@ -39,6 +40,17 @@ export type LiveBlocker = {
   dbSnapshot?: Record<string, any>;
   nextAction: string;
   detail: string;
+  // ── Flatten lifecycle enrichment ───────────────────────────────────
+  /** Structured diagnostics when a position is in emergency flatten mode. */
+  flattenDiagnostic?: {
+    recoveryState: string;
+    brokerPositionQty: number;
+    activeCloseOrderDetected: boolean;
+    activeCloseOrderId?: string;
+    activeCloseOrderStatus?: string;
+    residualQty: number;
+    flattenOrderId?: string;
+  };
 };
 
 export type LiveProtectionResult = {
@@ -102,6 +114,13 @@ function evaluateIncidentStaleness(
       // Was trying to flatten — if broker shows no position, the flatten eventually worked
       if (!brokerHasPosition(brokerTruth, sym)) return "stale";
       return "live";
+    }
+
+    case "FLATTEN_IN_PROGRESS":
+    case "FLATTEN_PARTIALLY_FILLED": {
+      // Active close order — if broker position is now gone, retire (eventual success)
+      if (!brokerHasPosition(brokerTruth, sym)) return "stale";
+      return "live"; // position still exists, keep monitoring
     }
 
     case "MISSING_STOP": {
@@ -425,6 +444,13 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
           console.log("[live-protection] repair: position flattened to resolve exposure", {
             symbol: d.symbol, tradeId: d.tradeId,
           });
+        } else if (d.finalResolution === "flatten_in_progress") {
+          console.log("[live-protection] flatten in progress for unprotected position", {
+            symbol: d.symbol,
+            tradeId: d.tradeId,
+            state: d.flattenState,
+            activeCloseOrderId: d.flattenOrderId,
+          });
         }
       }
 
@@ -446,8 +472,21 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
     // Build live blockers from audit — repair did not resolve all
     const criticalIncidents = audit.incidents.filter((i) => i.severity === "CRITICAL");
     for (const inc of criticalIncidents) {
+      // Get fresh protection state for this symbol
+      const canonicalTrade = canonicalTradeByTicker.get(inc.symbol);
+      const protNowInc = canonicalTrade
+        ? evaluateTradeProtectionNow(canonicalTrade, freshPositions, freshOrders)
+        : null;
+      const isFlattenInProgress =
+        protNowInc?.flattenLifecycleState === "FLATTEN_IN_PROGRESS" ||
+        protNowInc?.flattenLifecycleState === "FLATTEN_PARTIALLY_FILLED";
+
       liveBlockers.push({
-        blockerCode: inc.code,
+        blockerCode: isFlattenInProgress
+          ? (protNowInc?.flattenLifecycleState === "FLATTEN_PARTIALLY_FILLED"
+              ? "FLATTEN_PARTIALLY_FILLED"
+              : "FLATTEN_IN_PROGRESS")
+          : inc.code,
         symbol: inc.symbol,
         tradeId: inc.tradeId,
         repairAttempted: attemptRepairs,
@@ -455,13 +494,35 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
         brokerSnapshot: {
           hasPosition: brokerHasPosition(freshTruth, inc.symbol),
           hasActiveStop: brokerHasActiveStop(freshTruth, inc.symbol),
+          activeCloseOrderDetected: protNowInc?.activeCloseOrderDetected ?? false,
+          activeCloseOrderStatus: protNowInc?.activeCloseOrderStatus,
+          brokerPositionQty: protNowInc?.brokerPositionQty ?? 0,
         },
-        nextAction: "manual_intervention_required",
-        detail: inc.detail,
+        nextAction: isFlattenInProgress
+          ? "monitoring_close_order"
+          : "repair_failed_manual_intervention_required",
+        detail: isFlattenInProgress
+          ? `Emergency close in progress: ${protNowInc?.activeCloseOrderId ?? "unknown"} status=${protNowInc?.activeCloseOrderStatus ?? "?"} qty=${protNowInc?.brokerPositionQty ?? "?"}`
+          : inc.detail,
+        ...(isFlattenInProgress && protNowInc ? {
+          flattenDiagnostic: {
+            recoveryState: protNowInc.flattenLifecycleState,
+            brokerPositionQty: protNowInc.brokerPositionQty,
+            activeCloseOrderDetected: protNowInc.activeCloseOrderDetected,
+            activeCloseOrderId: protNowInc.activeCloseOrderId,
+            activeCloseOrderStatus: protNowInc.activeCloseOrderStatus,
+            residualQty: protNowInc.brokerPositionQty,
+            flattenOrderId: protNowInc.activeCloseOrderId,
+          },
+        } : {}),
       });
       // Persist as critical incident so agents can see and act on it
       await saveCriticalTask({
-        incidentCode: inc.code,
+        incidentCode: isFlattenInProgress
+          ? (protNowInc?.flattenLifecycleState === "FLATTEN_PARTIALLY_FILLED"
+              ? "FLATTEN_PARTIALLY_FILLED"
+              : "FLATTEN_IN_PROGRESS")
+          : inc.code,
         symbol: inc.symbol,
         severity: "CRITICAL",
         detail: `[live-protection] live blocker: ${inc.detail}`,
@@ -518,6 +579,19 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
     // "live" or "unknown" — treat as a live blocker (fail-closed on unknown)
     const brokerHasPos = brokerHasPosition(brokerTruth, sym);
     const brokerHasStop = brokerHasActiveStop(brokerTruth, sym);
+    const isFlattenInProgress =
+      task.incidentCode === "FLATTEN_IN_PROGRESS" ||
+      task.incidentCode === "FLATTEN_PARTIALLY_FILLED";
+
+    // Look up the canonical trade for flatten diagnostics
+    const canonicalTradeForDiag = trades.find(
+      (t) =>
+        isOperationallyOpenTrade(t) &&
+        String(t?.symbol ?? t?.ticker ?? "").toUpperCase() === sym,
+    );
+    const protNowDiag = canonicalTradeForDiag
+      ? evaluateTradeProtectionNow(canonicalTradeForDiag, brokerTruth.positions, brokerTruth.openOrders)
+      : null;
 
     liveBlockers.push({
       blockerCode: task.incidentCode,
@@ -529,16 +603,31 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
         hasPosition: brokerHasPos,
         hasActiveStop: brokerHasStop,
         positionsCount: brokerTruth.positionsCount,
+        activeCloseOrderDetected: protNowDiag?.activeCloseOrderDetected ?? false,
+        activeCloseOrderStatus: protNowDiag?.activeCloseOrderStatus,
+        brokerPositionQty: protNowDiag?.brokerPositionQty ?? 0,
       },
       dbSnapshot: {
         hasOpenTrade: openTradeSymbols.has(sym),
         openTradesCount: openTradeSymbols.size,
       },
-      nextAction:
-        staleness === "unknown"
+      nextAction: isFlattenInProgress
+        ? "monitoring_close_order"
+        : staleness === "unknown"
           ? "manual_review_required"
           : "repair_or_resolve_position",
       detail: task.detail,
+      ...(isFlattenInProgress && protNowDiag ? {
+        flattenDiagnostic: {
+          recoveryState: task.incidentCode,
+          brokerPositionQty: protNowDiag.brokerPositionQty,
+          activeCloseOrderDetected: protNowDiag.activeCloseOrderDetected,
+          activeCloseOrderId: protNowDiag.activeCloseOrderId,
+          activeCloseOrderStatus: protNowDiag.activeCloseOrderStatus,
+          residualQty: protNowDiag.brokerPositionQty,
+          flattenOrderId: protNowDiag.activeCloseOrderId,
+        },
+      } : {}),
     });
   }
 
@@ -701,10 +790,19 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
         console.log("[live-protection] position flattened for historical blocker", {
           symbol: d.symbol,
         });
+      } else if (d.finalResolution === "flatten_in_progress") {
+        // Flatten submitted / active — position still being closed, not a hard failure
+        console.log("[live-protection] flatten in progress for historical blocker", {
+          symbol: d.symbol,
+          tradeId: d.tradeId,
+          state: d.flattenState,
+          activeCloseOrderDetected: d.activeCloseOrderDetected,
+          activeCloseOrderStatus: d.activeCloseOrderStatus,
+        });
       }
     }
 
-    // Update repair flags on live blocker entries for diagnostic output
+    // Enrich live blockers with flatten diagnostic from recovery result
     for (const b of liveBlockers) {
       b.repairAttempted = true;
       const repairDetail = recoveryResult.details.find(
@@ -714,6 +812,23 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
         b.repairSucceeded = repairDetail.stopRepairSucceeded || repairDetail.flattenSucceeded;
         if (repairDetail.error) {
           b.detail = `${b.detail} [repair_error: ${repairDetail.error}]`;
+        }
+        // Update nextAction based on flatten state
+        if (
+          repairDetail.finalResolution === "flatten_in_progress" &&
+          repairDetail.flattenState
+        ) {
+          b.blockerCode = repairDetail.flattenState;
+          b.nextAction = "monitoring_close_order";
+          b.flattenDiagnostic = {
+            recoveryState: repairDetail.flattenState,
+            brokerPositionQty: repairDetail.brokerPositionQty ?? 0,
+            activeCloseOrderDetected: repairDetail.activeCloseOrderDetected ?? false,
+            activeCloseOrderId: repairDetail.flattenOrderId,
+            activeCloseOrderStatus: repairDetail.activeCloseOrderStatus,
+            residualQty: repairDetail.residualQty ?? 0,
+            flattenOrderId: repairDetail.flattenOrderId,
+          };
         }
       }
     }
@@ -732,6 +847,8 @@ export async function evaluateCurrentProtectionIntegrity(opts: {
               reason: "repaired",
             });
           } catch {}
+          // Also retire any flatten incidents for this symbol
+          await retireFlattenIncidents(sym, "position_flat_after_repair").catch(() => {});
         }
       }
 
