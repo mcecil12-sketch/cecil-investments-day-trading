@@ -101,6 +101,15 @@ type FunnelHealthResponse = {
   };
   /** Skip reason breakdown for seeded trades that were not executed this session */
   executeSkipReasonBreakdown?: Record<string, number>;
+  /** Number of seeded trades that aged out before execution */
+  staleExpiredCount?: number;
+  /** Timing stats for trades that were archived as stale/expired */
+  staleTimingStats?: {
+    count: number;
+    avgAgeMs: number;
+    thresholdMs: number | null;
+    overThresholdPct: number | null;
+  } | null;
   error?: string;
   // DEBUG: Temporary field for attribution verification (can be removed later)
   _debug?: {
@@ -379,6 +388,27 @@ export async function GET() {
       const outcome = String(t.executeOutcome);
       executeSkipReasonBreakdown[outcome] = (executeSkipReasonBreakdown[outcome] ?? 0) + 1;
     }
+
+    // Stale/expired explicit count and timing diagnostics
+    const staleExpiredCount = executeSkipReasonBreakdown["SKIPPED_EXPIRED"] ?? 0;
+    const staleTimingStats = (() => {
+      const staleTrades = todayTrades.filter((t: any) =>
+        (t?.source === "AUTO" || t?.source === "auto-entry") &&
+        t?.executeOutcome === "SKIPPED_EXPIRED" &&
+        typeof t?.pendingAgeMs === "number"
+      );
+      if (staleTrades.length === 0) return null;
+      const avgAgeMs = staleTrades.reduce((s: number, t: any) => s + (t.pendingAgeMs as number), 0) / staleTrades.length;
+      const thresholdMs: number | null = staleTrades[0]?.staleThresholdUsedMs ?? null;
+      return {
+        count: staleTrades.length,
+        avgAgeMs: Math.round(avgAgeMs),
+        thresholdMs,
+        overThresholdPct: thresholdMs
+          ? Math.round((staleTrades.filter((t: any) => (t.pendingAgeMs as number) > thresholdMs).length / staleTrades.length) * 1000) / 10
+          : null,
+      };
+    })();
 
     // -------------------------------------------------------------------------
     // Capacity Metrics
@@ -696,6 +726,9 @@ export async function GET() {
       ...(protectionDetail ? { protectionDetail } : {}),
       // Skip reason breakdown for seeded-but-not-executed trades (only present when relevant)
       ...(Object.keys(executeSkipReasonBreakdown).length > 0 ? { executeSkipReasonBreakdown } : {}),
+      // Stale/expired diagnostics
+      ...(staleExpiredCount > 0 ? { staleExpiredCount } : {}),
+      ...(staleTimingStats ? { staleTimingStats } : {}),
       // DEBUG: Temporary fields to verify source attribution
       _debug: {
         scope: dateET,

@@ -831,6 +831,45 @@ export async function POST(req: Request) {
       }
     }
 
+  // ─── Attribution backfill for pre-patch AUTO trades ─────────────────────
+  // Ensures every AUTO-source trade has seededAt (using createdAt as fallback)
+  // and that existing terminal-status trades lacking executeOutcome receive a
+  // best-effort inference so funnel-health can explain historical drop-off.
+  // This sweep is idempotent: once fields are set they are not overwritten.
+  {
+    let _backfillCount = 0;
+    for (let _bi = 0; _bi < trades.length; _bi++) {
+      const _bt = trades[_bi] as any;
+      if (!_bt || (_bt.source !== "AUTO" && _bt.source !== "auto-entry")) continue;
+      const _patch: Record<string, any> = {};
+      if (!_bt.seededAt && _bt.createdAt) {
+        _patch.seededAt = _bt.createdAt;
+      }
+      if (!_bt.executeOutcome && _bt.status && _bt.status !== "AUTO_PENDING") {
+        if (_bt.status === "OPEN" || _bt.status === "CLOSED" || _bt.status === "HIT" || _bt.status === "STOPPED") {
+          _patch.executeOutcome = "EXECUTED";
+          _patch.executeReason = _bt.executeReason ?? _bt.reason ?? "placed";
+        } else if (_bt.status === "ERROR") {
+          _patch.executeOutcome = "ERROR";
+          _patch.executeReason = _bt.executeReason ?? _bt.error ?? _bt.reason ?? "unknown_error";
+        } else if (_bt.status === "ARCHIVED") {
+          _patch.executeOutcome = "SKIPPED_NO_LONGER_ELIGIBLE";
+          _patch.executeReason = _bt.executeReason ?? _bt.reason ?? "archived";
+        } else if (_bt.status === "INVALID") {
+          _patch.executeOutcome = "INVALIDATED";
+          _patch.executeReason = _bt.executeReason ?? _bt.reason ?? "validation_failed";
+        }
+      }
+      if (Object.keys(_patch).length > 0) {
+        trades[_bi] = { ..._bt, ..._patch };
+        _backfillCount++;
+      }
+    }
+    if (_backfillCount > 0) {
+      await writeTrades(trades);
+      notes.push(`attribution_backfill:${_backfillCount}`);
+    }
+  }
 
   const pendingIndexes = trades
     .map((t, i) => ({ t, i }))
@@ -937,6 +976,7 @@ export async function POST(req: Request) {
 
       if (!eligibility.eligible) {
         if (eligibility.reason === "stale_trade") {
+          const _staleAgeMs = Math.round(eligibility.ageMin * 60_000);
           trades[item.i] = {
             ...trades[item.i],
             status: "ARCHIVED",
@@ -945,9 +985,13 @@ export async function POST(req: Request) {
             error: undefined,
             closedAt: trades[item.i]?.closedAt || nowForPending,
             updatedAt: nowForPending,
+            seededAt: trades[item.i].seededAt ?? trades[item.i].createdAt ?? null,
             executeAttemptedAt: nowForPending,
             executeOutcome: "SKIPPED_EXPIRED",
             executeReason: "stale_trade",
+            pendingAgeMs: _staleAgeMs,
+            staleThresholdUsedMs: maxAgeMin * 60_000,
+            seededToExecuteDelayMs: _staleAgeMs,
           };
           counts.staleArchived += 1;
           counts.skipped += 1;
@@ -1352,7 +1396,7 @@ export async function POST(req: Request) {
     for (const i of eligibleIndexes) {
       const t = trades[i];
       if (!t) continue;
-      trades[i] = { ...t, executeAttemptedAt: now, executeSkipReason: skipReason, executeOutcome: outcome, executeReason: skipReason, updatedAt: now };
+      trades[i] = { ...t, executeAttemptedAt: now, executeSkipReason: skipReason, executeOutcome: outcome, executeReason: skipReason, seededAt: t.seededAt ?? t.createdAt ?? null, updatedAt: now };
       changed = true;
     }
     return changed;
