@@ -20,14 +20,34 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: true, skipped: true, reason: "paused" }, { status: 200 });
   }
 
-  const url = `${baseUrl()}/api/auto-entry/execute`;
-  if (!url.startsWith("http")) {
+  const base = baseUrl();
+  const executeUrl = `${base}/api/auto-entry/execute`;
+  const seedUrl = `${base}/api/auto-entry/seed-from-signals?limit=3&minScore=7.5`;
+  if (!executeUrl.startsWith("http") || !seedUrl.startsWith("http")) {
     return NextResponse.json({ ok: false, error: "missing_base_url" }, { status: 500 });
   }
 
   const runId = `vercel-cron-auto-entry-${Date.now()}`;
 
-  const resp = await fetch(url, {
+  const seedResp = await fetch(seedUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-cron-token": process.env.CRON_TOKEN || "",
+      "x-run-source": "vercel-cron",
+      "x-run-id": runId,
+    },
+    body: "{}",
+    cache: "no-store",
+  });
+
+  const seedText = await seedResp.text();
+  let seedResult: any = seedText;
+  try {
+    seedResult = JSON.parse(seedText);
+  } catch {}
+
+  const resp = await fetch(executeUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -41,8 +61,28 @@ export async function GET(req: Request) {
 
   const text = await resp.text();
   try {
-    return NextResponse.json({ ok: true, status: resp.status, runId, result: JSON.parse(text) }, { status: 200 });
+    return NextResponse.json(
+      {
+        ok: true,
+        runId,
+        seedStatus: seedResp.status,
+        seedResult,
+        executeStatus: resp.status,
+        executeResult: JSON.parse(text),
+      },
+      { status: 200 }
+    );
   } catch {
-    return NextResponse.json({ ok: true, status: resp.status, runId, text }, { status: 200 });
+    return NextResponse.json(
+      {
+        ok: true,
+        runId,
+        seedStatus: seedResp.status,
+        seedResult,
+        executeStatus: resp.status,
+        text,
+      },
+      { status: 200 }
+    );
   }
 }

@@ -76,6 +76,12 @@ export type StoredSignal = {
 
   // Context enrichment (from buildSignalContext)
   signalContext?: SignalContext;
+
+  // Seed attribution (set by seed-from-signals runs)
+  seedEvaluatedAt?: string;
+  seedOutcome?: "created" | "skipped";
+  seedReason?: string;
+  linkedTradeId?: string | null;
 };
 
 const LOCAL_DATA_DIR = path.join(process.cwd(), "data");

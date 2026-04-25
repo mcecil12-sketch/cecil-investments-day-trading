@@ -8,6 +8,13 @@ import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { getGuardrailsState } from "@/lib/autoEntry/guardrailsStore";
 import { getGuardrailConfig } from "@/lib/autoEntry/guardrails";
+import { fetchAlpacaClockSafe } from "@/lib/alpacaClock";
+import { readSignals, writeSignals, type StoredSignal } from "@/lib/jsonDb";
+import {
+  recordSeedRunTelemetry,
+  type SeedRunTelemetry,
+  type SeedSkipReason,
+} from "@/lib/autoEntry/seedTelemetry";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -78,6 +85,37 @@ function parseSignalsPayload(payload: any): RawSignal[] {
   if (Array.isArray(payload?.data)) return payload.data;
   if (Array.isArray(payload?.items)) return payload.items;
   return [];
+}
+
+function parseBoolFlag(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  const v = String(value || "").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(v);
+}
+
+function mapSkipReason(raw: string): SeedSkipReason | null {
+  switch (raw) {
+    case "already_active_trade":
+    case "already_terminal_trade":
+    case "missing_prices":
+    case "missing_direction":
+    case "market_closed":
+    case "capacity_full":
+    case "below_threshold":
+    case "stale_signal":
+    case "duplicate_symbol":
+    case "overlay_block":
+      return raw;
+    default:
+      return null;
+  }
+}
+
+function bumpSkipReason(
+  counts: Partial<Record<SeedSkipReason, number>>,
+  reason: SeedSkipReason
+) {
+  counts[reason] = (counts[reason] ?? 0) + 1;
 }
 
 // -------------------------------------------------------------------------
@@ -249,56 +287,50 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true, skipped: true, reason: "AUTO_TRADING_ENABLED=false" }, { status: 200 });
   }
 
-  // Parse params from both URL query params AND JSON body for flexibility
+  const nowIso = new Date().toISOString();
+  const runSource = req.headers.get("x-run-source") || "unknown";
+  const runId = req.headers.get("x-run-id") || `seed-from-signals-${Date.now()}`;
+
+  // Parse params from both URL query params and JSON body
   const url = new URL(req.url);
+  const body = await req.json().catch(() => ({}));
   const limitRawQuery = url.searchParams.get("limit");
   const minScoreRawQuery = url.searchParams.get("minScore");
 
-  // Also try to read from JSON body (workflow sends params in body)
-  let bodyLimit: number | undefined;
-  let bodyMinScore: number | undefined;
-  try {
-    const body = await req.json().catch(() => ({}));
-    if (body && typeof body === "object") {
-      if (typeof body.limit === "number" && Number.isFinite(body.limit)) bodyLimit = body.limit;
-      if (typeof body.minScore === "number" && Number.isFinite(body.minScore)) bodyMinScore = body.minScore;
-    }
-  } catch {
-    // Ignore parse errors
-  }
+  const bodyLimit = typeof body?.limit === "number" && Number.isFinite(body.limit) ? body.limit : undefined;
+  const bodyMinScore = typeof body?.minScore === "number" && Number.isFinite(body.minScore) ? body.minScore : undefined;
+  const dryRun = parseBoolFlag(url.searchParams.get("dryRun")) || parseBoolFlag(body?.dryRun);
+  const debug = parseBoolFlag(url.searchParams.get("debug")) || parseBoolFlag(body?.debug);
 
-  // Priority: query param > body > default
   const limitParsed = Number(limitRawQuery) || bodyLimit;
   const minScoreParsed = Number(minScoreRawQuery) || bodyMinScore;
 
-  // Apply defaults and bounds - DEFAULT IS NOW 3 (capacity-aware, not throttled to 1)
-  const requestedLimit = (typeof limitParsed === "number" && Number.isFinite(limitParsed))
-    ? Math.max(1, Math.min(50, limitParsed))
-    : 3; // Default changed from 1 to 3 for capacity-aware seeding
-
-  const minScore = (typeof minScoreParsed === "number" && Number.isFinite(minScoreParsed))
-    ? minScoreParsed
-    : 0;
+  const requestedLimit =
+    typeof limitParsed === "number" && Number.isFinite(limitParsed)
+      ? Math.max(1, Math.min(50, limitParsed))
+      : 3;
+  const minScore = typeof minScoreParsed === "number" && Number.isFinite(minScoreParsed) ? minScoreParsed : 0;
 
   const today = getEtDateString();
   const { startMs: dayStartMs, endMs: dayEndMs } = getEtDayBoundsMs(today);
-
-  // Fetch guardrails config for capacity calculations
   const guardConfig = getGuardrailConfig();
+  const maxSignalAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN))
+    ? Math.max(1, Number(process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN))
+    : 30;
 
-  // Parallel fetch: signals, trades, overlay, broker truth, guardrails state
-  const [rawSignals, trades, overlay, brokerTruth, guardState] = await Promise.all([
+  const [rawSignals, trades, overlay, brokerTruth, guardState, clock, allStoredSignals] = await Promise.all([
     fetchScoredSignalsFromInternalApi(),
     readTrades<any>(),
     readExecutionOverlays(),
     fetchBrokerTruth(),
     getGuardrailsState(today),
+    fetchAlpacaClockSafe(),
+    readSignals(),
   ]);
 
-  // -------------------------------------------------------------------------
-  // ET-TODAY SIGNAL FILTERING
-  // Filter to only today's signals for consistent funnel attribution
-  // -------------------------------------------------------------------------
+  const marketOpen = clock.ok ? Boolean(clock.is_open) : false;
+  const allowAfterHoursCreate = debug;
+
   const signals = (rawSignals || []).filter((s: RawSignal) => {
     const createdAt = s?.createdAt;
     if (createdAt == null) return false;
@@ -306,304 +338,218 @@ export async function POST(req: NextRequest) {
     if (!Number.isFinite(tsMs)) return false;
     return tsMs >= dayStartMs && tsMs < dayEndMs;
   });
-
   const signalsFilteredOut = (rawSignals || []).length - signals.length;
 
-  // -------------------------------------------------------------------------
-  // CAPACITY-AWARE LIMIT CALCULATION
-  // -------------------------------------------------------------------------
-  // Compute remaining capacity from broker truth and guardrails state
   const currentOpenPositions = brokerTruth.positionsCount ?? 0;
   const maxOpenPositions = guardConfig.maxOpenPositions;
   const entriesToday = guardState.entriesToday ?? 0;
   const maxEntriesPerDay = guardConfig.maxEntriesPerDay;
-
   const remainingPositionSlots = Math.max(0, maxOpenPositions - currentOpenPositions);
   const remainingEntriesToday = Math.max(0, maxEntriesPerDay - entriesToday);
 
-  // Determine the tightest constraint for limit calculation
   let effectiveLimit = requestedLimit;
   let limitReason = "requested_limit";
-
-  // Apply overlay maxEntriesOverride if set
-  if (overlay.maxEntriesOverride != null && overlay.maxEntriesOverride >= 0) {
-    if (overlay.maxEntriesOverride < effectiveLimit) {
-      effectiveLimit = overlay.maxEntriesOverride;
-      limitReason = "overlay_max_entries_override";
-    }
+  if (overlay.maxEntriesOverride != null && overlay.maxEntriesOverride >= 0 && overlay.maxEntriesOverride < effectiveLimit) {
+    effectiveLimit = overlay.maxEntriesOverride;
+    limitReason = "overlay_max_entries_override";
   }
-
-  // Apply position capacity constraint
   if (remainingPositionSlots < effectiveLimit) {
     effectiveLimit = remainingPositionSlots;
     limitReason = remainingPositionSlots === 0 ? "no_position_capacity" : "position_capacity";
   }
-
-  // Apply entries/day constraint
   if (remainingEntriesToday < effectiveLimit) {
     effectiveLimit = remainingEntriesToday;
     limitReason = remainingEntriesToday === 0 ? "entries_per_day_exhausted" : "entries_per_day";
   }
-
-  // Ensure non-negative
   effectiveLimit = Math.max(0, effectiveLimit);
 
-  // If no capacity, return early with success (no error)
-  if (effectiveLimit === 0) {
-    console.log("[seed-from-signals] no capacity available", {
-      requestedLimit,
-      effectiveLimit,
-      limitReason,
-      currentOpenPositions,
-      maxOpenPositions,
-      remainingPositionSlots,
-      entriesToday,
-      maxEntriesPerDay,
-      remainingEntriesToday,
-    });
-
-    return NextResponse.json({
-      ok: true,
-      today,
-      // Core limits and capacity (top-level for easy access)
-      requestedLimit,
-      effectiveLimit: 0,
-      limitReason,
-      currentOpenPositions,
-      maxOpenPositions,
-      remainingPositionSlots,
-      entriesToday,
-      maxEntriesPerDay,
-      remainingEntriesToday,
-      // Scoring threshold
-      minScore,
-      // Signal and candidate counts
-      totalSignals: (signals || []).length,
-      totalCandidates: 0,
-      // Seeding results
-      seededCount: 0,
-      createdCount: 0,
-      skippedCount: 0,
-      // Broker truth status
-      brokerTruthError: brokerTruth.error ?? null,
-      created: [],
-      skipped: [],
-    }, { status: 200 });
-  }
-
-  console.log("[seed-from-signals] capacity check", {
-    requestedLimit,
-    effectiveLimit,
-    limitReason,
-    currentOpenPositions,
-    maxOpenPositions,
-    remainingPositionSlots,
-    entriesToday,
-    maxEntriesPerDay,
-    remainingEntriesToday,
-  });
-
-  const existingBySignalId = new Set<string>();
-  const existingPendingBySymbolSide = new Set<string>();
+  const activeStatuses = new Set(["AUTO_PENDING", "OPEN", "NEW"]);
+  const terminalStatuses = new Set(["CLOSED", "HIT", "STOPPED", "CANCELED", "CANCELLED", "REJECTED", "ARCHIVED", "ERROR"]);
+  const activeSignalIds = new Set<string>();
+  const terminalSignalIds = new Set<string>();
+  const activeSymbolSide = new Set<string>();
 
   for (const t of trades || []) {
     const sid = String(t?.signalId || "");
-    if (sid) existingBySignalId.add(sid);
-
     const status = String(t?.status || "").toUpperCase();
     const symbol = String(t?.ticker || t?.symbol || "").toUpperCase();
     const side = normalizeDirection(t?.side);
-    if (status === "AUTO_PENDING" && symbol && side) {
-      existingPendingBySymbolSide.add(`${symbol}:${side}`);
+
+    if (sid && activeStatuses.has(status)) activeSignalIds.add(sid);
+    if (sid && terminalStatuses.has(status)) terminalSignalIds.add(sid);
+    if (activeStatuses.has(status) && symbol && side) {
+      activeSymbolSide.add(`${symbol}:${side}`);
     }
   }
 
-  // -------------------------------------------------------------------------
-  // PHASE 3c: Two-Pass Candidate Processing with Deduplication
-  // -------------------------------------------------------------------------
-  // Pass 1: Collect all qualifying candidates (no limit yet)
-  // Pass 2: Dedupe by symbol+side, keeping best per group
-  // Pass 3: Apply limit AFTER deduplication
-  // -------------------------------------------------------------------------
-
   const created: any[] = [];
-  const skipped: any[] = [];
-  const skipReasonCounts: Record<string, number> = {};
-  
-  // Phase 3c: Track short quality metrics
+  const skipped: Array<{ signalId: string; symbol: string; reason: string }> = [];
+  const skippedByReason: Partial<Record<SeedSkipReason, number>> = {};
+  const attributionBySignalId = new Map<string, {
+    symbol: string;
+    seedOutcome: "created" | "skipped";
+    seedReason: string;
+    linkedTradeId: string | null;
+  }>();
+
   let shortQualified = 0;
   let shortSkippedWeakStructure = 0;
   let seededLong = 0;
   let seededShort = 0;
+  let notQualifiedSkippedCount = 0;
 
   const effectiveMinScore = minScore + overlay.minScoreAdjustment;
-  const allQualifyingCandidates: QualifiedCandidate[] = [];
+  const qualifiedSignals = (signals || []).filter((s) => {
+    const status = String(s?.status || "").toUpperCase();
+    return status === "SCORED" && s?.qualified === true;
+  });
 
-  // PASS 1: Collect all qualifying candidates
+  const allQualifyingCandidates: QualifiedCandidate[] = [];
+  const candidateKey = (c: QualifiedCandidate) => `${c.signalId}:${c.symbol}:${c.side}:${c.createdAt}`;
+
   for (const s of signals || []) {
     const status = String(s?.status || "").toUpperCase();
     if (status !== "SCORED") continue;
-    
     if (s?.qualified !== true) {
-      skipped.push({ symbol: getSymbol(s) || "UNKNOWN", reason: "not_qualified" });
+      notQualifiedSkippedCount += 1;
       continue;
     }
 
-    const symbol = getSymbol(s);
-    if (!symbol) {
-      skipped.push({ symbol: "UNKNOWN", reason: "missing_symbol" });
-      continue;
-    }
+    const signalId = String(s?.id || "").trim();
+    if (!signalId) continue;
 
+    const symbol = getSymbol(s) || "UNKNOWN";
     const side = getDirection(s);
-    if (!side) {
-      skipped.push({ symbol, reason: "missing_direction" });
-      continue;
-    }
-
-    const aiScore = getNum(s, ["aiScore", "score"]);
-    if (aiScore == null || aiScore < effectiveMinScore) {
-      skipped.push({
-        symbol,
-        reason: overlay.minScoreAdjustment !== 0 ? "below_overlay_adjusted_minScore" : "below_minScore",
-      });
-      continue;
-    }
-
     const entryPrice = getNum(s, ["entryPrice", "ai.entryPrice"]);
     const stopPrice = getNum(s, ["stopPrice", "ai.stopPrice"]);
     const targetPrice = getNum(s, ["targetPrice", "takeProfitPrice", "ai.targetPrice", "ai.takeProfitPrice"]);
+    const aiScore = getNum(s, ["aiScore", "score"]);
+    const createdAt = String(s?.createdAt || s?.updatedAt || nowIso);
+    const createdAtMs = Date.parse(createdAt);
+    const ageMin = Number.isFinite(createdAtMs) ? Math.max(0, (Date.now() - createdAtMs) / 60000) : Number.POSITIVE_INFINITY;
 
-    if (entryPrice == null || stopPrice == null || targetPrice == null) {
-      skipped.push({ symbol, reason: "INVALID_SIGNAL_PLAN_MISSING_VALUES" });
+    const markSkip = (reason: SeedSkipReason) => {
+      skipped.push({ signalId, symbol, reason });
+      bumpSkipReason(skippedByReason, reason);
+      attributionBySignalId.set(signalId, {
+        symbol,
+        seedOutcome: "skipped",
+        seedReason: reason,
+        linkedTradeId: null,
+      });
+    };
+
+    if (!side) {
+      markSkip("missing_direction");
       continue;
     }
 
-    const tier = tierForScore(aiScore) || "C";
-    if (tier === "C" && !cfg.allowedTiers.includes("C")) {
-      skipped.push({ symbol, reason: "tier_c_disabled" });
+    if (!(entryPrice != null && entryPrice > 0 && stopPrice != null && stopPrice > 0 && targetPrice != null && targetPrice > 0)) {
+      markSkip("missing_prices");
       continue;
     }
 
-    if (!overlay.allowedGrades.includes(tier as "A" | "B" | "C")) {
-      skipped.push({ symbol, reason: "overlay_grade_excluded", grade: tier, allowedGrades: overlay.allowedGrades });
+    if (!Number.isFinite(aiScore as number) || (aiScore as number) < effectiveMinScore) {
+      markSkip("below_threshold");
       continue;
     }
 
-    const signalId = String(s.id || "");
-
-    // Check for existing trades
-    if (signalId && existingBySignalId.has(signalId)) {
-      skipped.push({ symbol, reason: "already_has_trade_for_signal" });
+    if (!Number.isFinite(ageMin) || ageMin > maxSignalAgeMin) {
+      markSkip("stale_signal");
       continue;
     }
 
-    const symbolSide = `${symbol}:${side}`;
-    if (existingPendingBySymbolSide.has(symbolSide)) {
-      skipped.push({ symbol, reason: "already_has_pending_for_symbol_side" });
+    const tier = tierForScore(aiScore as number) || "C";
+    if ((tier === "C" && !cfg.allowedTiers.includes("C")) || !overlay.allowedGrades.includes(tier as "A" | "B" | "C")) {
+      markSkip("overlay_block");
       continue;
     }
 
-    // Phase 3c: Short-side quality check
+    if (activeSignalIds.has(signalId)) {
+      markSkip("already_active_trade");
+      continue;
+    }
+    if (terminalSignalIds.has(signalId)) {
+      markSkip("already_terminal_trade");
+      continue;
+    }
+    if (activeSymbolSide.has(`${symbol}:${side}`)) {
+      markSkip("already_active_trade");
+      continue;
+    }
+
+    if (!marketOpen && !allowAfterHoursCreate) {
+      markSkip("market_closed");
+      continue;
+    }
+
     let shortPenalty = 0;
     if (side === "SHORT") {
       const shortQuality = evaluateShortQuality(s);
       shortPenalty = shortQuality.penalty;
-      
       if (!shortQuality.pass) {
         shortSkippedWeakStructure += 1;
-        skipped.push({ 
-          symbol, 
-          reason: "short_weak_structure", 
-          penalty: shortPenalty,
-          detail: shortQuality.reason 
-        });
+        markSkip("below_threshold");
         continue;
       }
       shortQualified += 1;
     }
 
-    // Calculate effective score (aiScore - shortPenalty for shorts)
-    const effectiveScore = aiScore - shortPenalty;
     const actionabilityRank = getNum(s, ["actionabilityRank"]) ?? 5;
-
-    const createdAt = String(s?.createdAt || s?.updatedAt || new Date().toISOString());
-
     allQualifyingCandidates.push({
       signal: s,
       symbol,
       side,
-      aiScore,
-      entryPrice,
-      stopPrice,
-      targetPrice,
+      aiScore: aiScore as number,
+      entryPrice: entryPrice as number,
+      stopPrice: stopPrice as number,
+      targetPrice: targetPrice as number,
       tier,
       signalId,
       createdAt,
       shortPenalty,
-      effectiveScore,
+      effectiveScore: (aiScore as number) - shortPenalty,
       actionabilityRank,
     });
   }
 
-  // PASS 2: Deduplicate by symbol+side
   const { unique: uniqueCandidates, collapsedCount: duplicatesCollapsedCount } = dedupeCandidates(allQualifyingCandidates);
-  const totalCandidates = allQualifyingCandidates.length;
+  const selectedKeys = new Set(uniqueCandidates.map(candidateKey));
+  for (const c of allQualifyingCandidates) {
+    if (selectedKeys.has(candidateKey(c))) continue;
+    skipped.push({ signalId: c.signalId, symbol: c.symbol, reason: "duplicate_symbol" });
+    bumpSkipReason(skippedByReason, "duplicate_symbol");
+    attributionBySignalId.set(c.signalId, {
+      symbol: c.symbol,
+      seedOutcome: "skipped",
+      seedReason: "duplicate_symbol",
+      linkedTradeId: null,
+    });
+  }
+
   const uniqueCandidatesCount = uniqueCandidates.length;
+  const totalCandidates = allQualifyingCandidates.length;
 
-  // Track collapsed duplicates as skipped
-  if (duplicatesCollapsedCount > 0) {
-    skipped.push(...Array(duplicatesCollapsedCount).fill({ symbol: "COLLAPSED", reason: "duplicate_collapsed_in_dedupe" }));
-  }
-
-  // PASS 3: Apply limit AFTER deduplication and create trades
   const candidatesToSeed = uniqueCandidates.slice(0, effectiveLimit);
-  const limitSkippedCandidates = uniqueCandidates.slice(effectiveLimit);
-
-  // Track limit-reached skips
-  for (const c of limitSkippedCandidates) {
-    skipped.push({ symbol: c.symbol, reason: "limit_reached" });
+  const capacitySkippedCandidates = uniqueCandidates.slice(effectiveLimit);
+  for (const c of capacitySkippedCandidates) {
+    skipped.push({ signalId: c.signalId, symbol: c.symbol, reason: "capacity_full" });
+    bumpSkipReason(skippedByReason, "capacity_full");
+    attributionBySignalId.set(c.signalId, {
+      symbol: c.symbol,
+      seedOutcome: "skipped",
+      seedReason: "capacity_full",
+      linkedTradeId: null,
+    });
   }
 
-  // Create trades for selected candidates
   for (const c of candidatesToSeed) {
-    // ── Seed-time validation: reject malformed candidates before creating ──
-    const missingField = !c.symbol
-      ? "symbol"
-      : !c.side
-        ? "side"
-        : !(c.entryPrice > 0)
-          ? "entryPrice"
-          : !(c.stopPrice > 0)
-            ? "stopPrice"
-            : !(c.targetPrice > 0)
-              ? "targetPrice"
-              : !(c.aiScore >= 0)
-                ? "aiScore"
-                : !c.tier
-                  ? "tier"
-                  : !c.signalId
-                    ? "signalId"
-                    : null;
-
-    if (missingField) {
-      console.warn("[seed-from-signals] skipping malformed candidate", {
-        missingField,
-        symbol: c.symbol,
-        side: c.side,
-        signalId: c.signalId,
-      });
-      skipped.push({ symbol: c.symbol, reason: `missing_required_field_${missingField}` });
-      continue;
-    }
-
-    const now = new Date().toISOString();
-    const sessionMeta = deriveSessionMeta(now);
-    const scoredAt = String(c.signal?.scoredAt || c.signal?.updatedAt || c.createdAt || now);
+    const sessionMeta = deriveSessionMeta(nowIso);
+    const scoredAt = String(c.signal?.scoredAt || c.signal?.updatedAt || c.createdAt || nowIso);
+    const tradeId = crypto.randomUUID();
 
     const trade = {
-      id: crypto.randomUUID(),
-      // symbol is canonical; ticker kept for backward compat
+      id: tradeId,
       symbol: c.symbol,
       ticker: c.symbol,
       side: c.side,
@@ -614,15 +560,14 @@ export async function POST(req: NextRequest) {
       status: "AUTO_PENDING",
       source: "AUTO",
       paper: true,
-      createdAt: now,
-      updatedAt: now,
+      createdAt: nowIso,
+      updatedAt: nowIso,
       scoredAt,
       etDate: sessionMeta.etDate,
       sessionTag: sessionMeta.sessionTag,
       signalId: c.signalId,
       aiScore: c.aiScore,
       tier: c.tier,
-      // Normalize nested ai object to mirror top-level aiScore
       ai: {
         score: c.aiScore,
         tier: c.tier,
@@ -631,95 +576,120 @@ export async function POST(req: NextRequest) {
         summary: "",
       },
       autoEntryStatus: "AUTO_PENDING",
-      // Execution attribution: set at creation so every seeded trade is traceable
-      seededAt: now,
+      seededAt: nowIso,
       executeOutcome: "PENDING",
       executeReason: null as null,
-      // Phase 3c: Track short penalty for debugging
       ...(c.side === "SHORT" && c.shortPenalty > 0 ? { shortPenalty: c.shortPenalty } : {}),
     };
 
-    await upsertTrade(trade);
-
-    existingBySignalId.add(c.signalId);
-    existingPendingBySymbolSide.add(`${c.symbol}:${c.side}`);
+    if (!dryRun) {
+      await upsertTrade(trade);
+    }
 
     if (c.side === "LONG") seededLong += 1;
     if (c.side === "SHORT") seededShort += 1;
 
     created.push({
-      id: trade.id,
+      id: dryRun ? null : tradeId,
       symbol: c.symbol,
       side: c.side,
       signalId: c.signalId,
       aiScore: c.aiScore,
       effectiveScore: c.effectiveScore,
       tier: c.tier,
+      dryRun,
+    });
+
+    attributionBySignalId.set(c.signalId, {
+      symbol: c.symbol,
+      seedOutcome: "created",
+      seedReason: dryRun ? "created_dry_run" : "created",
+      linkedTradeId: dryRun ? null : tradeId,
     });
   }
 
-  // Aggregate skip reasons
-  for (const s of skipped) {
-    const reason = s.reason || "unknown";
-    skipReasonCounts[reason] = (skipReasonCounts[reason] ?? 0) + 1;
+  const seedEvaluatedAt = new Date().toISOString();
+  let updatedSignalsCount = 0;
+  const updatedSignals: StoredSignal[] = (allStoredSignals || []).map((sig) => {
+    const sid = String((sig as any)?.id || "");
+    const a = attributionBySignalId.get(sid);
+    if (!a) return sig;
+    updatedSignalsCount += 1;
+    return {
+      ...sig,
+      seedEvaluatedAt,
+      seedOutcome: a.seedOutcome,
+      seedReason: a.seedReason,
+      linkedTradeId: a.linkedTradeId,
+      updatedAt: seedEvaluatedAt,
+    };
+  });
+  if (updatedSignalsCount > 0) {
+    await writeSignals(updatedSignals);
   }
 
-  // Compute explicit skip counts
-  const duplicateSkippedCount = (skipReasonCounts["duplicate_collapsed_in_dedupe"] ?? 0);
-  const alreadyHasTradeSkippedCount = (skipReasonCounts["already_has_trade_for_signal"] ?? 0) + 
-                                      (skipReasonCounts["already_has_pending_for_symbol_side"] ?? 0);
-  const limitReachedSkippedCount = (skipReasonCounts["limit_reached"] ?? 0);
-  const notQualifiedSkippedCount = (skipReasonCounts["not_qualified"] ?? 0);
-  const belowMinScoreSkippedCount = (skipReasonCounts["below_minScore"] ?? 0) + 
-                                    (skipReasonCounts["below_overlay_adjusted_minScore"] ?? 0);
-  const missingDirectionSkippedCount = (skipReasonCounts["missing_direction"] ?? 0);
-  const missingPricesSkippedCount = (skipReasonCounts["INVALID_SIGNAL_PLAN_MISSING_VALUES"] ?? 0);
-  const tierDisabledSkippedCount = (skipReasonCounts["tier_c_disabled"] ?? 0);
-  const overlayGradeSkippedCount = (skipReasonCounts["overlay_grade_excluded"] ?? 0);
-  const shortWeakStructureSkippedCount = (skipReasonCounts["short_weak_structure"] ?? 0);
+  const duplicateSkippedCount = skippedByReason.duplicate_symbol ?? 0;
+  const alreadyHasTradeSkippedCount = (skippedByReason.already_active_trade ?? 0) + (skippedByReason.already_terminal_trade ?? 0);
+  const limitReachedSkippedCount = skippedByReason.capacity_full ?? 0;
+  const belowMinScoreSkippedCount = skippedByReason.below_threshold ?? 0;
+  const missingDirectionSkippedCount = skippedByReason.missing_direction ?? 0;
+  const missingPricesSkippedCount = skippedByReason.missing_prices ?? 0;
+  const overlayGradeSkippedCount = skippedByReason.overlay_block ?? 0;
 
-  // Bump funnel counters
   await bumpTodayFunnel({
     seedFromQualifiedLong: seededLong,
     seedFromQualifiedShort: seededShort,
     seedTotalCandidates: totalCandidates,
-    seedCreatedCount: created.length,
-    // Phase 3c: Deduplication visibility
+    seedCreatedCount: dryRun ? 0 : created.length,
     seedUniqueCandidates: uniqueCandidatesCount,
     seedDuplicatesCollapsed: duplicatesCollapsedCount,
-    // Phase 3c: Short quality
-    shortQualified: shortQualified,
+    shortQualified,
     shortSeeded: seededShort,
-    shortSkippedWeakStructure: shortSkippedWeakStructure,
-    // Skip reasons
+    shortSkippedWeakStructure,
     seedSkippedNotQualified: notQualifiedSkippedCount,
     seedSkippedOverlayGrade: overlayGradeSkippedCount,
-    seedSkippedMissingSymbol: skipReasonCounts["missing_symbol"] ?? 0,
+    seedSkippedMissingSymbol: 0,
     seedSkippedAlreadyHasTrade: alreadyHasTradeSkippedCount,
     seedSkippedDuplicate: duplicateSkippedCount,
     seedSkippedLimitReached: limitReachedSkippedCount,
     seedSkippedBelowMinScore: belowMinScoreSkippedCount,
     seedSkippedMissingDirection: missingDirectionSkippedCount,
     seedSkippedMissingPrices: missingPricesSkippedCount,
-    seedSkippedTierDisabled: tierDisabledSkippedCount,
-    seedSkippedOther: Math.max(0, skipped.length - (
-      notQualifiedSkippedCount +
-      overlayGradeSkippedCount +
-      (skipReasonCounts["missing_symbol"] ?? 0) +
-      alreadyHasTradeSkippedCount +
-      duplicateSkippedCount +
-      limitReachedSkippedCount +
-      belowMinScoreSkippedCount +
-      missingDirectionSkippedCount +
-      missingPricesSkippedCount +
-      tierDisabledSkippedCount +
-      shortWeakStructureSkippedCount
-    )),
+    seedSkippedTierDisabled: 0,
+    seedSkippedOther: (skippedByReason.market_closed ?? 0) + (skippedByReason.stale_signal ?? 0),
   });
 
-  // Lightweight summary log
+  const skippedQualifiedSignals = Array.from(attributionBySignalId.entries())
+    .map(([signalId, a]) => {
+      const mapped = mapSkipReason(a.seedReason);
+      if (a.seedOutcome !== "skipped" || !mapped) return null;
+      return { signalId, symbol: a.symbol, reason: mapped };
+    })
+    .filter(Boolean) as SeedRunTelemetry["skippedQualifiedSignals"];
+
+  const telemetryPayload: SeedRunTelemetry = {
+    runAt: seedEvaluatedAt,
+    source: runSource,
+    marketOpen,
+    totalQualifiedSignals: qualifiedSignals.length,
+    totalCandidates,
+    createdCount: dryRun ? 0 : created.length,
+    skippedByReason,
+    skippedQualifiedSignals,
+    dryRun,
+    debug,
+    runId,
+  };
+  await recordSeedRunTelemetry(today, telemetryPayload);
+
   console.log("[seed-from-signals] complete", {
-    seededCount: created.length,
+    runId,
+    source: runSource,
+    dryRun,
+    debug,
+    marketOpen,
+    seededCount: dryRun ? 0 : created.length,
+    totalQualifiedSignals: qualifiedSignals.length,
     candidates: totalCandidates,
     effectiveLimit,
     openPositions: currentOpenPositions,
@@ -727,65 +697,52 @@ export async function POST(req: NextRequest) {
     limitReason,
   });
 
-  return NextResponse.json(
-    {
-      ok: true,
-      today,
-      // Core limits and capacity (top-level for easy access)
-      requestedLimit,
-      effectiveLimit,
-      limitReason,
-      currentOpenPositions,
-      maxOpenPositions,
-      remainingPositionSlots,
-      entriesToday,
-      maxEntriesPerDay,
-      remainingEntriesToday,
-      // Scoring threshold
-      minScore,
-      // Signal and candidate counts
-      totalSignals: (signals || []).length,
-      signalsFilteredOutByEtDay: signalsFilteredOut,
-      rawSignalsFromApi: (rawSignals || []).length,
-      etDayBounds: { startMs: dayStartMs, endMs: dayEndMs },
-      totalCandidates,
-      uniqueCandidatesCount,
-      duplicatesCollapsedCount,
-      // Seeding results (seededCount = alias for createdCount)
-      seededCount: created.length,
-      createdCount: created.length,
-      skippedCount: skipped.length,
-      skippedByOverlayCount: skipped.filter((s) => s.reason === "overlay_grade_excluded" || s.reason === "below_overlay_adjusted_minScore").length,
-      // Direction breakdown
-      seededLong,
-      seededShort,
-      // Phase 3c: Short-side metrics
-      shortQualified,
-      shortSkippedWeakStructure,
-      // Explicit skip counts
-      duplicateSkippedCount,
-      alreadyHasTradeSkippedCount,
-      limitReachedSkippedCount,
-      notQualifiedSkippedCount,
-      belowMinScoreSkippedCount,
-      missingDirectionSkippedCount,
-      missingPricesSkippedCount,
-      tierDisabledSkippedCount,
-      overlayGradeSkippedCount,
-      shortWeakStructureSkippedCount,
-      skipReasonCounts,
-      created,
-      skipped: skipped.slice(0, 50),
-      // Broker truth status
-      brokerTruthError: brokerTruth.error ?? null,
-      overlay: {
-        posture: overlay.posture,
-        allowedGrades: overlay.allowedGrades,
-        minScoreAdjustment: overlay.minScoreAdjustment,
-        maxEntriesOverride: overlay.maxEntriesOverride,
-        stateAvailable: overlay.stateAvailable,
-      },
+  return NextResponse.json({
+    ok: true,
+    today,
+    runId,
+    runAt: seedEvaluatedAt,
+    source: runSource,
+    marketOpen,
+    dryRun,
+    debug,
+    requestedLimit,
+    effectiveLimit,
+    limitReason,
+    currentOpenPositions,
+    maxOpenPositions,
+    remainingPositionSlots,
+    entriesToday,
+    maxEntriesPerDay,
+    remainingEntriesToday,
+    minScore,
+    totalSignals: (signals || []).length,
+    totalQualifiedSignals: qualifiedSignals.length,
+    signalsFilteredOutByEtDay: signalsFilteredOut,
+    rawSignalsFromApi: (rawSignals || []).length,
+    etDayBounds: { startMs: dayStartMs, endMs: dayEndMs },
+    totalCandidates,
+    uniqueCandidatesCount,
+    duplicatesCollapsedCount,
+    seededCount: dryRun ? 0 : created.length,
+    createdCount: dryRun ? 0 : created.length,
+    skippedCount: skipped.length,
+    seededLong,
+    seededShort,
+    shortQualified,
+    shortSkippedWeakStructure,
+    skipReasonCounts: skippedByReason,
+    skippedQualifiedSignals: skippedQualifiedSignals.slice(0, 250),
+    attributedQualifiedSignals: updatedSignalsCount,
+    created,
+    skipped: skipped.slice(0, 100),
+    brokerTruthError: brokerTruth.error ?? null,
+    overlay: {
+      posture: overlay.posture,
+      allowedGrades: overlay.allowedGrades,
+      minScoreAdjustment: overlay.minScoreAdjustment,
+      maxEntriesOverride: overlay.maxEntriesOverride,
+      stateAvailable: overlay.stateAvailable,
     },
-    { status: 200 }
-  );
+  }, { status: 200 });
 }

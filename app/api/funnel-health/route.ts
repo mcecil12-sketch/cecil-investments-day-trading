@@ -12,6 +12,7 @@ import { isOpenTradeStatus } from "@/lib/trades/protection";
 import { getSignalTimestampMs } from "@/lib/signals/since";
 import { selectCanonicalOpenTrades } from "@/lib/trades/canonicalOpenBySymbol";
 import { evaluateTradeProtectionNow } from "@/lib/risk/protection-truth";
+import { readLatestSeedRunTelemetry } from "@/lib/autoEntry/seedTelemetry";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -60,6 +61,10 @@ type FunnelHealthResponse = {
     qualifiedToSeeded: number | null;
     seededToExecuted: number | null;
   };
+  qualifiedButNotSeeded?: number;
+  seedSkipReasonBreakdown?: Record<string, number>;
+  lastSeedRunAt?: string | null;
+  lastSeedRunSource?: string | null;
   score: FunnelScore;
   incidents: Incident[];
   timestamps?: {
@@ -313,7 +318,7 @@ export async function GET() {
   
   try {
     // Parallel fetch all required data
-    const [clock, brokerTruth, guardConfig, guardState, funnelData, allTrades, allSignals] = await Promise.all([
+    const [clock, brokerTruth, guardConfig, guardState, funnelData, allTrades, allSignals, lastSeedRun] = await Promise.all([
       fetchAlpacaClock().catch(() => ({ is_open: false } as { is_open: boolean })),
       fetchBrokerTruth(),
       Promise.resolve(getGuardrailConfig()),
@@ -321,6 +326,7 @@ export async function GET() {
       readTodayFunnel(),
       readTrades<any>().catch(() => []),
       readSignals().catch(() => []),
+      readLatestSeedRunTelemetry(dateET),
     ]);
 
     const marketOpen = Boolean(clock?.is_open);
@@ -429,6 +435,15 @@ export async function GET() {
     const signalToQualified = safePercent(qualified, signalsReceived);
     const qualifiedToSeeded = safePercent(seeded, qualified);
     const seededToExecuted = safePercent(executed, seeded);
+    const qualifiedButNotSeeded = Math.max(0, qualified - seeded);
+
+    const seedSkipReasonBreakdown: Record<string, number> = {};
+    if (lastSeedRun?.skippedByReason) {
+      for (const [reason, count] of Object.entries(lastSeedRun.skippedByReason)) {
+        if (typeof count !== "number" || !Number.isFinite(count)) continue;
+        seedSkipReasonBreakdown[reason] = count;
+      }
+    }
 
     // -------------------------------------------------------------------------
     // Protection Integrity Audit
@@ -552,12 +567,13 @@ export async function GET() {
     // Timestamp metrics (best-effort from funnel data)
     // -------------------------------------------------------------------------
     const lastScanAt = funnelData.lastScanAt;
+    const lastSeedAt = lastSeedRun?.runAt ?? lastScanAt;
     const lastEntryAt = guardState.lastEntryAt;
     
     // We don't have exact lastSeed/lastExecute timestamps, use proxies
     // lastEntryAt is bumped when trades execute, so use it for execute proxy
     const minsSinceLastExecute = minutesSince(lastEntryAt);
-    const minsSinceLastSeed = minutesSince(lastScanAt); // Proxy: scan triggers seeding
+    const minsSinceLastSeed = minutesSince(lastSeedAt);
 
     // -------------------------------------------------------------------------
     // Incident Detection
@@ -644,10 +660,14 @@ export async function GET() {
         qualifiedToSeeded,
         seededToExecuted,
       },
+      qualifiedButNotSeeded,
+      ...(Object.keys(seedSkipReasonBreakdown).length > 0 ? { seedSkipReasonBreakdown } : {}),
+      lastSeedRunAt: lastSeedRun?.runAt ?? null,
+      lastSeedRunSource: lastSeedRun?.source ?? null,
       score,
       incidents,
       timestamps: {
-        lastSeedAt: lastScanAt,
+        lastSeedAt,
         lastExecuteAt: lastEntryAt,
         minsSinceLastSeed,
         minsSinceLastExecute,

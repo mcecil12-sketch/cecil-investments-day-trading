@@ -20,6 +20,7 @@ jobs:
         env:
           BASE: ${{ secrets.PROD_BASE_URL }}
           CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+          AUTO_ENTRY_TOKEN: ${{ secrets.AUTO_ENTRY_TOKEN }}
         run: |
           set -euo pipefail
           NOW="$(date +%s)"
@@ -43,3 +44,25 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{}' \
             | jq '{attemptedCount,completedCount,timeoutCount,scoredCount,durationMs,remainingTimeMs,pickedStrategy}'
+
+          if [ "${{ matrix.worker }}" = "1" ]; then
+            echo "seed-from-signals after score drain"
+            curl -sS --max-time 90 -X POST \
+              "$BASE/api/auto-entry/seed-from-signals?limit=3&minScore=7.5&_=$NOW" \
+              -H "x-cron-token: $CRON_TOKEN" \
+              -H "x-run-source: github-actions" \
+              -H "x-run-id: $RUN_ID" \
+              -H "Content-Type: application/json" \
+              -d '{}' \
+              | jq '{ok,marketOpen,createdCount,totalQualifiedSignals,totalCandidates,skipReasonCounts}'
+
+            echo "execute after seed"
+            curl -sS --max-time 90 -X POST \
+              "$BASE/api/auto-entry/execute?_=$NOW" \
+              -H "x-auto-entry-token: $AUTO_ENTRY_TOKEN" \
+              -H "x-run-source: github-actions" \
+              -H "x-run-id: $RUN_ID" \
+              -H "Content-Type: application/json" \
+              -d '{}' \
+              | jq '{ok,summary,error}'
+          fi
