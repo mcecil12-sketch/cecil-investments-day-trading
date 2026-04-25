@@ -65,6 +65,7 @@ type FunnelHealthResponse = {
   seedSkipReasonBreakdown?: Record<string, number>;
   lastSeedRunAt?: string | null;
   lastSeedRunSource?: string | null;
+  lastSeedRunId?: string | null;
   score: FunnelScore;
   incidents: Incident[];
   timestamps?: {
@@ -664,6 +665,7 @@ export async function GET() {
       ...(Object.keys(seedSkipReasonBreakdown).length > 0 ? { seedSkipReasonBreakdown } : {}),
       lastSeedRunAt: lastSeedRun?.runAt ?? null,
       lastSeedRunSource: lastSeedRun?.source ?? null,
+      lastSeedRunId: lastSeedRun?.runId ?? null,
       score,
       incidents,
       timestamps: {
