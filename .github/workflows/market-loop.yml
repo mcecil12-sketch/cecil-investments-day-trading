@@ -115,7 +115,7 @@ jobs:
           echo
 
           echo "=== auto-entry seed-from-signals ==="
-          SEED_CODE="$(curl -sS -o /tmp/seed_from_signals.json -w "%{http_code}" -X POST "$BASE/api/auto-entry/seed-from-signals?limit=3&minScore=7.5" \
+          SEED_CODE="$(curl -sS -o /tmp/seed_from_signals.json -w "%{http_code}" -X POST "$BASE/api/auto-entry/seed-from-signals?limit=3" \
             -H "Content-Type: application/json" \
             -H "x-cron-token: $CRON_TOKEN" \
             -H "x-run-source: github-actions" \
@@ -126,7 +126,7 @@ jobs:
           cat /tmp/seed_from_signals.json | head -c 6000 || true
           echo
           echo "seed parsed metrics:"
-          cat /tmp/seed_from_signals.json | jq '{createdCount,totalQualifiedSignals,skippedQualifiedSignals,marketOpen,source,runId}' || true
+          cat /tmp/seed_from_signals.json | jq '{createdCount,totalQualifiedSignals,skippedQualifiedSignals,skipReasonCounts,marketOpen,source,runId}' || true
           if [ "$SEED_CODE" -ne 200 ]; then
             echo "WARN: seed-from-signals failed with HTTP $SEED_CODE"
           fi

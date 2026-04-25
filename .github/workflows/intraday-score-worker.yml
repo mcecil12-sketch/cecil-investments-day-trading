@@ -48,13 +48,13 @@ jobs:
           if [ "${{ matrix.worker }}" = "1" ]; then
             echo "seed-from-signals after score drain"
             curl -sS --max-time 90 -X POST \
-              "$BASE/api/auto-entry/seed-from-signals?limit=3&minScore=7.5&_=$NOW" \
+              "$BASE/api/auto-entry/seed-from-signals?limit=3&_=$NOW" \
               -H "x-cron-token: $CRON_TOKEN" \
               -H "x-run-source: github-actions" \
               -H "x-run-id: $RUN_ID" \
               -H "Content-Type: application/json" \
               -d '{}' \
-              | jq '{ok,marketOpen,createdCount,totalQualifiedSignals,totalCandidates,skipReasonCounts}'
+              | jq '{ok,marketOpen,createdCount,totalQualifiedSignals,skippedQualifiedSignals,totalCandidates,skipReasonCounts}'
 
             echo "execute after seed"
             curl -sS --max-time 90 -X POST \

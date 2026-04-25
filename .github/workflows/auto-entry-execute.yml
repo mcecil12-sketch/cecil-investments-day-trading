@@ -24,15 +24,16 @@ jobs:
 
           RUN_ID="gh-auto-entry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)"
 
-          SEED_BODY="$(curl -sS -X POST "$PROD/api/auto-entry/seed-from-signals" \
+          SEED_BODY="$(curl -sS -X POST "$PROD/api/auto-entry/seed-from-signals?limit=3" \
             -H "Content-Type: application/json" \
             -H "x-cron-token: $CRON_TOKEN" \
             -H "x-run-source: github-actions" \
             -H "x-run-id: $RUN_ID" \
-            -d '{"limit":3,"minScore":7.5}')"
+            -d '{}')"
 
           echo "$SEED_BODY"
           echo "$SEED_BODY" | jq -r '.' >/dev/null
+          echo "$SEED_BODY" | jq '{createdCount,totalQualifiedSignals,skippedQualifiedSignals,skipReasonCounts,marketOpen,source,runId}'
 
           BODY="$(curl -sS -X POST "$PROD/api/auto-entry/execute" \
             -H "Content-Type: application/json" \
