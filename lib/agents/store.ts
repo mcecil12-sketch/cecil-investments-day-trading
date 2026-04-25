@@ -677,7 +677,7 @@ export async function upsertIncident(
 
   if (idx >= 0) {
     const current = history[idx];
-    const severityRank = { LOW: 1, MEDIUM: 2, HIGH: 3 } as const;
+    const severityRank = { LOW: 1, MEDIUM: 2, HIGH: 3, CRITICAL: 4 } as const;
     const merged: AgentIncident = {
       ...current,
       updatedAt: now,

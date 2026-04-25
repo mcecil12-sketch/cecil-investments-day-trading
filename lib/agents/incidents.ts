@@ -88,6 +88,15 @@ export function likelyFilesForCategory(category: AgentIncidentCategory): string[
         "lib/autoEntry/guardrails.ts",
         "lib/autoEntry/guardrailsStore.ts",
       ];
+    case "FUNNEL_BLOCK":
+      return [
+        "app/api/funnel-health/route.ts",
+        "app/api/auto-entry/seed-from-signals/route.ts",
+        "app/api/auto-entry/execute/route.ts",
+        ".github/workflows/market-loop.yml",
+        ".github/workflows/intraday-score-worker.yml",
+        ".github/workflows/auto-entry-execute.yml",
+      ];
     case "TRADES":
       return [
         "app/api/trades/approve/route.ts",
@@ -136,6 +145,13 @@ function likelyRoutesForCategory(category: AgentIncidentCategory): string[] {
       return ["/api/readiness", "/api/ops/status", "/api/agents/run"];
     case "AUTO_ENTRY":
       return ["/api/auto-entry/execute", "/api/ops/status", "/api/agents/run"];
+    case "FUNNEL_BLOCK":
+      return [
+        "/api/funnel-health",
+        "/api/auto-entry/seed-from-signals",
+        "/api/auto-entry/execute",
+        "/api/agents/incidents",
+      ];
     default:
       return ["/api/ops/status", "/api/agents/run"];
   }
@@ -175,6 +191,13 @@ function inferLikelyRootCause(incident: AgentIncident): string {
       `Details: ${incident.summary}`
     );
   }
+  if (incident.category === "FUNNEL_BLOCK") {
+    return (
+      `Qualified signals are not progressing through seed/execute funnel stages during market hours. ` +
+      `Likely cause: workflow cadence or parameter mismatch, missing seed step, auth header mismatch, or guardrail/capacity block. ` +
+      `Details: ${incident.summary}`
+    );
+  }
   return `${incident.category} incident: ${incident.summary}`;
 }
 
@@ -206,6 +229,12 @@ function inferRecommendedNextAction(incident: AgentIncident): string {
         `Review guardrail config and daily loss state. ` +
         `If safe conditions are met, reset auto-entry via admin settings. ` +
         `Do not auto-reset without verifying root cause.`
+      );
+    case "FUNNEL_BLOCK":
+      return (
+        `Check market-loop workflow order and parameters (score drain -> seed -> execute). ` +
+        `Verify seed call uses x-cron-token and does not apply an unintended minScore threshold. ` +
+        `Confirm execute step runs and inspect seed/execute skip breakdowns from funnel-health.`
       );
     default:
       return `Review /api/ops/status diagnostics and agent logs. Escalate if persistent.`;

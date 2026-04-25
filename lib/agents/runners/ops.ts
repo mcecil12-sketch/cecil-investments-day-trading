@@ -20,8 +20,185 @@ import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { readTrades } from "@/lib/tradesStore";
 import { isOpenTradeStatus } from "@/lib/trades/protection";
+import { readTodayFunnel } from "@/lib/funnelRedis";
+import { readLatestSeedRunTelemetry } from "@/lib/autoEntry/seedTelemetry";
 import type { AgentBrief, AgentIncident, AgentIncidentCategory, AgentRunnerResult } from "@/lib/agents/types";
-import { nowIso } from "@/lib/agents/time";
+import { getEtDateString, nowIso } from "@/lib/agents/time";
+import { promises as fs } from "fs";
+import path from "path";
+
+type WorkflowChecks = {
+  minScoreThresholds: string[];
+  missingSteps: string[];
+  authHeaderIssues: string[];
+  proposedFixes: string[];
+};
+
+type FunnelMismatchDiagnostics = {
+  qualified: number;
+  seeded: number;
+  executed: number;
+  eligibleCount: number;
+  lastSeedAt: string | null;
+  lastExecuteAt: string | null;
+  seedSkipReasonBreakdown: Record<string, number>;
+  executeSkipReasonBreakdown: Record<string, number>;
+  workflowChecks: WorkflowChecks;
+};
+
+function upper(value: unknown): string {
+  return String(value || "").trim().toUpperCase();
+}
+
+function isFinitePositiveNumber(value: unknown): boolean {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0;
+}
+
+function detectSeedMinScoreThreshold(workflowPath: string, content: string): string[] {
+  const matches: string[] = [];
+  const endpointThreshold = /seed-from-signals[^\n]*minScore\s*=\s*7\.5/gi;
+  const bodyThreshold = /"minScore"\s*:\s*7\.5/gi;
+  if (endpointThreshold.test(content) || bodyThreshold.test(content)) {
+    matches.push(`${workflowPath}: seed-from-signals call hardcodes minScore=7.5`);
+  }
+  return matches;
+}
+
+function inspectWorkflowAuth(workflowPath: string, content: string): string[] {
+  const issues: string[] = [];
+  if (content.includes("/api/auto-entry/seed-from-signals") && !content.includes("x-cron-token: $CRON_TOKEN")) {
+    issues.push(`${workflowPath}: seed-from-signals call missing x-cron-token auth header`);
+  }
+  if (content.includes("/api/auto-entry/execute") && !content.includes("x-auto-entry-token: $AUTO_ENTRY_TOKEN")) {
+    issues.push(`${workflowPath}: auto-entry execute call missing x-auto-entry-token auth header`);
+  }
+  return issues;
+}
+
+function inspectMarketLoopOrder(workflowPath: string, content: string): string[] {
+  const issues: string[] = [];
+  const drainIdx = content.indexOf("/api/ai/score/drain");
+  const seedIdx = content.indexOf("/api/auto-entry/seed-from-signals");
+  const executeIdx = content.indexOf("/api/auto-entry/execute");
+
+  if (drainIdx < 0) issues.push(`${workflowPath}: missing /api/ai/score/drain step`);
+  if (seedIdx < 0) issues.push(`${workflowPath}: missing /api/auto-entry/seed-from-signals step`);
+  if (executeIdx < 0) issues.push(`${workflowPath}: missing /api/auto-entry/execute step`);
+  if (drainIdx >= 0 && seedIdx >= 0 && executeIdx >= 0 && !(drainIdx < seedIdx && seedIdx < executeIdx)) {
+    issues.push(`${workflowPath}: expected order is score/drain -> seed-from-signals -> execute`);
+  }
+
+  return issues;
+}
+
+async function checkWorkflowFunnelCadence(): Promise<WorkflowChecks> {
+  const files = [
+    ".github/workflows/market-loop.yml",
+    ".github/workflows/intraday-score-worker.yml",
+    ".github/workflows/auto-entry-execute.yml",
+  ];
+
+  const minScoreThresholds: string[] = [];
+  const missingSteps: string[] = [];
+  const authHeaderIssues: string[] = [];
+
+  for (const relativePath of files) {
+    const absolutePath = path.join(process.cwd(), relativePath);
+    const content = await fs.readFile(absolutePath, "utf8").catch(() => "");
+    if (!content) {
+      missingSteps.push(`${relativePath}: workflow file missing or unreadable`);
+      continue;
+    }
+
+    minScoreThresholds.push(...detectSeedMinScoreThreshold(relativePath, content));
+    authHeaderIssues.push(...inspectWorkflowAuth(relativePath, content));
+
+    if (relativePath.endsWith("market-loop.yml")) {
+      missingSteps.push(...inspectMarketLoopOrder(relativePath, content));
+    }
+  }
+
+  const proposedFixes: string[] = [];
+  if (minScoreThresholds.length > 0) {
+    proposedFixes.push("Remove minScore=7.5 from scheduled seed-from-signals calls and rely on qualified+tier+overlay gating.");
+  }
+  if (missingSteps.length > 0) {
+    proposedFixes.push("Ensure market-loop calls score drain, then seed-from-signals, then execute during market hours.");
+  }
+  if (authHeaderIssues.length > 0) {
+    proposedFixes.push("Use x-cron-token for seed-from-signals and x-auto-entry-token for execute in every workflow call.");
+  }
+  if (proposedFixes.length === 0) {
+    proposedFixes.push("No workflow threshold/order/auth mismatch detected; inspect runtime skip reason breakdowns for guardrail or capacity blocks.");
+  }
+
+  return {
+    minScoreThresholds,
+    missingSteps,
+    authHeaderIssues,
+    proposedFixes,
+  };
+}
+
+async function computeFunnelMismatchDiagnostics(now: string): Promise<FunnelMismatchDiagnostics> {
+  const etDate = getEtDateString(new Date(now));
+  const [funnel, trades, seedRun, workflowChecks] = await Promise.all([
+    readTodayFunnel().catch(() => null),
+    readTrades<any>().catch(() => []),
+    readLatestSeedRunTelemetry(etDate).catch(() => null),
+    checkWorkflowFunnelCadence(),
+  ]);
+
+  const qualified = Number(funnel?.qualified ?? 0);
+  const seeded = Number(funnel?.seedCreatedCount ?? 0);
+  const executeFromSeededLong = Number(funnel?.executeFromSeededLong ?? 0);
+  const executeFromSeededShort = Number(funnel?.executeFromSeededShort ?? 0);
+  const executed = executeFromSeededLong + executeFromSeededShort;
+
+  const todayTrades = (Array.isArray(trades) ? trades : []).filter((t: any) => String(t?.etDate || "") === etDate);
+  const autoTrades = todayTrades.filter((t: any) => {
+    const src = upper(t?.source);
+    return src === "AUTO" || src === "AUTO-ENTRY";
+  });
+
+  const eligibleCount = autoTrades.filter((t: any) => {
+    if (upper(t?.status) !== "AUTO_PENDING") return false;
+    const side = upper(t?.side);
+    if (side !== "LONG" && side !== "SHORT") return false;
+    if (!isFinitePositiveNumber(t?.entryPrice) || !isFinitePositiveNumber(t?.stopPrice)) return false;
+    const target = t?.takeProfitPrice ?? t?.targetPrice;
+    if (!isFinitePositiveNumber(target)) return false;
+    return true;
+  }).length;
+
+  const executeSkipReasonBreakdown: Record<string, number> = {};
+  let latestExecuteTs = Number.NEGATIVE_INFINITY;
+  for (const t of autoTrades) {
+    const outcome = String(t?.executeOutcome || "").trim();
+    if (outcome && outcome !== "EXECUTED" && outcome !== "PENDING") {
+      executeSkipReasonBreakdown[outcome] = (executeSkipReasonBreakdown[outcome] ?? 0) + 1;
+    }
+
+    const executeTs = Date.parse(String(t?.executeAttemptedAt || t?.openedAt || t?.updatedAt || ""));
+    if (Number.isFinite(executeTs) && executeTs > latestExecuteTs) latestExecuteTs = executeTs;
+  }
+
+  const lastSeedAt = seedRun?.runAt ?? null;
+  const lastExecuteAt = Number.isFinite(latestExecuteTs) ? new Date(latestExecuteTs).toISOString() : null;
+
+  return {
+    qualified,
+    seeded,
+    executed,
+    eligibleCount,
+    lastSeedAt,
+    lastExecuteAt,
+    seedSkipReasonBreakdown: (seedRun?.skippedByReason as Record<string, number>) || {},
+    executeSkipReasonBreakdown,
+    workflowChecks,
+  };
+}
 
 function summarizeOps(
   snapshot: AgentStateSnapshot,
@@ -46,6 +223,7 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
   const telemetry = await readAgentTelemetrySnapshot();
   const actions = await listAgentActions(50);
   let createdIncidentId: string | null = null;
+  let funnelMismatchSummary: string | null = null;
 
   // ------- Incident upsert / resolve cycle -------
 
@@ -109,6 +287,76 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
     await resolveIncident(
       { category: "AUTO_ENTRY", title: "Auto-entry disabled" },
       "Auto-entry enabled again.",
+    );
+  }
+
+  // ------- FUNNEL STAGE MISMATCH ESCALATION -------
+  // Raise CRITICAL incident if qualified signals are not seeding during market hours,
+  // or seeded trades are not executing despite eligible AUTO_PENDING candidates.
+  const funnelDiag = await computeFunnelMismatchDiagnostics(now);
+  const qualifiedNotSeeded = telemetry.marketOpen === true && funnelDiag.qualified > 0 && funnelDiag.seeded === 0;
+  const seededNotExecuted = funnelDiag.seeded > 0 && funnelDiag.executed === 0 && funnelDiag.eligibleCount > 0;
+
+  if (qualifiedNotSeeded || seededNotExecuted) {
+    const summary = [
+      qualifiedNotSeeded
+        ? `qualified=${funnelDiag.qualified} seeded=${funnelDiag.seeded} marketOpen=true`
+        : null,
+      seededNotExecuted
+        ? `seeded=${funnelDiag.seeded} executed=${funnelDiag.executed} eligibleCount=${funnelDiag.eligibleCount}`
+        : null,
+    ].filter(Boolean).join(" | ");
+
+    funnelMismatchSummary = `Funnel stage mismatch detected: ${summary}.`;
+
+    const notes = [
+      `counts qualified=${funnelDiag.qualified} seeded=${funnelDiag.seeded} executed=${funnelDiag.executed} eligibleCount=${funnelDiag.eligibleCount}`,
+      `lastSeedAt=${funnelDiag.lastSeedAt ?? "null"} lastExecuteAt=${funnelDiag.lastExecuteAt ?? "null"}`,
+      `seedSkipReasonBreakdown=${JSON.stringify(funnelDiag.seedSkipReasonBreakdown)}`,
+      `executeSkipReasonBreakdown=${JSON.stringify(funnelDiag.executeSkipReasonBreakdown)}`,
+      `workflowMinScoreChecks=${JSON.stringify(funnelDiag.workflowChecks.minScoreThresholds)}`,
+      `workflowMissingSteps=${JSON.stringify(funnelDiag.workflowChecks.missingSteps)}`,
+      `workflowAuthHeaderIssues=${JSON.stringify(funnelDiag.workflowChecks.authHeaderIssues)}`,
+      `proposedFix=${funnelDiag.workflowChecks.proposedFixes.join(" ")}`,
+    ];
+
+    const result = await upsertIncident({
+      severity: "CRITICAL",
+      source: "ops",
+      category: "FUNNEL_BLOCK",
+      title: "Funnel stage mismatch during market hours",
+      summary: funnelMismatchSummary,
+      notes,
+    });
+    if (result.created && !createdIncidentId) createdIncidentId = result.incident.id;
+
+    await appendAgentAction({
+      id: crypto.randomUUID(),
+      createdAt: now,
+      agent: "ops",
+      actionType: "INCIDENT_ESCALATED",
+      status: "APPLIED",
+      summary: `Escalated CRITICAL FUNNEL_BLOCK incident. ${funnelDiag.workflowChecks.proposedFixes[0] || "Check workflow cadence and auth headers."}`,
+      metadata: {
+        category: "FUNNEL_BLOCK",
+        severity: "CRITICAL",
+        counts: {
+          qualified: funnelDiag.qualified,
+          seeded: funnelDiag.seeded,
+          executed: funnelDiag.executed,
+          eligibleCount: funnelDiag.eligibleCount,
+        },
+        lastSeedAt: funnelDiag.lastSeedAt,
+        lastExecuteAt: funnelDiag.lastExecuteAt,
+        seedSkipReasonBreakdown: funnelDiag.seedSkipReasonBreakdown,
+        executeSkipReasonBreakdown: funnelDiag.executeSkipReasonBreakdown,
+        workflowChecks: funnelDiag.workflowChecks,
+      },
+    });
+  } else {
+    await resolveIncident(
+      { category: "FUNNEL_BLOCK", title: "Funnel stage mismatch during market hours" },
+      "Funnel progression is healthy for current session or market is not open.",
     );
   }
 
@@ -354,6 +602,7 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
       activeIncidentCount,
       recentActionCount: actions.length,
       remediationSummary: remediationSummary ?? null,
+      funnelMismatchSummary,
       protectionEscalation: {
         ran: true,
         escalatedCriticalCount,

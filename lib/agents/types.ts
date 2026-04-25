@@ -10,12 +10,13 @@ export type AllowedGrade = "A" | "B" | "C";
 
 export type AgentBriefType = "MORNING" | "MIDDAY" | "EOD" | "INCIDENT" | "STATUS";
 
-export type AgentIncidentSeverity = "LOW" | "MEDIUM" | "HIGH";
+export type AgentIncidentSeverity = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 
 export type AgentIncidentCategory =
   | "SCORING"
   | "SCANNER"
   | "AUTO_ENTRY"
+  | "FUNNEL_BLOCK"
   | "TRADES"
   | "BROKER_SYNC"
   | "NEWS"
