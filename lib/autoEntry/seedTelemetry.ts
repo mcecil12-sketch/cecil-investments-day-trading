@@ -8,6 +8,7 @@ export type SeedSkipReason =
   | "already_terminal_trade"
   | "missing_prices"
   | "missing_direction"
+  | "missing_signal_id"
   | "market_closed"
   | "capacity_full"
   | "below_threshold"
@@ -19,6 +20,7 @@ export type SeedSignalSkip = {
   signalId: string;
   symbol: string;
   reason: SeedSkipReason;
+  ageMs?: number | null;
 };
 
 export type SeedRunTelemetry = {
@@ -26,8 +28,11 @@ export type SeedRunTelemetry = {
   source: string;
   marketOpen: boolean;
   totalQualifiedSignals: number;
+  freshQualifiedSignals?: number;
+  staleQualifiedSignals?: number;
   totalCandidates: number;
   createdCount: number;
+  staleThresholdUsedMs?: number;
   skippedByReason: Partial<Record<SeedSkipReason, number>>;
   skippedQualifiedSignals: SeedSignalSkip[];
   dryRun?: boolean;
@@ -107,8 +112,11 @@ export async function recordSeedRunTelemetry(etDate: string, run: SeedRunTelemet
       lastSource: run.source,
       marketOpen: run.marketOpen ? "1" : "0",
       totalQualifiedSignals: run.totalQualifiedSignals,
+      freshQualifiedSignals: run.freshQualifiedSignals ?? 0,
+      staleQualifiedSignals: run.staleQualifiedSignals ?? 0,
       totalCandidates: run.totalCandidates,
       createdCount: run.createdCount,
+      staleThresholdUsedMs: run.staleThresholdUsedMs ?? 0,
       updatedAt: now,
       skippedByReason: JSON.stringify(run.skippedByReason || {}),
       skippedQualifiedSignalsCount: Array.isArray(run.skippedQualifiedSignals) ? run.skippedQualifiedSignals.length : 0,

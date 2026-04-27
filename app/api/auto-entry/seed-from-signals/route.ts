@@ -10,6 +10,7 @@ import { getGuardrailsState } from "@/lib/autoEntry/guardrailsStore";
 import { getGuardrailConfig } from "@/lib/autoEntry/guardrails";
 import { fetchAlpacaClockSafe } from "@/lib/alpacaClock";
 import { readSignals, writeSignals, type StoredSignal } from "@/lib/jsonDb";
+import { upsertIncident, resolveIncident } from "@/lib/agents/store";
 import {
   recordSeedRunTelemetry,
   type SeedRunTelemetry,
@@ -105,10 +106,37 @@ function mapSkipReason(raw: string): SeedSkipReason | null {
     case "stale_signal":
     case "duplicate_symbol":
     case "overlay_block":
+    case "missing_signal_id":
       return raw;
     default:
       return null;
   }
+}
+
+function parseTimestampMs(raw: unknown): number | null {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    // Interpret small epoch values as seconds and normalize to ms.
+    return raw < 1e11 ? raw * 1000 : raw;
+  }
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const asNum = Number(trimmed);
+    if (Number.isFinite(asNum)) {
+      return asNum < 1e11 ? asNum * 1000 : asNum;
+    }
+    const parsed = Date.parse(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function getSignalTimestampMs(signal: RawSignal): number | null {
+  return (
+    parseTimestampMs(signal?.createdAt) ??
+    parseTimestampMs(signal?.scoredAt) ??
+    parseTimestampMs(signal?.updatedAt)
+  );
 }
 
 function bumpSkipReason(
@@ -206,6 +234,7 @@ type QualifiedCandidate = {
   shortPenalty: number;
   effectiveScore: number;
   actionabilityRank: number; // 1-10 from aiScoring, higher = more actionable
+  ageMs: number;
 };
 
 /**
@@ -317,6 +346,7 @@ export async function POST(req: NextRequest) {
   const maxSignalAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN))
     ? Math.max(1, Number(process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN))
     : 30;
+  const staleThresholdUsedMs = Math.round(maxSignalAgeMin * 60 * 1000);
 
   const [rawSignals, trades, overlay, brokerTruth, guardState, clock, allStoredSignals] = await Promise.all([
     fetchScoredSignalsFromInternalApi(),
@@ -330,12 +360,11 @@ export async function POST(req: NextRequest) {
 
   const marketOpen = clock.ok ? Boolean(clock.is_open) : false;
   const allowAfterHoursCreate = debug;
+  const nowMs = Date.now();
 
   const signals = (rawSignals || []).filter((s: RawSignal) => {
-    const createdAt = s?.createdAt;
-    if (createdAt == null) return false;
-    const tsMs = typeof createdAt === "number" ? createdAt : Date.parse(createdAt);
-    if (!Number.isFinite(tsMs)) return false;
+    const tsMs = getSignalTimestampMs(s);
+    if (tsMs == null || !Number.isFinite(tsMs)) return false;
     return tsMs >= dayStartMs && tsMs < dayEndMs;
   });
   const signalsFilteredOut = (rawSignals || []).length - signals.length;
@@ -390,34 +419,56 @@ export async function POST(req: NextRequest) {
     seedOutcome: "created" | "skipped";
     seedReason: string;
     linkedTradeId: string | null;
+    createdAt: string;
+    ageMs: number | null;
+    side: "LONG" | "SHORT" | null;
   }>();
 
   let shortQualified = 0;
   let shortSkippedWeakStructure = 0;
   let seededLong = 0;
   let seededShort = 0;
-  let notQualifiedSkippedCount = 0;
+  const notQualifiedSkippedCount = (signals || []).filter((s) => s?.qualified !== true).length;
 
   const effectiveMinScore = minScore + overlay.minScoreAdjustment;
   const qualifiedSignals = (signals || []).filter((s) => {
+    if (s?.qualified !== true) return false;
     const status = String(s?.status || "").toUpperCase();
-    return status === "SCORED" && s?.qualified === true;
+    return status !== "ARCHIVED";
   });
+
+  const qualifiedSignalAges: Array<{
+    signalId: string;
+    symbol: string;
+    createdAt: string;
+    ageMs: number;
+    isFresh: boolean;
+  }> = [];
+  let freshQualifiedSignals = 0;
+  let staleQualifiedSignals = 0;
+  for (const s of qualifiedSignals) {
+    const signalId = String(s?.id || "").trim();
+    const symbol = getSymbol(s) || "UNKNOWN";
+    const tsMs = getSignalTimestampMs(s);
+    const ageMs = Number.isFinite(tsMs) ? Math.max(0, nowMs - (tsMs as number)) : Number.POSITIVE_INFINITY;
+    if (Number.isFinite(ageMs) && ageMs <= staleThresholdUsedMs) freshQualifiedSignals += 1;
+    else staleQualifiedSignals += 1;
+    if (!signalId) continue;
+    qualifiedSignalAges.push({
+      signalId,
+      symbol,
+      createdAt: String(s?.createdAt || s?.updatedAt || nowIso),
+      ageMs,
+      isFresh: Number.isFinite(ageMs) && ageMs <= staleThresholdUsedMs,
+    });
+  }
 
   const allQualifyingCandidates: QualifiedCandidate[] = [];
   const candidateKey = (c: QualifiedCandidate) => `${c.signalId}:${c.symbol}:${c.side}:${c.createdAt}`;
 
-  for (const s of signals || []) {
-    const status = String(s?.status || "").toUpperCase();
-    if (status !== "SCORED") continue;
-    if (s?.qualified !== true) {
-      notQualifiedSkippedCount += 1;
-      continue;
-    }
+  for (const s of qualifiedSignals || []) {
 
     const signalId = String(s?.id || "").trim();
-    if (!signalId) continue;
-
     const symbol = getSymbol(s) || "UNKNOWN";
     const side = getDirection(s);
     const entryPrice = getNum(s, ["entryPrice", "ai.entryPrice"]);
@@ -425,19 +476,28 @@ export async function POST(req: NextRequest) {
     const targetPrice = getNum(s, ["targetPrice", "takeProfitPrice", "ai.targetPrice", "ai.takeProfitPrice"]);
     const aiScore = getNum(s, ["aiScore", "score"]);
     const createdAt = String(s?.createdAt || s?.updatedAt || nowIso);
-    const createdAtMs = Date.parse(createdAt);
-    const ageMin = Number.isFinite(createdAtMs) ? Math.max(0, (Date.now() - createdAtMs) / 60000) : Number.POSITIVE_INFINITY;
+    const createdAtMs = getSignalTimestampMs(s);
+    const ageMs = Number.isFinite(createdAtMs) ? Math.max(0, nowMs - (createdAtMs as number)) : Number.POSITIVE_INFINITY;
 
     const markSkip = (reason: SeedSkipReason) => {
       skipped.push({ signalId, symbol, reason });
       bumpSkipReason(skippedByReason, reason);
+      if (!signalId) return;
       attributionBySignalId.set(signalId, {
         symbol,
         seedOutcome: "skipped",
         seedReason: reason,
         linkedTradeId: null,
+        createdAt,
+        ageMs,
+        side,
       });
     };
+
+    if (!signalId) {
+      markSkip("missing_signal_id");
+      continue;
+    }
 
     if (!side) {
       markSkip("missing_direction");
@@ -454,7 +514,7 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
-    if (!Number.isFinite(ageMin) || ageMin > maxSignalAgeMin) {
+    if (!Number.isFinite(ageMs) || ageMs > staleThresholdUsedMs) {
       markSkip("stale_signal");
       continue;
     }
@@ -510,6 +570,7 @@ export async function POST(req: NextRequest) {
       shortPenalty,
       effectiveScore: (aiScore as number) - shortPenalty,
       actionabilityRank,
+      ageMs,
     });
   }
 
@@ -524,6 +585,9 @@ export async function POST(req: NextRequest) {
       seedOutcome: "skipped",
       seedReason: "duplicate_symbol",
       linkedTradeId: null,
+      createdAt: c.createdAt,
+      ageMs: c.ageMs,
+      side: c.side,
     });
   }
 
@@ -540,6 +604,9 @@ export async function POST(req: NextRequest) {
       seedOutcome: "skipped",
       seedReason: "capacity_full",
       linkedTradeId: null,
+      createdAt: c.createdAt,
+      ageMs: c.ageMs,
+      side: c.side,
     });
   }
 
@@ -605,6 +672,9 @@ export async function POST(req: NextRequest) {
       seedOutcome: "created",
       seedReason: dryRun ? "created_dry_run" : "created",
       linkedTradeId: dryRun ? null : tradeId,
+      createdAt: c.createdAt,
+      ageMs: c.ageMs,
+      side: c.side,
     });
   }
 
@@ -663,17 +733,53 @@ export async function POST(req: NextRequest) {
     .map(([signalId, a]) => {
       const mapped = mapSkipReason(a.seedReason);
       if (a.seedOutcome !== "skipped" || !mapped) return null;
-      return { signalId, symbol: a.symbol, reason: mapped };
+      return {
+        signalId,
+        symbol: a.symbol,
+        reason: mapped,
+        ageMs: typeof a.ageMs === "number" && Number.isFinite(a.ageMs) ? a.ageMs : null,
+      };
     })
     .filter(Boolean) as SeedRunTelemetry["skippedQualifiedSignals"];
+
+  let funnelBlockIncident: { created: boolean; incidentId: string } | null = null;
+  const createdCount = dryRun ? 0 : created.length;
+  const shouldRaiseFunnelBlock = marketOpen && freshQualifiedSignals > 0 && createdCount === 0;
+  if (shouldRaiseFunnelBlock) {
+    const skipDetails = skippedQualifiedSignals.slice(0, 25).map((s) =>
+      `${s.symbol}:${s.signalId}:${s.reason}${s.ageMs != null ? `:${s.ageMs}ms` : ""}`
+    );
+    const result = await upsertIncident({
+      severity: "CRITICAL",
+      source: "ops",
+      category: "FUNNEL_BLOCK",
+      title: "Fresh qualified signals not seeded",
+      summary: `marketOpen=true freshQualifiedSignals=${freshQualifiedSignals} createdCount=${createdCount} staleQualifiedSignals=${staleQualifiedSignals}`,
+      notes: [
+        `runId=${runId}`,
+        `source=${runSource}`,
+        `skipReasonCounts=${JSON.stringify(skippedByReason)}`,
+        `skippedQualifiedSignals=${JSON.stringify(skipDetails)}`,
+      ],
+    });
+    funnelBlockIncident = { created: result.created, incidentId: result.incident.id };
+  } else {
+    await resolveIncident(
+      { category: "FUNNEL_BLOCK", title: "Fresh qualified signals not seeded" },
+      `Recovered: marketOpen=${marketOpen} freshQualifiedSignals=${freshQualifiedSignals} createdCount=${createdCount}`,
+    );
+  }
 
   const telemetryPayload: SeedRunTelemetry = {
     runAt: seedEvaluatedAt,
     source: runSource,
     marketOpen,
     totalQualifiedSignals: qualifiedSignals.length,
+    freshQualifiedSignals,
+    staleQualifiedSignals,
     totalCandidates,
-    createdCount: dryRun ? 0 : created.length,
+    createdCount,
+    staleThresholdUsedMs,
     skippedByReason,
     skippedQualifiedSignals,
     dryRun,
@@ -688,13 +794,17 @@ export async function POST(req: NextRequest) {
     dryRun,
     debug,
     marketOpen,
-    seededCount: dryRun ? 0 : created.length,
+    seededCount: createdCount,
     totalQualifiedSignals: qualifiedSignals.length,
+    freshQualifiedSignals,
+    staleQualifiedSignals,
     candidates: totalCandidates,
+    skipReasonCounts: skippedByReason,
     effectiveLimit,
     openPositions: currentOpenPositions,
     entriesToday,
     limitReason,
+    staleThresholdUsedMs,
   });
 
   return NextResponse.json({
@@ -716,8 +826,12 @@ export async function POST(req: NextRequest) {
     maxEntriesPerDay,
     remainingEntriesToday,
     minScore,
+    effectiveMinScore,
+    staleThresholdUsedMs,
     totalSignals: (signals || []).length,
     totalQualifiedSignals: qualifiedSignals.length,
+    freshQualifiedSignals,
+    staleQualifiedSignals,
     signalsFilteredOutByEtDay: signalsFilteredOut,
     rawSignalsFromApi: (rawSignals || []).length,
     etDayBounds: { startMs: dayStartMs, endMs: dayEndMs },
@@ -733,7 +847,21 @@ export async function POST(req: NextRequest) {
     shortSkippedWeakStructure,
     skipReasonCounts: skippedByReason,
     skippedQualifiedSignals: skippedQualifiedSignals.slice(0, 250),
+    qualifiedSignalAges: qualifiedSignalAges.slice(0, 250),
     attributedQualifiedSignals: updatedSignalsCount,
+    funnelBlockIncident,
+    eligibilityAudit: {
+      staleThresholdUsedMs,
+      etDayFiltering: {
+        startMs: dayStartMs,
+        endMs: dayEndMs,
+      },
+      statusRequirement: "qualified_true_and_not_archived",
+      shownInAppRequired: false,
+      directionRequired: true,
+      pricePlanRequired: true,
+      minScoreUsed: effectiveMinScore,
+    },
     created,
     skipped: skipped.slice(0, 100),
     brokerTruthError: brokerTruth.error ?? null,

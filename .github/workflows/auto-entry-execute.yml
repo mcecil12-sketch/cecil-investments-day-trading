@@ -33,7 +33,7 @@ jobs:
 
           echo "$SEED_BODY"
           echo "$SEED_BODY" | jq -r '.' >/dev/null
-          echo "$SEED_BODY" | jq '{createdCount,totalQualifiedSignals,skippedQualifiedSignals,skipReasonCounts,marketOpen,source,runId}'
+          echo "$SEED_BODY" | jq '{freshQualifiedSignals,staleQualifiedSignals,createdCount,skipReasonCounts,skippedQualifiedSignals,totalQualifiedSignals,marketOpen,source,runId}'
 
           BODY="$(curl -sS -X POST "$PROD/api/auto-entry/execute" \
             -H "Content-Type: application/json" \
