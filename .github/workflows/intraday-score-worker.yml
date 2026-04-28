@@ -2,10 +2,8 @@ name: intraday-score-worker
 
 on:
   schedule:
-    # Market hours ET (09:30-16:00), converted to UTC (14:30-21:00)
-    - cron: "30-59/5 14 * * 1-5"
-    - cron: "*/5 15-20 * * 1-5"
-    - cron: "0 21 * * 1-5"
+    # Run every 5 minutes on weekday daytime UTC; market-open API check gates trading actions.
+    - cron: "*/5 13-21 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -36,33 +34,42 @@ jobs:
           echo "RUN_ID=$RUN_ID"
           echo "drain recent-first (intraday), worker=${{ matrix.worker }}"
 
-          curl -sS --max-time 90 -X POST \
+          DRAIN_CODE="$(curl -sS --max-time 90 -o /tmp/intraday_drain_${{ matrix.worker }}.json -w "%{http_code}" -X POST \
             "$BASE/api/ai/score/drain?limit=2&releaseLimit=0&budgetMs=90000&recentWindowHours=48&_=$NOW" \
             -H "x-cron-token: $CRON_TOKEN" \
             -H "x-run-source: github-actions" \
             -H "x-run-id: $RUN_ID" \
             -H "Content-Type: application/json" \
-            -d '{}' \
-            | jq '{attemptedCount,completedCount,timeoutCount,scoredCount,durationMs,remainingTimeMs,pickedStrategy}'
+            -d '{}')"
+          echo "drain HTTP $DRAIN_CODE"
+          cat /tmp/intraday_drain_${{ matrix.worker }}.json | head -c 4000 || true
+          echo
+          cat /tmp/intraday_drain_${{ matrix.worker }}.json | jq '{attemptedCount,completedCount,timeoutCount,scoredCount,durationMs,remainingTimeMs,pickedStrategy}' || true
 
           if [ "${{ matrix.worker }}" = "1" ]; then
             echo "seed-from-signals after score drain"
-            curl -sS --max-time 90 -X POST \
+            SEED_CODE="$(curl -sS --max-time 90 -o /tmp/intraday_seed.json -w "%{http_code}" -X POST \
               "$BASE/api/auto-entry/seed-from-signals?limit=3&_=$NOW" \
               -H "x-cron-token: $CRON_TOKEN" \
               -H "x-run-source: github-actions" \
               -H "x-run-id: $RUN_ID" \
               -H "Content-Type: application/json" \
-              -d '{}' \
-              | jq '{ok,marketOpen,createdCount,totalQualifiedSignals,skippedQualifiedSignals,totalCandidates,skipReasonCounts}'
+              -d '{}')"
+            echo "seed HTTP $SEED_CODE"
+            cat /tmp/intraday_seed.json | head -c 6000 || true
+            echo
+            cat /tmp/intraday_seed.json | jq '{ok,totalQualifiedSignals,freshQualifiedSignals,staleQualifiedSignals,totalCandidates,createdCount,skippedQualifiedSignals,skipReasonCounts,staleThresholdUsedMs,marketOpen,runAt,runId,source}' || true
 
             echo "execute after seed"
-            curl -sS --max-time 90 -X POST \
+            EXEC_CODE="$(curl -sS --max-time 90 -o /tmp/intraday_execute.json -w "%{http_code}" -X POST \
               "$BASE/api/auto-entry/execute?_=$NOW" \
               -H "x-auto-entry-token: $AUTO_ENTRY_TOKEN" \
               -H "x-run-source: github-actions" \
               -H "x-run-id: $RUN_ID" \
               -H "Content-Type: application/json" \
-              -d '{}' \
-              | jq '{ok,summary,error}'
+              -d '{}')"
+            echo "execute HTTP $EXEC_CODE"
+            cat /tmp/intraday_execute.json | head -c 4000 || true
+            echo
+            cat /tmp/intraday_execute.json | jq '{ok,summary,error,reason,skipped,pendingCount,eligibleCount}' || true
           fi

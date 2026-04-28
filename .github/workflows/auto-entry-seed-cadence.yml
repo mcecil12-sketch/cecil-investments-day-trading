@@ -1,0 +1,67 @@
+name: auto-entry-seed-cadence
+
+"on":
+  schedule:
+    # Every 5 minutes on weekday daytime UTC; market-open check gates real runs.
+    - cron: "*/5 13-21 * * 1-5"
+  workflow_dispatch: {}
+
+concurrency:
+  group: auto-entry-seed-cadence
+  cancel-in-progress: true
+
+jobs:
+  seed-and-execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Market-hours seed + execute cadence
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+          AUTO_ENTRY_TOKEN: ${{ secrets.AUTO_ENTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          RUN_ID="gha-seed-cadence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)"
+          NOW="$(date +%s)"
+
+          if [ -z "${BASE:-}" ]; then
+            echo "FATAL: PROD_BASE_URL missing"
+            exit 1
+          fi
+
+          OPS_CODE="$(curl -sS -o /tmp/seed_cadence_ops.json -w "%{http_code}" "$BASE/api/ops/status?_=$NOW")"
+          echo "ops/status HTTP $OPS_CODE"
+          cat /tmp/seed_cadence_ops.json | head -c 3000 || true
+          echo
+
+          MARKET_OPEN="$(cat /tmp/seed_cadence_ops.json | jq -r '.market.is_open // false' 2>/dev/null || echo false)"
+          if [ "$MARKET_OPEN" != "true" ] && [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]; then
+            echo "market_closed and scheduled run; exiting to preserve after-hours safety"
+            exit 0
+          fi
+
+          echo "=== seed-from-signals ==="
+          SEED_CODE="$(curl -sS -o /tmp/seed_cadence_seed.json -w "%{http_code}" -X POST "$BASE/api/auto-entry/seed-from-signals?limit=3&_=$NOW" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            -H "x-run-source: github-actions-seed-cadence" \
+            -H "x-run-id: $RUN_ID" \
+            -d '{}')"
+          echo "seed HTTP $SEED_CODE"
+          cat /tmp/seed_cadence_seed.json | head -c 7000 || true
+          echo
+          cat /tmp/seed_cadence_seed.json | jq '{ok,totalQualifiedSignals,freshQualifiedSignals,staleQualifiedSignals,totalCandidates,createdCount,skippedQualifiedSignals,skipReasonCounts,staleThresholdUsedMs,marketOpen,runAt,runId,source}' || true
+
+          echo "=== auto-entry execute ==="
+          EXEC_CODE="$(curl -sS -o /tmp/seed_cadence_execute.json -w "%{http_code}" -X POST "$BASE/api/auto-entry/execute?_=$NOW" \
+            -H "Content-Type: application/json" \
+            -H "x-auto-entry-token: $AUTO_ENTRY_TOKEN" \
+            -H "x-run-source: github-actions-seed-cadence" \
+            -H "x-run-id: $RUN_ID" \
+            -d '{}')"
+          echo "execute HTTP $EXEC_CODE"
+          cat /tmp/seed_cadence_execute.json | head -c 5000 || true
+          echo
+          cat /tmp/seed_cadence_execute.json | jq '{ok,summary,error,reason,skipped,pendingCount,eligibleCount,runId}' || true

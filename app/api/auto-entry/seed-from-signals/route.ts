@@ -80,6 +80,12 @@ function getDirection(signal: RawSignal): "LONG" | "SHORT" | null {
   );
 }
 
+function normalizeTier(raw: unknown): "A" | "B" | "C" | null {
+  const v = String(raw || "").trim().toUpperCase();
+  if (v === "A" || v === "B" || v === "C") return v;
+  return null;
+}
+
 function parseSignalsPayload(payload: any): RawSignal[] {
   if (Array.isArray(payload)) return payload;
   if (Array.isArray(payload?.signals)) return payload.signals;
@@ -339,6 +345,9 @@ export async function POST(req: NextRequest) {
       ? Math.max(1, Math.min(50, limitParsed))
       : 3;
   const minScore = typeof minScoreParsed === "number" && Number.isFinite(minScoreParsed) ? minScoreParsed : 0;
+  const minScoreProvided =
+    (typeof minScoreRawQuery === "string" && url.searchParams.has("minScore")) ||
+    (typeof bodyMinScore === "number" && Number.isFinite(bodyMinScore));
 
   const today = getEtDateString();
   const { startMs: dayStartMs, endMs: dayEndMs } = getEtDayBoundsMs(today);
@@ -430,7 +439,7 @@ export async function POST(req: NextRequest) {
   let seededShort = 0;
   const notQualifiedSkippedCount = (signals || []).filter((s) => s?.qualified !== true).length;
 
-  const effectiveMinScore = minScore + overlay.minScoreAdjustment;
+  const effectiveMinScore = minScoreProvided ? minScore : 0;
   const qualifiedSignals = (signals || []).filter((s) => {
     if (s?.qualified !== true) return false;
     const status = String(s?.status || "").toUpperCase();
@@ -474,7 +483,19 @@ export async function POST(req: NextRequest) {
     const entryPrice = getNum(s, ["entryPrice", "ai.entryPrice"]);
     const stopPrice = getNum(s, ["stopPrice", "ai.stopPrice"]);
     const targetPrice = getNum(s, ["targetPrice", "takeProfitPrice", "ai.targetPrice", "ai.takeProfitPrice"]);
-    const aiScore = getNum(s, ["aiScore", "score"]);
+    const aiScoreRaw = getNum(s, ["aiScore", "score", "ai.score"]);
+    const scoreTier = Number.isFinite(aiScoreRaw as number) ? tierForScore(aiScoreRaw as number) : null;
+    const gradeTier = normalizeTier(getStr(s, ["aiGrade", "grade", "ai.grade"]));
+    const tier = scoreTier || gradeTier;
+    const aiScore = Number.isFinite(aiScoreRaw as number)
+      ? (aiScoreRaw as number)
+      : tier === "A"
+        ? cfg.tierAmin
+        : tier === "B"
+          ? cfg.tierBmin
+          : tier === "C"
+            ? cfg.tierCmin
+            : null;
     const createdAt = String(s?.createdAt || s?.updatedAt || nowIso);
     const createdAtMs = getSignalTimestampMs(s);
     const ageMs = Number.isFinite(createdAtMs) ? Math.max(0, nowMs - (createdAtMs as number)) : Number.POSITIVE_INFINITY;
@@ -509,7 +530,7 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
-    if (!Number.isFinite(aiScore as number) || (aiScore as number) < effectiveMinScore) {
+    if (effectiveMinScore > 0 && (!Number.isFinite(aiScore as number) || (aiScore as number) < effectiveMinScore)) {
       markSkip("below_threshold");
       continue;
     }
@@ -519,7 +540,11 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
-    const tier = tierForScore(aiScore as number) || "C";
+    if (!tier) {
+      markSkip("below_threshold");
+      continue;
+    }
+
     if ((tier === "C" && !cfg.allowedTiers.includes("C")) || !overlay.allowedGrades.includes(tier as "A" | "B" | "C")) {
       markSkip("overlay_block");
       continue;
@@ -848,6 +873,7 @@ export async function POST(req: NextRequest) {
     skipReasonCounts: skippedByReason,
     skippedQualifiedSignals: skippedQualifiedSignals.slice(0, 250),
     qualifiedSignalAges: qualifiedSignalAges.slice(0, 250),
+    perSignalAgeMs: qualifiedSignalAges.slice(0, 250),
     attributedQualifiedSignals: updatedSignalsCount,
     funnelBlockIncident,
     eligibilityAudit: {
@@ -860,6 +886,8 @@ export async function POST(req: NextRequest) {
       shownInAppRequired: false,
       directionRequired: true,
       pricePlanRequired: true,
+        qualifiedPrimaryEligibility: true,
+        minScoreProvided,
       minScoreUsed: effectiveMinScore,
     },
     created,

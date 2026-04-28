@@ -2,8 +2,8 @@ name: market-loop
 
 on:
   schedule:
-    # Run every 5 minutes during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)
-    - cron: "*/5 14-21 * * 1-5"
+    # Run every 5 minutes on weekday daytime UTC; route-level market-open checks gate trading actions.
+    - cron: "*/5 13-21 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -126,7 +126,7 @@ jobs:
           cat /tmp/seed_from_signals.json | head -c 6000 || true
           echo
           echo "seed parsed metrics:"
-          cat /tmp/seed_from_signals.json | jq '{freshQualifiedSignals,staleQualifiedSignals,createdCount,skipReasonCounts,skippedQualifiedSignals,totalQualifiedSignals,marketOpen,source,runId}' || true
+          cat /tmp/seed_from_signals.json | jq '{totalQualifiedSignals,freshQualifiedSignals,staleQualifiedSignals,totalCandidates,createdCount,skippedQualifiedSignals,skipReasonCounts,staleThresholdUsedMs,marketOpen,runAt,runId,source}' || true
           if [ "$SEED_CODE" -ne 200 ]; then
             echo "WARN: seed-from-signals failed with HTTP $SEED_CODE"
           fi

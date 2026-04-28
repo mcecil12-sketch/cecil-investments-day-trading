@@ -62,6 +62,19 @@ type FunnelHealthResponse = {
     seededToExecuted: number | null;
   };
   qualifiedButNotSeeded?: number;
+  freshQualifiedSignals?: number;
+  staleQualifiedSignals?: number;
+  qualifiedToSeedLatencyMaxMs?: number | null;
+  qualifiedToSeedLatencyAvgMs?: number | null;
+  seedSlaBreached?: boolean;
+  seedSlaBreachSignals?: Array<{
+    signalId: string;
+    symbol: string;
+    createdAt: string | null;
+    seedEvaluatedAt: string | null;
+    ageMs: number | null;
+    staleThresholdUsedMs: number;
+  }>;
   seedSkipReasonBreakdown?: Record<string, number>;
   lastSeedRunAt?: string | null;
   lastSeedRunSource?: string | null;
@@ -160,21 +173,29 @@ function detectIncidents(params: {
   marketOpen: boolean;
   candidates: number;
   qualified: number;
+  freshQualifiedSignals: number;
+  staleQualifiedSignals: number;
   seeded: number;
   executed: number;
   remainingPositionSlots: number;
   minsSinceLastExecute: number | null;
+  seedSlaBreached: boolean;
+  noAutoPendingSkips: number;
   protectionMissingTickers: string[];
 }): Incident[] {
   const incidents: Incident[] = [];
   const { 
     marketOpen, 
     candidates, 
-    qualified, 
-    seeded, 
-    executed, 
+    qualified,
+    freshQualifiedSignals,
+    staleQualifiedSignals,
+    seeded,
+    executed,
     remainingPositionSlots,
     minsSinceLastExecute,
+    seedSlaBreached,
+    noAutoPendingSkips,
     protectionMissingTickers,
   } = params;
 
@@ -206,6 +227,24 @@ function detectIncidents(params: {
       severity: "HIGH",
       message: `${qualified} qualified signals but 0 seeded. Check seeding logic or capacity constraints.`,
       context: { qualified, seeded },
+    });
+  }
+
+  if (marketOpen && seedSlaBreached) {
+    incidents.push({
+      code: "SEED_SLA_BREACH",
+      severity: "CRITICAL",
+      message: `Qualified-to-seed latency SLA breached with freshQualifiedSignals=${freshQualifiedSignals} and staleQualifiedSignals=${staleQualifiedSignals}.`,
+      context: { qualified, freshQualifiedSignals, staleQualifiedSignals },
+    });
+  }
+
+  if (marketOpen && freshQualifiedSignals > 0 && seeded === 0 && noAutoPendingSkips > 0) {
+    incidents.push({
+      code: "NO_AUTO_PENDING_WITH_FRESH_QUALIFIED",
+      severity: "CRITICAL",
+      message: `Fresh qualified signals exist but execute is skipping no-auto-pending (count=${noAutoPendingSkips}).`,
+      context: { freshQualifiedSignals, seeded, noAutoPendingSkips },
     });
   }
 
@@ -364,6 +403,57 @@ export async function GET() {
     const signalsReceived = todaySignals.length;
     const scored = todaySignals.filter((s: any) => s?.status === "SCORED" || s?.aiScore != null).length;
     const qualified = todaySignals.filter((s: any) => s?.qualified === true).length;
+    const qualifiedSignalsToday = todaySignals.filter((s: any) => s?.qualified === true);
+    const staleThresholdUsedMs = Number(lastSeedRun?.staleThresholdUsedMs ?? 30 * 60 * 1000);
+    const seedSlaThresholdMs = 10 * 60 * 1000;
+    let freshQualifiedSignals = 0;
+    let staleQualifiedSignals = 0;
+    const qualifiedToSeedLatencyValuesMs: number[] = [];
+    const seedSlaBreachSignals: NonNullable<FunnelHealthResponse["seedSlaBreachSignals"]> = [];
+
+    for (const s of qualifiedSignalsToday) {
+      const signalId = String(s?.id || "");
+      const symbol = String(s?.ticker || "UNKNOWN");
+      const createdAt = typeof s?.createdAt === "string" ? s.createdAt : null;
+      const createdMs = getSignalTimestampMs(s, "createdAt");
+      const seedEvaluatedAt = typeof s?.seedEvaluatedAt === "string" ? s.seedEvaluatedAt : null;
+      const seedEvaluatedMs = seedEvaluatedAt ? Date.parse(seedEvaluatedAt) : Number.NaN;
+
+      const ageMs = Number.isFinite(createdMs) ? Math.max(0, Date.now() - (createdMs as number)) : null;
+      if (typeof ageMs === "number" && ageMs <= staleThresholdUsedMs) freshQualifiedSignals += 1;
+      else staleQualifiedSignals += 1;
+
+      if (Number.isFinite(createdMs) && Number.isFinite(seedEvaluatedMs)) {
+        qualifiedToSeedLatencyValuesMs.push(Math.max(0, (seedEvaluatedMs as number) - (createdMs as number)));
+      }
+
+      const missingSeedEvalBeyondSla =
+        Number.isFinite(createdMs) &&
+        !Number.isFinite(seedEvaluatedMs) &&
+        Date.now() - (createdMs as number) > seedSlaThresholdMs;
+
+      if (missingSeedEvalBeyondSla) {
+        seedSlaBreachSignals.push({
+          signalId,
+          symbol,
+          createdAt,
+          seedEvaluatedAt,
+          ageMs,
+          staleThresholdUsedMs,
+        });
+      }
+    }
+
+    const qualifiedToSeedLatencyMaxMs =
+      qualifiedToSeedLatencyValuesMs.length > 0 ? Math.max(...qualifiedToSeedLatencyValuesMs) : null;
+    const qualifiedToSeedLatencyAvgMs =
+      qualifiedToSeedLatencyValuesMs.length > 0
+        ? Math.round(
+            qualifiedToSeedLatencyValuesMs.reduce((sum, value) => sum + value, 0) /
+              qualifiedToSeedLatencyValuesMs.length,
+          )
+        : null;
+    const seedSlaBreached = seedSlaBreachSignals.length > 0;
 
     // SEEDED: from funnelStats (seedCreatedCount is bumped by seed-from-signals)
     const seeded = num(funnelData.seedCreatedCount);
@@ -395,6 +485,9 @@ export async function GET() {
       const outcome = String(t.executeOutcome);
       executeSkipReasonBreakdown[outcome] = (executeSkipReasonBreakdown[outcome] ?? 0) + 1;
     }
+    const noAutoPendingSkips =
+      (executeSkipReasonBreakdown["SKIPPED_NO_AUTO_PENDING"] ?? 0) +
+      (executeSkipReasonBreakdown["SKIPPED_NO_LONGER_ELIGIBLE"] ?? 0);
 
     // Stale/expired explicit count and timing diagnostics
     const staleExpiredCount = executeSkipReasonBreakdown["SKIPPED_EXPIRED"] ?? 0;
@@ -436,7 +529,7 @@ export async function GET() {
     const signalToQualified = safePercent(qualified, signalsReceived);
     const qualifiedToSeeded = safePercent(seeded, qualified);
     const seededToExecuted = safePercent(executed, seeded);
-    const qualifiedButNotSeeded = Math.max(0, qualified - seeded);
+    const qualifiedButNotSeeded = qualifiedSignalsToday.filter((s: any) => s?.seedOutcome !== "created").length;
 
     const seedSkipReasonBreakdown: Record<string, number> = {};
     if (lastSeedRun?.skippedByReason) {
@@ -583,10 +676,14 @@ export async function GET() {
       marketOpen,
       candidates,
       qualified,
+      freshQualifiedSignals,
+      staleQualifiedSignals,
       seeded,
       executed,
       remainingPositionSlots,
       minsSinceLastExecute,
+      seedSlaBreached,
+      noAutoPendingSkips,
       protectionMissingTickers,
     });
 
@@ -662,6 +759,12 @@ export async function GET() {
         seededToExecuted,
       },
       qualifiedButNotSeeded,
+      freshQualifiedSignals,
+      staleQualifiedSignals,
+      qualifiedToSeedLatencyMaxMs,
+      qualifiedToSeedLatencyAvgMs,
+      seedSlaBreached,
+      seedSlaBreachSignals: seedSlaBreachSignals.slice(0, 50),
       ...(Object.keys(seedSkipReasonBreakdown).length > 0 ? { seedSkipReasonBreakdown } : {}),
       lastSeedRunAt: lastSeedRun?.runAt ?? null,
       lastSeedRunSource: lastSeedRun?.source ?? null,
