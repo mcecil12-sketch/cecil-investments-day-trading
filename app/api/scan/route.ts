@@ -154,13 +154,14 @@ const AI_SEED_SCAN_MIN_BARS = Math.max(
 );
 const AI_SEED_SCAN_MIN_DOLLAR_VOL = Math.max(
   MIN_AVG_DOLLAR_VOL,
-  Number(process.env.AI_SEED_SCAN_MIN_DOLLAR_VOL ?? 750_000)
+  Number(process.env.AI_SEED_SCAN_MIN_DOLLAR_VOL ?? 500_000)
 );
 
 const AI_SEED_REQUIRE_SETUP = (process.env.AI_SEED_REQUIRE_SETUP ?? "0") === "1";
 const AI_SEED_REQUIRE_RANGE = (process.env.AI_SEED_REQUIRE_RANGE ?? "0") === "1";
-const AI_SEED_MAX_POST = Number(process.env.AI_SEED_MAX_POST ?? 20);
+const AI_SEED_MAX_POST = Number(process.env.AI_SEED_MAX_POST ?? 5);
 const AI_SEED_MAX_QUEUE = Number(process.env.AI_SEED_MAX_QUEUE ?? 10);
+const SCAN_MAX_POSTS_PER_RUN = Math.max(1, Number(process.env.SCAN_MAX_POSTS_PER_RUN ?? 5));
 
 type RejectKey =
   | "volumeTooLow"
@@ -744,6 +745,7 @@ export async function GET(req: NextRequest) {
     universeCount: 0,
     candidateCount: 0,
     candidatesFound: 0,
+    candidatesAfterBasicFilters: 0,
     candidatesEligibleToPost: 0,
     attemptedPosts: 0,
     postSuccessCount: 0,
@@ -805,6 +807,7 @@ export async function GET(req: NextRequest) {
                 marketOpen,
                 universeCount: 0,
                 candidateCount: 0,
+                candidatesAfterBasicFilters: 0,
                 candidatesEligibleToPost: 0,
                 attemptedPosts: 0,
                 postSuccessCount: 0,
@@ -859,6 +862,7 @@ export async function GET(req: NextRequest) {
                 marketOpen,
                 universeCount: 0,
                 candidateCount: 0,
+                candidatesAfterBasicFilters: 0,
                 candidatesEligibleToPost: 0,
                 attemptedPosts: 0,
                 postSuccessCount: 0,
@@ -1301,6 +1305,9 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
   const postDebug: any[] = [];
 
   for (const candidate of topCandidates) {
+    if (postSuccessCount >= SCAN_MAX_POSTS_PER_RUN) {
+      break;
+    }
     if (aiSeedMode && (postedSignals >= AI_SEED_MAX_POST || queuedSignals >= AI_SEED_MAX_QUEUE)) {
       break;
     }
@@ -1497,6 +1504,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     universeCount: slicedUniverse.length,
     candidateCount: candidates.length,
     candidatesFound: candidates.length,
+    candidatesAfterBasicFilters: aiSeedMode ? totals.candidatesAfterBasicFilters : candidates.length,
     candidatesEligibleToPost: topCandidates.length,
     attemptedPosts,
     postSuccessCount,
@@ -1511,6 +1519,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     status,
     universeCount: slicedUniverse.length,
     candidateCount: candidates.length,
+    candidatesAfterBasicFilters: aiSeedMode ? totals.candidatesAfterBasicFilters : candidates.length,
     candidatesEligibleToPost: topCandidates.length,
     attemptedPosts,
     postSuccessCount,
@@ -1527,6 +1536,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     marketOpen,
     universeCount: slicedUniverse.length,
     candidateCount: candidates.length,
+    candidatesAfterBasicFilters: aiSeedMode ? totals.candidatesAfterBasicFilters : candidates.length,
     candidatesEligibleToPost: topCandidates.length,
     attemptedPosts,
     postSuccessCount,
@@ -1543,6 +1553,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     earlyReturnTriggered: false,
     scansRun: 1,
     candidatesFound: candidates.length,
+    candidatesAfterBasicFilters: aiSeedMode ? totals.candidatesAfterBasicFilters : candidates.length,
     candidatesEligibleToPost: topCandidates.length,
     candidatesPersisted: posted.length,
     candidatesSkippedDeduped,

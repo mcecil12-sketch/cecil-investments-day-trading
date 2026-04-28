@@ -33,9 +33,9 @@ export type CandidateContext = {
 // --------------------------------------------------------------------------
 
 // LONG thresholds
-const MIN_RELVOL_LONG = Number(process.env.SCAN_MIN_RELVOL_LONG ?? 1.0);
+const MIN_RELVOL_LONG = Number(process.env.SCAN_MIN_RELVOL_LONG ?? 0.6);
 const MIN_DOLLAR_VOL_LONG = Number(process.env.SCAN_MIN_DOLLAR_VOL_LONG ?? 500000);
-const MIN_PRESCORE_LONG = Number(process.env.SCAN_MIN_PRESCORE_LONG ?? 40);
+const MIN_PRESCORE_LONG = Number(process.env.SCAN_MIN_PRESCORE_LONG ?? 35);
 const MAX_SPREAD_PCT_LONG = Number(process.env.SCAN_MAX_SPREAD_PCT_LONG ?? 0.5);
 const MAX_VWAP_DIST_PCT_LONG = Number(process.env.SCAN_MAX_VWAP_DIST_PCT_LONG ?? 2.0);
 
