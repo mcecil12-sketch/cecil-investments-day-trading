@@ -160,10 +160,12 @@ export async function POST(req: Request) {
     }
   }
 
+  let latestTrades: any[] = trades;
   if (updates.length) {
     const byId = new Map<string, any>(updates.map((u) => [String(u.id), u]));
     const merged = trades.map((t: any) => byId.get(String(t.id)) || t);
     await writeTrades(merged);
+    latestTrades = merged;
   }
 
   // Send TRADE_CLOSED notifications for finalized trades
@@ -210,6 +212,20 @@ export async function POST(req: Request) {
         skippedReason: "notification_exception",
       });
     }
+  }
+
+  // Stamp closeNotificationSentAt on trades where notification was successfully sent
+  const sentTradeIds = new Set(
+    notificationResults.filter((n) => n.sent).map((n) => String(n.tradeId))
+  );
+  if (sentTradeIds.size > 0) {
+    const closeNotifAt = new Date().toISOString();
+    const closeStamped = latestTrades.map((t: any) =>
+      sentTradeIds.has(String(t.id))
+        ? { ...t, closeNotificationSentAt: closeNotifAt, lastNotificationReason: "trade_closed" }
+        : t
+    );
+    await writeTrades(closeStamped);
   }
 
   return NextResponse.json({

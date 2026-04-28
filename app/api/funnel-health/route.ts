@@ -192,6 +192,8 @@ function detectIncidents(params: {
   noAutoPendingSkips: number;
   protectionMissingTickers: string[];
   malformedPendingCount: number;
+  /** Count of AUTO_PENDING trades with no terminal executeOutcome — truly fresh unresolved. */
+  freshUnresolvedPendingCount: number;
 }): Incident[] {
   const incidents: Incident[] = [];
   const { 
@@ -208,6 +210,7 @@ function detectIncidents(params: {
     noAutoPendingSkips,
     protectionMissingTickers,
     malformedPendingCount,
+    freshUnresolvedPendingCount,
   } = params;
 
   // CRITICAL: Protection missing on open trades
@@ -269,13 +272,15 @@ function detectIncidents(params: {
     });
   }
 
-  // 3) SEED_NOT_EXECUTED: seeded trades exist but none executed (market open)
-  if (seeded > 0 && executed === 0 && marketOpen) {
+  // 3) SEED_NOT_EXECUTED: fresh AUTO_PENDING trades exist with no resolved outcome (market open)
+  // Only fire when there are actually unresolved pending trades — not just because historical
+  // closed/archived records exist in the seeded count.
+  if (freshUnresolvedPendingCount > 0 && executed === 0 && marketOpen) {
     incidents.push({
       code: "SEED_NOT_EXECUTED",
       severity: malformedPendingCount > 0 ? "CRITICAL" : "MEDIUM",
-      message: `${seeded} trades seeded but 0 executed. Check execute route or broker integration.`,
-      context: { seeded, executed, marketOpen, malformedPendingCount },
+      message: `${freshUnresolvedPendingCount} fresh pending trade(s) not yet executed. Check execute route or broker integration.`,
+      context: { seeded, executed, freshUnresolvedPendingCount, marketOpen, malformedPendingCount },
     });
   }
 
@@ -488,21 +493,41 @@ export async function GET() {
       (t?.status === "OPEN" || t?.status === "CLOSED" || t?.status === "HIT" || t?.status === "STOPPED")
     ).length;
 
-    // SEEDED_BUT_NOT_EXECUTED: trades that execute evaluated and set a non-EXECUTED/PENDING outcome
-    // This covers trades regardless of current status (ARCHIVED, ERROR, still AUTO_PENDING)
-    const seededButNotExecuted = todayTrades.filter((t: any) =>
+    // executedAndClosedCount: broker-executed trades that have since been closed
+    const executedAndClosedCount = todayTrades.filter((t: any) =>
       (t?.source === "AUTO" || t?.source === "auto-entry") &&
-      t?.executeOutcome != null &&
-      t?.executeOutcome !== "EXECUTED" &&
-      t?.executeOutcome !== "PENDING"
+      (t?.status === "CLOSED" || t?.status === "HIT" || t?.status === "STOPPED") &&
+      (t?.executeOutcome === "EXECUTED" || Boolean(t?.alpacaOrderId))
     ).length;
 
+    // SEEDED_BUT_NOT_EXECUTED: trades that were evaluated by execute but not placed.
+    // Excludes:
+    //   - trades with alpacaOrderId (went to broker, even if executeOutcome was written wrong)
+    //   - CLOSED/OPEN trades that have executeOutcome=EXECUTED (already counted in executed)
+    //   - ARCHIVED stale trades older than the stale threshold
+    const seededButNotExecuted = todayTrades.filter((t: any) => {
+      if (t?.source !== "AUTO" && t?.source !== "auto-entry") return false;
+      if (!t?.executeOutcome) return false;
+      if (t.executeOutcome === "EXECUTED" || t.executeOutcome === "PENDING") return false;
+      // Trades that actually reached the broker should not count as "not executed"
+      if (Boolean(t?.alpacaOrderId) || Boolean(t?.brokerOrderId)) return false;
+      // ARCHIVED stale records older than staleThreshold are historical noise
+      if (t?.status === "ARCHIVED" && t?.seededAt) {
+        const ageMs = Date.now() - Date.parse(t.seededAt);
+        if (ageMs > (t?.staleThresholdUsedMs ?? 30 * 60 * 1000) * 2) return false;
+      }
+      return true;
+    }).length;
+
     // Breakdown of executeOutcome values for seeded-but-not-executed trades
+    // Scoped to today's AUTO trades that were NOT broker-executed (no alpacaOrderId)
     const executeSkipReasonBreakdown: Record<string, number> = {};
     for (const t of todayTrades) {
       if (!t?.executeOutcome) continue;
       if (t.executeOutcome === "EXECUTED" || t.executeOutcome === "PENDING") continue;
       if (t?.source !== "AUTO" && t?.source !== "auto-entry") continue;
+      // Do not count trades that actually reached the broker
+      if (Boolean(t?.alpacaOrderId) || Boolean(t?.brokerOrderId)) continue;
       const outcome = String(t.executeOutcome);
       executeSkipReasonBreakdown[outcome] = (executeSkipReasonBreakdown[outcome] ?? 0) + 1;
     }
@@ -716,6 +741,16 @@ export async function GET() {
     // -------------------------------------------------------------------------
     // Incident Detection
     // -------------------------------------------------------------------------
+    // Count fresh AUTO_PENDING trades with no terminal outcome — these are the ones
+    // that genuinely need execution (not historical skipped/closed/archived records).
+    const freshUnresolvedPendingCount = todayTrades.filter((t: any) =>
+      (t?.source === "AUTO" || t?.source === "auto-entry") &&
+      t?.status === "AUTO_PENDING" &&
+      !Boolean(t?.alpacaOrderId) &&
+      !Boolean(t?.brokerOrderId) &&
+      (!t?.executeOutcome || t.executeOutcome === "PENDING")
+    ).length;
+
     const incidents = detectIncidents({
       marketOpen,
       candidates,
@@ -730,6 +765,7 @@ export async function GET() {
       noAutoPendingSkips,
       protectionMissingTickers,
       malformedPendingCount,
+      freshUnresolvedPendingCount,
     });
 
     // Add lower-severity incident for stale broker/DB mismatch (not live risk)
@@ -822,6 +858,9 @@ export async function GET() {
         minsSinceLastSeed,
         minsSinceLastExecute,
       },
+      // Additional diagnostic counts
+      ...(executedAndClosedCount > 0 ? { executedAndClosedCount } : {}),
+      ...(freshUnresolvedPendingCount > 0 ? { currentOpenPendingCount: freshUnresolvedPendingCount } : {}),
       // ─── Market-open funnel flow diagnostics ────────────────────────
       // Explains exactly where the funnel pipeline is stopping during market hours
       ...(marketOpen ? {

@@ -115,6 +115,7 @@ import {
 } from "@/lib/autoEntry/disabledNotification";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { buildAutoEntryFunnelFields } from "./funnel";
+import { preserveExecutionAttribution } from "@/lib/trades/lifecycle";
 import { isOperationallyOpenTrade } from "@/lib/trades/operational";
 import { buildOpenOrdersBySymbol, planConservativeReplacement } from "@/lib/autoManage/reliability";
 import { readExecutionOverlays, type ExecutionOverlays } from "@/lib/agents/overlays";
@@ -1948,7 +1949,7 @@ export async function POST(req: Request) {
     const normalizedSide = side === "BUY" ? "LONG" : side === "SELL" ? "SHORT" : side;
     if (suppressedSides.includes(normalizedSide)) {
       counts.skipped += 1;
-      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "adaptive_side_suppressed", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "adaptive_side_suppressed", updatedAt: nowIso() };
+      trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeSkipReason: "adaptive_side_suppressed", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "adaptive_side_suppressed", updatedAt: nowIso() });
       await writeTrades(trades);
       await recordOutcome({
         outcome: "SKIP",
@@ -1986,7 +1987,7 @@ export async function POST(req: Request) {
 
     if (!gradeAllowed) {
       counts.skipped += 1;
-      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "overlay_grade_excluded", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "overlay_grade_excluded", updatedAt: nowIso() };
+      trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeSkipReason: "overlay_grade_excluded", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "overlay_grade_excluded", updatedAt: nowIso() });
       await writeTrades(trades);
       await recordOutcome({
         outcome: "SKIP",
@@ -2002,7 +2003,7 @@ export async function POST(req: Request) {
 
     if (tradeScore != null && isScoreBelowAdjustedThreshold(thresholdDiagnostics)) {
         counts.skipped += 1;
-        trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_SCORE_THRESHOLD", executeReason: "score_threshold", updatedAt: nowIso() };
+        trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_SCORE_THRESHOLD", executeReason: "score_threshold", updatedAt: nowIso() });
         await writeTrades(trades);
         await recordOutcome({
           outcome: "SKIP",
@@ -2066,7 +2067,7 @@ export async function POST(req: Request) {
       replacement: replacementPlan,
     });
     await recordOutcome({ outcome: "SKIP", reason: "max_open_positions", ticker, tradeId: String(trade?.id || ""), detail });
-    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_CAPACITY", executeReason: "max_open_positions", updatedAt: nowIso() };
+    trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_CAPACITY", executeReason: "max_open_positions", updatedAt: nowIso() });
     await writeTrades(trades);
     perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "SKIPPED_CAPACITY", reason: "max_open_positions", aiScore: _tradeAiScore, tier: _tradeTier });
     skippedTradeIds.push(_tradeId);
@@ -2153,7 +2154,7 @@ export async function POST(req: Request) {
   if (sinceTicker != null && sinceTicker < guardConfig.tickerCooldownMin) {
     const minsRemaining = Math.ceil(guardConfig.tickerCooldownMin - sinceTicker);
     counts.skipped += 1;
-    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "ticker_cooldown", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "ticker_cooldown", updatedAt: nowIso() };
+    trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeSkipReason: "ticker_cooldown", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "ticker_cooldown", updatedAt: nowIso() });
     await writeTrades(trades);
     await recordOutcome({ outcome: "SKIP", reason: "ticker_cooldown", ticker });
     perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "SKIPPED_NO_LONGER_ELIGIBLE", reason: "ticker_cooldown", aiScore: _tradeAiScore, tier: _tradeTier });
@@ -2275,7 +2276,7 @@ export async function POST(req: Request) {
   }
   if (open.orders.length > 0) {
     counts.skipped += 1;
-    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "open_order_exists", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "open_order_exists", updatedAt: nowIso() };
+    trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeSkipReason: "open_order_exists", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "open_order_exists", updatedAt: nowIso() });
     await writeTrades(trades);
     await recordOutcome({ outcome: "SKIP", reason: "open_order_exists", ticker, tradeId });
     perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_NO_LONGER_ELIGIBLE", reason: "open_order_exists", aiScore: _tradeAiScore, tier: _tradeTier });
@@ -2312,7 +2313,7 @@ export async function POST(req: Request) {
     driftDiagnosticsForExec = driftDiag;
     if (!driftDiag.driftAllowed) {
       counts.skipped += 1;
-      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", executeOutcome: "SKIPPED_PRICE_DRIFT", executeReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", updatedAt: nowIso() };
+      trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeSkipReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", executeOutcome: "SKIPPED_PRICE_DRIFT", executeReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", updatedAt: nowIso() });
       await writeTrades(trades);
       await recordOutcome({ outcome: "SKIP", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", ticker, tradeId });
       perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_PRICE_DRIFT", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", aiScore: _tradeAiScore, tier: _tradeTier });
@@ -2866,7 +2867,12 @@ export async function POST(req: Request) {
       paper: true,
     };
 
-    trades[idx] = updated;
+    const entryNotifAt = new Date().toISOString();
+    trades[idx] = {
+      ...updated,
+      entryNotificationSentAt: entryNotifAt,
+      lastNotificationReason: "order_submitted",
+    };
     await writeTrades(trades);
     counts.executed += 1;
     if (carryoverEligibleIndexSet.has(idx)) {
@@ -2879,15 +2885,21 @@ export async function POST(req: Request) {
     // Phase 3: Include side for direction-aware attribution
     const normalizedSide = sideEnum === "LONG" ? "LONG" : sideEnum === "SHORT" ? "SHORT" : undefined;
     await recordOutcome({ outcome: "SUCCESS", reason: "placed", ticker, tradeId, side: normalizedSide });
+
+    // Stamp entryNotificationSentAt on the trade before notifying so it is
+    // persisted even if the notification delivery fails.
+
+    // Use AUTO_ENTRY_SUBMITTED: honest title that says "submitted/accepted",
+    // NOT "placed" which implies a confirmed fill or open position.
     await fireNotification({
-      type: "AUTO_ENTRY_PLACED",
+      type: "AUTO_ENTRY_SUBMITTED",
       tradeId,
       ticker,
       tier,
       paper: true,
-      title: `Auto entry placed ${ticker}`,
-      message: `Submitted ${qty} ${ticker} ${sideDirection} @ ${trade.entryPrice.toFixed(2)} stop ${trade.stopPrice.toFixed(2)} tp ${(trade.takeProfitPrice ?? trade.targetPrice).toFixed(2)}`,
-      dedupeKey: `AUTO_ENTRY_PLACED:${tradeId}`,
+      title: `Entry submitted: ${ticker}`,
+      message: `Order accepted — ${qty} ${ticker} ${sideDirection} @ ${trade.entryPrice.toFixed(2)} | stop ${trade.stopPrice.toFixed(2)} | tp ${(trade.takeProfitPrice ?? trade.targetPrice).toFixed(2)} | orderId ${(order as any).id}`,
+      dedupeKey: `AUTO_ENTRY_SUBMITTED:${tradeId}`,
       dedupeTtlSec: 600,
       meta: {
         score,
@@ -2895,6 +2907,8 @@ export async function POST(req: Request) {
         takeProfit: trade.takeProfitPrice ?? trade.targetPrice,
         stop: trade.stopPrice,
         source: "persisted_trade",
+        orderId: (order as any).id,
+        notificationPhase: "submitted",
       },
     });
 

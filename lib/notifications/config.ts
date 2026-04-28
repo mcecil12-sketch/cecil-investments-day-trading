@@ -2,6 +2,8 @@ import { NotificationEventType } from "./types";
 
 const DEFAULT_EVENTS: NotificationEventType[] = [
   "AUTO_ENTRY_PLACED",
+  "AUTO_ENTRY_SUBMITTED",
+  "AUTO_ENTRY_OPEN",
   "AUTO_ENTRY_FAILED",
   "AUTO_ENTRY_DISABLED",
   "AUTO_CUT_LOSS",

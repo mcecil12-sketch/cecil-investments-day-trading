@@ -5,6 +5,8 @@ import { shouldSendNotification } from "@/lib/notifications/dedupe";
 
 const VALID_TYPES: NotificationEventType[] = [
   "AUTO_ENTRY_PLACED",
+  "AUTO_ENTRY_SUBMITTED",
+  "AUTO_ENTRY_OPEN",
   "AUTO_ENTRY_FAILED",
   "AUTO_ENTRY_DISABLED",
   "TRADE_CLOSED",
