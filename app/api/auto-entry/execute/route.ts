@@ -114,6 +114,7 @@ import { buildAutoEntryFunnelFields } from "./funnel";
 import { isOperationallyOpenTrade } from "@/lib/trades/operational";
 import { buildOpenOrdersBySymbol, planConservativeReplacement } from "@/lib/autoManage/reliability";
 import { readExecutionOverlays, type ExecutionOverlays } from "@/lib/agents/overlays";
+import { isScoreBelowAdjustedThreshold, resolveThresholdDiagnostics } from "@/lib/autoEntry/executionThresholds";
 import {
   readAdaptiveGuardrailState,
   getActiveActions,
@@ -1753,6 +1754,7 @@ export async function POST(req: Request) {
   const trade = trades[idx];
   const ticker = String(trade.ticker || "").toUpperCase();
   const side = String(trade.side || "LONG").toUpperCase();
+  let thresholdDiagnosticsForTrade: ReturnType<typeof resolveThresholdDiagnostics> | null = null;
 
   // Adaptive guardrails: suppress side
   if (suppressedSides.length > 0) {
@@ -1797,9 +1799,23 @@ export async function POST(req: Request) {
 
   // Overlay: grade and score checks against the selected trade
   {
-    const tradeScore = typeof trade?.aiScore === "number" && Number.isFinite(trade.aiScore) ? trade.aiScore : null;
-    const tradeTier = (tierForScore(tradeScore ?? 0) || trade?.tier || "C") as string;
-    const gradeAllowed = overlay.allowedGrades.includes(tradeTier as "A" | "B" | "C");
+    const autoConfig = getAutoConfig();
+    const thresholdDiagnostics = resolveThresholdDiagnostics({
+      trade,
+      allowedGrades: overlay.allowedGrades,
+      overlayMinScoreAdjustment: overlay.minScoreAdjustment,
+      adaptiveMinScoreAdjustment: adaptiveScoreAdj,
+      thresholdConfig: {
+        tierAmin: autoConfig.tierAmin,
+        tierBmin: autoConfig.tierBmin,
+        tierCmin: autoConfig.tierCmin,
+      },
+      inferTierForScore: tierForScore,
+    });
+    thresholdDiagnosticsForTrade = thresholdDiagnostics;
+    const tradeScore = thresholdDiagnostics.aiScore;
+    const tradeTier = thresholdDiagnostics.tier;
+    const gradeAllowed = thresholdDiagnostics.allowedGrades.includes(tradeTier);
 
     if (!gradeAllowed) {
       counts.skipped += 1;
@@ -1810,14 +1826,14 @@ export async function POST(req: Request) {
         reason: "overlay_grade_excluded",
         ticker,
         tradeId: String(trade?.id || ""),
-        detail: `grade ${tradeTier} not in overlay allowedGrades [${overlay.allowedGrades.join(",")}]`,
+        detail: `grade ${tradeTier} not in overlay allowedGrades [${thresholdDiagnostics.allowedGrades.join(",")}]`,
       });
       return NextResponse.json(
         {
           ok: true,
           skipped: true,
           reason: "overlay_grade_excluded",
-          detail: `grade ${tradeTier} not in overlay allowedGrades [${overlay.allowedGrades.join(",")}]`,
+          detail: `grade ${tradeTier} not in overlay allowedGrades [${thresholdDiagnostics.allowedGrades.join(",")}]`,
           market: { isOpen: marketOpen, timestamp: marketTimestamp },
           openPositionsCount: brokerTruth.positionsCount,
           maxOpenPositions: guardConfig.maxOpenPositions,
@@ -1831,27 +1847,17 @@ export async function POST(req: Request) {
           guardrails: guardSummary,
           overlay: {
             posture: overlay.posture,
-            allowedGrades: overlay.allowedGrades,
+            allowedGrades: thresholdDiagnostics.allowedGrades,
             minScoreAdjustment: overlay.minScoreAdjustment,
             stateAvailable: overlay.stateAvailable,
           },
+          thresholdDiagnostics,
         },
         { status: 200 }
       );
     }
 
-    if ((overlay.minScoreAdjustment !== 0 || adaptiveScoreAdj !== 0) && tradeScore != null) {
-      // Determine the base threshold for this tier
-      const autoConfig = getAutoConfig();
-      const baseTierMin =
-        tradeTier === "A" ? autoConfig.tierAmin :
-        tradeTier === "B" ? autoConfig.tierBmin :
-        autoConfig.tierCmin;
-      const totalScoreAdj = overlay.minScoreAdjustment + adaptiveScoreAdj;
-      const effectiveTierMin = baseTierMin + totalScoreAdj;
-
-      if (tradeScore < effectiveTierMin) {
-        const adjSource = adaptiveScoreAdj !== 0 ? ` + adaptive ${adaptiveScoreAdj}` : "";
+    if (tradeScore != null && isScoreBelowAdjustedThreshold(thresholdDiagnostics)) {
         counts.skipped += 1;
         trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "overlay_score_below_adjusted_threshold", updatedAt: nowIso() };
         await writeTrades(trades);
@@ -1860,14 +1866,14 @@ export async function POST(req: Request) {
           reason: "overlay_score_below_adjusted_threshold",
           ticker,
           tradeId: String(trade?.id || ""),
-          detail: `score ${tradeScore} < adjusted threshold ${effectiveTierMin} (base ${baseTierMin} + overlay ${overlay.minScoreAdjustment}${adjSource})`,
+          detail: `score ${tradeScore} < adjusted threshold ${thresholdDiagnostics.adjustedThreshold} (base ${thresholdDiagnostics.baseTierThreshold} + overlay ${thresholdDiagnostics.overlayMinScoreAdjustment} + adaptive ${thresholdDiagnostics.adaptiveMinScoreAdjustment}; source ${thresholdDiagnostics.thresholdSource})`,
         });
         return NextResponse.json(
           {
             ok: true,
             skipped: true,
             reason: "overlay_score_below_adjusted_threshold",
-            detail: `score ${tradeScore} < adjusted threshold ${effectiveTierMin}`,
+            detail: `score ${tradeScore} < adjusted threshold ${thresholdDiagnostics.adjustedThreshold}`,
             market: { isOpen: marketOpen, timestamp: marketTimestamp },
             openPositionsCount: brokerTruth.positionsCount,
             maxOpenPositions: guardConfig.maxOpenPositions,
@@ -1881,14 +1887,14 @@ export async function POST(req: Request) {
             guardrails: guardSummary,
             overlay: {
               posture: overlay.posture,
-              allowedGrades: overlay.allowedGrades,
+              allowedGrades: thresholdDiagnostics.allowedGrades,
               minScoreAdjustment: overlay.minScoreAdjustment,
               stateAvailable: overlay.stateAvailable,
             },
+            thresholdDiagnostics,
           },
           { status: 200 }
         );
-      }
     }
   }
 
@@ -1961,6 +1967,7 @@ export async function POST(req: Request) {
         counts,
         notes: notes.slice(0, 40),
         guardrails: guardSummary,
+        ...(thresholdDiagnosticsForTrade ? { thresholdDiagnostics: thresholdDiagnosticsForTrade } : {}),
       },
       { status: 200 }
     );
