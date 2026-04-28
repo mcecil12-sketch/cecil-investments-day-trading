@@ -4,6 +4,7 @@ import { finalizeTradeClose } from "@/lib/trades/finalizeClose";
 import { notify } from "@/lib/notifications/notify";
 import { buildTradeClosedPayload } from "@/lib/notifications/tradeClose";
 import { recordTradeClose } from "@/lib/autoManage/gradeTelemetry";
+import { shouldSendCloseNotification, markCloseNotificationSent } from "@/lib/trades/lifecycle";
 
 export const dynamic = "force-dynamic";
 
@@ -169,8 +170,24 @@ export async function POST(req: Request) {
   }
 
   // Send TRADE_CLOSED notifications for finalized trades
+  // Guard: skip trades that already have closeNotificationSentAt persisted (idempotency).
+  const alreadyClosedNotified = new Set(
+    latestTrades
+      .filter((t: any) => t?.closeNotificationSentAt)
+      .map((t: any) => String(t?.id || ""))
+  );
   const notificationResults: any[] = [];
   for (const trade of finalizedTrades) {
+    // Idempotency: skip if already notified (DB-level check, doesn't depend on Redis)
+    if (alreadyClosedNotified.has(String(trade.id || ""))) {
+      notificationResults.push({
+        tradeId: trade.id,
+        ticker: trade.ticker,
+        sent: false,
+        skippedReason: "already_notified",
+      });
+      continue;
+    }
     try {
       const { title, message } = buildTradeClosedPayload(trade);
       
@@ -220,10 +237,9 @@ export async function POST(req: Request) {
   );
   if (sentTradeIds.size > 0) {
     const closeNotifAt = new Date().toISOString();
+    const stamp = markCloseNotificationSent(closeNotifAt);
     const closeStamped = latestTrades.map((t: any) =>
-      sentTradeIds.has(String(t.id))
-        ? { ...t, closeNotificationSentAt: closeNotifAt, lastNotificationReason: "trade_closed" }
-        : t
+      sentTradeIds.has(String(t.id)) ? { ...t, ...stamp } : t
     );
     await writeTrades(closeStamped);
   }

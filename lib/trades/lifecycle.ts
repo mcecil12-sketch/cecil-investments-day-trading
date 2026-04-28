@@ -169,3 +169,72 @@ export function buildBrokerSyncExecutedPatch(trade: any, nowIso: string): Record
 
   return patch;
 }
+
+// ---------------------------------------------------------------------------
+// Notification send decision helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true when an entry notification should be sent for this trade.
+ *
+ * Gate: broker execution evidence must exist (alpacaOrderId / brokerOrderId)
+ * and the notification must not have been sent already.
+ */
+export function shouldSendEntryNotification(trade: any): boolean {
+  if (!trade) return false;
+  if (trade.entryNotificationSentAt) return false;
+  return Boolean(trade.alpacaOrderId) || Boolean(trade.brokerOrderId);
+}
+
+/**
+ * Returns true when a close notification should be sent for this trade.
+ *
+ * Gate:
+ *  - trade is CLOSED or ERROR
+ *  - has broker execution evidence (alpacaOrderId, brokerOrderId, or executeOutcome=EXECUTED)
+ *  - close notification has not already been sent (closeNotificationSentAt is absent)
+ *
+ * This deliberately excludes stale AUTO_PENDING / ARCHIVED trades that were
+ * never broker-submitted — they do not warrant a "trade closed" notification.
+ */
+export function shouldSendCloseNotification(trade: any): boolean {
+  if (!trade) return false;
+  const status = String(trade?.status || "").toUpperCase();
+  if (status !== "CLOSED" && status !== "ERROR") return false;
+  if (trade.closeNotificationSentAt) return false;
+  return (
+    Boolean(trade.alpacaOrderId) ||
+    Boolean(trade.brokerOrderId) ||
+    trade.executeOutcome === "EXECUTED"
+  );
+}
+
+/**
+ * Returns a patch object that records an entry notification as sent.
+ * Apply this to the trade before or immediately after dispatching the notification.
+ */
+export function markEntryNotificationSent(
+  nowIso: string,
+  reason = "order_submitted",
+): Record<string, any> {
+  return {
+    entryNotificationSentAt: nowIso,
+    lastNotificationReason: reason,
+    updatedAt: nowIso,
+  };
+}
+
+/**
+ * Returns a patch object that records a close notification as sent.
+ * Apply this to the trade after dispatching the close notification.
+ */
+export function markCloseNotificationSent(
+  nowIso: string,
+  reason = "trade_closed",
+): Record<string, any> {
+  return {
+    closeNotificationSentAt: nowIso,
+    lastNotificationReason: reason,
+    updatedAt: nowIso,
+  };
+}

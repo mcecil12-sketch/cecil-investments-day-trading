@@ -4,6 +4,10 @@ import {
   preserveExecutionAttribution,
   normalizeClosedTradeProtection,
   buildBrokerSyncExecutedPatch,
+  shouldSendEntryNotification,
+  shouldSendCloseNotification,
+  markEntryNotificationSent,
+  markCloseNotificationSent,
 } from "@/lib/trades/lifecycle";
 
 const NOW = "2026-03-01T12:00:00.000Z";
@@ -191,3 +195,100 @@ describe("buildBrokerSyncExecutedPatch", () => {
     expect(buildBrokerSyncExecutedPatch(null, NOW)).toEqual({});
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// shouldSendEntryNotification
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("shouldSendEntryNotification", () => {
+  it("returns true when alpacaOrderId present and no entryNotificationSentAt", () => {
+    expect(shouldSendEntryNotification({ alpacaOrderId: "ord-1" })).toBe(true);
+  });
+
+  it("returns true when brokerOrderId present and no entryNotificationSentAt", () => {
+    expect(shouldSendEntryNotification({ brokerOrderId: "br-1" })).toBe(true);
+  });
+
+  it("returns false when entryNotificationSentAt already set", () => {
+    expect(shouldSendEntryNotification({ alpacaOrderId: "ord-1", entryNotificationSentAt: NOW })).toBe(false);
+  });
+
+  it("returns false when no broker evidence", () => {
+    expect(shouldSendEntryNotification({ executeOutcome: "PENDING" })).toBe(false);
+  });
+
+  it("returns false for null", () => {
+    expect(shouldSendEntryNotification(null)).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// shouldSendCloseNotification
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("shouldSendCloseNotification", () => {
+  it("returns true for CLOSED trade with alpacaOrderId and no closeNotificationSentAt", () => {
+    expect(shouldSendCloseNotification({ status: "CLOSED", alpacaOrderId: "ord-1" })).toBe(true);
+  });
+
+  it("returns true for ERROR trade with executeOutcome=EXECUTED", () => {
+    expect(shouldSendCloseNotification({ status: "ERROR", executeOutcome: "EXECUTED" })).toBe(true);
+  });
+
+  it("returns false when closeNotificationSentAt already set", () => {
+    expect(shouldSendCloseNotification({
+      status: "CLOSED",
+      alpacaOrderId: "ord-1",
+      closeNotificationSentAt: NOW,
+    })).toBe(false);
+  });
+
+  it("returns false for OPEN trade", () => {
+    expect(shouldSendCloseNotification({ status: "OPEN", alpacaOrderId: "ord-1" })).toBe(false);
+  });
+
+  it("returns false for AUTO_PENDING trade with no broker evidence", () => {
+    expect(shouldSendCloseNotification({ status: "AUTO_PENDING" })).toBe(false);
+  });
+
+  it("returns false for CLOSED trade with no broker evidence", () => {
+    expect(shouldSendCloseNotification({ status: "CLOSED", executeOutcome: "SKIPPED_EXPIRED" })).toBe(false);
+  });
+
+  it("returns false for null", () => {
+    expect(shouldSendCloseNotification(null)).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// markEntryNotificationSent / markCloseNotificationSent
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("markEntryNotificationSent", () => {
+  it("returns patch with entryNotificationSentAt and default reason", () => {
+    const patch = markEntryNotificationSent(NOW);
+    expect(patch.entryNotificationSentAt).toBe(NOW);
+    expect(patch.lastNotificationReason).toBe("order_submitted");
+    expect(patch.updatedAt).toBe(NOW);
+  });
+
+  it("accepts a custom reason", () => {
+    const patch = markEntryNotificationSent(NOW, "custom_reason");
+    expect(patch.lastNotificationReason).toBe("custom_reason");
+  });
+});
+
+describe("markCloseNotificationSent", () => {
+  it("returns patch with closeNotificationSentAt and default reason", () => {
+    const patch = markCloseNotificationSent(NOW);
+    expect(patch.closeNotificationSentAt).toBe(NOW);
+    expect(patch.lastNotificationReason).toBe("trade_closed");
+    expect(patch.updatedAt).toBe(NOW);
+  });
+
+  it("accepts a custom reason", () => {
+    const patch = markCloseNotificationSent(NOW, "stop_hit");
+    expect(patch.lastNotificationReason).toBe("stop_hit");
+  });
+});
+

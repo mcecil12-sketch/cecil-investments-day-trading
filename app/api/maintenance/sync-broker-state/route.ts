@@ -7,6 +7,8 @@ import { selectCanonicalOpenTrades } from "@/lib/trades/canonicalOpenBySymbol";
 import {
   buildBrokerSyncExecutedPatch,
   normalizeClosedTradeProtection,
+  shouldSendCloseNotification,
+  markCloseNotificationSent,
 } from "@/lib/trades/lifecycle";
 import { sendNotification } from "@/lib/notifications/notify";
 import { buildTradeClosedPayload } from "@/lib/notifications/tradeClose";
@@ -286,11 +288,7 @@ export async function POST(req: NextRequest) {
 
   for (const t of trades) {
     if (!t) continue;
-    const status = String((t as any)?.status || "").toUpperCase();
-    const isClosed = status === "CLOSED" || status === "ERROR";
-    if (!isClosed) continue;
-    if (!(t as any).entryNotificationSentAt) continue;
-    if ((t as any).closeNotificationSentAt) continue;
+    if (!shouldSendCloseNotification(t)) continue;
 
     try {
       const { title, message } = buildTradeClosedPayload({
@@ -314,7 +312,7 @@ export async function POST(req: NextRequest) {
       });
 
       if (result.sent || result.skippedReason === "deduped") {
-        closeNotifTradeUpdates.push({ id: (t as any).id, closeNotificationSentAt: closeNotifNow, lastNotificationReason: "trade_closed" });
+        closeNotifTradeUpdates.push({ id: (t as any).id, ...markCloseNotificationSent(closeNotifNow) });
         closeNotificationsSent++;
       }
     } catch {
