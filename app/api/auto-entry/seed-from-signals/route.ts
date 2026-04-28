@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readTrades, upsertTrade } from "@/lib/tradesStore";
+import { readTrades, writeTrades, upsertTrade } from "@/lib/tradesStore";
 import { getAutoConfig, tierForScore, riskMultForTier, type AutoTier } from "@/lib/autoEntry/config";
 import { deriveSessionMeta } from "@/lib/autoEntry/eligibility";
 import { getEtDateString, getEtDayBoundsMs } from "@/lib/time/etDate";
@@ -400,6 +400,62 @@ export async function POST(req: NextRequest) {
     limitReason = remainingEntriesToday === 0 ? "entries_per_day_exhausted" : "entries_per_day";
   }
   effectiveLimit = Math.max(0, effectiveLimit);
+
+  // ── Pre-seed stale trade cleanup ─────────────────────────────────────────
+  // Archive stale AUTO_PENDING and error-blocked trades from previous runs that
+  // would prevent fresh signals from being seeded via the already_active_trade
+  // check. Uses the same max-age threshold as the execute route.
+  {
+    const _maxAgeMs = Math.max(1, Number.isFinite(Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
+      ? Number(process.env.AUTO_ENTRY_MAX_AGE_MIN)
+      : 30) * 60_000;
+    const _blockingReasons = new Set(["rescore_required", "invalid_trade", "rescore_failed"]);
+    let _cleanedCount = 0;
+    const _tradesArr = trades as any[];
+    for (let _ci = 0; _ci < _tradesArr.length; _ci++) {
+      const _ct = _tradesArr[_ci];
+      if (!_ct) continue;
+      const _status = String(_ct?.status || "").toUpperCase();
+      const _src = String(_ct?.source || "").toLowerCase();
+      if (_src !== "auto-entry" && _src !== "auto") continue;
+      const _shouldClean = (() => {
+        if (_status === "AUTO_PENDING") {
+          const _ts = Date.parse(String(_ct?.createdAt || _ct?.updatedAt || ""));
+          if (!Number.isFinite(_ts)) return true; // no timestamp → stale
+          if (nowMs - _ts > _maxAgeMs) return true; // older than max age
+          // Previous ET date
+          try {
+            const _etDate = new Intl.DateTimeFormat("en-CA", {
+              timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+            }).format(new Date(_ts));
+            if (_etDate !== today) return true;
+          } catch { return true; }
+          return false;
+        }
+        if (_status === "ERROR") {
+          return _blockingReasons.has(String(_ct?.executeReason || _ct?.reason || ""));
+        }
+        return false;
+      })();
+      if (!_shouldClean) continue;
+      const _now2 = new Date().toISOString();
+      _tradesArr[_ci] = {
+        ..._ct,
+        status: "ARCHIVED",
+        autoEntryStatus: "AUTO_ARCHIVED",
+        reason: "pre_seed_stale_cleanup",
+        closedAt: _ct?.closedAt || _now2,
+        updatedAt: _now2,
+        executeOutcome: _ct?.executeOutcome || "SKIPPED_EXPIRED",
+        executeReason: _ct?.executeReason || "pre_seed_stale_cleanup",
+      };
+      _cleanedCount++;
+    }
+    if (_cleanedCount > 0) {
+      await writeTrades(_tradesArr);
+      console.log("[seed-from-signals] pre-seed-cleanup archived", _cleanedCount);
+    }
+  }
 
   const activeStatuses = new Set(["AUTO_PENDING", "OPEN", "NEW"]);
   const terminalStatuses = new Set(["CLOSED", "HIT", "STOPPED", "CANCELED", "CANCELLED", "REJECTED", "ARCHIVED", "ERROR"]);

@@ -1871,9 +1871,7 @@ export async function POST(req: Request) {
       { status: 200 }
     );
   }
-  let idx = eligibleIndexes.length > 0 ? eligibleIndexes[0] : -1;
-
-  if (idx === -1) {
+  if (eligibleIndexes.length === 0) {
     counts.skipped += 1;
     await recordOutcome({ outcome: "SKIP", reason: "no_AUTO_PENDING" });
     return NextResponse.json(
@@ -1900,10 +1898,50 @@ export async function POST(req: Request) {
     );
   }
 
-  const trade = trades[idx];
-  const ticker = String(trade.ticker || "").toUpperCase();
-  const side = String(trade.side || "LONG").toUpperCase();
-  let thresholdDiagnosticsForTrade: ReturnType<typeof resolveThresholdDiagnostics> | null = null;
+  // ── Per-trade execution loop ─────────────────────────────────────────────
+  // GLOBAL breakers (market_closed, circuit_breaker, cooldown_after_loss,
+  // max_entries_per_day, protection_integrity_failed, broker_truth_unavailable)
+  // are resolved BEFORE this loop and return early. Inside the loop:
+  //  - per-trade failures mark the trade SKIPPED and CONTINUE to the next candidate
+  //  - max_open_positions BREAKs the loop (once the cap is hit, no more entries)
+  const perTradeResults: Array<{
+    tradeId: string;
+    symbol: string;
+    outcome: string;
+    reason: string;
+    aiScore: number | null;
+    tier: string | null;
+  }> = [];
+  const attemptedTradeIds: string[] = [];
+  const skippedTradeIds: string[] = [];
+  const executedTradeIds: string[] = [];
+  let globalBreakerApplied = false;
+  let globalBreakerReason: string | null = null;
+
+  for (const idx of eligibleIndexes) {
+    // Re-check max entries per day each iteration — a prior iteration may have
+    // executed a trade and bumped the count.
+    if (guardState.entriesToday + counts.executed >= guardConfig.maxEntriesPerDay) {
+      globalBreakerApplied = true;
+      globalBreakerReason = "max_entries_per_day";
+      notes.push("loop_breaker:max_entries_per_day");
+      break;
+    }
+
+    const trade = trades[idx];
+    const ticker = String(trade.ticker || "").toUpperCase();
+    const side = String(trade.side || "LONG").toUpperCase();
+    // Per-trade identifiers captured at loop start for consistent tracking
+    const _tradeId = String(trade?.id || "");
+    const _tradeAiScore: number | null = (() => {
+      const s = Number(trade?.aiScore ?? trade?.ai?.score ?? 0);
+      return Number.isFinite(s) && s > 0 ? s : null;
+    })();
+    const _tradeTier: string | null = (() => {
+      const t = String(trade?.tier ?? trade?.ai?.tier ?? "").trim().toUpperCase();
+      return t === "A" || t === "B" || t === "C" ? t : null;
+    })();
+    let thresholdDiagnosticsForTrade: ReturnType<typeof resolveThresholdDiagnostics> | null = null;
 
   // Adaptive guardrails: suppress side
   if (suppressedSides.length > 0) {
@@ -1919,30 +1957,9 @@ export async function POST(req: Request) {
         tradeId: String(trade?.id || ""),
         detail: `Side ${normalizedSide} suppressed by adaptive guardrail`,
       });
-      return NextResponse.json(
-        {
-          ok: true,
-          skipped: true,
-          reason: "adaptive_side_suppressed",
-          detail: `Side ${normalizedSide} suppressed by adaptive guardrail`,
-          market: { isOpen: marketOpen, timestamp: marketTimestamp },
-          openPositionsCount: brokerTruth.positionsCount,
-          maxOpenPositions: guardConfig.maxOpenPositions,
-          entriesToday: guardState.entriesToday,
-          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-          pendingCount: counts.pendingCount,
-          eligibleCount: counts.eligibleCount,
-          executedCount: counts.executed,
-          counts,
-          notes: notes.slice(0, 40),
-          guardrails: guardSummary,
-          adaptiveGuardrails: {
-            activeActionCount: adaptiveActions.length,
-            suppressedSides,
-          },
-        },
-        { status: 200 },
-      );
+      perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "SKIPPED_NO_LONGER_ELIGIBLE", reason: "adaptive_side_suppressed", aiScore: _tradeAiScore, tier: _tradeTier });
+      skippedTradeIds.push(_tradeId);
+      continue;
     }
   }
 
@@ -1978,33 +1995,9 @@ export async function POST(req: Request) {
         tradeId: String(trade?.id || ""),
         detail: `grade ${tradeTier} not in overlay allowedGrades [${thresholdDiagnostics.allowedGrades.join(",")}]`,
       });
-      return NextResponse.json(
-        {
-          ok: true,
-          skipped: true,
-          reason: "overlay_grade_excluded",
-          detail: `grade ${tradeTier} not in overlay allowedGrades [${thresholdDiagnostics.allowedGrades.join(",")}]`,
-          market: { isOpen: marketOpen, timestamp: marketTimestamp },
-          openPositionsCount: brokerTruth.positionsCount,
-          maxOpenPositions: guardConfig.maxOpenPositions,
-          entriesToday: guardState.entriesToday,
-          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-          pendingCount: counts.pendingCount,
-          eligibleCount: counts.eligibleCount,
-          executedCount: counts.executed,
-          counts,
-          notes: notes.slice(0, 40),
-          guardrails: guardSummary,
-          overlay: {
-            posture: overlay.posture,
-            allowedGrades: thresholdDiagnostics.allowedGrades,
-            minScoreAdjustment: overlay.minScoreAdjustment,
-            stateAvailable: overlay.stateAvailable,
-          },
-          thresholdDiagnostics,
-        },
-        { status: 200 }
-      );
+      perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "SKIPPED_NO_LONGER_ELIGIBLE", reason: "overlay_grade_excluded", aiScore: _tradeAiScore, tier: _tradeTier });
+      skippedTradeIds.push(_tradeId);
+      continue;
     }
 
     if (tradeScore != null && isScoreBelowAdjustedThreshold(thresholdDiagnostics)) {
@@ -2018,33 +2011,9 @@ export async function POST(req: Request) {
           tradeId: String(trade?.id || ""),
           detail: `score ${tradeScore} < base tier threshold ${thresholdDiagnostics.baseTierThreshold} for stored tier ${tradeTier} (overlay ${thresholdDiagnostics.overlayMinScoreAdjustment} ignoredAtExecute=${thresholdDiagnostics.overlayMinScoreAdjustmentIgnoredAtExecute}; adaptive ${thresholdDiagnostics.adaptiveMinScoreAdjustment} ignoredAtExecute=${thresholdDiagnostics.adaptiveMinScoreAdjustmentIgnoredAtExecute}; source ${thresholdDiagnostics.thresholdSource})`,
         });
-        return NextResponse.json(
-          {
-            ok: true,
-            skipped: true,
-            reason: "score_threshold",
-            detail: `score ${tradeScore} < base tier threshold ${thresholdDiagnostics.baseTierThreshold} for stored tier ${tradeTier}`,
-            market: { isOpen: marketOpen, timestamp: marketTimestamp },
-            openPositionsCount: brokerTruth.positionsCount,
-            maxOpenPositions: guardConfig.maxOpenPositions,
-            entriesToday: guardState.entriesToday,
-            maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-            pendingCount: counts.pendingCount,
-            eligibleCount: counts.eligibleCount,
-            executedCount: counts.executed,
-            counts,
-            notes: notes.slice(0, 40),
-            guardrails: guardSummary,
-            overlay: {
-              posture: overlay.posture,
-              allowedGrades: thresholdDiagnostics.allowedGrades,
-              minScoreAdjustment: overlay.minScoreAdjustment,
-              stateAvailable: overlay.stateAvailable,
-            },
-            thresholdDiagnostics,
-          },
-          { status: 200 }
-        );
+        perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "SKIPPED_SCORE_THRESHOLD", reason: "score_threshold", aiScore: _tradeAiScore, tier: _tradeTier });
+        skippedTradeIds.push(_tradeId);
+        continue;
     }
   }
 
@@ -2099,28 +2068,12 @@ export async function POST(req: Request) {
     await recordOutcome({ outcome: "SKIP", reason: "max_open_positions", ticker, tradeId: String(trade?.id || ""), detail });
     trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_CAPACITY", executeReason: "max_open_positions", updatedAt: nowIso() };
     await writeTrades(trades);
-    return NextResponse.json(
-      {
-        ok: true,
-        skipped: true,
-        reason: "max_open_positions",
-        detail,
-        replacement: replacementPlan,
-        market: { isOpen: marketOpen, timestamp: marketTimestamp },
-        openPositionsCount: brokerTruth.positionsCount,
-        maxOpenPositions: guardConfig.maxOpenPositions,
-        entriesToday: guardState.entriesToday,
-        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-        pendingCount: counts.pendingCount,
-        eligibleCount: counts.eligibleCount,
-        executedCount: counts.executed,
-        counts,
-        notes: notes.slice(0, 40),
-        guardrails: guardSummary,
-        ...(thresholdDiagnosticsForTrade ? { thresholdDiagnostics: thresholdDiagnosticsForTrade } : {}),
-      },
-      { status: 200 }
-    );
+    perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "SKIPPED_CAPACITY", reason: "max_open_positions", aiScore: _tradeAiScore, tier: _tradeTier });
+    skippedTradeIds.push(_tradeId);
+    globalBreakerApplied = true;
+    globalBreakerReason = "max_open_positions";
+    notes.push("loop_breaker:max_open_positions");
+    break;
   }
 
   if (maxOpenReached && replacementPlan.replacementExecuted) {
@@ -2142,26 +2095,9 @@ export async function POST(req: Request) {
       });
       trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_CAPACITY", executeReason: "replacement_close_unavailable", updatedAt: nowIso() };
       await writeTrades(trades);
-      return NextResponse.json(
-        {
-          ok: true,
-          skipped: true,
-          reason: "replacement_close_unavailable",
-          replacement: replacementPlan,
-          market: { isOpen: marketOpen, timestamp: marketTimestamp },
-          openPositionsCount: brokerTruth.positionsCount,
-          maxOpenPositions: guardConfig.maxOpenPositions,
-          entriesToday: guardState.entriesToday,
-          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-          pendingCount: counts.pendingCount,
-          eligibleCount: counts.eligibleCount,
-          executedCount: counts.executed,
-          counts,
-          notes: notes.slice(0, 40),
-          guardrails: guardSummary,
-        },
-        { status: 200 }
-      );
+      perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "SKIPPED_CAPACITY", reason: "replacement_close_unavailable", aiScore: _tradeAiScore, tier: _tradeTier });
+      skippedTradeIds.push(_tradeId);
+      continue;
     }
 
     const weakestSide = String(weakestTrade?.side || "LONG").toUpperCase();
@@ -2206,26 +2142,9 @@ export async function POST(req: Request) {
       });
       trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "ERROR", executeReason: "replacement_close_submit_failed", updatedAt: nowIso() };
       await writeTrades(trades);
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "replacement_close_submit_failed",
-          detail: String(replacementErr?.message || replacementErr || "replacement_close_submit_failed"),
-          replacement: replacementPlan,
-          market: { isOpen: marketOpen, timestamp: marketTimestamp },
-          openPositionsCount: brokerTruth.positionsCount,
-          maxOpenPositions: guardConfig.maxOpenPositions,
-          entriesToday: guardState.entriesToday,
-          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-          pendingCount: counts.pendingCount,
-          eligibleCount: counts.eligibleCount,
-          executedCount: counts.executed,
-          counts,
-          notes: notes.slice(0, 40),
-          guardrails: guardSummary,
-        },
-        { status: 500 }
-      );
+      perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "ERROR", reason: "replacement_close_submit_failed", aiScore: _tradeAiScore, tier: _tradeTier });
+      skippedTradeIds.push(_tradeId);
+      continue;
     }
   }
 
@@ -2237,30 +2156,18 @@ export async function POST(req: Request) {
     trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "ticker_cooldown", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "ticker_cooldown", updatedAt: nowIso() };
     await writeTrades(trades);
     await recordOutcome({ outcome: "SKIP", reason: "ticker_cooldown", ticker });
-    return NextResponse.json(
-      {
-        ok: true,
-        skipped: true,
-        reason: "ticker_cooldown",
-        detail: `${minsRemaining}m`,
-        market: { isOpen: marketOpen, timestamp: marketTimestamp },
-        openPositionsCount: brokerTruth.positionsCount,
-        maxOpenPositions: guardConfig.maxOpenPositions,
-        entriesToday: guardState.entriesToday,
-        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-        pendingCount: counts.pendingCount,
-        eligibleCount: counts.eligibleCount,
-        executedCount: counts.executed,
-        counts,
-        notes: notes.slice(0, 40),
-        guardrails: guardSummary,
-      },
-      { status: 200 }
-    );
+    perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "SKIPPED_NO_LONGER_ELIGIBLE", reason: "ticker_cooldown", aiScore: _tradeAiScore, tier: _tradeTier });
+    skippedTradeIds.push(_tradeId);
+    continue;
   }
 
   const tradeId = String(trade.id || "");
-  if (!tradeId) return NextResponse.json({ ok: false, error: "trade missing id" }, { status: 400 });
+  if (!tradeId) {
+    perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "MALFORMED", reason: "missing_trade_id", aiScore: _tradeAiScore, tier: _tradeTier });
+    skippedTradeIds.push(_tradeId);
+    counts.skipped += 1;
+    continue;
+  }
 
   let entryPrice = safeNum(trade.entryPrice, 0);
   const stopPrice = safeNum(trade.stopPrice, 0);
@@ -2291,19 +2198,9 @@ export async function POST(req: Request) {
     counts.invalidMarked += 1;
     counts.skipped += 1;
     await recordOutcome({ outcome: "FAIL", reason: "INVALID_TRADE_PLAN_MISSING_VALUES", ticker, tradeId });
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "INVALID_TRADE_PLAN_MISSING_VALUES",
-        detail: "Trade is missing entryPrice, stopPrice, or targetPrice — no fallback % calculation allowed",
-        tradeId,
-        market: { isOpen: marketOpen, timestamp: marketTimestamp },
-        counts,
-        notes: notes.slice(0, 40),
-        guardrails: guardSummary,
-      },
-      { status: 422 }
-    );
+    perTradeResults.push({ tradeId, symbol: ticker, outcome: "MALFORMED", reason: "INVALID_TRADE_PLAN_MISSING_VALUES", aiScore: _tradeAiScore, tier: _tradeTier });
+    skippedTradeIds.push(tradeId);
+    continue;
   }
 
   // ─── HARD DIRECTIONAL VALIDATION ───────────────────────────────────
@@ -2337,23 +2234,16 @@ export async function POST(req: Request) {
     counts.invalidMarked += 1;
     counts.skipped += 1;
     await recordOutcome({ outcome: "FAIL", reason: "INVALID_TRADE_PLAN_STRUCTURE", ticker, tradeId });
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "INVALID_TRADE_PLAN_STRUCTURE",
-        detail: validationFailure,
-        tradeId,
-        market: { isOpen: marketOpen, timestamp: marketTimestamp },
-        counts,
-        notes: notes.slice(0, 40),
-        guardrails: guardSummary,
-      },
-      { status: 422 }
-    );
+    perTradeResults.push({ tradeId, symbol: ticker, outcome: "MALFORMED", reason: "INVALID_TRADE_PLAN_STRUCTURE", aiScore: _tradeAiScore, tier: _tradeTier });
+    skippedTradeIds.push(tradeId);
+    continue;
   }
 
   if (!ticker || (side !== "LONG" && side !== "SHORT")) {
-    return NextResponse.json({ ok: false, error: "trade missing ticker/side", tradeId }, { status: 400 });
+    perTradeResults.push({ tradeId, symbol: ticker || "unknown", outcome: "MALFORMED", reason: "missing_ticker_or_side", aiScore: _tradeAiScore, tier: _tradeTier });
+    skippedTradeIds.push(tradeId);
+    counts.skipped += 1;
+    continue;
   }
 
   const lockKey = `lock:auto-entry:${ticker}`;
@@ -2363,26 +2253,9 @@ export async function POST(req: Request) {
     trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "already_locked", updatedAt: nowIso() };
     await writeTrades(trades);
     await recordOutcome({ outcome: "SKIP", reason: "already_locked", ticker, tradeId });
-    return NextResponse.json(
-      {
-        ok: true,
-        skipped: true,
-        reason: "already_locked",
-        tradeId,
-        market: { isOpen: marketOpen, timestamp: marketTimestamp },
-        openPositionsCount: brokerTruth.positionsCount,
-        maxOpenPositions: guardConfig.maxOpenPositions,
-        entriesToday: guardState.entriesToday,
-        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-        pendingCount: counts.pendingCount,
-        eligibleCount: counts.eligibleCount,
-        executedCount: counts.executed,
-        counts,
-        notes: notes.slice(0, 40),
-        guardrails: guardSummary,
-      },
-      { status: 200 }
-    );
+    perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_NO_LONGER_ELIGIBLE", reason: "already_locked", aiScore: _tradeAiScore, tier: _tradeTier });
+    skippedTradeIds.push(tradeId);
+    continue;
   }
 
   const open = await hasOpenOrdersForSymbol(ticker);
@@ -2396,53 +2269,18 @@ export async function POST(req: Request) {
       tradeId,
       detail: open.text || "alpaca open orders lookup failed",
     });
-    return NextResponse.json(
-      {
-        ok: false,
-        status: open.status,
-        error: open.text || "alpaca open orders lookup failed",
-        tradeId,
-        market: { isOpen: marketOpen, timestamp: marketTimestamp },
-        openPositionsCount: brokerTruth.positionsCount,
-        maxOpenPositions: guardConfig.maxOpenPositions,
-        entriesToday: guardState.entriesToday,
-        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-        pendingCount: counts.pendingCount,
-        eligibleCount: counts.eligibleCount,
-        executedCount: counts.executed,
-        counts,
-        notes: notes.slice(0, 40),
-        guardrails: guardSummary,
-      },
-      { status: 500 }
-    );
+    perTradeResults.push({ tradeId, symbol: ticker, outcome: "ERROR", reason: "broker_open_orders_lookup_failed", aiScore: _tradeAiScore, tier: _tradeTier });
+    skippedTradeIds.push(tradeId);
+    continue;
   }
   if (open.orders.length > 0) {
     counts.skipped += 1;
     trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: "open_order_exists", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "open_order_exists", updatedAt: nowIso() };
     await writeTrades(trades);
     await recordOutcome({ outcome: "SKIP", reason: "open_order_exists", ticker, tradeId });
-    return NextResponse.json(
-      {
-        ok: true,
-        skipped: true,
-        reason: "open_order_exists",
-        tradeId,
-        openOrders: open.orders.map((o: any) => ({ id: o.id, symbol: o.symbol, side: o.side, type: o.type, status: o.status })),
-        market: { isOpen: marketOpen, timestamp: marketTimestamp },
-        openPositionsCount: brokerTruth.positionsCount,
-        maxOpenPositions: guardConfig.maxOpenPositions,
-        entriesToday: guardState.entriesToday,
-        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-        pendingCount: counts.pendingCount,
-        eligibleCount: counts.eligibleCount,
-        executedCount: counts.executed,
-        counts,
-        notes: notes.slice(0, 40),
-        guardrails: guardSummary,
-      },
-      { status: 200 }
-    );
+    perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_NO_LONGER_ELIGIBLE", reason: "open_order_exists", aiScore: _tradeAiScore, tier: _tradeTier });
+    skippedTradeIds.push(tradeId);
+    continue;
   }
 
   const score = safeNum(trade.ai?.score ?? trade.score ?? 0, 0);
@@ -2477,21 +2315,9 @@ export async function POST(req: Request) {
       trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", executeOutcome: "SKIPPED_PRICE_DRIFT", executeReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", updatedAt: nowIso() };
       await writeTrades(trades);
       await recordOutcome({ outcome: "SKIP", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", ticker, tradeId });
-      return NextResponse.json(
-        {
-          ok: true,
-          skipped: true,
-          reason: driftDiag.reason,
-          detail: `Live price ${decisionPriceForDrift.toFixed(2)} drifted from planned entry ${entryPrice.toFixed(2)} by ${(driftDiag.driftInR).toFixed(2)}R (max 0.5R)`,
-          tradeId,
-          driftDiagnostics: driftDiag,
-          market: { isOpen: marketOpen, timestamp: marketTimestamp },
-          counts,
-          notes: notes.slice(0, 40),
-          guardrails: guardSummary,
-        },
-        { status: 200 }
-      );
+      perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_PRICE_DRIFT", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", aiScore: _tradeAiScore, tier: _tradeTier });
+      skippedTradeIds.push(tradeId);
+      continue;
     }
     // Drift within tolerance — adjust entry to live price to improve fill probability
     if (driftDiag.adjustedEntryPrice != null && driftDiag.adjustedEntryPrice !== entryPrice) {
@@ -2798,17 +2624,9 @@ export async function POST(req: Request) {
     } else {
       await recordOutcome({ outcome: "FAIL", reason: "alpaca_error", ticker, tradeId, detail: lock.error });
     }
-    return NextResponse.json(
-      {
-        ok: false,
-        error: lock.error,
-        tradeId,
-        lockKey: redisLockKey,
-        debug: dbg,
-        guardrails: guardSummary,
-      },
-      { status: lock.error === "LOCKED" ? 409 : 500 }
-    );
+    perTradeResults.push({ tradeId, symbol: ticker, outcome: lockOutcome, reason: lockReason, aiScore: _tradeAiScore, tier: _tradeTier });
+    skippedTradeIds.push(tradeId);
+    continue;
   }
 
   try {
@@ -2842,28 +2660,9 @@ export async function POST(req: Request) {
             ? (order as any)?.detail || JSON.stringify({ base_price: Number(submitBasePrice.toFixed(2)), take_profit: Number(tp.toFixed(2)) })
             : JSON.stringify(validation),
       });
-      return NextResponse.json(
-        {
-          ok: true,
-          skipped: true,
-          reason: poisonReason,
-          classification: "payload_validation_retryable",
-          validation,
-          tradeId,
-          market: { isOpen: marketOpen, timestamp: marketTimestamp },
-          openPositionsCount: brokerTruth.positionsCount,
-          maxOpenPositions: guardConfig.maxOpenPositions,
-          entriesToday: guardState.entriesToday,
-          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-          pendingCount: counts.pendingCount,
-          eligibleCount: counts.eligibleCount,
-          executedCount: counts.executed,
-          counts,
-          notes: notes.slice(0, 40),
-          guardrails: guardSummary,
-        },
-        { status: 200 }
-      );
+      perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_NO_LONGER_ELIGIBLE", reason: poisonReason, aiScore: _tradeAiScore, tier: _tradeTier });
+      skippedTradeIds.push(tradeId);
+      continue;
     }
 
     const legs = Array.isArray((order as any)?.legs) ? (order as any).legs : [];
@@ -3028,36 +2827,9 @@ export async function POST(req: Request) {
         dedupeKey: `AUTO_ENTRY_MISSING_STOP:${tradeId}`,
         dedupeTtlSec: 600,
       });
-
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "missing_stop_protection",
-          detail: "Trade executed but stop verification failed; flatten attempted.",
-          tradeId,
-          trade: errorTrade,
-          broker: {
-            id: order.id,
-            status: (order as any).status,
-            order_class: (order as any).order_class ?? "bracket",
-            stopOrderId,
-            takeProfitOrderId,
-            stopVerified: false,
-          },
-          market: { isOpen: marketOpen, timestamp: marketTimestamp },
-          openPositionsCount: brokerTruth.positionsCount,
-          maxOpenPositions: guardConfig.maxOpenPositions,
-          entriesToday: guardState.entriesToday,
-          maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-          pendingCount: counts.pendingCount,
-          eligibleCount: counts.eligibleCount,
-          executedCount: counts.executed,
-          counts,
-          notes: notes.slice(0, 40),
-          guardrails: guardSummary,
-        },
-        { status: 500 }
-      );
+      perTradeResults.push({ tradeId, symbol: ticker, outcome: "ERROR", reason: "missing_stop_protection", aiScore: _tradeAiScore, tier: _tradeTier });
+      skippedTradeIds.push(tradeId);
+      continue;
     }
 
     // ─── STOP VERIFIED - Mark trade OPEN ──────────────────────────────
@@ -3126,36 +2898,11 @@ export async function POST(req: Request) {
       },
     });
 
-    return NextResponse.json(
-      {
-        ok: true,
-        trade: updated,
-        broker: {
-          id: order.id,
-          status: (order as any).status,
-          order_class: (order as any).order_class ?? "bracket",
-          stopOrderId: verifiedStopOrderId,
-          takeProfitOrderId,
-          stopVerified: true,
-        },
-        debug: dbg,
-        market: { isOpen: marketOpen, timestamp: marketTimestamp },
-        openPositionsCount: brokerTruth.positionsCount,
-        maxOpenPositions: guardConfig.maxOpenPositions,
-        entriesToday: guardState.entriesToday,
-        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-        pendingCount: counts.pendingCount,
-        eligibleCount: counts.eligibleCount,
-        executedCount: counts.executed,
-        carryoverEvaluatedCount: counts.carryoverEvaluatedCount,
-        carryoverExecutedCount: counts.carryoverExecutedCount,
-        carryoverArchivedCount: counts.carryoverArchivedCount,
-        counts,
-        notes: notes.slice(0, 40),
-        guardrails: guardSummary,
-      },
-      { status: 200 }
-    );
+    // Trade executed — record result and continue to process remaining candidates
+    executedTradeIds.push(tradeId);
+    attemptedTradeIds.push(tradeId);
+    perTradeResults.push({ tradeId, symbol: ticker, outcome: "EXECUTED", reason: "placed", aiScore: _tradeAiScore, tier: _tradeTier });
+    // Do not return here — the loop continues to the next eligible trade
   } catch (e: any) {
     const message = String(e?.message || e || "unknown_error");
     const stack = String(e?.stack || "");
@@ -3181,26 +2928,47 @@ export async function POST(req: Request) {
       dedupeKey: `AUTO_ENTRY_FAILED:${tradeId}`,
       dedupeTtlSec: 600,
     });
-    return NextResponse.json(
-      {
-        ok: false,
-        error: message,
-        stack,
-        tradeId,
-        debug: dbg,
-        market: { isOpen: marketOpen, timestamp: marketTimestamp },
-        openPositionsCount: brokerTruth.positionsCount,
-        maxOpenPositions: guardConfig.maxOpenPositions,
-        entriesToday: guardState.entriesToday,
-        maxEntriesPerDay: guardConfig.maxEntriesPerDay,
-        pendingCount: counts.pendingCount,
-        eligibleCount: counts.eligibleCount,
-        executedCount: counts.executed,
-        counts,
-        notes: notes.slice(0, 40),
-        guardrails: guardSummary,
-      },
-      { status: 500 }
-    );
+    perTradeResults.push({ tradeId, symbol: ticker, outcome: "ERROR", reason: "execute_error", aiScore: _tradeAiScore, tier: _tradeTier });
+    skippedTradeIds.push(tradeId);
+    notes.push(`execute_error:${ticker}:${message.slice(0, 60)}`);
+    continue;
   }
+  } // end for (next eligible trade)
+
+  // ── After the loop: consolidated response for ALL eligible candidates ─────
+  // Returns results for every trade evaluated in this run.
+  const loopReason =
+    counts.executed > 0
+      ? "executed"
+      : globalBreakerApplied
+        ? (globalBreakerReason ?? "global_breaker")
+        : "all_candidates_skipped";
+  return NextResponse.json(
+    {
+      ok: counts.executed > 0,
+      checked: counts.eligibleCount,
+      attemptedTradeIds,
+      skippedTradeIds,
+      executedTradeIds,
+      perTradeResults,
+      globalBreakerApplied,
+      globalBreakerReason: globalBreakerApplied ? globalBreakerReason : null,
+      reason: loopReason,
+      market: { isOpen: marketOpen, timestamp: marketTimestamp },
+      openPositionsCount: brokerTruth.positionsCount,
+      maxOpenPositions: guardConfig.maxOpenPositions,
+      entriesToday: guardSummary.entriesToday,
+      maxEntriesPerDay: guardConfig.maxEntriesPerDay,
+      pendingCount: counts.pendingCount,
+      eligibleCount: counts.eligibleCount,
+      executedCount: counts.executed,
+      carryoverEvaluatedCount: counts.carryoverEvaluatedCount,
+      carryoverExecutedCount: counts.carryoverExecutedCount,
+      carryoverArchivedCount: counts.carryoverArchivedCount,
+      counts,
+      notes: notes.slice(0, 40),
+      guardrails: guardSummary,
+    },
+    { status: 200 }
+  );
 }
