@@ -314,31 +314,65 @@ async function tryRescoreTrade(trade: any) {
   };
 }
 
+type PriceDriftDiagnostics = {
+  entryPrice: number;
+  currentPrice: number;
+  drift: number;
+  driftPct: number;
+  R: number;
+  driftInR: number;
+  driftAllowed: boolean;
+  /** Non-null when execution can still proceed with an adjusted entry. */
+  adjustedEntryPrice: number | null;
+  reason: string | null;
+};
+
 /**
- * Check if entry price has drifted too much from decision price.
- * Returns rejection reason if drifted, null if acceptable.
+ * Evaluates price drift using R-based tolerance only.
+ *
+ * Rules:
+ *   - Allow if drift <= 0.5R (where R = abs(entryPrice - stopPrice))
+ *   - Also allow if R == 0 / missing data (pass-through)
+ *   - When drift is within tolerance, return an adjustedEntryPrice = currentPrice
+ *     so the caller can slide the entry to the live market price.
  */
 function checkPriceDrift(
-  decisionPrice: number,
+  currentPrice: number,
   entryPrice: number,
   stopPrice: number
-): string | null {
-  if (decisionPrice <= 0 || entryPrice <= 0) return null;
-  
-  const priceDriftPct = Math.abs(decisionPrice - entryPrice) / entryPrice;
-  
-  // Allow 1-2% drift
-  if (priceDriftPct > 0.02) {
-    return "entry_price_drifted_too_much";
+): PriceDriftDiagnostics {
+  const drift = Math.abs(currentPrice - entryPrice);
+  const driftPct = entryPrice > 0 ? drift / entryPrice : 0;
+  const R = Math.abs(entryPrice - stopPrice);
+  const driftInR = R > 0 ? drift / R : 0;
+
+  // Safety passthrough: missing or zero prices
+  if (currentPrice <= 0 || entryPrice <= 0) {
+    return { entryPrice, currentPrice, drift, driftPct, R, driftInR, driftAllowed: true, adjustedEntryPrice: null, reason: null };
   }
-  
-  // Also check if drift exceeds 0.5R risk distance
-  const riskPerShare = Math.abs(entryPrice - stopPrice);
-  if (riskPerShare > 0 && Math.abs(decisionPrice - entryPrice) > 0.5 * riskPerShare) {
-    return "entry_price_drifted_risk_multiple";
+
+  // R invalid (stop == entry) → pass through
+  if (R <= 0) {
+    return { entryPrice, currentPrice, drift, driftPct, R, driftInR, driftAllowed: true, adjustedEntryPrice: null, reason: null };
   }
-  
-  return null;
+
+  // Reject only if drift > 0.5R
+  if (driftInR > 0.5) {
+    return {
+      entryPrice, currentPrice, drift, driftPct, R, driftInR,
+      driftAllowed: false,
+      adjustedEntryPrice: null,
+      reason: "entry_price_drifted_risk_multiple",
+    };
+  }
+
+  // Drift is within tolerance — allow and suggest adjusting entry to currentPrice
+  return {
+    entryPrice, currentPrice, drift, driftPct, R, driftInR,
+    driftAllowed: true,
+    adjustedEntryPrice: Number(currentPrice.toFixed(2)),
+    reason: null,
+  };
 }
 
 /**
@@ -881,7 +915,7 @@ export async function POST(req: Request) {
   const nowForPending = nowIso();
   const maxAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
     ? Math.max(1, Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
-    : 15;
+    : 30;
   const rescoreAfterMin = Number.isFinite(Number(process.env.AUTO_ENTRY_RESCORE_AFTER_MIN))
     ? Math.max(0, Number(process.env.AUTO_ENTRY_RESCORE_AFTER_MIN))
     : 10;
@@ -978,6 +1012,7 @@ export async function POST(req: Request) {
       if (!eligibility.eligible) {
         if (eligibility.reason === "stale_trade") {
           const _staleAgeMs = Math.round(eligibility.ageMin * 60_000);
+          const _staleThresholdMs = maxAgeMin * 60_000;
           trades[item.i] = {
             ...trades[item.i],
             status: "ARCHIVED",
@@ -991,7 +1026,7 @@ export async function POST(req: Request) {
             executeOutcome: "SKIPPED_EXPIRED",
             executeReason: "stale_trade",
             pendingAgeMs: _staleAgeMs,
-            staleThresholdUsedMs: maxAgeMin * 60_000,
+            staleThresholdUsedMs: _staleThresholdMs,
             seededToExecuteDelayMs: _staleAgeMs,
           };
           counts.staleArchived += 1;
@@ -1187,8 +1222,8 @@ export async function POST(req: Request) {
             ? (carryoverQuote.bid + carryoverQuote.ask) / 2
             : null);
         if (currentPrice && currentPrice > 0) {
-          const driftReason = checkPriceDrift(currentPrice, safeNum(item.t.entryPrice, 0), safeNum(item.t.stopPrice, 0));
-          if (driftReason) {
+          const driftDiag = checkPriceDrift(currentPrice, safeNum(item.t.entryPrice, 0), safeNum(item.t.stopPrice, 0));
+          if (!driftDiag.driftAllowed) {
             trades[item.i] = {
               ...trades[item.i],
               status: "ARCHIVED",
@@ -1199,7 +1234,8 @@ export async function POST(req: Request) {
               updatedAt: nowForPending,
               executeAttemptedAt: nowForPending,
               executeOutcome: "SKIPPED_PRICE_DRIFT",
-              executeReason: driftReason,
+              executeReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple",
+              driftDiagnostics: driftDiag,
             };
             counts.carryoverArchivedCount += 1;
             counts.skipped += 1;
@@ -2112,7 +2148,7 @@ export async function POST(req: Request) {
   const tradeId = String(trade.id || "");
   if (!tradeId) return NextResponse.json({ ok: false, error: "trade missing id" }, { status: 400 });
 
-  const entryPrice = safeNum(trade.entryPrice, 0);
+  let entryPrice = safeNum(trade.entryPrice, 0);
   const stopPrice = safeNum(trade.stopPrice, 0);
   const targetPriceRaw = safeNum(trade.takeProfitPrice ?? trade.targetPrice, 0);
   const targetPrice = targetPriceRaw > 0 ? targetPriceRaw : null;
@@ -2316,22 +2352,25 @@ export async function POST(req: Request) {
       ? decision.decisionPrice
       : null;
 
-  // Price drift guard: if the live market has moved too far from the planned entry,
-  // skip this trade. Do NOT recalculate and place at the wrong price.
+  // Price drift guard: only reject if drift > 0.5R from planned entry.
+  // When within tolerance, slide entryPrice to current market price.
+  let driftDiagnosticsForExec: PriceDriftDiagnostics | null = null;
   if (decisionPriceForDrift) {
-    const driftReason = checkPriceDrift(decisionPriceForDrift, entryPrice, stopPrice);
-    if (driftReason) {
+    const driftDiag = checkPriceDrift(decisionPriceForDrift, entryPrice, stopPrice);
+    driftDiagnosticsForExec = driftDiag;
+    if (!driftDiag.driftAllowed) {
       counts.skipped += 1;
-      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: driftReason, executeOutcome: "SKIPPED_PRICE_DRIFT", executeReason: driftReason, updatedAt: nowIso() };
+      trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeSkipReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", executeOutcome: "SKIPPED_PRICE_DRIFT", executeReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", updatedAt: nowIso() };
       await writeTrades(trades);
-      await recordOutcome({ outcome: "SKIP", reason: driftReason, ticker, tradeId });
+      await recordOutcome({ outcome: "SKIP", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", ticker, tradeId });
       return NextResponse.json(
         {
           ok: true,
           skipped: true,
-          reason: driftReason,
-          detail: `Live price ${decisionPriceForDrift.toFixed(2)} drifted from planned entry ${entryPrice.toFixed(2)} — order not placed`,
+          reason: driftDiag.reason,
+          detail: `Live price ${decisionPriceForDrift.toFixed(2)} drifted from planned entry ${entryPrice.toFixed(2)} by ${(driftDiag.driftInR).toFixed(2)}R (max 0.5R)`,
           tradeId,
+          driftDiagnostics: driftDiag,
           market: { isOpen: marketOpen, timestamp: marketTimestamp },
           counts,
           notes: notes.slice(0, 40),
@@ -2339,6 +2378,10 @@ export async function POST(req: Request) {
         },
         { status: 200 }
       );
+    }
+    // Drift within tolerance — adjust entry to live price to improve fill probability
+    if (driftDiag.adjustedEntryPrice != null && driftDiag.adjustedEntryPrice !== entryPrice) {
+      entryPrice = driftDiag.adjustedEntryPrice;
     }
   }
 
@@ -2395,6 +2438,8 @@ export async function POST(req: Request) {
     tier,
     score,
     replacement: replacementPlan,
+    driftDiagnostics: driftDiagnosticsForExec,
+    staleThresholdMs: maxAgeMin * 60_000,
   };
 
   const lock = await withRedisLock({
