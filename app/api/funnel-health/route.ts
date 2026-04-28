@@ -129,6 +129,15 @@ type FunnelHealthResponse = {
     thresholdMs: number | null;
     overThresholdPct: number | null;
   } | null;
+  /** Execute blocker metrics — present when any pending trades were rejected */
+  executeBlockerMetrics?: {
+    malformedPendingCount: number;
+    rescoreRequiredCount: number;
+    scoreThresholdBlockedCount: number;
+    priceDriftSkippedCount: number;
+    stalePendingCount: number;
+    executeSlaBreached: boolean;
+  };
   error?: string;
   // DEBUG: Temporary field for attribution verification (can be removed later)
   _debug?: {
@@ -182,6 +191,7 @@ function detectIncidents(params: {
   seedSlaBreached: boolean;
   noAutoPendingSkips: number;
   protectionMissingTickers: string[];
+  malformedPendingCount: number;
 }): Incident[] {
   const incidents: Incident[] = [];
   const { 
@@ -197,6 +207,7 @@ function detectIncidents(params: {
     seedSlaBreached,
     noAutoPendingSkips,
     protectionMissingTickers,
+    malformedPendingCount,
   } = params;
 
   // CRITICAL: Protection missing on open trades
@@ -248,13 +259,23 @@ function detectIncidents(params: {
     });
   }
 
+  // EXECUTE_BLOCKER: seeded trades marked malformed/rescore_required at execute time
+  if (marketOpen && seeded > 0 && executed === 0 && malformedPendingCount > 0) {
+    incidents.push({
+      code: "EXECUTE_BLOCKER",
+      severity: "CRITICAL",
+      message: `${seeded} trade(s) seeded but blocked at execute validation: ${malformedPendingCount} marked malformed/rescore_required. Execute payload normalization or eligibility check is rejecting valid seeded trades.`,
+      context: { seeded, executed, malformedPendingCount, remainingPositionSlots },
+    });
+  }
+
   // 3) SEED_NOT_EXECUTED: seeded trades exist but none executed (market open)
   if (seeded > 0 && executed === 0 && marketOpen) {
     incidents.push({
       code: "SEED_NOT_EXECUTED",
-      severity: "MEDIUM",
+      severity: malformedPendingCount > 0 ? "CRITICAL" : "MEDIUM",
       message: `${seeded} trades seeded but 0 executed. Check execute route or broker integration.`,
-      context: { seeded, executed, marketOpen },
+      context: { seeded, executed, marketOpen, malformedPendingCount },
     });
   }
 
@@ -491,6 +512,29 @@ export async function GET() {
 
     // Stale/expired explicit count and timing diagnostics
     const staleExpiredCount = executeSkipReasonBreakdown["SKIPPED_EXPIRED"] ?? 0;
+
+    // Execute blocker metrics — surfaced for ops and agent monitoring
+    const malformedPendingCount = executeSkipReasonBreakdown["MALFORMED"] ?? 0;
+    const rescoreRequiredCount = todayTrades.filter((t: any) =>
+      (t?.source === "AUTO" || t?.source === "auto-entry") &&
+      typeof t?.executeReason === "string" &&
+      (t.executeReason === "rescore_required" || t.executeReason === "rescore_failed")
+    ).length;
+    const scoreThresholdBlockedCount = todayTrades.filter((t: any) =>
+      (t?.source === "AUTO" || t?.source === "auto-entry") &&
+      typeof t?.executeReason === "string" &&
+      (t.executeReason === "score_below_base_tier_threshold" || t.executeReason === "overlay_grade_excluded")
+    ).length;
+    const priceDriftSkippedCount = executeSkipReasonBreakdown["SKIPPED_PRICE_DRIFT"] ?? 0;
+    const stalePendingCount = todayTrades.filter((t: any) =>
+      (t?.source === "AUTO" || t?.source === "auto-entry") &&
+      t?.status === "AUTO_PENDING" &&
+      typeof t?.seededAt === "string" &&
+      Date.now() - Date.parse(t.seededAt) > 30 * 60 * 1000
+    ).length;
+    const executeSlaBreached =
+      marketOpen && seeded > 0 && executed === 0 && (malformedPendingCount > 0 || rescoreRequiredCount > 0);
+
     const staleTimingStats = (() => {
       const staleTrades = todayTrades.filter((t: any) =>
         (t?.source === "AUTO" || t?.source === "auto-entry") &&
@@ -685,6 +729,7 @@ export async function GET() {
       seedSlaBreached,
       noAutoPendingSkips,
       protectionMissingTickers,
+      malformedPendingCount,
     });
 
     // Add lower-severity incident for stale broker/DB mismatch (not live risk)
@@ -851,6 +896,17 @@ export async function GET() {
       ...(protectionDetail ? { protectionDetail } : {}),
       // Skip reason breakdown for seeded-but-not-executed trades (only present when relevant)
       ...(Object.keys(executeSkipReasonBreakdown).length > 0 ? { executeSkipReasonBreakdown } : {}),
+      // Execute blocker metrics — always present during market hours when seeded > 0
+      ...((marketOpen && seeded > 0) || malformedPendingCount > 0 || rescoreRequiredCount > 0 || scoreThresholdBlockedCount > 0 ? {
+        executeBlockerMetrics: {
+          malformedPendingCount,
+          rescoreRequiredCount,
+          scoreThresholdBlockedCount,
+          priceDriftSkippedCount,
+          stalePendingCount,
+          executeSlaBreached,
+        },
+      } : {}),
       // Stale/expired diagnostics
       ...(staleExpiredCount > 0 ? { staleExpiredCount } : {}),
       ...(staleTimingStats ? { staleTimingStats } : {}),

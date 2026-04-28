@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { readTrades, upsertTrade } from "@/lib/tradesStore";
-import { getAutoConfig, tierForScore } from "@/lib/autoEntry/config";
+import { getAutoConfig, tierForScore, riskMultForTier, type AutoTier } from "@/lib/autoEntry/config";
 import { deriveSessionMeta } from "@/lib/autoEntry/eligibility";
 import { getEtDateString, getEtDayBoundsMs } from "@/lib/time/etDate";
 import { readExecutionOverlays } from "@/lib/agents/overlays";
@@ -663,7 +663,9 @@ export async function POST(req: NextRequest) {
       ai: {
         score: c.aiScore,
         tier: c.tier,
-        grade: null as string | null,
+        grade: getStr(c.signal, ["aiGrade", "grade", "ai.grade"]) || null,
+        riskMult: riskMultForTier(c.tier as AutoTier),
+        riskDollars: cfg.baseRiskDollars * riskMultForTier(c.tier as AutoTier),
         qualified: c.aiScore > 0,
         summary: "",
       },

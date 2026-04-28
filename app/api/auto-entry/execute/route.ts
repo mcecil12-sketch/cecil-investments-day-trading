@@ -957,6 +957,53 @@ export async function POST(req: Request) {
       counts.checked += 1;
       const tradeId = String(item.t?.id || "");
       let workingTrade = item.t;
+
+      // ── Normalize payload before eligibility evaluation ──────────────────
+      // Ensure symbol/ticker, aiScore, tier, and ai object are consistent so
+      // that seeds written before this normalization are not mistakenly flagged
+      // as not_scored or missing fields.
+      {
+        const normPatch: Record<string, unknown> = {};
+        const resolvedSymbol = String(workingTrade?.symbol || workingTrade?.ticker || "").toUpperCase();
+        if (resolvedSymbol) {
+          if (!workingTrade?.symbol) normPatch.symbol = resolvedSymbol;
+          if (!workingTrade?.ticker) normPatch.ticker = resolvedSymbol;
+        }
+
+        const rawAiScore = Number(workingTrade?.aiScore);
+        const rawNestedScore = Number(workingTrade?.ai?.score);
+        const resolvedScore =
+          Number.isFinite(rawAiScore) && rawAiScore > 0 ? rawAiScore
+          : Number.isFinite(rawNestedScore) && rawNestedScore > 0 ? rawNestedScore
+          : null;
+
+        if (resolvedScore !== null && !(Number.isFinite(rawAiScore) && rawAiScore > 0)) {
+          normPatch.aiScore = resolvedScore;
+        }
+
+        const rawTier = String(workingTrade?.tier || workingTrade?.ai?.tier || "").trim().toUpperCase();
+        const validTier = rawTier === "A" || rawTier === "B" || rawTier === "C" ? rawTier as "A" | "B" | "C" : null;
+        if (validTier && !workingTrade?.tier) normPatch.tier = validTier;
+
+        const effectiveScore = resolvedScore ?? rawAiScore;
+        if (!workingTrade?.ai && Number.isFinite(effectiveScore) && effectiveScore > 0) {
+          const derivedTier = validTier ?? tierForScore(effectiveScore) ?? "C";
+          normPatch.ai = { score: effectiveScore, tier: derivedTier, grade: workingTrade?.aiGrade ?? null, qualified: effectiveScore > 0 };
+        } else if (workingTrade?.ai && resolvedScore !== null) {
+          const nestedScore = Number(workingTrade?.ai?.score);
+          if (!(Number.isFinite(nestedScore) && nestedScore > 0)) {
+            normPatch.ai = { ...workingTrade.ai, score: resolvedScore };
+          }
+        }
+
+        if (Object.keys(normPatch).length > 0) {
+          workingTrade = { ...workingTrade, ...normPatch };
+          trades[item.i] = { ...trades[item.i], ...normPatch };
+          tradesChanged = true;
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
       let eligibility = evaluatePendingEligibility(workingTrade, nowForPending, eligibilityCfg);
 
       if (!eligibility.eligible && eligibility.requiresRescore) {

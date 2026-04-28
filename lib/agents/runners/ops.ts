@@ -622,6 +622,111 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
     );
   }
 
+  // ------- EXECUTE BLOCKER DETECTION -------
+  // When seeded > 0, executed = 0, and execute marked trades MALFORMED or
+  // SKIPPED_NO_LONGER_ELIGIBLE during market hours, this is a critical engineering
+  // bug — not a data or capacity issue — and warrants an immediate task.
+  {
+    const executeBlockerCount =
+      (funnelDiag.executeSkipReasonBreakdown["MALFORMED"] ?? 0) +
+      (funnelDiag.executeSkipReasonBreakdown["SKIPPED_NO_LONGER_ELIGIBLE"] ?? 0);
+    const shouldEscalateExecuteBlocker =
+      isMarketOpen &&
+      funnelDiag.seeded > 0 &&
+      funnelDiag.executed === 0 &&
+      executeBlockerCount > 0 &&
+      funnelDiag.eligibleCount === 0;
+
+    if (shouldEscalateExecuteBlocker) {
+      const summary = [
+        `seeded=${funnelDiag.seeded}`,
+        `executed=${funnelDiag.executed}`,
+        `eligibleCount=${funnelDiag.eligibleCount}`,
+        `executeBlockerCount=${executeBlockerCount}`,
+        `executeSkipReasonBreakdown=${JSON.stringify(funnelDiag.executeSkipReasonBreakdown)}`,
+      ].join(" ");
+
+      const result = await upsertIncident({
+        severity: "CRITICAL",
+        source: "ops",
+        category: "FUNNEL_BLOCK",
+        title: "Execute is blocking all seeded trades",
+        summary: `CRITICAL: Seeded trades exist but execute validation is rejecting all of them. ${summary}`,
+        notes: [
+          `counts seeded=${funnelDiag.seeded} executed=${funnelDiag.executed} eligibleCount=${funnelDiag.eligibleCount}`,
+          `executeSkipReasonBreakdown=${JSON.stringify(funnelDiag.executeSkipReasonBreakdown)}`,
+          `lastSeedAt=${funnelDiag.lastSeedAt ?? "null"} lastExecuteAt=${funnelDiag.lastExecuteAt ?? "null"}`,
+        ],
+      });
+      if (result.created && !createdIncidentId) createdIncidentId = result.incident.id;
+
+      // Create a concrete engineering task so this is actionable
+      const title = "Fix execute payload validation blocking seeded AUTO_PENDING trades";
+      const existing = await listManualActionTasks({ status: "OPEN", limit: 200 }).catch(() => []);
+      const alreadyOpen = existing.some(
+        (task) => String(task?.title || "").trim().toLowerCase() === title.toLowerCase(),
+      );
+      if (!alreadyOpen) {
+        await createManualActionTask({
+          title,
+          description:
+            "Execute route is rejecting all seeded AUTO_PENDING trades with rescore_required or MALFORMED. " +
+            "Seeded trades carrying a valid aiScore and tier must not require a second AI rescore at execute time. " +
+            "Fix: ensure per-trade normalization (symbol/ticker/aiScore/tier cross-population) runs before eligibility evaluation, " +
+            "and that isScoredTrade/rescoreAfterMin gate honours existing seed-validated scores.",
+          priority: "CRITICAL",
+          taskType: "BUGFIX",
+          executionReady: true,
+          source: "ops_execute_blocker",
+          objective: [
+            `seeded=${funnelDiag.seeded} executed=${funnelDiag.executed} eligibleCount=${funnelDiag.eligibleCount}`,
+            `executeSkipReasonBreakdown=${JSON.stringify(funnelDiag.executeSkipReasonBreakdown)}`,
+          ].join(" | "),
+          fileHints: [
+            "app/api/auto-entry/execute/route.ts",
+            "lib/autoEntry/eligibility.ts",
+            "app/api/auto-entry/seed-from-signals/route.ts",
+          ],
+          routeHints: [
+            "/api/auto-entry/execute",
+            "/api/auto-entry/seed-from-signals",
+            "/api/funnel-health",
+          ],
+          acceptanceCriteria: [
+            "A seeded AUTO_PENDING trade with aiScore > 0 and tier set is not rejected as rescore_required.",
+            "Execute eligibleCount > 0 when pendingCount > 0 and seeded trades are fresh and valid.",
+            "seededToExecuted conversion rate rises above 0 during market hours.",
+          ],
+        }).catch(() => null);
+      }
+
+      await appendAgentAction({
+        id: crypto.randomUUID(),
+        createdAt: now,
+        agent: "ops",
+        actionType: "INCIDENT_ESCALATED",
+        status: "APPLIED",
+        summary: `Escalated CRITICAL execute blocker: all ${funnelDiag.seeded} seeded trades rejected at execute validation. ${summary}`,
+        metadata: {
+          category: "FUNNEL_BLOCK",
+          severity: "CRITICAL",
+          executeBlockerCount,
+          counts: {
+            seeded: funnelDiag.seeded,
+            executed: funnelDiag.executed,
+            eligibleCount: funnelDiag.eligibleCount,
+          },
+          executeSkipReasonBreakdown: funnelDiag.executeSkipReasonBreakdown,
+        },
+      });
+    } else {
+      await resolveIncident(
+        { category: "FUNNEL_BLOCK", title: "Execute is blocking all seeded trades" },
+        `Execute blocker cleared: seeded=${funnelDiag.seeded} executed=${funnelDiag.executed} eligibleCount=${funnelDiag.eligibleCount} executeBlockerCount=${executeBlockerCount}.`,
+      );
+    }
+  }
+
   let brokerSyncIncidentId: string | null = null;
   if (telemetry.openTradeMismatch) {
     const result = await upsertIncident({

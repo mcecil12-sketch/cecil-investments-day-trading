@@ -206,14 +206,25 @@ export function evaluatePendingEligibility(
   }
 
   if (cfg.rescoreAfterMin > 0 && ageMin > cfg.rescoreAfterMin) {
-    return {
-      eligible: false,
-      reason: "rescore_required",
-      ageMin,
-      etDate,
-      sessionTag,
-      requiresRescore: true,
-    };
+    // Skip the rescore gate for trades already fully scored by seed-from-signals.
+    // If the trade carries a positive aiScore and a canonical tier (A/B/C), the seed
+    // decision is authoritative: do not require a second AI call at execute time.
+    const existingScore = Number(trade?.aiScore ?? trade?.ai?.score ?? 0);
+    const existingTier = String(trade?.tier ?? trade?.ai?.tier ?? "").trim().toUpperCase();
+    const fullyScored =
+      Number.isFinite(existingScore) &&
+      existingScore > 0 &&
+      (existingTier === "A" || existingTier === "B" || existingTier === "C");
+    if (!fullyScored) {
+      return {
+        eligible: false,
+        reason: "rescore_required",
+        ageMin,
+        etDate,
+        sessionTag,
+        requiresRescore: true,
+      };
+    }
   }
 
   return {
