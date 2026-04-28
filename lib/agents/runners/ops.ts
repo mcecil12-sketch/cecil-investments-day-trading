@@ -629,7 +629,8 @@ export async function runOpsAgent(): Promise<AgentRunnerResult> {
   {
     const executeBlockerCount =
       (funnelDiag.executeSkipReasonBreakdown["MALFORMED"] ?? 0) +
-      (funnelDiag.executeSkipReasonBreakdown["SKIPPED_NO_LONGER_ELIGIBLE"] ?? 0);
+      (funnelDiag.executeSkipReasonBreakdown["SKIPPED_NO_LONGER_ELIGIBLE"] ?? 0) +
+      (funnelDiag.executeSkipReasonBreakdown["SKIPPED_SCORE_THRESHOLD"] ?? 0);
     const shouldEscalateExecuteBlocker =
       isMarketOpen &&
       funnelDiag.seeded > 0 &&

@@ -99,7 +99,11 @@ import {
   deriveSessionMeta,
   evaluatePendingEligibility,
   getTradeTimestamp,
+  getTradeAgeMin,
+  getTradeEtDate,
+  getTradeSessionTag,
   type EligibilityConfig,
+  type EligibilityResult,
 } from "@/lib/autoEntry/eligibility";
 import { scoreSignalWithAI } from "@/lib/aiScoring";
 import { evaluateBreakerTransition } from "@/lib/autoEntry/breaker";
@@ -248,6 +252,63 @@ function hasValidPendingRisk(trade: any) {
     if (takeProfitPrice >= entryPrice) return false;
   }
   return true;
+}
+
+/**
+ * Normalizes an AUTO_PENDING trade payload before eligibility/rescore evaluation.
+ *
+ * Returns a `isExecutionPayloadComplete` flag. When `true`, the trade carries
+ * all required execution fields and must NOT be routed through the AI rescore
+ * path or marked as rescore_required/MALFORMED. Any block at that point must
+ * use an explicit, actionable reason (score_threshold, stale_trade, etc.).
+ */
+function normalizeExecutionCandidate(trade: any): {
+  symbol: string;
+  ticker: string;
+  side: string;
+  aiScore: number | null;
+  tier: "A" | "B" | "C" | null;
+  entryPrice: number;
+  stopPrice: number;
+  targetPrice: number;
+  isExecutionPayloadComplete: boolean;
+  missingFields: string[];
+} {
+  const symbol = String(trade?.symbol || trade?.ticker || "").toUpperCase();
+  const side = String(trade?.side || "").toUpperCase();
+
+  const rawScore = Number(trade?.aiScore ?? trade?.ai?.score ?? 0);
+  const aiScore = Number.isFinite(rawScore) && rawScore > 0 ? rawScore : null;
+
+  const rawTier = String(trade?.tier ?? trade?.ai?.tier ?? "").trim().toUpperCase();
+  const storedTier = (rawTier === "A" || rawTier === "B" || rawTier === "C") ? rawTier as "A" | "B" | "C" : null;
+  const derivedTier = storedTier ?? (aiScore !== null ? tierForScore(aiScore) : null);
+
+  const entryPrice = safeNum(trade?.entryPrice, 0);
+  const stopPrice = safeNum(trade?.stopPrice, 0);
+  const targetPrice = safeNum(trade?.takeProfitPrice ?? trade?.targetPrice, 0);
+
+  const missingFields: string[] = [];
+  if (!symbol) missingFields.push("symbol");
+  if (side !== "LONG" && side !== "SHORT") missingFields.push("side");
+  if (aiScore === null) missingFields.push("aiScore");
+  if (derivedTier === null) missingFields.push("tier");
+  if (!(entryPrice > 0)) missingFields.push("entryPrice");
+  if (!(stopPrice > 0)) missingFields.push("stopPrice");
+  if (!(targetPrice > 0)) missingFields.push("targetPrice");
+
+  return {
+    symbol,
+    ticker: symbol,
+    side,
+    aiScore,
+    tier: derivedTier,
+    entryPrice,
+    stopPrice,
+    targetPrice,
+    isExecutionPayloadComplete: missingFields.length === 0,
+    missingFields,
+  };
 }
 
 function byNewestCreatedAtDesc(a: any, b: any) {
@@ -958,44 +1019,24 @@ export async function POST(req: Request) {
       const tradeId = String(item.t?.id || "");
       let workingTrade = item.t;
 
-      // ── Normalize payload before eligibility evaluation ──────────────────
-      // Ensure symbol/ticker, aiScore, tier, and ai object are consistent so
-      // that seeds written before this normalization are not mistakenly flagged
-      // as not_scored or missing fields.
+      // ── Normalize payload ────────────────────────────────────────────────
+      const norm = normalizeExecutionCandidate(workingTrade);
       {
         const normPatch: Record<string, unknown> = {};
-        const resolvedSymbol = String(workingTrade?.symbol || workingTrade?.ticker || "").toUpperCase();
-        if (resolvedSymbol) {
-          if (!workingTrade?.symbol) normPatch.symbol = resolvedSymbol;
-          if (!workingTrade?.ticker) normPatch.ticker = resolvedSymbol;
+        if (norm.symbol && !workingTrade?.symbol) normPatch.symbol = norm.symbol;
+        if (norm.symbol && !workingTrade?.ticker) normPatch.ticker = norm.symbol;
+        if (norm.aiScore !== null && !(Number.isFinite(Number(workingTrade?.aiScore)) && Number(workingTrade?.aiScore) > 0)) {
+          normPatch.aiScore = norm.aiScore;
         }
-
-        const rawAiScore = Number(workingTrade?.aiScore);
-        const rawNestedScore = Number(workingTrade?.ai?.score);
-        const resolvedScore =
-          Number.isFinite(rawAiScore) && rawAiScore > 0 ? rawAiScore
-          : Number.isFinite(rawNestedScore) && rawNestedScore > 0 ? rawNestedScore
-          : null;
-
-        if (resolvedScore !== null && !(Number.isFinite(rawAiScore) && rawAiScore > 0)) {
-          normPatch.aiScore = resolvedScore;
-        }
-
-        const rawTier = String(workingTrade?.tier || workingTrade?.ai?.tier || "").trim().toUpperCase();
-        const validTier = rawTier === "A" || rawTier === "B" || rawTier === "C" ? rawTier as "A" | "B" | "C" : null;
-        if (validTier && !workingTrade?.tier) normPatch.tier = validTier;
-
-        const effectiveScore = resolvedScore ?? rawAiScore;
-        if (!workingTrade?.ai && Number.isFinite(effectiveScore) && effectiveScore > 0) {
-          const derivedTier = validTier ?? tierForScore(effectiveScore) ?? "C";
-          normPatch.ai = { score: effectiveScore, tier: derivedTier, grade: workingTrade?.aiGrade ?? null, qualified: effectiveScore > 0 };
-        } else if (workingTrade?.ai && resolvedScore !== null) {
+        if (norm.tier && !workingTrade?.tier) normPatch.tier = norm.tier;
+        if (!workingTrade?.ai && norm.aiScore !== null) {
+          normPatch.ai = { score: norm.aiScore, tier: norm.tier ?? "C", grade: workingTrade?.aiGrade ?? null, qualified: true };
+        } else if (workingTrade?.ai && norm.aiScore !== null) {
           const nestedScore = Number(workingTrade?.ai?.score);
           if (!(Number.isFinite(nestedScore) && nestedScore > 0)) {
-            normPatch.ai = { ...workingTrade.ai, score: resolvedScore };
+            normPatch.ai = { ...workingTrade.ai, score: norm.aiScore };
           }
         }
-
         if (Object.keys(normPatch).length > 0) {
           workingTrade = { ...workingTrade, ...normPatch };
           trades[item.i] = { ...trades[item.i], ...normPatch };
@@ -1004,12 +1045,59 @@ export async function POST(req: Request) {
       }
       // ─────────────────────────────────────────────────────────────────────
 
-      let eligibility = evaluatePendingEligibility(workingTrade, nowForPending, eligibilityCfg);
+      // ── Eligibility: two-path ─────────────────────────────────────────────
+      // Complete trades (have score + tier + prices + side) bypass the AI
+      // rescore gate entirely. Only stale/carryover checks apply to them.
+      // Incomplete trades go through the full evaluatePendingEligibility path.
+      let eligibility: EligibilityResult;
 
-      if (!eligibility.eligible && eligibility.requiresRescore) {
-        try {
-          const rescored = await tryRescoreTrade(workingTrade);
-          if (!rescored.ok) {
+      if (norm.isExecutionPayloadComplete) {
+        const ageMin = getTradeAgeMin(workingTrade, nowForPending);
+        const etDate = getTradeEtDate(workingTrade);
+        const sessionTag = getTradeSessionTag(workingTrade);
+        if (!Number.isFinite(ageMin) || ageMin > maxAgeMin) {
+          eligibility = { eligible: false, reason: "stale_trade", ageMin: Number.isFinite(ageMin) ? ageMin : Number.POSITIVE_INFINITY, etDate, sessionTag, requiresRescore: false };
+        } else if (
+          blockCarryover &&
+          (!etDate || etDate !== eligibilityCfg.todayET ||
+            (!marketOpen && sessionTag !== eligibilityCfg.currentSessionTag))
+        ) {
+          eligibility = { eligible: false, reason: "carryover_session", ageMin, etDate, sessionTag, requiresRescore: false };
+        } else {
+          eligibility = { eligible: true, reason: "eligible", ageMin, etDate, sessionTag, requiresRescore: false };
+        }
+      } else {
+        // Payload is incomplete — run full eligibility (may trigger rescore for unscored trades)
+        eligibility = evaluatePendingEligibility(workingTrade, nowForPending, eligibilityCfg);
+
+        if (!eligibility.eligible && eligibility.requiresRescore) {
+          try {
+            const rescored = await tryRescoreTrade(workingTrade);
+            if (!rescored.ok) {
+              trades[item.i] = {
+                ...trades[item.i],
+                status: "ERROR",
+                autoEntryStatus: "AUTO_ERROR",
+                reason: "rescore_failed",
+                error: "rescore_failed",
+                updatedAt: nowForPending,
+                rescoredAt: nowForPending,
+                executeAttemptedAt: nowForPending,
+                executeOutcome: "MALFORMED",
+                executeReason: "rescore_failed",
+              };
+              counts.invalidMarked += 1;
+              counts.skipped += 1;
+              tradesChanged = true;
+              processed.add(item.i);
+              notes.push(`rescore_failed:${ticker}:${tradeId || "unknown"}`);
+              continue;
+            }
+            workingTrade = { ...workingTrade, ...rescored.patch };
+            trades[item.i] = { ...trades[item.i], ...rescored.patch };
+            tradesChanged = true;
+            eligibility = evaluatePendingEligibility(workingTrade, nowForPending, eligibilityCfg);
+          } catch {
             trades[item.i] = {
               ...trades[item.i],
               status: "ERROR",
@@ -1029,31 +1117,9 @@ export async function POST(req: Request) {
             notes.push(`rescore_failed:${ticker}:${tradeId || "unknown"}`);
             continue;
           }
-          workingTrade = { ...workingTrade, ...rescored.patch };
-          trades[item.i] = { ...trades[item.i], ...rescored.patch };
-          tradesChanged = true;
-          eligibility = evaluatePendingEligibility(workingTrade, nowForPending, eligibilityCfg);
-        } catch {
-          trades[item.i] = {
-            ...trades[item.i],
-            status: "ERROR",
-            autoEntryStatus: "AUTO_ERROR",
-            reason: "rescore_failed",
-            error: "rescore_failed",
-            updatedAt: nowForPending,
-            rescoredAt: nowForPending,
-            executeAttemptedAt: nowForPending,
-            executeOutcome: "MALFORMED",
-            executeReason: "rescore_failed",
-          };
-          counts.invalidMarked += 1;
-          counts.skipped += 1;
-          tradesChanged = true;
-          processed.add(item.i);
-          notes.push(`rescore_failed:${ticker}:${tradeId || "unknown"}`);
-          continue;
         }
       }
+      // ─────────────────────────────────────────────────────────────────────
 
 
       if (!eligibility.eligible) {
@@ -1943,11 +2009,11 @@ export async function POST(req: Request) {
 
     if (tradeScore != null && isScoreBelowAdjustedThreshold(thresholdDiagnostics)) {
         counts.skipped += 1;
-        trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "score_below_base_tier_threshold", updatedAt: nowIso() };
+        trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_SCORE_THRESHOLD", executeReason: "score_threshold", updatedAt: nowIso() };
         await writeTrades(trades);
         await recordOutcome({
           outcome: "SKIP",
-          reason: "score_below_base_tier_threshold",
+          reason: "score_threshold",
           ticker,
           tradeId: String(trade?.id || ""),
           detail: `score ${tradeScore} < base tier threshold ${thresholdDiagnostics.baseTierThreshold} for stored tier ${tradeTier} (overlay ${thresholdDiagnostics.overlayMinScoreAdjustment} ignoredAtExecute=${thresholdDiagnostics.overlayMinScoreAdjustmentIgnoredAtExecute}; adaptive ${thresholdDiagnostics.adaptiveMinScoreAdjustment} ignoredAtExecute=${thresholdDiagnostics.adaptiveMinScoreAdjustmentIgnoredAtExecute}; source ${thresholdDiagnostics.thresholdSource})`,
@@ -1956,7 +2022,7 @@ export async function POST(req: Request) {
           {
             ok: true,
             skipped: true,
-            reason: "score_below_base_tier_threshold",
+            reason: "score_threshold",
             detail: `score ${tradeScore} < base tier threshold ${thresholdDiagnostics.baseTierThreshold} for stored tier ${tradeTier}`,
             market: { isOpen: marketOpen, timestamp: marketTimestamp },
             openPositionsCount: brokerTruth.positionsCount,

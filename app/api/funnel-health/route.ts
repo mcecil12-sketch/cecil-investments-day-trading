@@ -523,7 +523,7 @@ export async function GET() {
     const scoreThresholdBlockedCount = todayTrades.filter((t: any) =>
       (t?.source === "AUTO" || t?.source === "auto-entry") &&
       typeof t?.executeReason === "string" &&
-      (t.executeReason === "score_below_base_tier_threshold" || t.executeReason === "overlay_grade_excluded")
+      (t.executeReason === "score_threshold" || t.executeReason === "score_below_base_tier_threshold" || t.executeReason === "overlay_grade_excluded")
     ).length;
     const priceDriftSkippedCount = executeSkipReasonBreakdown["SKIPPED_PRICE_DRIFT"] ?? 0;
     const stalePendingCount = todayTrades.filter((t: any) =>
