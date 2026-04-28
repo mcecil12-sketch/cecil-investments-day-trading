@@ -1841,6 +1841,7 @@ export async function POST(req: Request) {
       allowedGrades: overlay.allowedGrades,
       overlayMinScoreAdjustment: overlay.minScoreAdjustment,
       adaptiveMinScoreAdjustment: adaptiveScoreAdj,
+      honorSeedDecisionAtExecute: true,
       thresholdConfig: {
         tierAmin: autoConfig.tierAmin,
         tierBmin: autoConfig.tierBmin,
@@ -1895,21 +1896,21 @@ export async function POST(req: Request) {
 
     if (tradeScore != null && isScoreBelowAdjustedThreshold(thresholdDiagnostics)) {
         counts.skipped += 1;
-        trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "overlay_score_below_adjusted_threshold", updatedAt: nowIso() };
+        trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "score_below_base_tier_threshold", updatedAt: nowIso() };
         await writeTrades(trades);
         await recordOutcome({
           outcome: "SKIP",
-          reason: "overlay_score_below_adjusted_threshold",
+          reason: "score_below_base_tier_threshold",
           ticker,
           tradeId: String(trade?.id || ""),
-          detail: `score ${tradeScore} < adjusted threshold ${thresholdDiagnostics.adjustedThreshold} (base ${thresholdDiagnostics.baseTierThreshold} + overlay ${thresholdDiagnostics.overlayMinScoreAdjustment} + adaptive ${thresholdDiagnostics.adaptiveMinScoreAdjustment}; source ${thresholdDiagnostics.thresholdSource})`,
+          detail: `score ${tradeScore} < base tier threshold ${thresholdDiagnostics.baseTierThreshold} for stored tier ${tradeTier} (overlay ${thresholdDiagnostics.overlayMinScoreAdjustment} ignoredAtExecute=${thresholdDiagnostics.overlayMinScoreAdjustmentIgnoredAtExecute}; adaptive ${thresholdDiagnostics.adaptiveMinScoreAdjustment} ignoredAtExecute=${thresholdDiagnostics.adaptiveMinScoreAdjustmentIgnoredAtExecute}; source ${thresholdDiagnostics.thresholdSource})`,
         });
         return NextResponse.json(
           {
             ok: true,
             skipped: true,
-            reason: "overlay_score_below_adjusted_threshold",
-            detail: `score ${tradeScore} < adjusted threshold ${thresholdDiagnostics.adjustedThreshold}`,
+            reason: "score_below_base_tier_threshold",
+            detail: `score ${tradeScore} < base tier threshold ${thresholdDiagnostics.baseTierThreshold} for stored tier ${tradeTier}`,
             market: { isOpen: marketOpen, timestamp: marketTimestamp },
             openPositionsCount: brokerTruth.positionsCount,
             maxOpenPositions: guardConfig.maxOpenPositions,

@@ -1,6 +1,7 @@
 export type AllowedTier = "A" | "B" | "C";
 
 export type ThresholdSource =
+  | "seed_decision_honored"
   | "seeded_tier"
   | "seeded_grade"
   | "score_inferred"
@@ -11,7 +12,9 @@ export type ThresholdDiagnostics = {
   tier: AllowedTier;
   baseTierThreshold: number;
   overlayMinScoreAdjustment: number;
+  overlayMinScoreAdjustmentIgnoredAtExecute: boolean;
   adaptiveMinScoreAdjustment: number;
+  adaptiveMinScoreAdjustmentIgnoredAtExecute: boolean;
   adjustedThreshold: number;
   allowedGrades: AllowedTier[];
   thresholdSource: ThresholdSource;
@@ -47,6 +50,7 @@ export function resolveThresholdDiagnostics(params: {
   adaptiveMinScoreAdjustment: number;
   thresholdConfig: ThresholdConfig;
   inferTierForScore: (score: number) => AllowedTier | null;
+  honorSeedDecisionAtExecute?: boolean;
 }): ThresholdDiagnostics {
   const aiScore =
     typeof params.trade?.aiScore === "number" && Number.isFinite(params.trade.aiScore)
@@ -73,17 +77,22 @@ export function resolveThresholdDiagnostics(params: {
   const baseTierThreshold = tierBaseThreshold(tier, params.thresholdConfig);
   const overlayMinScoreAdjustment = finiteOr(params.overlayMinScoreAdjustment, 0);
   const adaptiveMinScoreAdjustment = finiteOr(params.adaptiveMinScoreAdjustment, 0);
-  const adjustedThreshold = baseTierThreshold + overlayMinScoreAdjustment + adaptiveMinScoreAdjustment;
+  const honorSeedDecisionAtExecute = params.honorSeedDecisionAtExecute === true;
+  const adjustedThreshold = honorSeedDecisionAtExecute
+    ? baseTierThreshold
+    : baseTierThreshold + overlayMinScoreAdjustment + adaptiveMinScoreAdjustment;
 
   return {
     aiScore,
     tier,
     baseTierThreshold,
     overlayMinScoreAdjustment,
+    overlayMinScoreAdjustmentIgnoredAtExecute: honorSeedDecisionAtExecute,
     adaptiveMinScoreAdjustment,
+    adaptiveMinScoreAdjustmentIgnoredAtExecute: honorSeedDecisionAtExecute,
     adjustedThreshold,
     allowedGrades: Array.isArray(params.allowedGrades) ? params.allowedGrades : ["A", "B", "C"],
-    thresholdSource,
+    thresholdSource: honorSeedDecisionAtExecute ? "seed_decision_honored" : thresholdSource,
   };
 }
 
