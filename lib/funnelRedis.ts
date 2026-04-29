@@ -107,6 +107,9 @@ const NUMERIC_COUNTERS = [
   "executeInvalidMarked",
   "executeStaleArchived",
   "executeDuplicatesArchived",
+  // Execute archive attribution
+  "executeArchivedDrifted",
+  "executeArchivedNoLongerEligible",
 ] as const;
 
 type NumericCounterKey = (typeof NUMERIC_COUNTERS)[number];

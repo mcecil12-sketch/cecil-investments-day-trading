@@ -194,6 +194,8 @@ function detectIncidents(params: {
   malformedPendingCount: number;
   /** Count of AUTO_PENDING trades with no terminal executeOutcome — truly fresh unresolved. */
   freshUnresolvedPendingCount: number;
+  /** Count of AUTO_PENDING trades older than the stale threshold during market hours. */
+  staleActivePendingCount: number;
 }): Incident[] {
   const incidents: Incident[] = [];
   const { 
@@ -211,6 +213,7 @@ function detectIncidents(params: {
     protectionMissingTickers,
     malformedPendingCount,
     freshUnresolvedPendingCount,
+    staleActivePendingCount,
   } = params;
 
   // CRITICAL: Protection missing on open trades
@@ -291,6 +294,18 @@ function detectIncidents(params: {
       severity: "MEDIUM",
       message: `No execution activity for ${minsSinceLastExecute} minutes during market hours.`,
       context: { minsSinceLastExecute, marketOpen },
+    });
+  }
+
+  // 5) STALE_AUTO_PENDING: AUTO_PENDING trades older than stale threshold still present during market hours.
+  // These should have been archived by the execute route's stale check. Indicates execute is not running
+  // or the stale threshold config is missing.
+  if (marketOpen && staleActivePendingCount > 0) {
+    incidents.push({
+      code: "STALE_AUTO_PENDING",
+      severity: "HIGH",
+      message: `${staleActivePendingCount} AUTO_PENDING trade(s) exceeded max pending age during market hours without being archived. Execute stale-check may not be running.`,
+      context: { staleActivePendingCount, marketOpen },
     });
   }
 
@@ -500,22 +515,13 @@ export async function GET() {
       (t?.executeOutcome === "EXECUTED" || Boolean(t?.alpacaOrderId))
     ).length;
 
-    // SEEDED_BUT_NOT_EXECUTED: trades that were evaluated by execute but not placed.
-    // Excludes:
-    //   - trades with alpacaOrderId (went to broker, even if executeOutcome was written wrong)
-    //   - CLOSED/OPEN trades that have executeOutcome=EXECUTED (already counted in executed)
-    //   - ARCHIVED stale trades older than the stale threshold
+    // SEEDED_BUT_NOT_EXECUTED: trades that are genuinely active AUTO_PENDING (not archived/errored/placed).
+    // With the execute route now archiving all skip cases, only legitimately unprocessed
+    // pending trades will have status=AUTO_PENDING and no alpacaOrderId.
     const seededButNotExecuted = todayTrades.filter((t: any) => {
       if (t?.source !== "AUTO" && t?.source !== "auto-entry") return false;
-      if (!t?.executeOutcome) return false;
-      if (t.executeOutcome === "EXECUTED" || t.executeOutcome === "PENDING") return false;
-      // Trades that actually reached the broker should not count as "not executed"
+      if (t?.status !== "AUTO_PENDING") return false;
       if (Boolean(t?.alpacaOrderId) || Boolean(t?.brokerOrderId)) return false;
-      // ARCHIVED stale records older than staleThreshold are historical noise
-      if (t?.status === "ARCHIVED" && t?.seededAt) {
-        const ageMs = Date.now() - Date.parse(t.seededAt);
-        if (ageMs > (t?.staleThresholdUsedMs ?? 30 * 60 * 1000) * 2) return false;
-      }
       return true;
     }).length;
 
@@ -751,6 +757,18 @@ export async function GET() {
       (!t?.executeOutcome || t.executeOutcome === "PENDING")
     ).length;
 
+    // AUTO_PENDING trades older than the stale threshold that should have been archived
+    const staleMaxAgeMs = Number.isFinite(Number(process.env.AUTO_ENTRY_MAX_PENDING_AGE_MS))
+      ? Math.max(10_000, Number(process.env.AUTO_ENTRY_MAX_PENDING_AGE_MS))
+      : 180_000;
+    const staleActivePendingCount = todayTrades.filter((t: any) =>
+      (t?.source === "AUTO" || t?.source === "auto-entry") &&
+      t?.status === "AUTO_PENDING" &&
+      !Boolean(t?.alpacaOrderId) &&
+      typeof t?.createdAt === "string" &&
+      Date.now() - Date.parse(t.createdAt) > staleMaxAgeMs
+    ).length;
+
     const incidents = detectIncidents({
       marketOpen,
       candidates,
@@ -766,6 +784,7 @@ export async function GET() {
       protectionMissingTickers,
       malformedPendingCount,
       freshUnresolvedPendingCount,
+      staleActivePendingCount,
     });
 
     // Add lower-severity incident for stale broker/DB mismatch (not live risk)
@@ -935,6 +954,12 @@ export async function GET() {
       ...(protectionDetail ? { protectionDetail } : {}),
       // Skip reason breakdown for seeded-but-not-executed trades (only present when relevant)
       ...(Object.keys(executeSkipReasonBreakdown).length > 0 ? { executeSkipReasonBreakdown } : {}),
+      // Archive attribution counts — derived from executeSkipReasonBreakdown
+      ...(priceDriftSkippedCount > 0 ? { executeArchivedDrifted: priceDriftSkippedCount } : {}),
+      ...(staleExpiredCount > 0 ? { executeArchivedStale: staleExpiredCount } : {}),
+      ...((executeSkipReasonBreakdown["SKIPPED_NO_LONGER_ELIGIBLE"] ?? 0) > 0
+        ? { executeArchivedNoLongerEligible: executeSkipReasonBreakdown["SKIPPED_NO_LONGER_ELIGIBLE"] }
+        : {}),
       // Execute blocker metrics — always present during market hours when seeded > 0
       ...((marketOpen && seeded > 0) || malformedPendingCount > 0 || rescoreRequiredCount > 0 || scoreThresholdBlockedCount > 0 ? {
         executeBlockerMetrics: {

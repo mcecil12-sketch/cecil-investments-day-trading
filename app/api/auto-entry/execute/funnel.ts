@@ -17,6 +17,9 @@ export type AutoEntryFunnelFields = {
   executeSkippedLiquidity?: number;
   executeSkippedBracketInvalid?: number;
   executeSkippedOther?: number;
+  // Execute archive attribution
+  executeArchivedDrifted?: number;
+  executeArchivedNoLongerEligible?: number;
 };
 
 export function buildAutoEntryFunnelFields(params: AutoEntryFunnelOutcome): AutoEntryFunnelFields {

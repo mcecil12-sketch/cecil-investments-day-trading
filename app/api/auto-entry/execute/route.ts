@@ -182,23 +182,53 @@ async function markTradeValidationSkipped(tradeId: string, reason: string, detai
   const next = trades.map((t: any) => {
     if (t.id !== tradeId) return t;
     updated += 1;
-    const previousSkips = Number(t?.validationSkips ?? 0);
     return {
       ...t,
-      status: "AUTO_PENDING",
-      autoEntryStatus: "AUTO_PENDING",
+      status: "ARCHIVED",
+      autoEntryStatus: "AUTO_ARCHIVED",
       validationStatus: "PAYLOAD_VALIDATION_SKIPPED",
       validationReason: reason,
-      validationSkips: Number.isFinite(previousSkips) ? previousSkips + 1 : 1,
       validationDetails: detail ?? t?.validationDetails,
+      closedAt: t?.closedAt ?? now,
       updatedAt: now,
       executeAttemptedAt: now,
-      executeOutcome: "INVALIDATED",
+      executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE",
       executeReason: reason,
+      seededAt: t?.seededAt ?? t?.createdAt ?? null,
     };
   });
   if (updated) await writeTrades(next);
   return updated;
+}
+
+/**
+ * Centralized helper: archive an AUTO_PENDING trade with a clear outcome/reason.
+ * Always moves the trade out of AUTO_PENDING so it cannot linger or distort execute cycles.
+ * Use outcome "MALFORMED" or "ERROR" only for truly corrupt/unsafe payloads (maps to ERROR status).
+ * All other ineligibility reasons map to ARCHIVED status.
+ */
+function archivePendingTrade(
+  tradeObj: any,
+  reason: string,
+  outcome: string,
+  diagnostics?: Record<string, any>,
+): Record<string, any> {
+  const now = nowIso();
+  const useMalformedStatus = outcome === "MALFORMED" || outcome === "ERROR";
+  return {
+    ...tradeObj,
+    status: useMalformedStatus ? "ERROR" : "ARCHIVED",
+    autoEntryStatus: useMalformedStatus ? "AUTO_ERROR" : "AUTO_ARCHIVED",
+    reason,
+    error: useMalformedStatus ? reason : undefined,
+    closedAt: tradeObj?.closedAt ?? now,
+    updatedAt: now,
+    executeAttemptedAt: tradeObj?.executeAttemptedAt ?? now,
+    executeOutcome: outcome,
+    executeReason: reason,
+    seededAt: tradeObj?.seededAt ?? tradeObj?.createdAt ?? null,
+    ...(diagnostics ?? {}),
+  };
 }
 
 
@@ -978,6 +1008,14 @@ export async function POST(req: Request) {
   const maxAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
     ? Math.max(1, Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
     : 30;
+  // AUTO_ENTRY_MAX_PENDING_AGE_MS: shorter market-hours stale threshold (default 3 min).
+  // When market is open, the effective age cap is the minimum of both thresholds.
+  const maxPendingAgeMs = Number.isFinite(Number(process.env.AUTO_ENTRY_MAX_PENDING_AGE_MS))
+    ? Math.max(10_000, Number(process.env.AUTO_ENTRY_MAX_PENDING_AGE_MS))
+    : 180_000;
+  const effectiveMaxAgeMin = marketOpen
+    ? Math.min(maxAgeMin, maxPendingAgeMs / 60_000)
+    : maxAgeMin;
   const rescoreAfterMin = Number.isFinite(Number(process.env.AUTO_ENTRY_RESCORE_AFTER_MIN))
     ? Math.max(0, Number(process.env.AUTO_ENTRY_RESCORE_AFTER_MIN))
     : 10;
@@ -989,7 +1027,7 @@ export async function POST(req: Request) {
     todayET: sessionMeta.etDate,
     currentSessionTag: sessionMeta.sessionTag,
     marketIsOpen: marketOpen,
-    maxAgeMin,
+    maxAgeMin: effectiveMaxAgeMin,
     rescoreAfterMin,
     blockCarryover,
   };
@@ -1056,7 +1094,7 @@ export async function POST(req: Request) {
         const ageMin = getTradeAgeMin(workingTrade, nowForPending);
         const etDate = getTradeEtDate(workingTrade);
         const sessionTag = getTradeSessionTag(workingTrade);
-        if (!Number.isFinite(ageMin) || ageMin > maxAgeMin) {
+        if (!Number.isFinite(ageMin) || ageMin > effectiveMaxAgeMin) {
           eligibility = { eligible: false, reason: "stale_trade", ageMin: Number.isFinite(ageMin) ? ageMin : Number.POSITIVE_INFINITY, etDate, sessionTag, requiresRescore: false };
         } else if (
           blockCarryover &&
@@ -1126,7 +1164,7 @@ export async function POST(req: Request) {
       if (!eligibility.eligible) {
         if (eligibility.reason === "stale_trade") {
           const _staleAgeMs = Math.round(eligibility.ageMin * 60_000);
-          const _staleThresholdMs = maxAgeMin * 60_000;
+          const _staleThresholdMs = effectiveMaxAgeMin * 60_000;
           trades[item.i] = {
             ...trades[item.i],
             status: "ARCHIVED",
@@ -1949,8 +1987,9 @@ export async function POST(req: Request) {
     const normalizedSide = side === "BUY" ? "LONG" : side === "SELL" ? "SHORT" : side;
     if (suppressedSides.includes(normalizedSide)) {
       counts.skipped += 1;
-      trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeSkipReason: "adaptive_side_suppressed", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "adaptive_side_suppressed", updatedAt: nowIso() });
+      trades[idx] = archivePendingTrade(trades[idx], "adaptive_side_suppressed", "SKIPPED_NO_LONGER_ELIGIBLE");
       await writeTrades(trades);
+      await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
       await recordOutcome({
         outcome: "SKIP",
         reason: "adaptive_side_suppressed",
@@ -1987,8 +2026,9 @@ export async function POST(req: Request) {
 
     if (!gradeAllowed) {
       counts.skipped += 1;
-      trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeSkipReason: "overlay_grade_excluded", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "overlay_grade_excluded", updatedAt: nowIso() });
+      trades[idx] = archivePendingTrade(trades[idx], "overlay_grade_excluded", "SKIPPED_NO_LONGER_ELIGIBLE");
       await writeTrades(trades);
+      await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
       await recordOutcome({
         outcome: "SKIP",
         reason: "overlay_grade_excluded",
@@ -2003,8 +2043,9 @@ export async function POST(req: Request) {
 
     if (tradeScore != null && isScoreBelowAdjustedThreshold(thresholdDiagnostics)) {
         counts.skipped += 1;
-        trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_SCORE_THRESHOLD", executeReason: "score_threshold", updatedAt: nowIso() });
+        trades[idx] = archivePendingTrade(trades[idx], "score_threshold", "SKIPPED_SCORE_THRESHOLD");
         await writeTrades(trades);
+        await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
         await recordOutcome({
           outcome: "SKIP",
           reason: "score_threshold",
@@ -2154,8 +2195,9 @@ export async function POST(req: Request) {
   if (sinceTicker != null && sinceTicker < guardConfig.tickerCooldownMin) {
     const minsRemaining = Math.ceil(guardConfig.tickerCooldownMin - sinceTicker);
     counts.skipped += 1;
-    trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeSkipReason: "ticker_cooldown", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "ticker_cooldown", updatedAt: nowIso() });
+    trades[idx] = archivePendingTrade(trades[idx], "ticker_cooldown", "SKIPPED_NO_LONGER_ELIGIBLE");
     await writeTrades(trades);
+    await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
     await recordOutcome({ outcome: "SKIP", reason: "ticker_cooldown", ticker });
     perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "SKIPPED_NO_LONGER_ELIGIBLE", reason: "ticker_cooldown", aiScore: _tradeAiScore, tier: _tradeTier });
     skippedTradeIds.push(_tradeId);
@@ -2164,9 +2206,11 @@ export async function POST(req: Request) {
 
   const tradeId = String(trade.id || "");
   if (!tradeId) {
+    trades[idx] = archivePendingTrade(trades[idx], "missing_trade_id", "MALFORMED");
+    await writeTrades(trades);
+    counts.skipped += 1;
     perTradeResults.push({ tradeId: _tradeId, symbol: ticker, outcome: "MALFORMED", reason: "missing_trade_id", aiScore: _tradeAiScore, tier: _tradeTier });
     skippedTradeIds.push(_tradeId);
-    counts.skipped += 1;
     continue;
   }
 
@@ -2241,9 +2285,11 @@ export async function POST(req: Request) {
   }
 
   if (!ticker || (side !== "LONG" && side !== "SHORT")) {
+    trades[idx] = archivePendingTrade(trades[idx], "missing_ticker_or_side", "MALFORMED");
+    await writeTrades(trades);
+    counts.skipped += 1;
     perTradeResults.push({ tradeId, symbol: ticker || "unknown", outcome: "MALFORMED", reason: "missing_ticker_or_side", aiScore: _tradeAiScore, tier: _tradeTier });
     skippedTradeIds.push(tradeId);
-    counts.skipped += 1;
     continue;
   }
 
@@ -2251,8 +2297,9 @@ export async function POST(req: Request) {
   const locked = await setnxLock(lockKey, 60 * 10);
   if (!locked) {
     counts.skipped += 1;
-    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "already_locked", updatedAt: nowIso() };
+    trades[idx] = archivePendingTrade(trades[idx], "already_locked", "SKIPPED_NO_LONGER_ELIGIBLE");
     await writeTrades(trades);
+    await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
     await recordOutcome({ outcome: "SKIP", reason: "already_locked", ticker, tradeId });
     perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_NO_LONGER_ELIGIBLE", reason: "already_locked", aiScore: _tradeAiScore, tier: _tradeTier });
     skippedTradeIds.push(tradeId);
@@ -2276,8 +2323,9 @@ export async function POST(req: Request) {
   }
   if (open.orders.length > 0) {
     counts.skipped += 1;
-    trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeSkipReason: "open_order_exists", executeOutcome: "SKIPPED_NO_LONGER_ELIGIBLE", executeReason: "open_order_exists", updatedAt: nowIso() });
+    trades[idx] = archivePendingTrade(trades[idx], "open_order_exists", "SKIPPED_NO_LONGER_ELIGIBLE");
     await writeTrades(trades);
+    await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
     await recordOutcome({ outcome: "SKIP", reason: "open_order_exists", ticker, tradeId });
     perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_NO_LONGER_ELIGIBLE", reason: "open_order_exists", aiScore: _tradeAiScore, tier: _tradeTier });
     skippedTradeIds.push(tradeId);
@@ -2313,8 +2361,14 @@ export async function POST(req: Request) {
     driftDiagnosticsForExec = driftDiag;
     if (!driftDiag.driftAllowed) {
       counts.skipped += 1;
-      trades[idx] = preserveExecutionAttribution(trades[idx], { executeAttemptedAt: nowIso(), executeSkipReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", executeOutcome: "SKIPPED_PRICE_DRIFT", executeReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", updatedAt: nowIso() });
+      trades[idx] = archivePendingTrade(
+        trades[idx],
+        driftDiag.reason ?? "entry_price_drifted_risk_multiple",
+        "SKIPPED_PRICE_DRIFT",
+        { driftDiagnostics: driftDiag },
+      );
       await writeTrades(trades);
+      await bumpAutoEntryFunnelSafe({ executeArchivedDrifted: 1 });
       await recordOutcome({ outcome: "SKIP", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", ticker, tradeId });
       perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_PRICE_DRIFT", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", aiScore: _tradeAiScore, tier: _tradeTier });
       skippedTradeIds.push(tradeId);
@@ -2617,9 +2671,12 @@ export async function POST(req: Request) {
   if (!lock.ok) {
     const lockOutcome = lock.error === "LOCKED" ? "SKIPPED_NO_LONGER_ELIGIBLE" : "ERROR";
     const lockReason = lock.error === "LOCKED" ? "already_locked" : "alpaca_lock_error";
-    trades[idx] = { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: lockOutcome, executeReason: lockReason, updatedAt: nowIso() };
+    trades[idx] = lock.error === "LOCKED"
+      ? archivePendingTrade(trades[idx], lockReason, lockOutcome)
+      : { ...trades[idx], executeAttemptedAt: nowIso(), executeOutcome: lockOutcome, executeReason: lockReason, updatedAt: nowIso() };
     await writeTrades(trades);
     if (lock.error === "LOCKED") {
+      await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
       counts.skipped += 1;
       await recordOutcome({ outcome: "SKIP", reason: "already_locked", ticker, tradeId });
     } else {
