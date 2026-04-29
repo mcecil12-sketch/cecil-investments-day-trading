@@ -111,6 +111,10 @@ export function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
+  if (pathname.startsWith("/api/notifications/audit") && isCronAuthed(req)) {
+    return NextResponse.next();
+  }
+
   if (pathname === "/api/auto-manage/run" && isCronAuthed(req)) {
     return NextResponse.next();
   }
