@@ -43,6 +43,13 @@ export function getAutoConfig() {
 
   const token = autoEnvStr("AUTO_ENTRY_TOKEN", "");
 
+  // C-tier execution quality gates (v2 performance upgrade)
+  const allowCTier = autoEnvBool("AUTO_ENTRY_ALLOW_C_TIER", true);
+  const cMinScore = autoEnvNum("AUTO_ENTRY_C_MIN_SCORE", 6.8);
+  const cMinRelVol = autoEnvNum("AUTO_ENTRY_C_MIN_RELVOL", 1.2);
+  const requireTrendAlignment = autoEnvBool("AUTO_ENTRY_REQUIRE_TREND_ALIGNMENT", true);
+  const cMinRR = autoEnvNum("AUTO_ENTRY_C_MIN_RR", 1.8);
+
   return {
     enabled,
     paperOnly,
@@ -56,6 +63,12 @@ export function getAutoConfig() {
     cutoffMinutesToClose,
     baseRiskDollars,
     token,
+    // C-tier quality gates
+    allowCTier,
+    cMinScore,
+    cMinRelVol,
+    requireTrendAlignment,
+    cMinRR,
   };
 }
 

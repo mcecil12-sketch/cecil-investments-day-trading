@@ -90,6 +90,7 @@ const NUMERIC_COUNTERS = [
   "seedSkippedMissingDirection",
   "seedSkippedMissingPrices",
   "seedSkippedTierDisabled",
+  "seedSkippedCTierQualityBlock",
   // Phase 3c: Short quality tracking
   "shortQualified",
   "shortSeeded",

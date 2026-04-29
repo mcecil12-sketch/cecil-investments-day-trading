@@ -38,5 +38,7 @@ export async function GET(req: Request) {
     range,
     meta: { closedTrades: closed.length },
     ...analytics,
+    // Performance recommendations for adaptive tuning
+    adaptiveRecommendations: analytics.recommendations,
   });
 }

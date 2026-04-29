@@ -113,6 +113,12 @@ function mapSkipReason(raw: string): SeedSkipReason | null {
     case "duplicate_symbol":
     case "overlay_block":
     case "missing_signal_id":
+    // C-tier quality block reasons (v2 performance upgrade)
+    case "c_tier_quality_block":
+    case "flat_trend_block":
+    case "weak_volume_block":
+    case "vwap_alignment_block":
+    case "poor_rr_block":
       return raw;
     default:
       return null;
@@ -223,11 +229,92 @@ function evaluateShortQuality(signal: RawSignal): ShortQualityResult {
 }
 
 // -------------------------------------------------------------------------
+// C-Tier Execution Quality Gate (v2 performance upgrade)
+// -------------------------------------------------------------------------
+
+type CTierQualityResult = {
+  pass: boolean;
+  blockReason: SeedSkipReason | null;
+  debugNote: string;
+};
+
+/**
+ * Evaluate C-tier execution quality gates.
+ * Returns pass=false with a specific blockReason when the signal fails.
+ * A/B tier signals are not evaluated here.
+ */
+function evaluateCTierQuality(
+  signal: RawSignal,
+  aiScore: number,
+  side: "LONG" | "SHORT",
+  cfg: {
+    allowCTier: boolean;
+    cMinScore: number;
+    cMinRelVol: number;
+    requireTrendAlignment: boolean;
+    cMinRR: number;
+  }
+): CTierQualityResult {
+  if (!cfg.allowCTier) {
+    return { pass: false, blockReason: "c_tier_quality_block", debugNote: "AUTO_ENTRY_ALLOW_C_TIER=false" };
+  }
+
+  // Score gate
+  if (aiScore < cfg.cMinScore) {
+    return { pass: false, blockReason: "c_tier_quality_block", debugNote: `score ${aiScore.toFixed(2)} < cMinScore ${cfg.cMinScore}` };
+  }
+
+  // relVol gate
+  const relVol = getNum(signal, ["relVol", "relativeVolume", "context.relVol", "signalContext.relVolume"]);
+  if (relVol != null && relVol < cfg.cMinRelVol) {
+    return { pass: false, blockReason: "weak_volume_block", debugNote: `relVol ${relVol.toFixed(2)} < cMinRelVol ${cfg.cMinRelVol}` };
+  }
+
+  // Trend alignment gate
+  if (cfg.requireTrendAlignment) {
+    const trend = getStr(signal, ["trend", "trendBucket", "context.trend", "signalContext.trend", "ai.trendBucket"]);
+    if (trend) {
+      const tLower = trend.toLowerCase();
+      if (side === "LONG" && (tLower === "flat" || tLower === "down" || tLower === "strong_down" || tLower === "weak_down")) {
+        return { pass: false, blockReason: "flat_trend_block", debugNote: `trend=${trend} incompatible with LONG` };
+      }
+      if (side === "SHORT" && (tLower === "up" || tLower === "strong_up" || tLower === "weak_up")) {
+        return { pass: false, blockReason: "vwap_alignment_block", debugNote: `trend=${trend} incompatible with SHORT` };
+      }
+    }
+    // Also check rejectionTags from scorer
+    const rejectionTags: string[] = Array.isArray((signal as any).rejectionTags) ? (signal as any).rejectionTags : [];
+    if (side === "LONG" && rejectionTags.includes("flat_trend_long")) {
+      return { pass: false, blockReason: "flat_trend_block", debugNote: "rejectionTags includes flat_trend_long" };
+    }
+    if (side === "LONG" && rejectionTags.includes("below_vwap_long") && aiScore < cfg.cMinScore + 0.3) {
+      return { pass: false, blockReason: "vwap_alignment_block", debugNote: `below_vwap_long at marginal C score ${aiScore.toFixed(2)}` };
+    }
+    if (side === "SHORT" && (rejectionTags.includes("poor_short_vwap") || rejectionTags.includes("uptrend_short"))) {
+      return { pass: false, blockReason: "vwap_alignment_block", debugNote: `short rejectionTags: ${rejectionTags.join(",")}` };
+    }
+  }
+
+  // R:R gate
+  const entryPrice = getNum(signal, ["entryPrice", "price"]);
+  const stopPrice = getNum(signal, ["stopPrice"]);
+  const targetPrice = getNum(signal, ["targetPrice", "takeProfitPrice"]);
+  if (entryPrice != null && stopPrice != null && targetPrice != null) {
+    const risk = Math.abs(entryPrice - stopPrice);
+    const reward = Math.abs(targetPrice - entryPrice);
+    if (risk > 0 && reward / risk < cfg.cMinRR) {
+      return { pass: false, blockReason: "poor_rr_block", debugNote: `R:R ${(reward / risk).toFixed(2)} < cMinRR ${cfg.cMinRR}` };
+    }
+  }
+
+  return { pass: true, blockReason: null, debugNote: "passed_c_tier_quality_gate" };
+}
+
+// -------------------------------------------------------------------------
 // Phase 3c: Candidate Deduplication & Ranking
 // -------------------------------------------------------------------------
 
 type QualifiedCandidate = {
-  signal: RawSignal;
   symbol: string;
   side: "LONG" | "SHORT";
   aiScore: number;
@@ -284,11 +371,18 @@ function dedupeCandidates(candidates: QualifiedCandidate[]): {
     collapsedCount += group.length - 1;
   }
 
-  // Final sort: primary by effectiveScore; within 0.3 points, prefer higher actionabilityRank
+  // Final sort: tier-priority first (A > B > C), then effectiveScore, then actionabilityRank, then freshest
+  const tierWeight = (tier: string) => tier === "A" ? 3 : tier === "B" ? 2 : 1;
   unique.sort((a, b) => {
+    const tierDiff = tierWeight(b.tier) - tierWeight(a.tier);
+    if (tierDiff !== 0) return tierDiff;
     const scoreDiff = b.effectiveScore - a.effectiveScore;
     if (Math.abs(scoreDiff) > 0.3) return scoreDiff;
-    return b.actionabilityRank - a.actionabilityRank;
+    // Within same tier+score band: prefer higher actionability then freshest signal
+    const rankDiff = b.actionabilityRank - a.actionabilityRank;
+    if (rankDiff !== 0) return rankDiff;
+    // Freshest first within same tier/score/rank
+    return (b.ageMs ?? Infinity) < (a.ageMs ?? Infinity) ? -1 : 1;
   });
 
   return { unique, collapsedCount };
@@ -636,9 +730,25 @@ export async function POST(req: NextRequest) {
       shortQualified += 1;
     }
 
+    // C-tier execution quality gate (v2 performance upgrade)
+    // A/B tier signals skip this gate entirely and proceed to execution.
+    if (tier === "C") {
+      const cGate = evaluateCTierQuality(s, aiScore as number, side, {
+        allowCTier: cfg.allowCTier,
+        cMinScore: cfg.cMinScore,
+        cMinRelVol: cfg.cMinRelVol,
+        requireTrendAlignment: cfg.requireTrendAlignment,
+        cMinRR: cfg.cMinRR,
+      });
+      if (!cGate.pass) {
+        const blockReason = cGate.blockReason ?? "c_tier_quality_block";
+        markSkip(blockReason);
+        continue;
+      }
+    }
+
     const actionabilityRank = getNum(s, ["actionabilityRank"]) ?? 5;
     allQualifyingCandidates.push({
-      signal: s,
       symbol,
       side,
       aiScore: aiScore as number,
@@ -693,7 +803,7 @@ export async function POST(req: NextRequest) {
 
   for (const c of candidatesToSeed) {
     const sessionMeta = deriveSessionMeta(nowIso);
-    const scoredAt = String(c.signal?.scoredAt || c.signal?.updatedAt || c.createdAt || nowIso);
+    const scoredAt = String(c.createdAt || nowIso);
     const tradeId = crypto.randomUUID();
 
     const trade = {
@@ -719,7 +829,7 @@ export async function POST(req: NextRequest) {
       ai: {
         score: c.aiScore,
         tier: c.tier,
-        grade: getStr(c.signal, ["aiGrade", "grade", "ai.grade"]) || null,
+        grade: null,
         riskMult: riskMultForTier(c.tier as AutoTier),
         riskDollars: cfg.baseRiskDollars * riskMultForTier(c.tier as AutoTier),
         qualified: c.aiScore > 0,
@@ -788,6 +898,12 @@ export async function POST(req: NextRequest) {
   const missingDirectionSkippedCount = skippedByReason.missing_direction ?? 0;
   const missingPricesSkippedCount = skippedByReason.missing_prices ?? 0;
   const overlayGradeSkippedCount = skippedByReason.overlay_block ?? 0;
+  const cTierQualityBlockCount =
+    (skippedByReason.c_tier_quality_block ?? 0) +
+    (skippedByReason.flat_trend_block ?? 0) +
+    (skippedByReason.weak_volume_block ?? 0) +
+    (skippedByReason.vwap_alignment_block ?? 0) +
+    (skippedByReason.poor_rr_block ?? 0);
 
   await bumpTodayFunnel({
     seedFromQualifiedLong: seededLong,
@@ -809,6 +925,7 @@ export async function POST(req: NextRequest) {
     seedSkippedMissingDirection: missingDirectionSkippedCount,
     seedSkippedMissingPrices: missingPricesSkippedCount,
     seedSkippedTierDisabled: 0,
+    seedSkippedCTierQualityBlock: cTierQualityBlockCount,
     seedSkippedOther: (skippedByReason.market_closed ?? 0) + (skippedByReason.stale_signal ?? 0),
   });
 
@@ -827,7 +944,17 @@ export async function POST(req: NextRequest) {
 
   let funnelBlockIncident: { created: boolean; incidentId: string } | null = null;
   const createdCount = dryRun ? 0 : created.length;
-  const shouldRaiseFunnelBlock = marketOpen && freshQualifiedSignals > 0 && createdCount === 0;
+
+  // Distinguish QUALITY_FILTERING (intentional gates) from TRUE_EXECUTION_BLOCK (system broken)
+  // Only raise CRITICAL incident when ALL skips are NOT quality gates — meaning a real system issue.
+  const qualityFilteredAllSkips =
+    freshQualifiedSignals > 0 &&
+    createdCount === 0 &&
+    cTierQualityBlockCount + (skippedByReason.below_threshold ?? 0) >= freshQualifiedSignals;
+
+  const shouldRaiseFunnelBlock =
+    marketOpen && freshQualifiedSignals > 0 && createdCount === 0 && !qualityFilteredAllSkips;
+
   if (shouldRaiseFunnelBlock) {
     const skipDetails = skippedQualifiedSignals.slice(0, 25).map((s) =>
       `${s.symbol}:${s.signalId}:${s.reason}${s.ageMs != null ? `:${s.ageMs}ms` : ""}`
@@ -837,15 +964,22 @@ export async function POST(req: NextRequest) {
       source: "ops",
       category: "FUNNEL_BLOCK",
       title: "Fresh qualified signals not seeded",
-      summary: `marketOpen=true freshQualifiedSignals=${freshQualifiedSignals} createdCount=${createdCount} staleQualifiedSignals=${staleQualifiedSignals}`,
+      summary: `marketOpen=true freshQualifiedSignals=${freshQualifiedSignals} createdCount=${createdCount} staleQualifiedSignals=${staleQualifiedSignals} incidentType=TRUE_EXECUTION_BLOCK`,
       notes: [
         `runId=${runId}`,
         `source=${runSource}`,
         `skipReasonCounts=${JSON.stringify(skippedByReason)}`,
         `skippedQualifiedSignals=${JSON.stringify(skipDetails)}`,
+        `recommendedAction=Check seed route auth, capacity, and overlay config. A/B-tier signals should not be blocked.`,
       ],
     });
     funnelBlockIncident = { created: result.created, incidentId: result.incident.id };
+  } else if (qualityFilteredAllSkips) {
+    // Quality filtering is working as intended — resolve any stale FUNNEL_BLOCK incident
+    await resolveIncident(
+      { category: "FUNNEL_BLOCK", title: "Fresh qualified signals not seeded" },
+      `Quality filtering active: cTierQualityBlockCount=${cTierQualityBlockCount} qualifiedSignals=${freshQualifiedSignals} — no true execution block detected.`,
+    );
   } else {
     await resolveIncident(
       { category: "FUNNEL_BLOCK", title: "Fresh qualified signals not seeded" },
@@ -929,6 +1063,23 @@ export async function POST(req: NextRequest) {
     shortQualified,
     shortSkippedWeakStructure,
     skipReasonCounts: skippedByReason,
+    // C-tier quality gate debug counts
+    cTierQualityBlockCount,
+    cTierQualityGateConfig: {
+      allowCTier: cfg.allowCTier,
+      cMinScore: cfg.cMinScore,
+      cMinRelVol: cfg.cMinRelVol,
+      requireTrendAlignment: cfg.requireTrendAlignment,
+      cMinRR: cfg.cMinRR,
+    },
+    // Funnel intent classification
+    funnelIntent: qualityFilteredAllSkips
+      ? "QUALITY_FILTERING"
+      : createdCount > 0
+      ? "SEEDED"
+      : freshQualifiedSignals === 0
+      ? "NO_FRESH_SIGNALS"
+      : "SYSTEM_ISSUE",
     skippedQualifiedSignals: skippedQualifiedSignals.slice(0, 250),
     qualifiedSignalAges: qualifiedSignalAges.slice(0, 250),
     perSignalAgeMs: qualifiedSignalAges.slice(0, 250),

@@ -2043,7 +2043,16 @@ export async function POST(req: Request) {
 
     if (tradeScore != null && isScoreBelowAdjustedThreshold(thresholdDiagnostics)) {
         counts.skipped += 1;
-        trades[idx] = archivePendingTrade(trades[idx], "score_threshold", "SKIPPED_SCORE_THRESHOLD");
+        trades[idx] = archivePendingTrade(trades[idx], "score_threshold", "SKIPPED_SCORE_THRESHOLD", {
+          thresholdDiagnostics: {
+            tier: thresholdDiagnostics.tier,
+            aiScore: thresholdDiagnostics.aiScore,
+            baseTierThreshold: thresholdDiagnostics.baseTierThreshold,
+            adjustedThreshold: thresholdDiagnostics.adjustedThreshold,
+            thresholdSource: thresholdDiagnostics.thresholdSource,
+            allowedReason: "score_below_threshold",
+          },
+        });
         await writeTrades(trades);
         await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
         await recordOutcome({

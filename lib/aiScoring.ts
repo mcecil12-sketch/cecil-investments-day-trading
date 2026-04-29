@@ -108,6 +108,10 @@ export type ScoredSignal = RawSignal & {
   qualifyDiagnostic?: string | null;
   // Scorer version tag for smoke-test confirmation
   _scorerVersion?: string;
+  // Setup quality classification tags (v2 performance upgrade)
+  setupQualityTags?: string[];
+  rejectionTags?: string[];
+  performanceBucket?: string;
 };
 
 type ModelResponse = {
@@ -568,12 +572,15 @@ function evaluateLongQuality(params: {
   diagnostics.longTrendQuality = trendQuality;
 
   if (context.trend === "FLAT") {
-    // Strong relVolume partially offsets flat trend concern; reduce penalty when participation is high
-    const flatLongPenalty = (context.relVolume ?? 0) >= 1.3 ? -0.2 : -0.4;
+    // Tightened: flat-trend longs are high-noise setups. Only exceptional volume partially redeems.
+    // Strong relVolume (>=1.5) → -0.3, decent (>=1.0) → -0.6, weak → -0.9
+    const rv = context.relVolume ?? 0;
+    const flatLongPenalty = rv >= 1.5 ? -0.3 : rv >= 1.0 ? -0.6 : -0.9;
     adjustedScore += flatLongPenalty;
     reasons.push("flat_trend_long");
   } else if (context.trend === "DOWN") {
-    adjustedScore -= 0.8;
+    // Down-trend longs are strongly contradictory; harsher penalty
+    adjustedScore -= 1.2;
     reasons.push("downtrend_long_contradiction");
   } else {
     // UP trend — weak slope is a very minor signal, trim only slightly
@@ -599,10 +606,23 @@ function evaluateLongQuality(params: {
       // At or above VWAP: ideal for LONG
       vwapQuality = priceVsVwap > 1.0 ? 0.65 : 0.85;
     } else {
-      // Below VWAP in non-uptrend: dip-buy risk, minor penalty
-      vwapQuality = 0.35;
-      adjustedScore -= 0.15;
-      reasons.push("entry_below_vwap_no_reclaim");
+      // Below VWAP: penalty scales with distance + trend context
+      if (context.trend === "UP" && priceVsVwap > -0.5) {
+        // Shallow pullback in uptrend: mild penalty (dip-buy)
+        vwapQuality = 0.6;
+        adjustedScore -= 0.1;
+        reasons.push("shallow_pullback_below_vwap");
+      } else if (context.trend === "UP") {
+        // Deeper pullback in uptrend: moderate concern
+        vwapQuality = 0.45;
+        adjustedScore -= 0.25;
+        reasons.push("entry_below_vwap_no_reclaim");
+      } else {
+        // Below VWAP in non-uptrend: strong penalty
+        vwapQuality = 0.25;
+        adjustedScore -= 0.5;
+        reasons.push("below_vwap_non_uptrend_long");
+      }
     }
   }
   diagnostics.vwapAlignmentQuality = vwapQuality;
@@ -612,19 +632,25 @@ function evaluateLongQuality(params: {
   if (context.relVolume != null) {
     if (context.relVolume >= 1.3) {
       participationQuality = 0.9;
-    } else if (context.relVolume >= 0.9) {
+    } else if (context.relVolume >= 1.0) {
       participationQuality = 0.7;
-    } else if (context.relVolume >= 0.65) {
-      // Mediocre volume: only trim when trend is not UP — uptrend context offsets weak participation
+    } else if (context.relVolume >= 0.75) {
+      // relVol < 1.0: penalize unless strong trend AND VWAP-aligned
       participationQuality = 0.45;
-      if (context.trend !== "UP") {
-        adjustedScore -= 0.15;
-        reasons.push("mediocre_volume_participation");
+      const hasStrongTrendVwap = context.trend === "UP" && (priceVsVwap !== null && priceVsVwap >= 0);
+      if (!hasStrongTrendVwap) {
+        adjustedScore -= 0.25;
+        reasons.push("sub1_volume_no_trend_vwap_offset");
       }
+    } else if (context.relVolume >= 0.65) {
+      // Mediocre volume: trim unless uptrend with VWAP
+      participationQuality = 0.4;
+      adjustedScore -= 0.25;
+      reasons.push("mediocre_volume_participation");
     } else {
-      // Light volume: meaningful concern but not disqualifying alone
+      // Light volume: meaningful concern
       participationQuality = 0.2;
-      adjustedScore -= 0.20;   // reduced from -0.30 to prevent runaway stacking
+      adjustedScore -= 0.35;
       reasons.push("light_volume_participation");
     }
   }
@@ -657,10 +683,10 @@ function evaluateLongQuality(params: {
   diagnostics.continuationQuality = continuationQuality;
 
   // ===== TOTAL ADJUSTMENT CAP =====
-  // Prevent runaway penalty stacking: no signal should lose more than 0.65 from quality
-  // evaluation alone. This ensures a 7.0 AI score can still clear a 6.5 threshold even
-  // with multiple structural concerns (the AI's own rubric already priced them in).
-  const minAllowedByPenaltyCap = rawScore - 0.65;
+  // Prevent runaway penalty stacking: no signal should lose more than 1.2 from quality
+  // evaluation alone. Tightened from 0.65 to allow stronger flat/below-VWAP filtering
+  // while still respecting the AI's own rubric for high-conviction setups.
+  const minAllowedByPenaltyCap = rawScore - 1.2;
   if (adjustedScore < minAllowedByPenaltyCap) {
     adjustedScore = minAllowedByPenaltyCap;
     reasons.push("penalty_cap_applied");
@@ -916,6 +942,69 @@ function sleepWithJitter(baseMs: number): Promise<void> {
   const jitter = Math.random() * 0.3; // 0-30% jitter
   const actualMs = baseMs * (1 + jitter);
   return new Promise(resolve => setTimeout(resolve, actualMs));
+}
+
+/**
+ * Build structured quality tags from scoring factors.
+ * Produces: setupQualityTags (positive), rejectionTags (negative), performanceBucket (primary bucket key).
+ */
+function buildSetupQualityTags(params: {
+  direction: "LONG" | "SHORT" | "NONE";
+  penaltyReasons: string[];
+  trendBucket: "strong_up" | "weak_up" | "flat" | "weak_down" | "strong_down";
+  vwapBucket: "well_above" | "above" | "near" | "below" | "well_below";
+  relVolBucket: "strong" | "normal" | "mediocre" | "light";
+  setupFrame: "continuation" | "mean_reversion" | "dip_buy" | "breakout" | "reversal" | "unknown";
+  tier: string;
+  score: number;
+}): { setupQualityTags: string[]; rejectionTags: string[]; performanceBucket: string } {
+  const { direction, penaltyReasons, trendBucket, vwapBucket, relVolBucket, setupFrame, tier, score } = params;
+  const setupQualityTags: string[] = [];
+  const rejectionTags: string[] = [];
+
+  // Positive tags
+  if (trendBucket === "strong_up" && direction === "LONG") setupQualityTags.push("strong_uptrend_long");
+  if (trendBucket === "strong_down" && direction === "SHORT") setupQualityTags.push("strong_downtrend_short");
+  if ((vwapBucket === "above" || vwapBucket === "well_above") && direction === "LONG") setupQualityTags.push("strong_vwap_reclaim");
+  if ((vwapBucket === "below" || vwapBucket === "well_below") && direction === "SHORT") setupQualityTags.push("vwap_aligned_short");
+  if (relVolBucket === "strong") setupQualityTags.push("high_relative_volume");
+  if (setupFrame === "continuation") setupQualityTags.push("clean_continuation");
+  if (setupFrame === "breakout") setupQualityTags.push("clean_breakout");
+  if (score >= 8.5) setupQualityTags.push("high_liquidity_trend");
+
+  // Rejection / penalty tags derived from penalty reasons
+  const penaltySet = new Set(penaltyReasons);
+  if (penaltySet.has("flat_trend_long")) rejectionTags.push("flat_trend_long");
+  if (penaltySet.has("downtrend_long_contradiction")) rejectionTags.push("downtrend_long");
+  if (
+    penaltySet.has("entry_below_vwap_no_reclaim") ||
+    penaltySet.has("below_vwap_non_uptrend_long") ||
+    penaltySet.has("shallow_pullback_below_vwap")
+  ) rejectionTags.push("below_vwap_long");
+  if (
+    penaltySet.has("light_volume_participation") ||
+    penaltySet.has("mediocre_volume_participation") ||
+    penaltySet.has("sub1_volume_no_trend_vwap_offset")
+  ) rejectionTags.push("weak_volume");
+  if (penaltySet.has("entry_above_vwap_short")) rejectionTags.push("poor_short_vwap");
+  if (penaltySet.has("flat_trend_short")) rejectionTags.push("flat_trend_short");
+  if (penaltySet.has("uptrend_short_contradiction")) rejectionTags.push("uptrend_short");
+  if (penaltySet.has("weak_bearish_conviction")) rejectionTags.push("poor_short_structure");
+  if (tier === "C" && (penaltySet.has("flat_trend_long") || penaltySet.has("below_vwap_non_uptrend_long") || penaltySet.has("light_volume_participation"))) {
+    rejectionTags.push("low_quality_c_tier");
+  }
+  if (setupFrame === "mean_reversion" || setupFrame === "dip_buy") rejectionTags.push("counter_trend_setup");
+
+  // Performance bucket: primary classification for analytics grouping
+  let performanceBucket = `${tier.toLowerCase()}_${direction.toLowerCase()}`;
+  if (rejectionTags.includes("flat_trend_long")) performanceBucket = "c_flat_trend_long";
+  else if (rejectionTags.includes("below_vwap_long")) performanceBucket = `${tier.toLowerCase()}_below_vwap_long`;
+  else if (rejectionTags.includes("counter_trend_setup")) performanceBucket = `${tier.toLowerCase()}_counter_trend`;
+  else if (setupQualityTags.includes("clean_breakout") || setupQualityTags.includes("clean_continuation")) {
+    performanceBucket = `${tier.toLowerCase()}_clean_${direction.toLowerCase()}`;
+  }
+
+  return { setupQualityTags, rejectionTags, performanceBucket };
 }
 
 export async function scoreSignalWithAI(rawSignal: RawSignal): Promise<AiScoreResult> {
@@ -1496,6 +1585,20 @@ Return ONLY valid JSON:
     qualifyDiagnostic,
     // Smoke-test sentinel: confirms Patch 2 scorer path is active
     _scorerVersion: "patch2-v2",
+    // Setup quality classification tags (v2 performance upgrade)
+    ...buildSetupQualityTags({
+      direction: _direction,
+      penaltyReasons: [
+        ...(longDiagnostics?.longPenaltyReasons ?? []),
+        ...(shortDiagnostics?.shortPenaltyReasons ?? []),
+      ],
+      trendBucket,
+      vwapBucket,
+      relVolBucket,
+      setupFrame,
+      tier: qualifyBand,
+      score: winnerScore,
+    }),
   };
 
   if (bestDirection === "LONG") {

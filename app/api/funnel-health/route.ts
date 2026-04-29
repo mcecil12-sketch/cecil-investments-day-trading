@@ -26,6 +26,10 @@ type Incident = {
   severity: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
   message: string;
   context: Record<string, unknown>;
+  /** Intent classification for distinguishing system failures from normal quality gating */
+  incidentType?: "SYSTEM_BROKEN" | "QUALITY_FILTERING" | "EXECUTION_SELECTIVITY" | "TRUE_EXECUTION_BLOCK";
+  /** Human-readable recommended action for ops/agent */
+  recommendedAction?: string;
 };
 
 type FunnelScore = {
@@ -196,6 +200,10 @@ function detectIncidents(params: {
   freshUnresolvedPendingCount: number;
   /** Count of AUTO_PENDING trades older than the stale threshold during market hours. */
   staleActivePendingCount: number;
+  /** Count of seeds blocked by C-tier quality gates (intentional filtering). */
+  cTierQualityBlockCount?: number;
+  /** Count of seeds blocked by quality-based thresholds in general (below_threshold). */
+  qualityThresholdBlockCount?: number;
 }): Incident[] {
   const incidents: Incident[] = [];
   const { 
@@ -214,13 +222,19 @@ function detectIncidents(params: {
     malformedPendingCount,
     freshUnresolvedPendingCount,
     staleActivePendingCount,
+    cTierQualityBlockCount = 0,
+    qualityThresholdBlockCount = 0,
   } = params;
+
+  const totalQualityBlocks = cTierQualityBlockCount + qualityThresholdBlockCount;
 
   // CRITICAL: Protection missing on open trades
   if (protectionMissingTickers.length > 0) {
     incidents.push({
       code: "PROTECTION_MISSING",
       severity: "CRITICAL",
+      incidentType: "SYSTEM_BROKEN",
+      recommendedAction: "Check stop protection logic immediately. Open positions may be unprotected.",
       message: `${protectionMissingTickers.length} open trade(s) missing stop protection: ${protectionMissingTickers.slice(0, 5).join(", ")}${protectionMissingTickers.length > 5 ? "..." : ""}`,
       context: { tickers: protectionMissingTickers, count: protectionMissingTickers.length },
     });
@@ -232,18 +246,28 @@ function detectIncidents(params: {
     incidents.push({
       code: "UNDERUTILIZED_FUNNEL",
       severity: "HIGH",
+      incidentType: "SYSTEM_BROKEN",
+      recommendedAction: "High signal count but few seeded. Check scoring thresholds or capacity constraints.",
       message: `High candidate count (${candidates}) but only ${seeded} seeded (capacity allows ${remainingPositionSlots}). Check scoring thresholds or capacity constraints.`,
       context: { candidates, seeded, remainingPositionSlots, minSeededExpected },
     });
   }
 
   // 2) QUALIFIED_NOT_SEEDED: qualified signals exist but none seeded
+  // Distinguish quality-gate filtering from a true system block.
   if (qualified > 10 && seeded === 0) {
+    const mostlyQualityBlocked = totalQualityBlocks >= qualified * 0.8;
     incidents.push({
       code: "QUALIFIED_NOT_SEEDED",
-      severity: "HIGH",
-      message: `${qualified} qualified signals but 0 seeded. Check seeding logic or capacity constraints.`,
-      context: { qualified, seeded },
+      severity: mostlyQualityBlocked ? "MEDIUM" : "HIGH",
+      incidentType: mostlyQualityBlocked ? "QUALITY_FILTERING" : "TRUE_EXECUTION_BLOCK",
+      recommendedAction: mostlyQualityBlocked
+        ? "Quality gates blocking C-tier signals intentionally. Verify A/B signals are not also blocked."
+        : "Qualified signals exist but seeding stalled. Check seed route auth, capacity limits, and skip reasons.",
+      message: mostlyQualityBlocked
+        ? `${qualified} qualified signals blocked by quality gates (${totalQualityBlocks} quality blocks). Intentional filtering — verify A/B signals pass.`
+        : `${qualified} qualified signals but 0 seeded. Check seeding logic or capacity constraints.`,
+      context: { qualified, seeded, cTierQualityBlockCount, qualityThresholdBlockCount, totalQualityBlocks },
     });
   }
 
@@ -251,6 +275,8 @@ function detectIncidents(params: {
     incidents.push({
       code: "SEED_SLA_BREACH",
       severity: "CRITICAL",
+      incidentType: "SYSTEM_BROKEN",
+      recommendedAction: "Seed cron may not be running. Check cron logs.",
       message: `Qualified-to-seed latency SLA breached with freshQualifiedSignals=${freshQualifiedSignals} and staleQualifiedSignals=${staleQualifiedSignals}.`,
       context: { qualified, freshQualifiedSignals, staleQualifiedSignals },
     });
@@ -260,6 +286,8 @@ function detectIncidents(params: {
     incidents.push({
       code: "NO_AUTO_PENDING_WITH_FRESH_QUALIFIED",
       severity: "CRITICAL",
+      incidentType: "TRUE_EXECUTION_BLOCK",
+      recommendedAction: "Fresh A/B signals exist but not seeding. Check seed route auth and capacity.",
       message: `Fresh qualified signals exist but execute is skipping no-auto-pending (count=${noAutoPendingSkips}).`,
       context: { freshQualifiedSignals, seeded, noAutoPendingSkips },
     });
@@ -270,6 +298,8 @@ function detectIncidents(params: {
     incidents.push({
       code: "EXECUTE_BLOCKER",
       severity: "CRITICAL",
+      incidentType: "SYSTEM_BROKEN",
+      recommendedAction: "Seeded trades malformed at execute. Check payload normalization in execute route.",
       message: `${seeded} trade(s) seeded but blocked at execute validation: ${malformedPendingCount} marked malformed/rescore_required. Execute payload normalization or eligibility check is rejecting valid seeded trades.`,
       context: { seeded, executed, malformedPendingCount, remainingPositionSlots },
     });
@@ -282,6 +312,8 @@ function detectIncidents(params: {
     incidents.push({
       code: "SEED_NOT_EXECUTED",
       severity: malformedPendingCount > 0 ? "CRITICAL" : "MEDIUM",
+      incidentType: "EXECUTION_SELECTIVITY",
+      recommendedAction: "Pending trades not yet executed. Check execute cron and broker connectivity.",
       message: `${freshUnresolvedPendingCount} fresh pending trade(s) not yet executed. Check execute route or broker integration.`,
       context: { seeded, executed, freshUnresolvedPendingCount, marketOpen, malformedPendingCount },
     });
@@ -292,6 +324,8 @@ function detectIncidents(params: {
     incidents.push({
       code: "NO_EXECUTION_ACTIVITY",
       severity: "MEDIUM",
+      incidentType: "SYSTEM_BROKEN",
+      recommendedAction: "Execute cron may not be running. Check execute route logs.",
       message: `No execution activity for ${minsSinceLastExecute} minutes during market hours.`,
       context: { minsSinceLastExecute, marketOpen },
     });
@@ -304,6 +338,8 @@ function detectIncidents(params: {
     incidents.push({
       code: "STALE_AUTO_PENDING",
       severity: "HIGH",
+      incidentType: "SYSTEM_BROKEN",
+      recommendedAction: "Execute stale-check not archiving old pending trades. Execute route may not be running.",
       message: `${staleActivePendingCount} AUTO_PENDING trade(s) exceeded max pending age during market hours without being archived. Execute stale-check may not be running.`,
       context: { staleActivePendingCount, marketOpen },
     });
@@ -769,6 +805,14 @@ export async function GET() {
       Date.now() - Date.parse(t.createdAt) > staleMaxAgeMs
     ).length;
 
+    const cTierQualityBlockCount =
+      (seedSkipReasonBreakdown["c_tier_quality_block"] ?? 0) +
+      (seedSkipReasonBreakdown["flat_trend_block"] ?? 0) +
+      (seedSkipReasonBreakdown["weak_volume_block"] ?? 0) +
+      (seedSkipReasonBreakdown["vwap_alignment_block"] ?? 0) +
+      (seedSkipReasonBreakdown["poor_rr_block"] ?? 0);
+    const qualityThresholdBlockCount = seedSkipReasonBreakdown["below_threshold"] ?? 0;
+
     const incidents = detectIncidents({
       marketOpen,
       candidates,
@@ -785,6 +829,8 @@ export async function GET() {
       malformedPendingCount,
       freshUnresolvedPendingCount,
       staleActivePendingCount,
+      cTierQualityBlockCount,
+      qualityThresholdBlockCount,
     });
 
     // Add lower-severity incident for stale broker/DB mismatch (not live risk)

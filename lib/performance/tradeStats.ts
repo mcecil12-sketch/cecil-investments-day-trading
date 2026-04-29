@@ -26,6 +26,14 @@ export type ClosedTrade = {
   quantity?: number;
 
   source?: string;
+
+  // Quality tag fields (v2 performance upgrade)
+  performanceBucket?: string;
+  setupQualityTags?: string[];
+  rejectionTags?: string[];
+  trendBucket?: string;
+  vwapBucket?: string;
+  relVolBucket?: string;
 };
 
 function isClosed(t: any) {
@@ -110,6 +118,13 @@ export function extractClosedTrades(allTrades: any[]): ClosedTrade[] {
         stopPrice: num(t?.stopPrice, null) ?? undefined,
         quantity: num(t?.quantity ?? t?.qty, null) ?? undefined,
         source: typeof t?.source === "string" ? t.source : undefined,
+        // Quality tag fields
+        performanceBucket: typeof t?.performanceBucket === "string" ? t.performanceBucket : undefined,
+        setupQualityTags: Array.isArray(t?.setupQualityTags) ? t.setupQualityTags : undefined,
+        rejectionTags: Array.isArray(t?.rejectionTags) ? t.rejectionTags : undefined,
+        trendBucket: typeof t?.trendBucket === "string" ? t.trendBucket : undefined,
+        vwapBucket: typeof t?.vwapBucket === "string" ? t.vwapBucket : undefined,
+        relVolBucket: typeof t?.relVolBucket === "string" ? t.relVolBucket : undefined,
       };
     });
 }
@@ -163,6 +178,15 @@ export function buildAnalytics(trades: ClosedTrade[]) {
     after: emptyTotals(),
   };
 
+  // Direction breakdown
+  const byDirection: Record<string, AnalyticsTotals> = {
+    LONG: emptyTotals(),
+    SHORT: emptyTotals(),
+  };
+
+  // Performance bucket breakdown (flat_trend_long, c_clean_long etc.)
+  const byPerformanceBucket: Record<string, AnalyticsTotals> = {};
+
   for (const t of trades) {
     addTrade(totals, t);
     addTrade(byTier[t.tier || "REJECT"] || byTier.REJECT, t);
@@ -171,11 +195,102 @@ export function buildAnalytics(trades: ClosedTrade[]) {
     const { hhmm } = etParts(ts || undefined);
     const b = bucketET(hhmm);
     addTrade(byBucket[b], t);
+
+    // Direction
+    const dir = String(t.side || "").toUpperCase();
+    if (dir === "LONG" || dir === "SHORT") {
+      addTrade(byDirection[dir], t);
+    }
+
+    // Performance bucket
+    const pb = t.performanceBucket || `${(t.tier || "REJECT").toLowerCase()}_${dir.toLowerCase() || "unknown"}`;
+    if (!byPerformanceBucket[pb]) byPerformanceBucket[pb] = emptyTotals();
+    addTrade(byPerformanceBucket[pb], t);
   }
+
+  const finalizedByPerformanceBucket = Object.fromEntries(
+    Object.entries(byPerformanceBucket).map(([k, v]) => [k, finalizeTotals(v)])
+  );
+
+  const recommendations = buildRecommendations({
+    byTier: Object.fromEntries(Object.entries(byTier).map(([k, v]) => [k, finalizeTotals(v)])),
+    byDirection: Object.fromEntries(Object.entries(byDirection).map(([k, v]) => [k, finalizeTotals(v)])),
+    byPerformanceBucket: finalizedByPerformanceBucket,
+    minSampleSize: 3,
+  });
 
   return {
     totals: finalizeTotals(totals),
     byTier: Object.fromEntries(Object.entries(byTier).map(([k, v]) => [k, finalizeTotals(v)])),
     byBucket: Object.fromEntries(Object.entries(byBucket).map(([k, v]) => [k, finalizeTotals(v)])),
+    byDirection: Object.fromEntries(Object.entries(byDirection).map(([k, v]) => [k, finalizeTotals(v)])),
+    byPerformanceBucket: finalizedByPerformanceBucket,
+    recommendations,
   };
+}
+
+export type PerformanceRecommendation = {
+  action: "tighten_c_tier" | "disable_c_tier" | "block_flat_trend_long" | "restrict_shorts" | "no_action";
+  reason: string;
+  avgR?: number;
+  sampleSize?: number;
+  urgency: "high" | "medium" | "low";
+};
+
+/**
+ * Build adaptive restriction recommendations from recent closed trade performance.
+ * Returns action hints — does NOT auto-disable anything. Surfaced in /api/performance/analytics.
+ */
+function buildRecommendations(params: {
+  byTier: Record<string, AnalyticsTotals>;
+  byDirection: Record<string, AnalyticsTotals>;
+  byPerformanceBucket: Record<string, AnalyticsTotals>;
+  minSampleSize: number;
+}): PerformanceRecommendation[] {
+  const { byTier, byDirection, byPerformanceBucket, minSampleSize } = params;
+  const recs: PerformanceRecommendation[] = [];
+
+  // C-tier performance
+  const c = byTier["C"];
+  if (c && c.trades >= minSampleSize) {
+    if (c.avgR < -0.3) {
+      recs.push({
+        action: c.avgR < -0.7 ? "disable_c_tier" : "tighten_c_tier",
+        reason: `C-tier avgR=${c.avgR.toFixed(3)} over ${c.trades} trades. Consider raising AUTO_ENTRY_C_MIN_SCORE.`,
+        avgR: c.avgR,
+        sampleSize: c.trades,
+        urgency: c.avgR < -0.7 ? "high" : "medium",
+      });
+    }
+  }
+
+  // Flat-trend long bucket
+  const ftl = byPerformanceBucket["c_flat_trend_long"];
+  if (ftl && ftl.trades >= minSampleSize && ftl.avgR < -0.2) {
+    recs.push({
+      action: "block_flat_trend_long",
+      reason: `flat_trend_long avgR=${ftl.avgR.toFixed(3)} over ${ftl.trades} trades. Enable AUTO_ENTRY_REQUIRE_TREND_ALIGNMENT=true.`,
+      avgR: ftl.avgR,
+      sampleSize: ftl.trades,
+      urgency: "medium",
+    });
+  }
+
+  // Short performance
+  const shorts = byDirection["SHORT"];
+  if (shorts && shorts.trades >= minSampleSize && shorts.avgR < -0.4) {
+    recs.push({
+      action: "restrict_shorts",
+      reason: `SHORT avgR=${shorts.avgR.toFixed(3)} over ${shorts.trades} trades. Consider raising SHORT score threshold.`,
+      avgR: shorts.avgR,
+      sampleSize: shorts.trades,
+      urgency: shorts.avgR < -0.8 ? "high" : "medium",
+    });
+  }
+
+  if (recs.length === 0) {
+    recs.push({ action: "no_action", reason: "Performance within acceptable bounds.", urgency: "low" });
+  }
+
+  return recs;
 }

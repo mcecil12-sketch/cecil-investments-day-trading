@@ -14,7 +14,13 @@ export type SeedSkipReason =
   | "below_threshold"
   | "stale_signal"
   | "duplicate_symbol"
-  | "overlay_block";
+  | "overlay_block"
+  // C-tier quality block reasons (v2 performance upgrade)
+  | "c_tier_quality_block"
+  | "flat_trend_block"
+  | "weak_volume_block"
+  | "vwap_alignment_block"
+  | "poor_rr_block";
 
 export type SeedSignalSkip = {
   signalId: string;
