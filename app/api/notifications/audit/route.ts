@@ -1,19 +1,25 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { readTrades } from "@/lib/tradesStore";
 import { requireAuth } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function hasCronToken(req: Request): boolean {
-  const tok = String(req.headers.get("x-cron-token") || "").trim();
-  return Boolean(process.env.CRON_TOKEN) && tok === process.env.CRON_TOKEN;
+function isCronAuthed(req: NextRequest) {
+  const tok = req.headers.get("x-cron-token") || "";
+  return Boolean(process.env.CRON_TOKEN && tok && tok === process.env.CRON_TOKEN);
 }
 
-export async function GET(req: Request) {
-  const cronOk = hasCronToken(req);
+function isScannerAuthed(req: NextRequest) {
+  const tok = req.headers.get("x-scanner-token") || "";
+  return Boolean(process.env.SCANNER_TOKEN && tok && tok === process.env.SCANNER_TOKEN);
+}
+
+export async function GET(req: NextRequest) {
+  const cronOk = isCronAuthed(req);
+  const scannerOk = isScannerAuthed(req);
   const cookieAuth = await requireAuth(req);
-  if (!cronOk && !cookieAuth.ok) {
+  if (!cronOk && !scannerOk && !cookieAuth.ok) {
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
 
