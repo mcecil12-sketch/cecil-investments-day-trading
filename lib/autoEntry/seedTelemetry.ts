@@ -9,6 +9,7 @@ export type SeedSkipReason =
   | "missing_prices"
   | "missing_direction"
   | "missing_signal_id"
+  | "invalid_trade_plan_for_side"
   | "market_closed"
   | "capacity_full"
   | "below_threshold"

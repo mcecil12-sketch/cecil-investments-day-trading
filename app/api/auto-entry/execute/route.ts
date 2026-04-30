@@ -120,6 +120,7 @@ import { isOperationallyOpenTrade } from "@/lib/trades/operational";
 import { buildOpenOrdersBySymbol, planConservativeReplacement } from "@/lib/autoManage/reliability";
 import { readExecutionOverlays, type ExecutionOverlays } from "@/lib/agents/overlays";
 import { isScoreBelowAdjustedThreshold, resolveThresholdDiagnostics } from "@/lib/autoEntry/executionThresholds";
+import { normalizeTradePlanForSide } from "@/lib/trades/planNormalization";
 import {
   readAdaptiveGuardrailState,
   getActiveActions,
@@ -272,17 +273,15 @@ function hasValidPendingRisk(trade: any) {
   const takeProfitPrice = pendingTp(trade);
   const side = String(trade?.side || "LONG").toUpperCase();
 
-  if (!(entryPrice > 0 && stopPrice > 0 && takeProfitPrice > 0)) return false;
-  if (!(side === "LONG" || side === "SHORT")) return false;
-
-  if (side === "LONG") {
-    if (stopPrice >= entryPrice) return false;
-    if (takeProfitPrice <= entryPrice) return false;
-  } else {
-    if (stopPrice <= entryPrice) return false;
-    if (takeProfitPrice >= entryPrice) return false;
-  }
-  return true;
+  if (side !== "LONG" && side !== "SHORT") return false;
+  const normalized = normalizeTradePlanForSide({
+    side,
+    entryPrice,
+    stopPrice,
+    targetPrice: takeProfitPrice,
+    rewardMultiple: 2,
+  });
+  return normalized.ok;
 }
 
 /**
@@ -1239,29 +1238,59 @@ export async function POST(req: Request) {
       }
 
       if (!hasValidPendingRisk(workingTrade)) {
-        trades[item.i] = {
-          ...trades[item.i],
-          status: "ERROR",
-          autoEntryStatus: "AUTO_ERROR",
-          reason: "invalid_pending_missing_risk",
-          error: "invalid_pending_missing_risk",
-          errorDetails: {
-            entryPrice: workingTrade?.entryPrice ?? null,
-            stopPrice: workingTrade?.stopPrice ?? null,
-            takeProfitPrice: workingTrade?.takeProfitPrice ?? workingTrade?.targetPrice ?? null,
-          },
-          updatedAt: nowForPending,
-          executeAttemptedAt: nowForPending,
-          executeOutcome: "MALFORMED",
-          executeReason: "invalid_pending_missing_risk",
-        };
-        counts.invalidMarked += 1;
-        counts.skipped += 1;
-        tradesChanged = true;
-        processed.add(item.i);
-        notes.push(`invalid_pending:${ticker}:${tradeId || "unknown"}`);
-        malformedPendingTrades.push({ id: tradeId, reason: "invalid_pending_missing_risk", symbol: ticker });
-        continue;
+        const side = String(workingTrade?.side || "").toUpperCase();
+        const normalized =
+          side === "LONG" || side === "SHORT"
+            ? normalizeTradePlanForSide({
+                side,
+                entryPrice: safeNum(workingTrade?.entryPrice, 0),
+                stopPrice: safeNum(workingTrade?.stopPrice, 0),
+                targetPrice: pendingTp(workingTrade),
+                rewardMultiple: 2,
+              })
+            : null;
+
+        if (normalized?.ok) {
+          trades[item.i] = {
+            ...trades[item.i],
+            entryPrice: normalized.normalizedEntryPrice,
+            stopPrice: normalized.normalizedStopPrice,
+            targetPrice: normalized.normalizedTargetPrice,
+            takeProfitPrice: normalized.normalizedTargetPrice,
+            planNormalizedForSideAt: nowForPending,
+            planNormalizationReason: normalized.normalizedForSide
+              ? "side_inversion_repaired"
+              : "side_plan_already_valid",
+            updatedAt: nowForPending,
+          };
+          tradesChanged = true;
+          item.t = trades[item.i];
+        } else {
+          trades[item.i] = {
+            ...trades[item.i],
+            status: "ERROR",
+            autoEntryStatus: "AUTO_ERROR",
+            reason: "invalid_pending_missing_risk",
+            error: "invalid_pending_missing_risk",
+            errorDetails: {
+              entryPrice: workingTrade?.entryPrice ?? null,
+              stopPrice: workingTrade?.stopPrice ?? null,
+              takeProfitPrice: workingTrade?.takeProfitPrice ?? workingTrade?.targetPrice ?? null,
+              invalidReason: normalized?.invalidReason ?? "invalid_trade_plan_for_side",
+            },
+            updatedAt: nowForPending,
+            executeAttemptedAt: nowForPending,
+            executeOutcome: "MALFORMED",
+            executeReason: "invalid_pending_missing_risk",
+          };
+          counts.invalidMarked += 1;
+          counts.skipped += 1;
+          tradesChanged = true;
+          processed.add(item.i);
+          notes.push(`invalid_pending:${ticker}:${tradeId || "unknown"}`);
+          malformedPendingTrades.push({ id: tradeId, reason: "invalid_pending_missing_risk", symbol: ticker });
+          continue;
+        }
       }
 
       selectedIndex = item.i;
@@ -2224,9 +2253,9 @@ export async function POST(req: Request) {
   }
 
   let entryPrice = safeNum(trade.entryPrice, 0);
-  const stopPrice = safeNum(trade.stopPrice, 0);
+  let stopPrice = safeNum(trade.stopPrice, 0);
   const targetPriceRaw = safeNum(trade.takeProfitPrice ?? trade.targetPrice, 0);
-  const targetPrice = targetPriceRaw > 0 ? targetPriceRaw : null;
+  let targetPrice = targetPriceRaw > 0 ? targetPriceRaw : null;
 
   // ─── HARD VALIDATION: All three fields must be present ─────────────
   // DO NOT fallback to % calculation. Missing fields = ERROR.
@@ -2257,20 +2286,21 @@ export async function POST(req: Request) {
     continue;
   }
 
-  // ─── HARD DIRECTIONAL VALIDATION ───────────────────────────────────
-  // LONG: stop < entry < target
-  // SHORT: target < entry < stop
   const sideEnum: Side = side === "LONG" ? "LONG" : "SHORT";
-  const tradePlanValid =
-    sideEnum === "LONG"
-      ? stopPrice < entryPrice && targetPrice > entryPrice
-      : stopPrice > entryPrice && targetPrice < entryPrice;
+  const normalizedPlan = normalizeTradePlanForSide({
+    side: sideEnum,
+    entryPrice,
+    stopPrice,
+    targetPrice,
+    rewardMultiple: 2,
+  });
 
-  if (!tradePlanValid) {
+  if (!normalizedPlan.ok) {
     const validationFailure =
-      sideEnum === "LONG"
+      normalizedPlan.invalidReason ||
+      (sideEnum === "LONG"
         ? `LONG requires stopPrice(${stopPrice}) < entryPrice(${entryPrice}) < targetPrice(${targetPrice})`
-        : `SHORT requires targetPrice(${targetPrice}) < entryPrice(${entryPrice}) < stopPrice(${stopPrice})`;
+        : `SHORT requires targetPrice(${targetPrice}) < entryPrice(${entryPrice}) < stopPrice(${stopPrice})`);
     const now = nowIso();
     trades[idx] = {
       ...trade,
@@ -2291,6 +2321,24 @@ export async function POST(req: Request) {
     perTradeResults.push({ tradeId, symbol: ticker, outcome: "MALFORMED", reason: "INVALID_TRADE_PLAN_STRUCTURE", aiScore: _tradeAiScore, tier: _tradeTier });
     skippedTradeIds.push(tradeId);
     continue;
+  }
+
+  if (normalizedPlan.normalizedForSide) {
+    entryPrice = normalizedPlan.normalizedEntryPrice;
+    stopPrice = normalizedPlan.normalizedStopPrice;
+    targetPrice = normalizedPlan.normalizedTargetPrice;
+    const now = nowIso();
+    trades[idx] = {
+      ...trades[idx],
+      entryPrice,
+      stopPrice,
+      targetPrice,
+      takeProfitPrice: targetPrice,
+      planNormalizedForSideAt: now,
+      planNormalizationReason: "side_inversion_repaired",
+      updatedAt: now,
+    };
+    await writeTrades(trades);
   }
 
   if (!ticker || (side !== "LONG" && side !== "SHORT")) {

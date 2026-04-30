@@ -16,6 +16,7 @@ import {
   type SeedRunTelemetry,
   type SeedSkipReason,
 } from "@/lib/autoEntry/seedTelemetry";
+import { normalizeTradePlanForSide } from "@/lib/trades/planNormalization";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -113,6 +114,7 @@ function mapSkipReason(raw: string): SeedSkipReason | null {
     case "duplicate_symbol":
     case "overlay_block":
     case "missing_signal_id":
+    case "invalid_trade_plan_for_side":
     // C-tier quality block reasons (v2 performance upgrade)
     case "c_tier_quality_block":
     case "flat_trend_block":
@@ -321,6 +323,10 @@ type QualifiedCandidate = {
   entryPrice: number;
   stopPrice: number;
   targetPrice: number;
+  originalEntryPrice: number;
+  originalStopPrice: number;
+  originalTargetPrice: number;
+  normalizedForSide: boolean;
   tier: string;
   signalId: string;
   createdAt: string;
@@ -571,7 +577,20 @@ export async function POST(req: NextRequest) {
   }
 
   const created: any[] = [];
-  const skipped: Array<{ signalId: string; symbol: string; reason: string }> = [];
+  const skipped: Array<{
+    signalId: string;
+    symbol: string;
+    reason: string;
+    side?: "LONG" | "SHORT" | null;
+    originalEntryPrice?: number | null;
+    originalStopPrice?: number | null;
+    originalTargetPrice?: number | null;
+    normalizedEntryPrice?: number | null;
+    normalizedStopPrice?: number | null;
+    normalizedTargetPrice?: number | null;
+    normalizedForSide?: boolean;
+    invalidReason?: string;
+  }> = [];
   const skippedByReason: Partial<Record<SeedSkipReason, number>> = {};
   const attributionBySignalId = new Map<string, {
     symbol: string;
@@ -650,8 +669,20 @@ export async function POST(req: NextRequest) {
     const createdAtMs = getSignalTimestampMs(s);
     const ageMs = Number.isFinite(createdAtMs) ? Math.max(0, nowMs - (createdAtMs as number)) : Number.POSITIVE_INFINITY;
 
-    const markSkip = (reason: SeedSkipReason) => {
-      skipped.push({ signalId, symbol, reason });
+    const markSkip = (
+      reason: SeedSkipReason,
+      planDiagnostics?: {
+        originalEntryPrice?: number | null;
+        originalStopPrice?: number | null;
+        originalTargetPrice?: number | null;
+        normalizedEntryPrice?: number | null;
+        normalizedStopPrice?: number | null;
+        normalizedTargetPrice?: number | null;
+        normalizedForSide?: boolean;
+        invalidReason?: string;
+      },
+    ) => {
+      skipped.push({ signalId, symbol, reason, side, ...planDiagnostics });
       bumpSkipReason(skippedByReason, reason);
       if (!signalId) return;
       attributionBySignalId.set(signalId, {
@@ -677,6 +708,28 @@ export async function POST(req: NextRequest) {
 
     if (!(entryPrice != null && entryPrice > 0 && stopPrice != null && stopPrice > 0 && targetPrice != null && targetPrice > 0)) {
       markSkip("missing_prices");
+      continue;
+    }
+
+    const normalizedPlan = normalizeTradePlanForSide({
+      side,
+      entryPrice,
+      stopPrice,
+      targetPrice,
+      rewardMultiple: 2,
+    });
+
+    if (!normalizedPlan.ok) {
+      markSkip("invalid_trade_plan_for_side", {
+        originalEntryPrice: normalizedPlan.originalEntryPrice,
+        originalStopPrice: normalizedPlan.originalStopPrice,
+        originalTargetPrice: normalizedPlan.originalTargetPrice,
+        normalizedEntryPrice: normalizedPlan.normalizedEntryPrice,
+        normalizedStopPrice: normalizedPlan.normalizedStopPrice,
+        normalizedTargetPrice: normalizedPlan.normalizedTargetPrice,
+        normalizedForSide: normalizedPlan.normalizedForSide,
+        invalidReason: normalizedPlan.invalidReason,
+      });
       continue;
     }
 
@@ -752,9 +805,13 @@ export async function POST(req: NextRequest) {
       symbol,
       side,
       aiScore: aiScore as number,
-      entryPrice: entryPrice as number,
-      stopPrice: stopPrice as number,
-      targetPrice: targetPrice as number,
+      entryPrice: normalizedPlan.normalizedEntryPrice,
+      stopPrice: normalizedPlan.normalizedStopPrice,
+      targetPrice: normalizedPlan.normalizedTargetPrice,
+      originalEntryPrice: normalizedPlan.originalEntryPrice,
+      originalStopPrice: normalizedPlan.originalStopPrice,
+      originalTargetPrice: normalizedPlan.originalTargetPrice,
+      normalizedForSide: normalizedPlan.normalizedForSide,
       tier,
       signalId,
       createdAt,
@@ -769,7 +826,19 @@ export async function POST(req: NextRequest) {
   const selectedKeys = new Set(uniqueCandidates.map(candidateKey));
   for (const c of allQualifyingCandidates) {
     if (selectedKeys.has(candidateKey(c))) continue;
-    skipped.push({ signalId: c.signalId, symbol: c.symbol, reason: "duplicate_symbol" });
+    skipped.push({
+      signalId: c.signalId,
+      symbol: c.symbol,
+      reason: "duplicate_symbol",
+      side: c.side,
+      originalEntryPrice: c.originalEntryPrice,
+      originalStopPrice: c.originalStopPrice,
+      originalTargetPrice: c.originalTargetPrice,
+      normalizedEntryPrice: c.entryPrice,
+      normalizedStopPrice: c.stopPrice,
+      normalizedTargetPrice: c.targetPrice,
+      normalizedForSide: c.normalizedForSide,
+    });
     bumpSkipReason(skippedByReason, "duplicate_symbol");
     attributionBySignalId.set(c.signalId, {
       symbol: c.symbol,
@@ -788,7 +857,19 @@ export async function POST(req: NextRequest) {
   const candidatesToSeed = uniqueCandidates.slice(0, effectiveLimit);
   const capacitySkippedCandidates = uniqueCandidates.slice(effectiveLimit);
   for (const c of capacitySkippedCandidates) {
-    skipped.push({ signalId: c.signalId, symbol: c.symbol, reason: "capacity_full" });
+    skipped.push({
+      signalId: c.signalId,
+      symbol: c.symbol,
+      reason: "capacity_full",
+      side: c.side,
+      originalEntryPrice: c.originalEntryPrice,
+      originalStopPrice: c.originalStopPrice,
+      originalTargetPrice: c.originalTargetPrice,
+      normalizedEntryPrice: c.entryPrice,
+      normalizedStopPrice: c.stopPrice,
+      normalizedTargetPrice: c.targetPrice,
+      normalizedForSide: c.normalizedForSide,
+    });
     bumpSkipReason(skippedByReason, "capacity_full");
     attributionBySignalId.set(c.signalId, {
       symbol: c.symbol,
@@ -857,6 +938,13 @@ export async function POST(req: NextRequest) {
       aiScore: c.aiScore,
       effectiveScore: c.effectiveScore,
       tier: c.tier,
+      originalEntryPrice: c.originalEntryPrice,
+      originalStopPrice: c.originalStopPrice,
+      originalTargetPrice: c.originalTargetPrice,
+      normalizedEntryPrice: c.entryPrice,
+      normalizedStopPrice: c.stopPrice,
+      normalizedTargetPrice: c.targetPrice,
+      normalizedForSide: c.normalizedForSide,
       dryRun,
     });
 

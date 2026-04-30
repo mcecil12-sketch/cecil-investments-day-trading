@@ -1,9 +1,12 @@
-import { alpacaRequest } from "@/lib/alpaca";
+import { alpacaRequest, createOrder } from "@/lib/alpaca";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { recordReconcile } from "@/lib/maintenance/reconcileTelemetry";
 import { isOperationallyOpenTrade } from "@/lib/trades/operational";
 import { selectCanonicalOpenTrades } from "@/lib/trades/canonicalOpenBySymbol";
+import { forceFlattenPosition } from "@/lib/broker/forceFlattenPosition";
+import { verifyStopAtBroker } from "@/lib/risk/stop-verification";
+import { findProtectiveStopOrder } from "@/lib/trades/protection";
 
 const POSITION_OPEN_OVERRIDES_CANCELED_v1 = true;
 
@@ -267,6 +270,12 @@ export type ReconcileOpenTradesResult = {
   cleanedDuplicateBackfill: number;
   cleanedDuplicateBackfillIds: string[];
   cleanedDuplicateBackfillTickers: string[];
+  openPositions: number;
+  protectedPositions: number;
+  missingStopCount: number;
+  repairedStops: number;
+  flattenedUnprotected: number;
+  unresolvedCriticalCount: number;
   broker: {
     positionsCount: number;
     openOrdersCount: number;
@@ -323,6 +332,12 @@ export async function reconcileOpenTrades(
         cleanedDuplicateBackfill: 0,
         cleanedDuplicateBackfillIds: [],
         cleanedDuplicateBackfillTickers: [],
+        openPositions: 0,
+        protectedPositions: 0,
+        missingStopCount: 0,
+        repairedStops: 0,
+        flattenedUnprotected: 0,
+        unresolvedCriticalCount: 0,
         broker: {
           positionsCount: 0,
           openOrdersCount: 0,
@@ -1079,9 +1094,250 @@ export async function reconcileOpenTrades(
     }
     // ── end all-source ghost pass ─────────────────────────────────────────────
 
-    if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0 || cleanedPending > 0 || cleanedStaleBackfill > 0 || cleanedDuplicateBackfill > 0)) {
+    // ── Broker protection enforcement pass ───────────────────────────────────
+    const ACTIVE_ORDER_STATUSES = new Set([
+      "new",
+      "accepted",
+      "pending_new",
+      "pending_replace",
+      "held",
+      "partially_filled",
+      "accepted_for_bidding",
+    ]);
+
+    const closeSideFromPos = (pos: any): "buy" | "sell" => {
+      const rawQty = Number(pos?.qty ?? 0);
+      const side = String(pos?.side || "").toLowerCase();
+      if (side === "short" || rawQty < 0) return "buy";
+      return "sell";
+    };
+
+    const hasActiveTakeProfit = (symbol: string, closeSide: "buy" | "sell", orders: any[]) =>
+      orders.some((o: any) => {
+        if (up(o?.symbol) !== symbol) return false;
+        if (String(o?.side || "").toLowerCase() !== closeSide) return false;
+        const type = String(o?.type || "").toLowerCase();
+        const status = String(o?.status || "").toLowerCase();
+        if (!ACTIVE_ORDER_STATUSES.has(status)) return false;
+        return type === "limit";
+      });
+
+    const pickLinkedOpenTrade = (symbol: string): any | null => {
+      const candidates = trades.filter(
+        (t) => isOperationallyOpenTrade(t) && up(t?.ticker ?? t?.symbol) === symbol
+      );
+      if (candidates.length === 0) return null;
+      return candidates
+        .map((t) => ({
+          trade: t,
+          richness:
+            (t?.source === "AUTO" || t?.source === "AUTO-ENTRY" ? 8 : 0) +
+            (t?.signalId ? 4 : 0) +
+            (t?.stopOrderId ? 2 : 0) +
+            (t?.takeProfitOrderId ? 1 : 0),
+        }))
+        .sort((a, b) => b.richness - a.richness)[0]?.trade;
+    };
+
+    const emergencyStopPrice = (entry: number, closeSide: "buy" | "sell") =>
+      Number((closeSide === "sell" ? entry * 0.98 : entry * 1.02).toFixed(2));
+
+    let repairedStops = 0;
+    let flattenedUnprotected = 0;
+    let unresolvedCriticalCount = 0;
+
+    const repairAttemptedAt = new Date().toISOString();
+    const workingOrders = Array.isArray(brokerTruth.openOrders) ? [...brokerTruth.openOrders] : [];
+
+    for (const pos of brokerTruth.positions) {
+      checkDeadline();
+
+      const symbol = up(pos?.symbol);
+      const brokerQty = Math.abs(Number(pos?.qty ?? 0));
+      if (!symbol || !(brokerQty > 0)) continue;
+
+      let linkedTrade = pickLinkedOpenTrade(symbol);
+      if (!linkedTrade && !dryRun) {
+        linkedTrade = {
+          id: crypto.randomUUID(),
+          ticker: symbol,
+          side: Number(pos?.qty ?? 0) < 0 ? "SHORT" : "LONG",
+          qty: brokerQty,
+          status: "OPEN",
+          source: "broker_backfill",
+          paper: true,
+          note: "Backfilled from broker truth during stop-protection reconcile",
+          createdAt: pos?.created_at || nowIso,
+          openedAt: pos?.created_at || nowIso,
+          updatedAt: nowIso,
+          entryPrice: Number(pos?.avg_entry_price || 0),
+          avgFillPrice: Number(pos?.avg_entry_price || 0),
+          filledQty: brokerQty,
+          stopPrice: null,
+          autoEntryStatus: "INVALID",
+          alpacaStatus: "position_open",
+          brokerStatus: "position_open",
+          protectionStatus: "MISSING_STOP",
+          protectionRepairReason: "broker_position_without_app_trade",
+        };
+        trades.push(linkedTrade);
+        backfilled += 1;
+        if (backfilledTickers.length < 10) backfilledTickers.push(symbol);
+      }
+
+      const closeSide = closeSideFromPos(pos);
+      const tradeSide: "LONG" | "SHORT" = closeSide === "sell" ? "LONG" : "SHORT";
+      const symbolOrders = workingOrders.filter((o: any) => up(o?.symbol) === symbol);
+      const activeStop = findProtectiveStopOrder({
+        ticker: symbol,
+        tradeSide,
+        openOrders: symbolOrders,
+      });
+      const tpOnly = !activeStop && hasActiveTakeProfit(symbol, closeSide, symbolOrders);
+
+      if (activeStop) {
+        if (!dryRun && linkedTrade) {
+          linkedTrade.stopOrderId = linkedTrade.stopOrderId || activeStop.id;
+          linkedTrade.protectionStatus = "VERIFIED";
+          linkedTrade.protectionRepairOutcome = "already_protected";
+          linkedTrade.protectionRepairReason = tpOnly
+            ? "tp_only_resolved_by_broker_scan"
+            : "active_stop_detected";
+          linkedTrade.updatedAt = nowIso;
+        }
+        continue;
+      }
+
+      if (!dryRun && linkedTrade) {
+        linkedTrade.protectionStatus = "MISSING_STOP";
+        linkedTrade.protectionRepairAttemptedAt = repairAttemptedAt;
+        linkedTrade.protectionRepairOutcome = "repair_attempting";
+        linkedTrade.protectionRepairReason = tpOnly
+          ? "tp_only_bracket_state"
+          : "no_active_stop_at_broker";
+        linkedTrade.updatedAt = nowIso;
+      }
+
+      const entryPrice = Number(pos?.avg_entry_price ?? linkedTrade?.entryPrice ?? 0);
+      const stopPrice = entryPrice > 0 ? emergencyStopPrice(entryPrice, closeSide) : 0;
+
+      let repairOk = false;
+      let repairOrderId: string | null = null;
+      let repairFailureReason = "repair_not_attempted";
+
+      if (!dryRun && stopPrice > 0) {
+        try {
+          const created = await createOrder({
+            symbol,
+            qty: String(brokerQty),
+            side: closeSide,
+            type: "stop",
+            stop_price: String(stopPrice),
+            time_in_force: "gtc",
+          });
+          repairOrderId = String((created as any)?.id || "") || null;
+          if (repairOrderId) {
+            const verify = await verifyStopAtBroker({
+              symbol,
+              side: tradeSide,
+              stopOrderId: repairOrderId,
+            });
+            if (verify.verified) {
+              repairOk = true;
+              repairedStops += 1;
+              workingOrders.push({
+                id: verify.stopOrderId || repairOrderId,
+                symbol,
+                side: closeSide,
+                type: "stop",
+                status: "new",
+                stop_price: stopPrice,
+              });
+            } else {
+              repairFailureReason = verify.reason || verify.detail || "stop_not_verified";
+            }
+          } else {
+            repairFailureReason = "stop_order_missing_id";
+          }
+        } catch (err: any) {
+          repairFailureReason = String(err?.message || err || "stop_repair_failed");
+        }
+      } else if (dryRun) {
+        repairFailureReason = "dry_run";
+      } else {
+        repairFailureReason = "missing_entry_price";
+      }
+
+      if (repairOk) {
+        if (!dryRun && linkedTrade) {
+          linkedTrade.stopOrderId = repairOrderId;
+          linkedTrade.stopPrice = stopPrice;
+          linkedTrade.protectionStatus = "VERIFIED";
+          linkedTrade.protectionRepairOutcome = "repaired_stop";
+          linkedTrade.protectionRepairReason = "stop_repair_success";
+          linkedTrade.flattenReason = null;
+          linkedTrade.updatedAt = nowIso;
+        }
+        continue;
+      }
+
+      if (dryRun) {
+        unresolvedCriticalCount += 1;
+        continue;
+      }
+
+      const flat = await forceFlattenPosition(symbol);
+      if (flat.ok) {
+        flattenedUnprotected += 1;
+        if (linkedTrade) {
+          linkedTrade.status = "ERROR";
+          linkedTrade.autoEntryStatus = "AUTO_ERROR";
+          linkedTrade.closeReason = linkedTrade.closeReason || "flattened_unprotected_position";
+          linkedTrade.flattenReason = `repair_failed:${repairFailureReason}`;
+          linkedTrade.closedAt = linkedTrade.closedAt || nowIso;
+          linkedTrade.protectionStatus = "FLATTENED_UNPROTECTED";
+          linkedTrade.protectionRepairOutcome = "flattened_after_repair_failure";
+          linkedTrade.protectionRepairReason = repairFailureReason;
+          linkedTrade.updatedAt = nowIso;
+        }
+      } else {
+        unresolvedCriticalCount += 1;
+        if (linkedTrade) {
+          linkedTrade.protectionStatus = "FLATTEN_FAILED";
+          linkedTrade.protectionRepairOutcome = "flatten_failed_after_repair_failure";
+          linkedTrade.protectionRepairReason = `${repairFailureReason};${flat.error || flat.step}`;
+          linkedTrade.flattenReason = `${flat.step}:${flat.error || "unknown"}`;
+          linkedTrade.updatedAt = nowIso;
+        }
+      }
+    }
+
+    const shouldPersistProtectionPass =
+      repairedStops > 0 || flattenedUnprotected > 0 || unresolvedCriticalCount > 0;
+
+    if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0 || cleanedPending > 0 || cleanedStaleBackfill > 0 || cleanedDuplicateBackfill > 0 || shouldPersistProtectionPass)) {
       await writeTrades(trades);
     }
+
+    const finalBrokerTruth = dryRun ? brokerTruth : await fetchBrokerTruth();
+    const finalPositions = Array.isArray(finalBrokerTruth.positions) ? finalBrokerTruth.positions : [];
+    const finalOrders = Array.isArray(finalBrokerTruth.openOrders) ? finalBrokerTruth.openOrders : [];
+
+    let openPositions = 0;
+    let protectedPositions = 0;
+    for (const pos of finalPositions) {
+      const symbol = up(pos?.symbol);
+      const brokerQty = Math.abs(Number(pos?.qty ?? 0));
+      if (!symbol || !(brokerQty > 0)) continue;
+      openPositions += 1;
+      const closeSide = closeSideFromPos(pos);
+      const tradeSide: "LONG" | "SHORT" = closeSide === "sell" ? "LONG" : "SHORT";
+      const symbolOrders = finalOrders.filter((o: any) => up(o?.symbol) === symbol);
+      const activeStop = findProtectiveStopOrder({ ticker: symbol, tradeSide, openOrders: symbolOrders });
+      if (activeStop) protectedPositions += 1;
+    }
+    const missingStopCount = Math.max(0, openPositions - protectedPositions);
+    unresolvedCriticalCount += missingStopCount;
 
     console.log(
       `[reconcile] completed (source=${runSource}, id=${runId})`,
@@ -1098,7 +1354,7 @@ export async function reconcileOpenTrades(
       }
     );
 
-    const result = {
+    const result: ReconcileOpenTradesResult = {
       ok: true,
       dryRun,
       checked: openTrades.length,
@@ -1115,10 +1371,16 @@ export async function reconcileOpenTrades(
       cleanedDuplicateBackfill,
       cleanedDuplicateBackfillIds,
       cleanedDuplicateBackfillTickers,
+      openPositions,
+      protectedPositions,
+      missingStopCount,
+      repairedStops,
+      flattenedUnprotected,
+      unresolvedCriticalCount,
       broker: {
-        positionsCount: brokerTruth.positionsCount,
-        openOrdersCount: brokerTruth.openOrdersCount,
-        fetchedAt: brokerTruth.fetchedAt,
+        positionsCount: finalBrokerTruth.positionsCount,
+        openOrdersCount: finalBrokerTruth.openOrdersCount,
+        fetchedAt: finalBrokerTruth.fetchedAt,
       },
       results,
     };
@@ -1174,6 +1436,12 @@ export async function reconcileOpenTrades(
       cleanedDuplicateBackfill: 0,
       cleanedDuplicateBackfillIds: [],
       cleanedDuplicateBackfillTickers: [],
+      openPositions: 0,
+      protectedPositions: 0,
+      missingStopCount: 0,
+      repairedStops: 0,
+      flattenedUnprotected: 0,
+      unresolvedCriticalCount: 0,
       broker: {
         positionsCount: 0,
         openOrdersCount: 0,
