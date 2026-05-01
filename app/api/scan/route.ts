@@ -1468,56 +1468,137 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     }
   }
 
-  // Fallback: if many candidates were gate-rejected but nothing was posted, force-post top 5 by preScore
+  // -----------------------------------------------------------------------
+  // Fallback posting: fires when market is open, there are eligible candidates,
+  // but normal gate + dedupe produced zero posts.
+  // Ignores soft quality gates (trendWeak, lowRelVol, lowRange, preScoreTooLow)
+  // but still enforces hard safety gates.
+  // -----------------------------------------------------------------------
   let forcedPostFallback = false;
-  if (candidatesSkippedPrePostGate >= 20 && attemptedPosts === 0 && gateRejectedCandidates.length > 0) {
-    forcedPostFallback = true;
-    const fallbackCandidates = [...gateRejectedCandidates]
-      .sort((a, b) => ((b as any).preScore ?? 0) - ((a as any).preScore ?? 0))
-      .slice(0, 5);
-    console.warn("[SCAN] fallback_post_triggered", {
-      candidatesSkippedPrePostGate,
-      fallbackCount: fallbackCandidates.length,
+  let forcedPostFallbackAttempted = false;
+  let fallbackCandidatesConsidered = 0;
+  let fallbackCandidatesPosted = 0;
+  const fallbackSkippedReasons: Record<string, number> = {};
+  let fallbackBlockerReason: string | null = null;
+  let fallbackReason: string | null = null;
+
+  const shouldAttemptFallback =
+    marketOpen === true &&
+    topCandidates.length >= 10 &&
+    postedCount === 0 &&
+    (aiSeedMode || debugScan);
+
+  if (shouldAttemptFallback) {
+    forcedPostFallbackAttempted = true;
+    fallbackReason = "zero_posts_with_eligible_candidates";
+
+    // Build pool from ALL topCandidates (includes deduped + gate-rejected).
+    // Re-sort by preScore → patternScore → avgDollarVol to pick the best.
+    const fallbackPool = [...topCandidates].sort((a, b) => {
+      const ps = ((b as any).preScore ?? 0) - ((a as any).preScore ?? 0);
+      if (ps !== 0) return ps;
+      const pt = (b.patternScore ?? 0) - (a.patternScore ?? 0);
+      if (pt !== 0) return pt;
+      return ((b.avgDollarVol ?? 0) - (a.avgDollarVol ?? 0));
     });
-    for (const candidate of fallbackCandidates) {
-      if (postSuccessCount >= SCAN_MAX_POSTS_PER_RUN) break;
-      try {
-        const payload = toOutgoing(candidate);
-        const postUrl = `${baseUrl}/api/signals`;
-        const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
-        attemptedPosts += 1;
-        const res = await fetch(postUrl, {
-          method: "POST",
-          body: JSON.stringify(payload),
-          cache: "no-store",
-          headers: {
-            "Content-Type": "application/json",
-            "x-defer-ai": "1",
-            ...(authCookie ? { cookie: authCookie } : {}),
-            ...(inboundScannerToken ? { "x-scanner-token": inboundScannerToken } : {}),
-            ...(scanSource ? { "x-scan-source": scanSource } : {}),
-            ...(scanRunId ? { "x-scan-run-id": String(scanRunId) } : {}),
-            ...(bypassSecret ? { "x-vercel-protection-bypass": bypassSecret } : {}),
-          },
-        });
-        if (res.ok) {
-          postSuccessCount += 1;
-          postedCount += 1;
-          posted.push(payload);
-          if (aiSeedMode) {
-            postedSignals += 1;
-            queuedSignals += 1;
-            totals.signalsPosted += 1;
+
+    const fallbackSelected: typeof topCandidates = [];
+    for (const c of fallbackPool) {
+      if (fallbackSelected.length >= 5) break;
+
+      // Hard safety gates (non-negotiable)
+      if (!c.ticker || typeof c.ticker !== "string") {
+        fallbackSkippedReasons["invalidTicker"] = (fallbackSkippedReasons["invalidTicker"] ?? 0) + 1;
+        continue;
+      }
+      const cPrice = Number((c as any).price ?? c.entryPrice ?? 0);
+      if (cPrice < 3) {
+        fallbackSkippedReasons["priceTooLow"] = (fallbackSkippedReasons["priceTooLow"] ?? 0) + 1;
+        continue;
+      }
+      if ((c.avgDollarVol ?? 0) < 250_000) {
+        fallbackSkippedReasons["dollarVolTooLow"] = (fallbackSkippedReasons["dollarVolTooLow"] ?? 0) + 1;
+        continue;
+      }
+      if ((c.spreadAbs ?? 0) > 2.0) {
+        fallbackSkippedReasons["spreadExtreme"] = (fallbackSkippedReasons["spreadExtreme"] ?? 0) + 1;
+        continue;
+      }
+      if (
+        !Number.isFinite(c.entryPrice) || c.entryPrice <= 0 ||
+        !Number.isFinite(c.stopPrice) || c.stopPrice <= 0 ||
+        !Number.isFinite(c.targetPrice) || c.targetPrice <= 0
+      ) {
+        fallbackSkippedReasons["invalidPrices"] = (fallbackSkippedReasons["invalidPrices"] ?? 0) + 1;
+        continue;
+      }
+
+      fallbackSelected.push(c);
+    }
+
+    fallbackCandidatesConsidered = fallbackPool.length;
+
+    if (fallbackSelected.length === 0) {
+      fallbackBlockerReason = "no_candidates_passed_hard_safety_gates";
+      console.warn("[SCAN] fallback_blocked", { fallbackBlockerReason, fallbackSkippedReasons });
+    } else {
+      forcedPostFallback = true;
+      console.warn("[SCAN] fallback_post_triggered", {
+        candidatesEligibleToPost: topCandidates.length,
+        fallbackCount: fallbackSelected.length,
+        topPreScores: fallbackSelected.slice(0, 3).map((c) => (c as any).preScore ?? null),
+      });
+
+      for (const candidate of fallbackSelected) {
+        if (postSuccessCount >= SCAN_MAX_POSTS_PER_RUN) break;
+        try {
+          const payload = toOutgoing(candidate);
+          const postUrl = `${baseUrl}/api/signals`;
+          const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
+          attemptedPosts += 1;
+          const res = await fetch(postUrl, {
+            method: "POST",
+            body: JSON.stringify(payload),
+            cache: "no-store",
+            headers: {
+              "Content-Type": "application/json",
+              "x-defer-ai": "1",
+              ...(authCookie ? { cookie: authCookie } : {}),
+              ...(inboundScannerToken ? { "x-scanner-token": inboundScannerToken } : {}),
+              ...(scanSource ? { "x-scan-source": scanSource } : {}),
+              ...(scanRunId ? { "x-scan-run-id": String(scanRunId) } : {}),
+              ...(bypassSecret ? { "x-vercel-protection-bypass": bypassSecret } : {}),
+            },
+          });
+          if (res.ok) {
+            postSuccessCount += 1;
+            postedCount += 1;
+            posted.push(payload);
+            fallbackCandidatesPosted += 1;
+            if (aiSeedMode) {
+              postedSignals += 1;
+              queuedSignals += 1;
+              totals.signalsPosted += 1;
+            }
+          } else {
+            postFailureCount += 1;
+            const errText = await res.text().catch(() => "");
+            postFailureDetails.push({ ticker: candidate.ticker, status: res.status, error: errText.slice(0, 200) });
+            fallbackSkippedReasons["postFailed"] = (fallbackSkippedReasons["postFailed"] ?? 0) + 1;
           }
-        } else {
-          postFailureCount += 1;
-          const errText = await res.text().catch(() => "");
-          postFailureDetails.push({ ticker: candidate.ticker, status: res.status, error: errText.slice(0, 200) });
+        } catch (err) {
+          console.error("[SCAN] Failed posting fallback candidate", candidate.ticker, err);
+          fallbackSkippedReasons["postException"] = (fallbackSkippedReasons["postException"] ?? 0) + 1;
         }
-      } catch (err) {
-        console.error("[SCAN] Failed posting fallback candidate", candidate.ticker, err);
+      }
+
+      if (fallbackCandidatesPosted === 0) {
+        fallbackBlockerReason = "fallback_candidates_all_failed_to_post";
       }
     }
+  } else if (marketOpen === true && topCandidates.length >= 10 && postedCount === 0) {
+    // Market open + eligible candidates + zero posts but fallback was not attempted (wrong mode).
+    fallbackBlockerReason = "mode_not_eligible_for_fallback";
   }
 
   const status: ScanStatus = "RUN";
@@ -1670,6 +1751,12 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     gptQueued: posted.length,
     aiSeedDebug,
     forcedPostFallback,
+    forcedPostFallbackAttempted,
+    fallbackReason,
+    fallbackCandidatesConsidered,
+    fallbackCandidatesPosted,
+    ...(Object.keys(fallbackSkippedReasons).length > 0 ? { fallbackSkippedReasons } : {}),
+    ...(fallbackBlockerReason ? { fallbackBlockerReason } : {}),
     topRejectReason: Object.keys(prePostGateReasons).reduce((topKey, k) =>
       (prePostGateReasons[k] ?? 0) > (prePostGateReasons[topKey] ?? 0) ? k : topKey, Object.keys(prePostGateReasons)[0] ?? null),
     topRejectCount: Object.values(prePostGateReasons).reduce((max, v) => Math.max(max, v), 0) || null,
