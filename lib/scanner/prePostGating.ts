@@ -26,6 +26,11 @@ export type CandidateContext = {
   atrPct?: number;
   minutesSinceOpen?: number;
   preScore?: number;
+  trendStrengthPct?: number;
+  rangePct?: number;
+  belowVwap?: boolean;
+  lowerHighLowerLow?: boolean;
+  breakdownVolumeIncreasing?: boolean;
 };
 
 // --------------------------------------------------------------------------
@@ -33,18 +38,22 @@ export type CandidateContext = {
 // --------------------------------------------------------------------------
 
 // LONG thresholds
-const MIN_RELVOL_LONG = Number(process.env.SCAN_MIN_RELVOL_LONG ?? 0.6);
-const MIN_DOLLAR_VOL_LONG = Number(process.env.SCAN_MIN_DOLLAR_VOL_LONG ?? 500000);
+const MIN_RELVOL_LONG = Number(process.env.SCAN_MIN_RELVOL_LONG ?? 0.8);
+const MIN_DOLLAR_VOL_LONG = Number(process.env.SCAN_MIN_DOLLAR_VOL_LONG ?? 1_000_000);
 const MIN_PRESCORE_LONG = Number(process.env.SCAN_MIN_PRESCORE_LONG ?? 35);
 const MAX_SPREAD_PCT_LONG = Number(process.env.SCAN_MAX_SPREAD_PCT_LONG ?? 0.5);
-const MAX_VWAP_DIST_PCT_LONG = Number(process.env.SCAN_MAX_VWAP_DIST_PCT_LONG ?? 2.0);
+const MAX_VWAP_DIST_PCT_LONG = Number(process.env.SCAN_MAX_VWAP_DIST_PCT_LONG ?? 1.2);
 
 // SHORT thresholds (typically stricter due to higher risk)
-const MIN_RELVOL_SHORT = Number(process.env.SCAN_MIN_RELVOL_SHORT ?? 1.5);
-const MIN_DOLLAR_VOL_SHORT = Number(process.env.SCAN_MIN_DOLLAR_VOL_SHORT ?? 750000);
+const MIN_RELVOL_SHORT = Number(process.env.SCAN_MIN_RELVOL_SHORT ?? 2.0);
+const MIN_DOLLAR_VOL_SHORT = Number(process.env.SCAN_MIN_DOLLAR_VOL_SHORT ?? 1_500_000);
 const MIN_PRESCORE_SHORT = Number(process.env.SCAN_MIN_PRESCORE_SHORT ?? 50);
 const MAX_SPREAD_PCT_SHORT = Number(process.env.SCAN_MAX_SPREAD_PCT_SHORT ?? 0.4);
-const MAX_VWAP_DIST_PCT_SHORT = Number(process.env.SCAN_MAX_VWAP_DIST_PCT_SHORT ?? 3.0);
+const MAX_VWAP_DIST_PCT_SHORT = Number(process.env.SCAN_MAX_VWAP_DIST_PCT_SHORT ?? 1.8);
+
+const MIN_TREND_STRENGTH_LONG_PCT = Number(process.env.SCAN_MIN_TREND_STRENGTH_LONG_PCT ?? 0.2);
+const MIN_TREND_STRENGTH_SHORT_PCT = Number(process.env.SCAN_MIN_TREND_STRENGTH_SHORT_PCT ?? 0.25);
+const MIN_RANGE_PCT = Number(process.env.SCAN_PREPOST_MIN_RANGE_PCT ?? 0.35);
 
 // Universal gates (apply to both directions)
 const MIN_PATTERN_SCORE = Number(process.env.SCAN_MIN_PATTERN_SCORE ?? 0);
@@ -79,6 +88,9 @@ export function getPrePostConfig() {
       minPatternScore: MIN_PATTERN_SCORE,
       openingGraceMinutes: OPENING_GRACE_MINUTES,
       openingPreScoreDiscount: OPENING_PRESCORE_DISCOUNT,
+      minTrendStrengthLongPct: MIN_TREND_STRENGTH_LONG_PCT,
+      minTrendStrengthShortPct: MIN_TREND_STRENGTH_SHORT_PCT,
+      minRangePct: MIN_RANGE_PCT,
     },
   };
 }
@@ -130,7 +142,7 @@ export function shouldPostSignal(ctx: CandidateContext): GateResult {
   if (ctx.relVol !== undefined && ctx.relVol < minRelVol) {
     const result: GateResult = {
       shouldPost: false,
-      reason: "relVolTooLow",
+      reason: "lowRelVol",
       note: `relVol=${ctx.relVol.toFixed(2)} min=${minRelVol} side=${ctx.side}`,
     };
     maybeLog(ctx, result);
@@ -141,7 +153,7 @@ export function shouldPostSignal(ctx: CandidateContext): GateResult {
   if (ctx.avgDollarVol !== undefined && ctx.avgDollarVol < minDollarVol) {
     const result: GateResult = {
       shouldPost: false,
-      reason: "dollarVolTooLow",
+      reason: "lowDollarVol",
       note: `dollarVol=${Math.round(ctx.avgDollarVol)} min=${minDollarVol} side=${ctx.side}`,
     };
     maybeLog(ctx, result);
@@ -167,8 +179,72 @@ export function shouldPostSignal(ctx: CandidateContext): GateResult {
     if (absVwapDist > maxVwapDistPct) {
       const result: GateResult = {
         shouldPost: false,
-        reason: "vwapDistTooFar",
+        reason: "vwapTooFar",
         note: `vwapDistPct=${ctx.vwapDistPct.toFixed(2)} max=${maxVwapDistPct} side=${ctx.side}`,
+      };
+      maybeLog(ctx, result);
+      return result;
+    }
+  }
+
+  // Trend strength gate to reject flat/weak trends.
+  if (ctx.trendStrengthPct !== undefined) {
+    if (isLong && ctx.trendStrengthPct < MIN_TREND_STRENGTH_LONG_PCT) {
+      const result: GateResult = {
+        shouldPost: false,
+        reason: "trendWeak",
+        note: `trendStrengthPct=${ctx.trendStrengthPct.toFixed(3)} min=${MIN_TREND_STRENGTH_LONG_PCT} side=${ctx.side}`,
+      };
+      maybeLog(ctx, result);
+      return result;
+    }
+    if (!isLong && Math.abs(Math.min(0, ctx.trendStrengthPct)) < MIN_TREND_STRENGTH_SHORT_PCT) {
+      const result: GateResult = {
+        shouldPost: false,
+        reason: "trendWeak",
+        note: `trendStrengthPct=${ctx.trendStrengthPct.toFixed(3)} minDowntrend=${MIN_TREND_STRENGTH_SHORT_PCT} side=${ctx.side}`,
+      };
+      maybeLog(ctx, result);
+      return result;
+    }
+  }
+
+  // Reject low-range compression candles without expansion.
+  if (ctx.rangePct !== undefined && ctx.rangePct < MIN_RANGE_PCT) {
+    const result: GateResult = {
+      shouldPost: false,
+      reason: "lowRange",
+      note: `rangePct=${ctx.rangePct.toFixed(3)} min=${MIN_RANGE_PCT}`,
+    };
+    maybeLog(ctx, result);
+    return result;
+  }
+
+  // Short-only structural quality requirements.
+  if (!isLong) {
+    if (ctx.belowVwap === false) {
+      const result: GateResult = {
+        shouldPost: false,
+        reason: "vwapTooFar",
+        note: "short_requires_below_vwap",
+      };
+      maybeLog(ctx, result);
+      return result;
+    }
+    if (ctx.lowerHighLowerLow === false) {
+      const result: GateResult = {
+        shouldPost: false,
+        reason: "trendWeak",
+        note: "short_requires_lower_highs_and_lower_lows",
+      };
+      maybeLog(ctx, result);
+      return result;
+    }
+    if (ctx.breakdownVolumeIncreasing === false) {
+      const result: GateResult = {
+        shouldPost: false,
+        reason: "lowRelVol",
+        note: "short_requires_increasing_breakdown_volume",
       };
       maybeLog(ctx, result);
       return result;

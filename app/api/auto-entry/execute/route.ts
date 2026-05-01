@@ -423,17 +423,23 @@ type PriceDriftDiagnostics = {
   driftPct: number;
   R: number;
   driftInR: number;
+  driftR: number;
   driftAllowed: boolean;
   /** Non-null when execution can still proceed with an adjusted entry. */
   adjustedEntryPrice: number | null;
+  usedFastMoveBuffer: boolean;
   reason: string | null;
 };
+
+const DRIFT_MAX_R = Number(process.env.AUTO_ENTRY_MAX_DRIFT_R ?? 0.5);
+const DRIFT_FAST_MOVE_BUFFER_PCT = Number(process.env.AUTO_ENTRY_FAST_MOVE_BUFFER_PCT ?? 0.0035);
 
 /**
  * Evaluates price drift using R-based tolerance only.
  *
  * Rules:
- *   - Allow if drift <= 0.5R (where R = abs(entryPrice - stopPrice))
+ *   - Allow if drift <= configured R threshold (default 0.5R)
+ *   - Also allow a small fast-move percent buffer (default 0.35%)
  *   - Also allow if R == 0 / missing data (pass-through)
  *   - When drift is within tolerance, return an adjustedEntryPrice = currentPrice
  *     so the caller can slide the entry to the live market price.
@@ -447,32 +453,63 @@ function checkPriceDrift(
   const driftPct = entryPrice > 0 ? drift / entryPrice : 0;
   const R = Math.abs(entryPrice - stopPrice);
   const driftInR = R > 0 ? drift / R : 0;
+  const driftR = driftInR;
 
   // Safety passthrough: missing or zero prices
   if (currentPrice <= 0 || entryPrice <= 0) {
-    return { entryPrice, currentPrice, drift, driftPct, R, driftInR, driftAllowed: true, adjustedEntryPrice: null, reason: null };
+    return {
+      entryPrice,
+      currentPrice,
+      drift,
+      driftPct,
+      R,
+      driftInR,
+      driftR,
+      driftAllowed: true,
+      adjustedEntryPrice: null,
+      usedFastMoveBuffer: false,
+      reason: null,
+    };
   }
 
   // R invalid (stop == entry) → pass through
   if (R <= 0) {
-    return { entryPrice, currentPrice, drift, driftPct, R, driftInR, driftAllowed: true, adjustedEntryPrice: null, reason: null };
+    return {
+      entryPrice,
+      currentPrice,
+      drift,
+      driftPct,
+      R,
+      driftInR,
+      driftR,
+      driftAllowed: true,
+      adjustedEntryPrice: null,
+      usedFastMoveBuffer: false,
+      reason: null,
+    };
   }
 
-  // Reject only if drift > 0.5R
-  if (driftInR > 0.5) {
+  const withinRLimit = driftInR <= DRIFT_MAX_R;
+  const withinFastMoveBuffer = driftPct <= DRIFT_FAST_MOVE_BUFFER_PCT;
+
+  if (!withinRLimit && !withinFastMoveBuffer) {
     return {
       entryPrice, currentPrice, drift, driftPct, R, driftInR,
+      driftR,
       driftAllowed: false,
       adjustedEntryPrice: null,
+      usedFastMoveBuffer: false,
       reason: "entry_price_drifted_risk_multiple",
     };
   }
 
-  // Drift is within tolerance — allow and suggest adjusting entry to currentPrice
+  // Drift is within tolerance — allow and suggest adjusting entry to currentPrice.
   return {
     entryPrice, currentPrice, drift, driftPct, R, driftInR,
+    driftR,
     driftAllowed: true,
     adjustedEntryPrice: Number(currentPrice.toFixed(2)),
+    usedFastMoveBuffer: !withinRLimit && withinFastMoveBuffer,
     reason: null,
   };
 }
@@ -2424,6 +2461,7 @@ export async function POST(req: Request) {
   // Price drift guard: only reject if drift > 0.5R from planned entry.
   // When within tolerance, slide entryPrice to current market price.
   let driftDiagnosticsForExec: PriceDriftDiagnostics | null = null;
+  let executionAdjustments = false;
   if (decisionPriceForDrift) {
     const driftDiag = checkPriceDrift(decisionPriceForDrift, entryPrice, stopPrice);
     driftDiagnosticsForExec = driftDiag;
@@ -2442,14 +2480,56 @@ export async function POST(req: Request) {
       skippedTradeIds.push(tradeId);
       continue;
     }
-    // Drift within tolerance — adjust entry to live price to improve fill probability
+    // Drift within tolerance — adjust entry to live price and preserve original R geometry.
     if (driftDiag.adjustedEntryPrice != null && driftDiag.adjustedEntryPrice !== entryPrice) {
+      const originalEntry = entryPrice;
+      const originalStop = stopPrice;
+      const originalTarget = targetPrice;
+      const riskDistance = Math.abs(originalEntry - originalStop);
+      const rewardDistance = Math.abs(originalTarget - originalEntry);
+
       entryPrice = driftDiag.adjustedEntryPrice;
+
+      if (sideEnum === "LONG") {
+        stopPrice = Number((entryPrice - riskDistance).toFixed(2));
+        targetPrice = Number((entryPrice + rewardDistance).toFixed(2));
+      } else {
+        stopPrice = Number((entryPrice + riskDistance).toFixed(2));
+        targetPrice = Number((entryPrice - rewardDistance).toFixed(2));
+      }
+
+      executionAdjustments = true;
+      console.log("[execute] adaptive_entry_adjustment", {
+        tradeId,
+        ticker,
+        side: sideEnum,
+        executionAdjustments,
+        driftPct: driftDiag.driftPct,
+        driftR: driftDiag.driftR,
+        usedFastMoveBuffer: driftDiag.usedFastMoveBuffer,
+        originalEntry,
+        adjustedEntry: entryPrice,
+        adjustedStop: stopPrice,
+        adjustedTarget: targetPrice,
+      });
+
+      trades[idx] = {
+        ...trades[idx],
+        entryPrice,
+        stopPrice,
+        targetPrice,
+        takeProfitPrice: targetPrice,
+        executionAdjustments: true,
+        adjustedForDriftAt: nowIso(),
+        driftDiagnostics: driftDiag,
+        updatedAt: nowIso(),
+      };
+      await writeTrades(trades);
     }
   }
 
-  // submitBasePrice = trade plan entry price. NEVER the live quote.
-  // tp and bracketStop = trade plan values directly. NO recalculation.
+  // submitBasePrice = drift-adjusted trade-plan entry price (if adjusted), never raw quote.
+  // tp and bracketStop come from the active trade plan, including proportional drift adjustment.
   const submitBasePrice = Number(entryPrice.toFixed(2));
   const computedBasePrice = submitBasePrice;
   let tp = Number(targetPrice.toFixed(2));
@@ -2502,6 +2582,9 @@ export async function POST(req: Request) {
     score,
     replacement: replacementPlan,
     driftDiagnostics: driftDiagnosticsForExec,
+    executionAdjustments,
+    driftPct: driftDiagnosticsForExec?.driftPct ?? null,
+    driftR: driftDiagnosticsForExec?.driftR ?? null,
     staleThresholdMs: maxAgeMin * 60_000,
   };
 

@@ -167,32 +167,62 @@ function bumpSkipReason(
 type ShortQualityResult = {
   pass: boolean;
   reason: string | null;
-  penalty: number;
+  blockReason: SeedSkipReason | null;
 };
 
 /**
- * Lightweight short-side quality check.
- * Uses existing signal fields only - does NOT block, just penalizes score.
+ * Strict short-side quality check.
+ * Rejects shorts that are not below VWAP, not in lower-high/lower-low structure,
+ * or lacking increasing volume on breakdown.
  */
 function evaluateShortQuality(signal: RawSignal): ShortQualityResult {
-  let penalty = 0;
   const reasons: string[] = [];
 
-  // 1. Trend check: prefer "down" trend for shorts
+  const toBool = (v: unknown): boolean | null => {
+    if (typeof v === "boolean") return v;
+    const s = String(v ?? "").trim().toLowerCase();
+    if (!s) return null;
+    if (["1", "true", "yes", "y", "on"].includes(s)) return true;
+    if (["0", "false", "no", "n", "off"].includes(s)) return false;
+    return null;
+  };
+
+  // 1. Trend structure: lower highs / lower lows and downtrend alignment
   const trend = getStr(signal, ["trend", "ai.trend", "context.trend"]);
-  if (trend) {
-    const trendLower = trend.toLowerCase();
-    if (trendLower === "flat" || trendLower === "neutral") {
-      penalty += 5;
-      reasons.push("flat_trend");
-    } else if (trendLower === "up" || trendLower === "bullish") {
-      penalty += 10;
-      reasons.push("bullish_trend");
-    }
-    // "down" or "bearish" = no penalty
+  const lowerHighs =
+    toBool(signal?.lowerHighs) ??
+    toBool(signal?.context?.lowerHighs) ??
+    toBool(signal?.structure?.lowerHighs);
+  const lowerLows =
+    toBool(signal?.lowerLows) ??
+    toBool(signal?.context?.lowerLows) ??
+    toBool(signal?.structure?.lowerLows);
+
+  if (lowerHighs === false || lowerLows === false) {
+    return {
+      pass: false,
+      reason: "missing_lower_highs_lows",
+      blockReason: "flat_trend_block",
+    };
   }
 
-  // 2. VWAP alignment: shorts should prefer at/below VWAP or rejection above
+  if (trend) {
+    const trendLower = trend.toLowerCase();
+    if (
+      trendLower === "flat" ||
+      trendLower === "neutral" ||
+      trendLower === "up" ||
+      trendLower === "bullish"
+    ) {
+      return {
+        pass: false,
+        reason: `trend=${trendLower}`,
+        blockReason: "flat_trend_block",
+      };
+    }
+  }
+
+  // 2. VWAP alignment: shorts must be below VWAP.
   const vwapPosition = getStr(signal, ["vwapPosition", "ai.vwapPosition", "context.vwapPosition"]);
   const price = getNum(signal, ["entryPrice", "price", "lastPrice"]);
   const vwap = getNum(signal, ["vwap", "context.vwap"]);
@@ -200,33 +230,50 @@ function evaluateShortQuality(signal: RawSignal): ShortQualityResult {
   if (vwapPosition) {
     const vpLower = vwapPosition.toLowerCase();
     if (vpLower === "above" || vpLower.includes("above")) {
-      // Above VWAP short - slightly risky
-      penalty += 3;
-      reasons.push("above_vwap");
+      return {
+        pass: false,
+        reason: "above_vwap",
+        blockReason: "vwap_alignment_block",
+      };
     }
   } else if (price && vwap && vwap > 0) {
     const distPct = ((price - vwap) / vwap) * 100;
-    if (distPct > 1.0) {
-      // More than 1% above VWAP
-      penalty += 3;
-      reasons.push("above_vwap_calc");
+    if (distPct >= 0) {
+      return {
+        pass: false,
+        reason: `not_below_vwap:${distPct.toFixed(2)}%`,
+        blockReason: "vwap_alignment_block",
+      };
     }
   }
 
-  // 3. Relative volume check: shorts need decent volume
-  const relVol = getNum(signal, ["relVol", "relativeVolume", "context.relVol"]);
-  if (relVol != null && relVol < 1.2) {
-    // Below 1.2x relative volume - weak liquidity for short
-    penalty += 5;
-    reasons.push("low_relvol");
+  // 3. Breakdown volume: must be increasing on breakdown.
+  const breakdownVolumeIncreasing =
+    toBool(signal?.breakdownVolumeIncreasing) ??
+    toBool(signal?.context?.breakdownVolumeIncreasing) ??
+    toBool(signal?.volume?.breakdownIncreasing);
+  if (breakdownVolumeIncreasing === false) {
+    return {
+      pass: false,
+      reason: "breakdown_volume_not_increasing",
+      blockReason: "weak_volume_block",
+    };
   }
 
-  // Threshold: if penalty >= 15, soft reject (but don't hard block)
-  const pass = penalty < 15;
+  // 4. Relative volume check: shorts need decent volume.
+  const relVol = getNum(signal, ["relVol", "relativeVolume", "context.relVol"]);
+  if (relVol != null && relVol < 1.5) {
+    return {
+      pass: false,
+      reason: `relVol=${relVol.toFixed(2)}<1.5`,
+      blockReason: "weak_volume_block",
+    };
+  }
+
   return {
-    pass,
-    penalty,
+    pass: true,
     reason: reasons.length > 0 ? reasons.join(",") : null,
+    blockReason: null,
   };
 }
 
@@ -271,6 +318,9 @@ function evaluateCTierQuality(
   if (relVol != null && relVol < cfg.cMinRelVol) {
     return { pass: false, blockReason: "weak_volume_block", debugNote: `relVol ${relVol.toFixed(2)} < cMinRelVol ${cfg.cMinRelVol}` };
   }
+  if (relVol == null) {
+    return { pass: false, blockReason: "weak_volume_block", debugNote: "relVol missing for C-tier" };
+  }
 
   // Trend alignment gate
   if (cfg.requireTrendAlignment) {
@@ -280,7 +330,7 @@ function evaluateCTierQuality(
       if (side === "LONG" && (tLower === "flat" || tLower === "down" || tLower === "strong_down" || tLower === "weak_down")) {
         return { pass: false, blockReason: "flat_trend_block", debugNote: `trend=${trend} incompatible with LONG` };
       }
-      if (side === "SHORT" && (tLower === "up" || tLower === "strong_up" || tLower === "weak_up")) {
+      if (side === "SHORT" && (tLower === "flat" || tLower === "neutral" || tLower === "up" || tLower === "strong_up" || tLower === "weak_up")) {
         return { pass: false, blockReason: "vwap_alignment_block", debugNote: `trend=${trend} incompatible with SHORT` };
       }
     }
@@ -380,10 +430,10 @@ function dedupeCandidates(candidates: QualifiedCandidate[]): {
   // Final sort: tier-priority first (A > B > C), then effectiveScore, then actionabilityRank, then freshest
   const tierWeight = (tier: string) => tier === "A" ? 3 : tier === "B" ? 2 : 1;
   unique.sort((a, b) => {
+    const scoreDiff = b.aiScore - a.aiScore;
+    if (Math.abs(scoreDiff) > 0.01) return scoreDiff;
     const tierDiff = tierWeight(b.tier) - tierWeight(a.tier);
     if (tierDiff !== 0) return tierDiff;
-    const scoreDiff = b.effectiveScore - a.effectiveScore;
-    if (Math.abs(scoreDiff) > 0.3) return scoreDiff;
     // Within same tier+score band: prefer higher actionability then freshest signal
     const rankDiff = b.actionabilityRank - a.actionabilityRank;
     if (rankDiff !== 0) return rankDiff;
@@ -454,7 +504,7 @@ export async function POST(req: NextRequest) {
   const guardConfig = getGuardrailConfig();
   const maxSignalAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN))
     ? Math.max(1, Number(process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN))
-    : 30;
+    : 5;
   const staleThresholdUsedMs = Math.round(maxSignalAgeMin * 60 * 1000);
 
   const [rawSignals, trades, overlay, brokerTruth, guardState, clock, allStoredSignals] = await Promise.all([
@@ -613,6 +663,10 @@ export async function POST(req: NextRequest) {
     if (s?.qualified !== true) return false;
     const status = String(s?.status || "").toUpperCase();
     return status !== "ARCHIVED";
+  }).sort((a, b) => {
+    const aTs = getSignalTimestampMs(a) ?? 0;
+    const bTs = getSignalTimestampMs(b) ?? 0;
+    return bTs - aTs;
   });
 
   const qualifiedSignalAges: Array<{
@@ -774,10 +828,16 @@ export async function POST(req: NextRequest) {
     let shortPenalty = 0;
     if (side === "SHORT") {
       const shortQuality = evaluateShortQuality(s);
-      shortPenalty = shortQuality.penalty;
       if (!shortQuality.pass) {
         shortSkippedWeakStructure += 1;
-        markSkip("below_threshold");
+        markSkip(shortQuality.blockReason ?? "below_threshold");
+        console.log("[seed-from-signals] short_rejected", {
+          signalId,
+          symbol,
+          side,
+          rejectReason: shortQuality.reason,
+          blockReason: shortQuality.blockReason ?? "below_threshold",
+        });
         continue;
       }
       shortQualified += 1;
@@ -788,14 +848,22 @@ export async function POST(req: NextRequest) {
     if (tier === "C") {
       const cGate = evaluateCTierQuality(s, aiScore as number, side, {
         allowCTier: cfg.allowCTier,
-        cMinScore: cfg.cMinScore,
-        cMinRelVol: cfg.cMinRelVol,
-        requireTrendAlignment: cfg.requireTrendAlignment,
-        cMinRR: cfg.cMinRR,
+        cMinScore: Math.max(cfg.cMinScore, 7.2),
+        cMinRelVol: Math.max(cfg.cMinRelVol, 1.5),
+        requireTrendAlignment: true,
+        cMinRR: Math.max(cfg.cMinRR, 2.0),
       });
       if (!cGate.pass) {
         const blockReason = cGate.blockReason ?? "c_tier_quality_block";
         markSkip(blockReason);
+        console.log("[seed-from-signals] c_tier_rejected", {
+          signalId,
+          symbol,
+          side,
+          aiScore,
+          rejectReason: cGate.debugNote,
+          blockReason,
+        });
         continue;
       }
     }
@@ -854,8 +922,33 @@ export async function POST(req: NextRequest) {
   const uniqueCandidatesCount = uniqueCandidates.length;
   const totalCandidates = allQualifyingCandidates.length;
 
-  const candidatesToSeed = uniqueCandidates.slice(0, effectiveLimit);
-  const capacitySkippedCandidates = uniqueCandidates.slice(effectiveLimit);
+  const effectiveCTierGate = {
+    cMinScore: Math.max(cfg.cMinScore, 7.2),
+    cMinRelVol: Math.max(cfg.cMinRelVol, 1.5),
+    requireTrendAlignment: true,
+    cMinRR: Math.max(cfg.cMinRR, 2.0),
+  };
+
+  const abCandidates = uniqueCandidates.filter((c) => c.tier === "A" || c.tier === "B");
+  const cCandidates = uniqueCandidates.filter((c) => c.tier === "C");
+  const sortedAbCandidates = [...abCandidates].sort((a, b) => {
+    if (b.aiScore !== a.aiScore) return b.aiScore - a.aiScore;
+    return b.ageMs - a.ageMs;
+  });
+  const sortedCCandidates = [...cCandidates].sort((a, b) => {
+    if (b.aiScore !== a.aiScore) return b.aiScore - a.aiScore;
+    return b.ageMs - a.ageMs;
+  });
+
+  const candidatesToSeed =
+    sortedAbCandidates.length > 0
+      ? sortedAbCandidates.slice(0, effectiveLimit)
+      : sortedCCandidates.slice(0, effectiveLimit);
+
+  const capacitySkippedCandidates =
+    sortedAbCandidates.length > 0
+      ? [...sortedAbCandidates.slice(effectiveLimit), ...sortedCCandidates]
+      : sortedCCandidates.slice(effectiveLimit);
   for (const c of capacitySkippedCandidates) {
     skipped.push({
       signalId: c.signalId,
@@ -1155,10 +1248,10 @@ export async function POST(req: NextRequest) {
     cTierQualityBlockCount,
     cTierQualityGateConfig: {
       allowCTier: cfg.allowCTier,
-      cMinScore: cfg.cMinScore,
-      cMinRelVol: cfg.cMinRelVol,
-      requireTrendAlignment: cfg.requireTrendAlignment,
-      cMinRR: cfg.cMinRR,
+      cMinScore: effectiveCTierGate.cMinScore,
+      cMinRelVol: effectiveCTierGate.cMinRelVol,
+      requireTrendAlignment: effectiveCTierGate.requireTrendAlignment,
+      cMinRR: effectiveCTierGate.cMinRR,
     },
     // Funnel intent classification
     funnelIntent: qualityFilteredAllSkips

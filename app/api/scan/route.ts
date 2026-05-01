@@ -60,6 +60,11 @@ interface CandidateSignal {
   spreadAbs?: number;
   price?: number;
   avgDollarVol?: number;
+  trendStrengthPct?: number;
+  rangePct?: number;
+  belowVwap?: boolean;
+  lowerHighLowerLow?: boolean;
+  breakdownVolumeIncreasing?: boolean;
 }
 
 /**
@@ -585,6 +590,9 @@ function detectAiSeedCandidate(
   const distToVwapPct = vwap > 0 ? ((last.c - vwap) / vwap) * 100 : 0;
   const avgDollarVol = avg(bars.map(b => Number(b.v ?? 0) * Number((b.vw ?? b.c ?? 0) || 0)));
   const prev = bars.length >= 2 ? bars[bars.length - 2] : null;
+  const trendAnchor = bars.length >= 6 ? bars[bars.length - 6] : bars[0];
+  const trendStrengthPct = trendAnchor?.c > 0 ? ((last.c - trendAnchor.c) / trendAnchor.c) * 100 : 0;
+  const rangePct = last.c > 0 ? ((last.h - last.l) / last.c) * 100 : 0;
   const vwapSlopePct = prev ? ((last.c - prev.c) / prev.c) * 100 : 0;
   const ranges = bars.slice(-20).map(b => b.h - b.l);
   const atrPct = last.c > 0 ? (avg(ranges) / last.c) * 100 : 0;
@@ -609,6 +617,8 @@ function detectAiSeedCandidate(
     spreadAbs,
     price: last.c,
     avgDollarVol,
+    trendStrengthPct,
+    rangePct,
   };
 }
 
@@ -658,16 +668,24 @@ function detectShortCandidate(
   const recent5 = bars.slice(-5);
   const lowerHigh = recent5.length >= 2 && 
     recent5[recent5.length - 1].h < recent5[recent5.length - 2].h;
+  const lowerLow = recent5.length >= 2 &&
+    recent5[recent5.length - 1].l < recent5[recent5.length - 2].l;
+  const lowerHighLowerLow = lowerHigh && lowerLow;
   
   // 3. 5-min trend negative?
   const first5 = bars.slice(-5)[0];
   const trendNegative = last.c < first5.c;
+  const trendStrengthPct = first5?.c > 0 ? ((last.c - first5.c) / first5.c) * 100 : 0;
   
   // 4. Below VWAP (post-fade)?
   const belowVwap = last.c < vwap;
+
+  const priorVolAvg = avg(recent5.slice(0, Math.max(0, recent5.length - 1)).map((b) => Number(b.v ?? 0)));
+  const breakdownVolumeIncreasing = priorVolAvg > 0 ? Number(last.v ?? 0) >= priorVolAvg * 1.1 : false;
+  const rangePct = last.c > 0 ? ((last.h - last.l) / last.c) * 100 : 0;
   
   // Score: if any 2+ signals present, consider it
-  const signals = [extended, lowerHigh, trendNegative, belowVwap].filter(Boolean).length;
+  const signals = [extended, lowerHighLowerLow, trendNegative, belowVwap, breakdownVolumeIncreasing].filter(Boolean).length;
   
   if (signals < 2) {
     reject(symbol, "other", `shortSignals=${signals}`);
@@ -696,7 +714,7 @@ function detectShortCandidate(
     mode: "short",
     features,
     patternScore: scorePattern("SHORT_CANDIDATE", features),
-    reasoning: `Short candidate: ${signals} bearish signals (extended=${extended}, lowerHigh=${lowerHigh}, trendNeg=${trendNegative}, belowVwap=${belowVwap}).`,
+    reasoning: `Short candidate: ${signals} bearish signals (extended=${extended}, lhll=${lowerHighLowerLow}, trendNeg=${trendNegative}, belowVwap=${belowVwap}, volBreak=${breakdownVolumeIncreasing}).`,
     source: "scan:short",
     bias: "SHORT_CANDIDATE",
     relVol,
@@ -706,6 +724,11 @@ function detectShortCandidate(
     spreadAbs,
     price: last.c,
     avgDollarVol: avgDollarVolCalc,
+    trendStrengthPct,
+    rangePct,
+    belowVwap,
+    lowerHighLowerLow,
+    breakdownVolumeIncreasing,
   };
 }
 
@@ -1344,6 +1367,11 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
         atrPct: candidate.atrPct,
         minutesSinceOpen: (candidate as any).minutesSinceOpen,
         preScore: (candidate as any).preScore,
+        trendStrengthPct: candidate.trendStrengthPct,
+        rangePct: candidate.rangePct,
+        belowVwap: candidate.belowVwap,
+        lowerHighLowerLow: candidate.lowerHighLowerLow,
+        breakdownVolumeIncreasing: candidate.breakdownVolumeIncreasing,
       };
       const gateResult = shouldPostSignal(gateContext);
       if (!gateResult.shouldPost) {
@@ -1358,8 +1386,22 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
             skipReason: "prePostGate",
             gateReason: gateResult.reason,
             gateNote: gateResult.note,
+            rejectReason: gateResult.reason,
+            trendStrengthPct: candidate.trendStrengthPct ?? null,
+            relVol: candidate.relVol ?? null,
+            vwapDistPct: candidate.distToVwapPct ?? null,
           });
         }
+        console.log("[scan] candidate_rejected", {
+          ticker: candidate.ticker,
+          side: candidate.side,
+          rejectReason: gateResult.reason,
+          note: gateResult.note,
+          relVol: candidate.relVol ?? null,
+          vwapDistPct: candidate.distToVwapPct ?? null,
+          trendStrengthPct: candidate.trendStrengthPct ?? null,
+          rangePct: candidate.rangePct ?? null,
+        });
         continue;
       }
       
