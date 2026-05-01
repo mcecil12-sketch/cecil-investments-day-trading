@@ -26,9 +26,12 @@ const VALID_TASK_TYPES: ManualActionTaskType[] = [
 export interface IntakePayload {
   title?: unknown;
   description?: unknown;
+  message?: unknown;
   priority?: unknown;
   taskType?: unknown;
+  type?: unknown;
   executionReady?: unknown;
+  execute?: unknown;
   acceptanceCriteria?: unknown;
   fileHints?: unknown;
   routeHints?: unknown;
@@ -75,13 +78,15 @@ export function normalizeIntakePayload(
   }
 
   // Description
-  const description = trimStr(raw.description);
+  const description = trimStr(raw.description) || trimStr(raw.message);
   if (!description) {
     return { ok: false, error: "Missing required field: description", field: "description" };
   }
 
   // Priority
-  const rawPriority = trimStr(raw.priority).toUpperCase() as ManualActionPriority;
+  const rawPriorityInput = trimStr(raw.priority).toUpperCase();
+  const rawPriority =
+    (rawPriorityInput || "MEDIUM") as ManualActionPriority;
   if (!VALID_PRIORITIES.includes(rawPriority)) {
     return {
       ok: false,
@@ -91,11 +96,16 @@ export function normalizeIntakePayload(
   }
 
   // TaskType
-  const rawTaskType = trimStr(raw.taskType).toUpperCase().replace(/-/g, "_") as ManualActionTaskType;
+  const rawTypeInput = (trimStr(raw.taskType || raw.type) || "TASK").toUpperCase().replace(/-/g, "_");
+  const rawTaskType = (
+    rawTypeInput === "BUG" ? "BUGFIX" :
+    rawTypeInput === "TASK" || rawTypeInput === "" ? "OTHER" :
+    rawTypeInput
+  ) as ManualActionTaskType;
   if (!VALID_TASK_TYPES.includes(rawTaskType)) {
     return {
       ok: false,
-      error: `Invalid taskType "${trimStr(raw.taskType)}". Must be one of: ${VALID_TASK_TYPES.join(", ")}`,
+      error: `Invalid taskType/type "${trimStr(raw.taskType || raw.type)}". Must be one of: ${VALID_TASK_TYPES.join(", ")}`,
       field: "taskType",
     };
   }
@@ -104,7 +114,8 @@ export function normalizeIntakePayload(
   const normalizedSource: ManualActionSource = trimStr(raw.source) || "chat_intake";
 
   // ExecutionReady
-  const executionReady = raw.executionReady === true || raw.executionReady === "true";
+  const executeRaw = raw.executionReady ?? raw.execute;
+  const executionReady = executeRaw === true || executeRaw === "true";
 
   // Arrays
   const acceptanceCriteria = toStringArray(raw.acceptanceCriteria);

@@ -7,6 +7,7 @@ import { selectCanonicalOpenTrades } from "@/lib/trades/canonicalOpenBySymbol";
 import {
   buildBrokerSyncExecutedPatch,
   normalizeClosedTradeProtection,
+  repairStaleTerminalTrades,
   shouldSendCloseNotification,
   markCloseNotificationSent,
 } from "@/lib/trades/lifecycle";
@@ -271,6 +272,19 @@ export async function POST(req: NextRequest) {
   }
   // ── end closed-trade protection normalization ─────────────────────────────
 
+  const terminalRepairNow = new Date().toISOString();
+  const staleTerminalRepair = repairStaleTerminalTrades(trades, terminalRepairNow);
+  const staleTerminalRepairedCount = staleTerminalRepair.staleTerminalRepairedCount;
+  if (staleTerminalRepairedCount > 0) {
+    for (let i = 0; i < trades.length; i++) {
+      trades[i] = staleTerminalRepair.trades[i];
+    }
+    updated += staleTerminalRepairedCount;
+    console.log("[sync-broker-state] repaired stale terminal closedAt", {
+      count: staleTerminalRepairedCount,
+    });
+  }
+
   await writeTrades(trades);
 
   // ── Close notification follow-up pass ────────────────────────────────────
@@ -345,6 +359,7 @@ export async function POST(req: NextRequest) {
     missingAtBroker,
     closedGhosts,
     closedProtectionNormalized,
+    staleTerminalRepairedCount,
     closeNotificationsSent,
   };
 

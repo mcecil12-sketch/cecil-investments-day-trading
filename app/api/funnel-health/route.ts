@@ -5,7 +5,7 @@ import { getGuardrailConfig } from "@/lib/autoEntry/guardrails";
 import { getGuardrailsState } from "@/lib/autoEntry/guardrailsStore";
 import { readTodayFunnel } from "@/lib/funnelRedis";
 import { getEtDateString, getEtDayBoundsMs, isTimestampInEtDay } from "@/lib/time/etDate";
-import { readTrades } from "@/lib/tradesStore";
+import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { readSignals } from "@/lib/jsonDb";
 import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
 import { isOpenTradeStatus } from "@/lib/trades/protection";
@@ -13,6 +13,7 @@ import { getSignalTimestampMs } from "@/lib/signals/since";
 import { selectCanonicalOpenTrades } from "@/lib/trades/canonicalOpenBySymbol";
 import { evaluateTradeProtectionNow } from "@/lib/risk/protection-truth";
 import { readLatestSeedRunTelemetry } from "@/lib/autoEntry/seedTelemetry";
+import { repairStaleTerminalTrades } from "@/lib/trades/lifecycle";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -85,6 +86,9 @@ type FunnelHealthResponse = {
   lastSeedRunId?: string | null;
   score: FunnelScore;
   incidents: Incident[];
+  activeMalformedPendingCount?: number;
+  terminalMalformedCount?: number;
+  staleTerminalRepairedCount?: number;
   timestamps?: {
     lastSeedAt?: string | null;
     lastExecuteAt?: string | null;
@@ -135,7 +139,9 @@ type FunnelHealthResponse = {
   } | null;
   /** Execute blocker metrics — present when any pending trades were rejected */
   executeBlockerMetrics?: {
-    malformedPendingCount: number;
+    activeMalformedPendingCount: number;
+    terminalMalformedCount: number;
+    staleTerminalRepairedCount?: number;
     rescoreRequiredCount: number;
     scoreThresholdBlockedCount: number;
     priceDriftSkippedCount: number;
@@ -195,7 +201,8 @@ function detectIncidents(params: {
   seedSlaBreached: boolean;
   noAutoPendingSkips: number;
   protectionMissingTickers: string[];
-  malformedPendingCount: number;
+  activeMalformedPendingCount: number;
+  openProtectionBlockerCount: number;
   /** Count of AUTO_PENDING trades with no terminal executeOutcome — truly fresh unresolved. */
   freshUnresolvedPendingCount: number;
   /** Count of AUTO_PENDING trades older than the stale threshold during market hours. */
@@ -219,7 +226,8 @@ function detectIncidents(params: {
     seedSlaBreached,
     noAutoPendingSkips,
     protectionMissingTickers,
-    malformedPendingCount,
+    activeMalformedPendingCount,
+    openProtectionBlockerCount,
     freshUnresolvedPendingCount,
     staleActivePendingCount,
     cTierQualityBlockCount = 0,
@@ -293,15 +301,22 @@ function detectIncidents(params: {
     });
   }
 
-  // EXECUTE_BLOCKER: seeded trades marked malformed/rescore_required at execute time
-  if (marketOpen && seeded > 0 && executed === 0 && malformedPendingCount > 0) {
+  // EXECUTE_BLOCKER: only unresolved active blockers should count.
+  // Excludes terminal ERROR/ARCHIVED/CLOSED and any trade with closedAt set.
+  if (marketOpen && (activeMalformedPendingCount > 0 || openProtectionBlockerCount > 0)) {
     incidents.push({
       code: "EXECUTE_BLOCKER",
       severity: "CRITICAL",
       incidentType: "SYSTEM_BROKEN",
       recommendedAction: "Seeded trades malformed at execute. Check payload normalization in execute route.",
-      message: `${seeded} trade(s) seeded but blocked at execute validation: ${malformedPendingCount} marked malformed/rescore_required. Execute payload normalization or eligibility check is rejecting valid seeded trades.`,
-      context: { seeded, executed, malformedPendingCount, remainingPositionSlots },
+      message: `Active execute blockers detected: malformedPending=${activeMalformedPendingCount}, openProtectionBlockers=${openProtectionBlockerCount}.`,
+      context: {
+        seeded,
+        executed,
+        activeMalformedPendingCount,
+        openProtectionBlockerCount,
+        remainingPositionSlots,
+      },
     });
   }
 
@@ -311,11 +326,11 @@ function detectIncidents(params: {
   if (freshUnresolvedPendingCount > 0 && executed === 0 && marketOpen) {
     incidents.push({
       code: "SEED_NOT_EXECUTED",
-      severity: malformedPendingCount > 0 ? "CRITICAL" : "MEDIUM",
+      severity: activeMalformedPendingCount > 0 ? "CRITICAL" : "MEDIUM",
       incidentType: "EXECUTION_SELECTIVITY",
       recommendedAction: "Pending trades not yet executed. Check execute cron and broker connectivity.",
       message: `${freshUnresolvedPendingCount} fresh pending trade(s) not yet executed. Check execute route or broker integration.`,
-      context: { seeded, executed, freshUnresolvedPendingCount, marketOpen, malformedPendingCount },
+      context: { seeded, executed, freshUnresolvedPendingCount, marketOpen, activeMalformedPendingCount },
     });
   }
 
@@ -447,6 +462,13 @@ export async function GET() {
     ]);
 
     const marketOpen = Boolean(clock?.is_open);
+    const staleRepairNow = new Date().toISOString();
+    const staleTerminalRepair = repairStaleTerminalTrades(allTrades || [], staleRepairNow);
+    const staleTerminalRepairedCount = staleTerminalRepair.staleTerminalRepairedCount;
+    const tradesForMetrics = staleTerminalRepair.trades;
+    if (staleTerminalRepairedCount > 0) {
+      await writeTrades(tradesForMetrics);
+    }
 
     // -------------------------------------------------------------------------
     // CONSISTENT ET-TODAY FILTERING
@@ -536,7 +558,7 @@ export async function GET() {
     const seeded = num(funnelData.seedCreatedCount);
 
     // TRADES: Filter by etDate for today
-    const todayTrades = (allTrades || []).filter((t: any) => t?.etDate === dateET);
+    const todayTrades = (tradesForMetrics || []).filter((t: any) => t?.etDate === dateET);
     
     // EXECUTED: trades that actually entered the market (not AUTO_PENDING)
     const executed = todayTrades.filter((t: any) =>
@@ -581,9 +603,42 @@ export async function GET() {
     const staleExpiredCount = executeSkipReasonBreakdown["SKIPPED_EXPIRED"] ?? 0;
 
     // Execute blocker metrics — surfaced for ops and agent monitoring
-    const malformedPendingCount = executeSkipReasonBreakdown["MALFORMED"] ?? 0;
+    const activeMalformedPendingCount = todayTrades.filter((t: any) => {
+      if (t?.source !== "AUTO" && t?.source !== "auto-entry") return false;
+      if (t?.status !== "AUTO_PENDING") return false;
+      if (t?.closedAt) return false;
+      if (Boolean(t?.alpacaOrderId) || Boolean(t?.brokerOrderId)) return false;
+      const outcome = String(t?.executeOutcome || "").toUpperCase();
+      const reason = String(t?.executeReason || "").toLowerCase();
+      return (
+        outcome === "MALFORMED" ||
+        reason === "invalid_pending_missing_risk" ||
+        reason === "invalid_trade" ||
+        reason === "rescore_required" ||
+        reason === "stale_trade"
+      );
+    }).length;
+
+    const terminalMalformedCount = todayTrades.filter((t: any) => {
+      if (t?.source !== "AUTO" && t?.source !== "auto-entry") return false;
+      const status = String(t?.status || "").toUpperCase();
+      if (status !== "ERROR" && status !== "ARCHIVED" && status !== "CLOSED") return false;
+      const outcome = String(t?.executeOutcome || "").toUpperCase();
+      const reason = String(t?.executeReason || "").toLowerCase();
+      return (
+        outcome === "MALFORMED" ||
+        outcome === "ERROR" ||
+        reason === "invalid_pending_missing_risk" ||
+        reason === "invalid_trade" ||
+        reason === "rescore_required" ||
+        reason === "stale_trade"
+      );
+    }).length;
+
     const rescoreRequiredCount = todayTrades.filter((t: any) =>
       (t?.source === "AUTO" || t?.source === "auto-entry") &&
+      !t?.closedAt &&
+      (String(t?.status || "").toUpperCase() === "AUTO_PENDING") &&
       typeof t?.executeReason === "string" &&
       (t.executeReason === "rescore_required" || t.executeReason === "rescore_failed")
     ).length;
@@ -596,11 +651,12 @@ export async function GET() {
     const stalePendingCount = todayTrades.filter((t: any) =>
       (t?.source === "AUTO" || t?.source === "auto-entry") &&
       t?.status === "AUTO_PENDING" &&
+      !t?.closedAt &&
       typeof t?.seededAt === "string" &&
       Date.now() - Date.parse(t.seededAt) > 30 * 60 * 1000
     ).length;
     const executeSlaBreached =
-      marketOpen && seeded > 0 && executed === 0 && (malformedPendingCount > 0 || rescoreRequiredCount > 0);
+      marketOpen && seeded > 0 && executed === 0 && (activeMalformedPendingCount > 0 || rescoreRequiredCount > 0);
 
     const staleTimingStats = (() => {
       const staleTrades = todayTrades.filter((t: any) =>
@@ -656,6 +712,7 @@ export async function GET() {
     let protectionMissingTickers: string[] = [];
     let brokerIsFlat = false;
     let staleMismatchTickers: string[] = [];
+    let openProtectionBlockerCount = 0;
     let protectionDetail: FunnelHealthResponse["protectionDetail"] | undefined;
     
     if (!brokerTruth.error) {
@@ -666,7 +723,7 @@ export async function GET() {
       // Deduplicate: when multiple OPEN records exist for the same broker position,
       // audit only the canonical (richest-metadata) trade so ghost duplicates lacking
       // stopOrderId do not trigger false PROTECTION_MISSING incidents.
-      const { canonical: canonicalMap, diagnostics: dupDiag } = selectCanonicalOpenTrades(allTrades || []);
+      const { canonical: canonicalMap, diagnostics: dupDiag } = selectCanonicalOpenTrades(tradesForMetrics || []);
 
       if (dupDiag.length > 0) {
         console.warn("[funnel-health] duplicate OPEN trades detected — protection audit using canonical only", {
@@ -755,6 +812,12 @@ export async function GET() {
             };
           });
 
+        if (!brokerIsFlat) {
+          openProtectionBlockerCount = perTradeDetail.filter(
+            (d) => !d.isCurrentlyProtected || !d.brokerPositionExists,
+          ).length;
+        }
+
         // Only include protectionDetail when there are unprotected trades or flatten-in-progress
         const hasIssues = perTradeDetail.some(
           (d) => !d.isCurrentlyProtected && d.brokerPositionExists,
@@ -826,7 +889,8 @@ export async function GET() {
       seedSlaBreached,
       noAutoPendingSkips,
       protectionMissingTickers,
-      malformedPendingCount,
+      activeMalformedPendingCount,
+      openProtectionBlockerCount,
       freshUnresolvedPendingCount,
       staleActivePendingCount,
       cTierQualityBlockCount,
@@ -1006,17 +1070,20 @@ export async function GET() {
       ...((executeSkipReasonBreakdown["SKIPPED_NO_LONGER_ELIGIBLE"] ?? 0) > 0
         ? { executeArchivedNoLongerEligible: executeSkipReasonBreakdown["SKIPPED_NO_LONGER_ELIGIBLE"] }
         : {}),
-      // Execute blocker metrics — always present during market hours when seeded > 0
-      ...((marketOpen && seeded > 0) || malformedPendingCount > 0 || rescoreRequiredCount > 0 || scoreThresholdBlockedCount > 0 ? {
-        executeBlockerMetrics: {
-          malformedPendingCount,
-          rescoreRequiredCount,
-          scoreThresholdBlockedCount,
-          priceDriftSkippedCount,
-          stalePendingCount,
-          executeSlaBreached,
-        },
-      } : {}),
+      // Execute blocker metrics — always numeric for smoke-test stability
+      activeMalformedPendingCount,
+      terminalMalformedCount,
+      staleTerminalRepairedCount,
+      executeBlockerMetrics: {
+        activeMalformedPendingCount,
+        terminalMalformedCount,
+        staleTerminalRepairedCount,
+        rescoreRequiredCount,
+        scoreThresholdBlockedCount,
+        priceDriftSkippedCount,
+        stalePendingCount,
+        executeSlaBreached,
+      },
       // Stale/expired diagnostics
       ...(staleExpiredCount > 0 ? { staleExpiredCount } : {}),
       ...(staleTimingStats ? { staleTimingStats } : {}),
@@ -1040,7 +1107,7 @@ export async function GET() {
         rawCounts: {
           totalSignals: (allSignals || []).length,
           todaySignals: todaySignals.length,
-          totalTrades: (allTrades || []).length,
+          totalTrades: (tradesForMetrics || []).length,
           todayTrades: todayTrades.length,
           funnelCandidatesFound: num(funnelData.candidatesFound),
           funnelSeedCreatedCount: num(funnelData.seedCreatedCount),

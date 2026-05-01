@@ -22,7 +22,6 @@ export const dynamic = "force-dynamic";
 import { NextRequest, NextResponse } from "next/server";
 import {
   runIntakePipeline,
-  resolvePayload,
 } from "@/lib/agents/intake-pipeline";
 
 // ─── Token auth (no cookies, no app-PIN) ────────────────────────────
@@ -73,35 +72,19 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const message = typeof body.message === "string" ? body.message.trim() : "";
-  if (!message) {
-    return NextResponse.json(
-      { ok: false, error: "Missing required field: message" },
-      { status: 400 },
-    );
-  }
-
-  // 3. Pre-resolve the conversational message into a structured payload
-  //    so we can apply executeOverride before handing off to the pipeline.
-  const resolved = resolvePayload({ message });
-  if (!resolved.ok) {
-    return NextResponse.json(
-      { ok: false, error: resolved.error },
-      { status: resolved.status },
-    );
-  }
-
-  const payload = resolved.raw;
+  // 3. Accept either structured intake payload or message-only payload.
+  const payload: Record<string, unknown> = {
+    ...body,
+    source: "chat_action_intake",
+  };
 
   // 4. Apply executeOverride when explicitly provided
   const executeOverride = body.executeOverride;
   if (executeOverride === true || executeOverride === false) {
     payload.executionReady = executeOverride;
+    payload.execute = executeOverride;
   }
-  // null / undefined → keep the value the parser produced
-
-  // 5. Stamp source for observability
-  payload.source = "chat_action_intake";
+  // null / undefined → keep payload value as provided
 
   // 6. Delegate to the canonical pipeline (structured path — no re-parse)
   const result = await runIntakePipeline(payload as Record<string, unknown>);

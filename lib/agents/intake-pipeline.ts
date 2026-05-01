@@ -165,8 +165,33 @@ export function resolvePayload(
 ): ResolvePayloadResult {
   const message = typeof body.message === "string" ? body.message.trim() : "";
 
+  const hasStructuredFields =
+    typeof body.title === "string" ||
+    typeof body.description === "string" ||
+    typeof body.priority === "string" ||
+    typeof body.type === "string" ||
+    typeof body.taskType === "string" ||
+    body.execute === true ||
+    body.execute === false ||
+    body.executionReady === true ||
+    body.executionReady === false;
+
+  if (hasStructuredFields) {
+    return { ok: true, raw: body as IntakePayload, conversational: false };
+  }
+
   if (message && isConversationalTask(message)) {
     const parsed = parseConversationalTask(message);
+    if (!parsed.ok) {
+      return { ok: false, error: parsed.error, status: 400 };
+    }
+    return { ok: true, raw: parsed.payload, conversational: true };
+  }
+
+  // Message-only fallback parser for GPT action payloads that send:
+  // Title: ...\nType: ...\nPriority: ...\nExecute: ...\n\nDescription...
+  if (message && !body.title && /(^|\n)\s*title\s*:/i.test(message)) {
+    const parsed = parseConversationalTask(`Execute the following task:\n${message}`);
     if (!parsed.ok) {
       return { ok: false, error: parsed.error, status: 400 };
     }
@@ -201,10 +226,44 @@ export type IntakePipelineResult = IntakePipelineSuccess | IntakePipelineError;
 export async function runIntakePipeline(
   body: Record<string, unknown>,
 ): Promise<IntakePipelineResult> {
+  const receivedKeys = Object.keys(body || {});
+
+  const fallbackTitle = typeof body?.title === "string" ? body.title.trim() : "";
+  const fallbackDescription =
+    typeof body?.description === "string"
+      ? body.description.trim()
+      : typeof body?.message === "string"
+        ? body.message.trim()
+        : "";
+  const fallbackTypeInput = String(body?.taskType ?? body?.type ?? "").trim().toUpperCase();
+  const fallbackPriority = String(body?.priority ?? "MEDIUM").trim().toUpperCase() || "MEDIUM";
+  const fallbackExecute =
+    body?.executionReady === true ||
+    body?.executionReady === "true" ||
+    body?.execute === true ||
+    body?.execute === "true";
+
   // 1. Resolve conversational vs structured
   const resolved = resolvePayload(body);
   if (!resolved.ok) {
-    return { ok: false, status: resolved.status, body: { ok: false, error: resolved.error } };
+    return {
+      ok: false,
+      status: resolved.status,
+      body: {
+        ok: false,
+        error: resolved.error,
+        receivedKeys,
+        normalizedTitle: fallbackTitle || null,
+        normalizedType: fallbackTypeInput || "TASK",
+        normalizedPriority: fallbackPriority,
+        execute: fallbackExecute,
+        missingNormalizedFields: [
+          ...(fallbackTitle ? [] : ["title"]),
+          ...(fallbackDescription ? [] : ["description"]),
+        ],
+        taskCreated: false,
+      },
+    };
   }
 
   const raw = resolved.raw;
@@ -215,10 +274,40 @@ export async function runIntakePipeline(
   // 2. Normalise & validate
   const normalized: NormalizedIntakeResult | IntakeValidationError = normalizeIntakePayload(raw);
   if (!normalized.ok) {
+    const normalizedTitle = typeof (raw as any)?.title === "string" ? String((raw as any).title).trim() : "";
+    const normalizedDescription =
+      typeof (raw as any)?.description === "string"
+        ? String((raw as any).description).trim()
+        : typeof (raw as any)?.message === "string"
+          ? String((raw as any).message).trim()
+          : "";
+    const normalizedTypeInput = String((raw as any)?.taskType ?? (raw as any)?.type ?? "").trim().toUpperCase();
+    const normalizedType = normalizedTypeInput || "OTHER";
+    const normalizedPriority = String((raw as any)?.priority ?? "MEDIUM").trim().toUpperCase() || "MEDIUM";
+    const execute =
+      (raw as any)?.executionReady === true ||
+      (raw as any)?.executionReady === "true" ||
+      (raw as any)?.execute === true ||
+      (raw as any)?.execute === "true";
     return {
       ok: false,
       status: 400,
-      body: { ok: false, error: normalized.error, field: normalized.field },
+      body: {
+        ok: false,
+        error: normalized.error,
+        field: normalized.field,
+        receivedKeys,
+        normalizedTitle: normalizedTitle || null,
+        normalizedDescriptionPresent: Boolean(normalizedDescription),
+        normalizedType,
+        normalizedPriority,
+        execute,
+        missingNormalizedFields: [
+          ...(normalizedTitle ? [] : ["title"]),
+          ...(normalizedDescription ? [] : ["description"]),
+        ],
+        taskCreated: false,
+      },
     };
   }
 
@@ -271,8 +360,13 @@ export async function runIntakePipeline(
       body: {
         ok: true,
         created: false,
+        taskCreated: false,
         deduped: true,
         duplicateTaskId: duplicate.id,
+        normalizedTitle: input.title,
+        normalizedType: input.taskType,
+        normalizedPriority: input.priority,
+        execute: input.executionReady,
         parsedPayload,
         task: {
           id: duplicate.id,
@@ -311,7 +405,12 @@ export async function runIntakePipeline(
     body: {
       ok: true,
       created: true,
+      taskCreated: true,
       deduped: false,
+      normalizedTitle: input.title,
+      normalizedType: input.taskType,
+      normalizedPriority: input.priority,
+      execute: input.executionReady,
       parsedPayload,
       task: {
         id: task.id,

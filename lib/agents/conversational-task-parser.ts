@@ -117,9 +117,18 @@ export function parseConversationalTask(
       continue;
     }
 
-    // Continuation of a single-line field (e.g. multi-line description)
-    if (currentField && SINGLE_LINE_FIELDS.has(currentField)) {
+    // Continuation of description field only.
+    if (currentField === "description") {
       fields[currentField].push(line.trim());
+      continue;
+    }
+
+    // If we have already parsed fields and encounter freeform text,
+    // treat it as implicit description content.
+    if (currentField && SINGLE_LINE_FIELDS.has(currentField)) {
+      if (!fields["description"]) fields["description"] = [];
+      fields["description"].push(line.trim());
+      currentField = "description";
       continue;
     }
 

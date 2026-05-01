@@ -238,3 +238,105 @@ export function markCloseNotificationSent(
     updatedAt: nowIso,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Terminal trade lifecycle cleanup
+// ---------------------------------------------------------------------------
+
+const TERMINAL_STATUSES = new Set(["ERROR", "ARCHIVED"]);
+const TERMINAL_EXECUTE_OUTCOMES = new Set([
+  "MALFORMED",
+  "SKIPPED_PRICE_DRIFT",
+  "SKIPPED_EXPIRED",
+  "SKIPPED_NO_LONGER_ELIGIBLE",
+  "ERROR",
+  "PENDING",
+]);
+const TERMINAL_EXECUTE_REASONS = new Set([
+  "invalid_pending_missing_risk",
+  "invalid_trade",
+  "rescore_required",
+  "stale_trade",
+]);
+
+/**
+ * Ensures terminal lifecycle fields are present for error/archived trades.
+ *
+ * Rules:
+ * - If trade is ERROR/ARCHIVED and closedAt is null, set closedAt from
+ *   executeAttemptedAt || updatedAt || nowIso.
+ * - If trade is ERROR/ARCHIVED, OR executeOutcome/reason indicates terminal skip,
+ *   set executeAttemptedAt when missing using updatedAt || nowIso.
+ */
+export function normalizeTerminalTradeLifecycle(
+  trade: any,
+  nowIso: string,
+): { changed: boolean; trade: any } {
+  if (!trade || typeof trade !== "object") return { changed: false, trade };
+
+  const status = String(trade?.status || "").toUpperCase();
+  const executeOutcome = String(trade?.executeOutcome || "").toUpperCase();
+  const executeReason = String(trade?.executeReason || "").toLowerCase();
+
+  const isTerminalStatus = TERMINAL_STATUSES.has(status);
+  const terminalOutcome = TERMINAL_EXECUTE_OUTCOMES.has(executeOutcome);
+  const terminalReason = TERMINAL_EXECUTE_REASONS.has(executeReason);
+
+  let changed = false;
+  const next = { ...trade };
+
+  if ((isTerminalStatus || terminalOutcome || terminalReason) && !next.executeAttemptedAt) {
+    next.executeAttemptedAt = next.updatedAt || nowIso;
+    changed = true;
+  }
+
+  if (isTerminalStatus && !next.closedAt) {
+    next.closedAt = next.executeAttemptedAt || next.updatedAt || nowIso;
+    changed = true;
+  }
+
+  if (changed && !next.updatedAt) {
+    next.updatedAt = nowIso;
+  }
+
+  return { changed, trade: changed ? next : trade };
+}
+
+/**
+ * Repairs stale terminal trades that are missing closedAt.
+ *
+ * Criteria:
+ * - status in ERROR or ARCHIVED
+ * - executeOutcome in MALFORMED, SKIPPED_PRICE_DRIFT, SKIPPED_EXPIRED,
+ *   SKIPPED_NO_LONGER_ELIGIBLE, ERROR, PENDING
+ * - closedAt is null
+ */
+export function repairStaleTerminalTrades(
+  trades: any[],
+  nowIso: string,
+): { trades: any[]; staleTerminalRepairedCount: number } {
+  let staleTerminalRepairedCount = 0;
+
+  const nextTrades = (Array.isArray(trades) ? trades : []).map((t) => {
+    if (!t || typeof t !== "object") return t;
+    const status = String(t?.status || "").toUpperCase();
+    const executeOutcome = String(t?.executeOutcome || "").toUpperCase();
+
+    const shouldRepair =
+      TERMINAL_STATUSES.has(status) &&
+      TERMINAL_EXECUTE_OUTCOMES.has(executeOutcome) &&
+      !t?.closedAt;
+
+    if (!shouldRepair) return t;
+
+    staleTerminalRepairedCount += 1;
+    return {
+      ...t,
+      executeAttemptedAt: t?.executeAttemptedAt || t?.updatedAt || nowIso,
+      closedAt: t?.executeAttemptedAt || t?.updatedAt || nowIso,
+      updatedAt: t?.updatedAt || nowIso,
+    };
+  });
+
+  return { trades: nextTrades, staleTerminalRepairedCount };
+}

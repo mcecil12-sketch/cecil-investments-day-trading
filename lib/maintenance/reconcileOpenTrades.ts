@@ -7,6 +7,7 @@ import { selectCanonicalOpenTrades } from "@/lib/trades/canonicalOpenBySymbol";
 import { forceFlattenPosition } from "@/lib/broker/forceFlattenPosition";
 import { verifyStopAtBroker } from "@/lib/risk/stop-verification";
 import { findProtectiveStopOrder } from "@/lib/trades/protection";
+import { repairStaleTerminalTrades } from "@/lib/trades/lifecycle";
 
 const POSITION_OPEN_OVERRIDES_CANCELED_v1 = true;
 
@@ -276,6 +277,7 @@ export type ReconcileOpenTradesResult = {
   repairedStops: number;
   flattenedUnprotected: number;
   unresolvedCriticalCount: number;
+  staleTerminalRepairedCount: number;
   broker: {
     positionsCount: number;
     openOrdersCount: number;
@@ -338,6 +340,7 @@ export async function reconcileOpenTrades(
         repairedStops: 0,
         flattenedUnprotected: 0,
         unresolvedCriticalCount: 0,
+        staleTerminalRepairedCount: 0,
         broker: {
           positionsCount: 0,
           openOrdersCount: 0,
@@ -1339,6 +1342,21 @@ export async function reconcileOpenTrades(
     const missingStopCount = Math.max(0, openPositions - protectedPositions);
     unresolvedCriticalCount += missingStopCount;
 
+    let staleTerminalRepairedCount = 0;
+    if (!dryRun) {
+      const staleRepair = repairStaleTerminalTrades(trades, new Date().toISOString());
+      staleTerminalRepairedCount = staleRepair.staleTerminalRepairedCount;
+      if (staleTerminalRepairedCount > 0) {
+        for (let i = 0; i < trades.length; i++) {
+          trades[i] = staleRepair.trades[i];
+        }
+      }
+    }
+
+    if (!dryRun && staleTerminalRepairedCount > 0) {
+      await writeTrades(trades);
+    }
+
     console.log(
       `[reconcile] completed (source=${runSource}, id=${runId})`,
       {
@@ -1377,6 +1395,7 @@ export async function reconcileOpenTrades(
       repairedStops,
       flattenedUnprotected,
       unresolvedCriticalCount,
+      staleTerminalRepairedCount,
       broker: {
         positionsCount: finalBrokerTruth.positionsCount,
         openOrdersCount: finalBrokerTruth.openOrdersCount,
@@ -1442,6 +1461,7 @@ export async function reconcileOpenTrades(
       repairedStops: 0,
       flattenedUnprotected: 0,
       unresolvedCriticalCount: 0,
+      staleTerminalRepairedCount: 0,
       broker: {
         positionsCount: 0,
         openOrdersCount: 0,

@@ -1,6 +1,6 @@
 import { evaluateCurrentProtectionIntegrity } from "@/lib/risk/live-protection";
 import { NextResponse } from "next/server";
-import { readTrades, writeTrades } from "@/lib/tradesStore";
+import { readTrades, writeTrades as writeTradesRaw } from "@/lib/tradesStore";
 import { verifyStopOrderDirect, recoverUnprotectedTrade, flattenUnprotectedPosition } from "@/lib/risk/stop-verification";
 import { rescueStop } from "@/lib/autoManage/stopSync";
 // --- Risk Enforcement & Stop Protection Invariant ---
@@ -115,7 +115,7 @@ import {
 } from "@/lib/autoEntry/disabledNotification";
 import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { buildAutoEntryFunnelFields } from "./funnel";
-import { preserveExecutionAttribution } from "@/lib/trades/lifecycle";
+import { preserveExecutionAttribution, normalizeTerminalTradeLifecycle } from "@/lib/trades/lifecycle";
 import { isOperationallyOpenTrade } from "@/lib/trades/operational";
 import { buildOpenOrdersBySymbol, planConservativeReplacement } from "@/lib/autoManage/reliability";
 import { readExecutionOverlays, type ExecutionOverlays } from "@/lib/agents/overlays";
@@ -230,6 +230,17 @@ function archivePendingTrade(
     seededAt: tradeObj?.seededAt ?? tradeObj?.createdAt ?? null,
     ...(diagnostics ?? {}),
   };
+}
+
+function finalizeTerminalTradesBeforePersist(trades: any[]): any[] {
+  const now = nowIso();
+  return (Array.isArray(trades) ? trades : []).map((t) =>
+    normalizeTerminalTradeLifecycle(t, now).trade,
+  );
+}
+
+async function writeTrades(trades: any[]) {
+  await writeTradesRaw(finalizeTerminalTradesBeforePersist(trades));
 }
 
 
