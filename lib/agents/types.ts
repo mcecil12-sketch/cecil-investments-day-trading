@@ -440,6 +440,11 @@ export interface StructuredVerificationResult {
     target: string;
     ok: boolean;
     detail: string | null;
+    requestedMethod?: string;
+    finalMethod?: string;
+    retriedAfter405?: boolean;
+    authHeaderUsed?: string | null;
+    status?: number | null;
   }>;
   overall: boolean;
   verifiedAt: string;
