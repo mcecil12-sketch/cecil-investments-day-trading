@@ -1326,6 +1326,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
   const postFailureDetails: Array<{ ticker: string; status: number; error: string }> = [];
   const prePostGateReasons: Record<string, number> = {};
   const postDebug: any[] = [];
+  const gateRejectedCandidates: typeof topCandidates = [];
 
   for (const candidate of topCandidates) {
     if (postSuccessCount >= SCAN_MAX_POSTS_PER_RUN) {
@@ -1378,6 +1379,7 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
         candidatesSkippedPrePostGate += 1;
         const reason = gateResult.reason ?? "unknown";
         prePostGateReasons[reason] = (prePostGateReasons[reason] ?? 0) + 1;
+        gateRejectedCandidates.push(candidate);
         if (debugScan) {
           postDebug.push({
             ticker: candidate.ticker,
@@ -1463,6 +1465,58 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
       }
     } catch (err) {
       console.error("[SCAN] Failed posting candidate", candidate.ticker, err);
+    }
+  }
+
+  // Fallback: if many candidates were gate-rejected but nothing was posted, force-post top 5 by preScore
+  let forcedPostFallback = false;
+  if (candidatesSkippedPrePostGate >= 20 && attemptedPosts === 0 && gateRejectedCandidates.length > 0) {
+    forcedPostFallback = true;
+    const fallbackCandidates = [...gateRejectedCandidates]
+      .sort((a, b) => ((b as any).preScore ?? 0) - ((a as any).preScore ?? 0))
+      .slice(0, 5);
+    console.warn("[SCAN] fallback_post_triggered", {
+      candidatesSkippedPrePostGate,
+      fallbackCount: fallbackCandidates.length,
+    });
+    for (const candidate of fallbackCandidates) {
+      if (postSuccessCount >= SCAN_MAX_POSTS_PER_RUN) break;
+      try {
+        const payload = toOutgoing(candidate);
+        const postUrl = `${baseUrl}/api/signals`;
+        const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET ?? "";
+        attemptedPosts += 1;
+        const res = await fetch(postUrl, {
+          method: "POST",
+          body: JSON.stringify(payload),
+          cache: "no-store",
+          headers: {
+            "Content-Type": "application/json",
+            "x-defer-ai": "1",
+            ...(authCookie ? { cookie: authCookie } : {}),
+            ...(inboundScannerToken ? { "x-scanner-token": inboundScannerToken } : {}),
+            ...(scanSource ? { "x-scan-source": scanSource } : {}),
+            ...(scanRunId ? { "x-scan-run-id": String(scanRunId) } : {}),
+            ...(bypassSecret ? { "x-vercel-protection-bypass": bypassSecret } : {}),
+          },
+        });
+        if (res.ok) {
+          postSuccessCount += 1;
+          postedCount += 1;
+          posted.push(payload);
+          if (aiSeedMode) {
+            postedSignals += 1;
+            queuedSignals += 1;
+            totals.signalsPosted += 1;
+          }
+        } else {
+          postFailureCount += 1;
+          const errText = await res.text().catch(() => "");
+          postFailureDetails.push({ ticker: candidate.ticker, status: res.status, error: errText.slice(0, 200) });
+        }
+      } catch (err) {
+        console.error("[SCAN] Failed posting fallback candidate", candidate.ticker, err);
+      }
     }
   }
 
@@ -1615,6 +1669,10 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     signalsPosted: posted.length,
     gptQueued: posted.length,
     aiSeedDebug,
+    forcedPostFallback,
+    topRejectReason: Object.keys(prePostGateReasons).reduce((topKey, k) =>
+      (prePostGateReasons[k] ?? 0) > (prePostGateReasons[topKey] ?? 0) ? k : topKey, Object.keys(prePostGateReasons)[0] ?? null),
+    topRejectCount: Object.values(prePostGateReasons).reduce((max, v) => Math.max(max, v), 0) || null,
     ...(debugScan ? { debug: debugDetails } : {}),
     ...(debugScan ? { postDebug } : {}),
     ...(debugScan && summarySnapshot ? { debugSummary: summarySnapshot } : {}),

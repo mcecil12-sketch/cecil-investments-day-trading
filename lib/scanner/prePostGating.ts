@@ -38,16 +38,16 @@ export type CandidateContext = {
 // --------------------------------------------------------------------------
 
 // LONG thresholds
-const MIN_RELVOL_LONG = Number(process.env.SCAN_MIN_RELVOL_LONG ?? 0.8);
-const MIN_DOLLAR_VOL_LONG = Number(process.env.SCAN_MIN_DOLLAR_VOL_LONG ?? 1_000_000);
-const MIN_PRESCORE_LONG = Number(process.env.SCAN_MIN_PRESCORE_LONG ?? 35);
-const MAX_SPREAD_PCT_LONG = Number(process.env.SCAN_MAX_SPREAD_PCT_LONG ?? 0.5);
+const MIN_RELVOL_LONG = Number(process.env.SCAN_MIN_RELVOL_LONG ?? 0.4);
+const MIN_DOLLAR_VOL_LONG = Number(process.env.SCAN_MIN_DOLLAR_VOL_LONG ?? 250_000);
+const MIN_PRESCORE_LONG = Number(process.env.SCAN_MIN_PRESCORE_LONG ?? 25);
+const MAX_SPREAD_PCT_LONG = Number(process.env.SCAN_MAX_SPREAD_PCT_LONG ?? 0.75);
 const MAX_VWAP_DIST_PCT_LONG = Number(process.env.SCAN_MAX_VWAP_DIST_PCT_LONG ?? 1.2);
 
 // SHORT thresholds (typically stricter due to higher risk)
-const MIN_RELVOL_SHORT = Number(process.env.SCAN_MIN_RELVOL_SHORT ?? 2.0);
-const MIN_DOLLAR_VOL_SHORT = Number(process.env.SCAN_MIN_DOLLAR_VOL_SHORT ?? 1_500_000);
-const MIN_PRESCORE_SHORT = Number(process.env.SCAN_MIN_PRESCORE_SHORT ?? 50);
+const MIN_RELVOL_SHORT = Number(process.env.SCAN_MIN_RELVOL_SHORT ?? 1.2);
+const MIN_DOLLAR_VOL_SHORT = Number(process.env.SCAN_MIN_DOLLAR_VOL_SHORT ?? 400_000);
+const MIN_PRESCORE_SHORT = Number(process.env.SCAN_MIN_PRESCORE_SHORT ?? 40);
 const MAX_SPREAD_PCT_SHORT = Number(process.env.SCAN_MAX_SPREAD_PCT_SHORT ?? 0.4);
 const MAX_VWAP_DIST_PCT_SHORT = Number(process.env.SCAN_MAX_VWAP_DIST_PCT_SHORT ?? 1.8);
 

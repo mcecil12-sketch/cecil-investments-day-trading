@@ -504,7 +504,7 @@ export async function POST(req: NextRequest) {
   const guardConfig = getGuardrailConfig();
   const maxSignalAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN))
     ? Math.max(1, Number(process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN))
-    : 5;
+    : 10;
   const staleThresholdUsedMs = Math.round(maxSignalAgeMin * 60 * 1000);
 
   const [rawSignals, trades, overlay, brokerTruth, guardState, clock, allStoredSignals] = await Promise.all([
