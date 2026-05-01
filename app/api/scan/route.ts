@@ -1483,10 +1483,19 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
   let fallbackReason: string | null = null;
 
   const shouldAttemptFallback =
-    marketOpen === true &&
+    marketOpen !== false &&
     topCandidates.length >= 10 &&
     postedCount === 0 &&
     (aiSeedMode || debugScan);
+
+  console.log("[scan] fallback_check", {
+    shouldAttemptFallback,
+    marketOpen,
+    candidatesEligibleToPost: topCandidates.length,
+    postedCount,
+    aiSeedMode,
+    debugScan,
+  });
 
   if (shouldAttemptFallback) {
     forcedPostFallbackAttempted = true;
@@ -1596,16 +1605,17 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
         fallbackBlockerReason = "fallback_candidates_all_failed_to_post";
       }
     }
-  } else if (marketOpen === true && topCandidates.length >= 10 && postedCount === 0) {
+  } else if (marketOpen !== false && topCandidates.length >= 10 && postedCount === 0) {
     // Market open + eligible candidates + zero posts but fallback was not attempted (wrong mode).
     fallbackBlockerReason = "mode_not_eligible_for_fallback";
   }
 
   const status: ScanStatus = "RUN";
+  // Hard override: outcome is driven purely by postedCount so fallback posts are always reflected.
   const runOutcome: ScanRunOutcome =
     slicedUniverse.length === 0
       ? "RUN_EMPTY_UNIVERSE"
-      : postSuccessCount > 0
+      : postedCount > 0
       ? "RUN_POSTED_SIGNALS"
       : "RUN_NO_ELIGIBLE_CANDIDATES";
 
@@ -1720,6 +1730,15 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
     postFailureCount,
     scanSource,
     scanRunId,
+  });
+
+  console.log("SCAN_RESULT", {
+    postedCount,
+    fallbackTriggered: forcedPostFallback,
+    fallbackPosted: fallbackCandidatesPosted,
+    outcome: runOutcome,
+    marketOpen,
+    candidatesEligibleToPost: topCandidates.length,
   });
 
   return NextResponse.json({
