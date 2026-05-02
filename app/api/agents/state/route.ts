@@ -15,7 +15,7 @@ import {
 import { getGuardrailConfig } from "@/lib/autoEntry/guardrails";
 import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
 import { redis } from "@/lib/redis";
-import { AGENT_LATEST_EXECUTION_KEY } from "@/lib/agents/keys";
+import { AGENT_LATEST_EXECUTION_KEY, AGENT_LATEST_BATCH_EXECUTION_KEY } from "@/lib/agents/keys";
 import type { EngineeringTask } from "@/lib/agents/types";
 import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask, getTrulyActiveManualTask, getNextQueuedManualTask, getManualQueueDiagnostics } from "@/lib/agents/manual-action-queue";
 
@@ -42,7 +42,7 @@ export async function GET(req: Request) {
     return unauthorizedAgentResponse(auth.error);
   }
 
-  const [snapshot, state, tasks, adaptiveState, latestExecRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics] = await Promise.all([
+  const [snapshot, state, tasks, adaptiveState, latestExecRaw, latestBatchRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics] = await Promise.all([
     readAgentStateSnapshot(),
     ensureAgentState(),
     listEngineeringTasks(200).then((t) =>
@@ -50,6 +50,7 @@ export async function GET(req: Request) {
     ),
     readAdaptiveGuardrailState().catch(() => ({ actions: [], lastEvaluatedAt: null, evaluationSource: null })),
     redis ? redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
+    redis ? redis.get<string>(AGENT_LATEST_BATCH_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
     listManualActionTasks({ limit: 10 }).catch(() => []),
     countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0, selectedCount: 0, selectableCount: 0, recoverableBlockedCount: 0, idleReason: "count_fetch_failed" as string | null })),
     getActiveManualTask().catch(() => null),
@@ -88,6 +89,67 @@ export async function GET(req: Request) {
       return typeof parsed === "object" && parsed !== null ? parsed as Record<string, unknown> : null;
     } catch { return null; }
   })();
+  const latestBatchExec: Record<string, unknown> | null = (() => {
+    if (!latestBatchRaw) return null;
+    try {
+      const parsed = typeof latestBatchRaw === "string" ? JSON.parse(latestBatchRaw) : latestBatchRaw;
+      return typeof parsed === "object" && parsed !== null ? parsed as Record<string, unknown> : null;
+    } catch { return null; }
+  })();
+
+  const autonomyEnabled = process.env.AGENT_AUTONOMY_ENABLED === "1";
+  const maxTasksPerRun = Math.max(1, Math.min(5, Number(process.env.AGENT_MAX_TASKS_PER_RUN ?? "3") || 3));
+
+  const nextSelectableManualTasks = manualTasks
+    .filter((t) => t.status === "OPEN" && t.executionReady)
+    .slice(0, 5)
+    .map((t) => ({
+      id: t.id,
+      title: t.title,
+      source: "manual-action-queue",
+      priority: t.priority,
+      taskType: t.taskType,
+      executionReady: true,
+      blockedReason: null,
+      readinessReasons: ["open_and_execution_ready"],
+      requiresApproval: false,
+      riskLevel: t.priority === "CRITICAL" ? "high" : t.priority === "HIGH" ? "medium" : "low",
+      hasPatchPlan: Array.isArray(t.fileHints) && t.fileHints.length > 0,
+      hasVerificationPlan: Array.isArray(t.acceptanceCriteria) && t.acceptanceCriteria.length > 0,
+    }));
+
+  const nextSelectableEngineeringTasks = tasks
+    .filter((t) => t.status === "OPEN" || t.status === "READY_FOR_EXECUTION")
+    .slice(0, 5)
+    .map((t) => ({
+      id: t.id,
+      title: t.title,
+      source: "engineering-backlog",
+      priority: t.incidentId ? "CRITICAL" : t.status === "READY_FOR_EXECUTION" ? "HIGH" : "MEDIUM",
+      taskType: t.incidentCategory ?? "ENGINEERING",
+      executionReady: t.status === "READY_FOR_EXECUTION",
+      blockedReason: t.status === "READY_FOR_EXECUTION" ? null : "requires_preparation_or_approval",
+      readinessReasons: t.status === "READY_FOR_EXECUTION" ? ["ready_for_execution"] : ["open_task_requires_preparation"],
+      requiresApproval: t.status === "OPEN",
+      riskLevel: t.incidentId ? "high" : "medium",
+      hasPatchPlan: t.patchPlan?.mode === "GITHUB_COMMIT",
+      hasVerificationPlan: Boolean(t.validationPlan?.smokeChecks?.length || t.smokeTestBlock),
+    }));
+
+  const nextSelectableTasks = [...nextSelectableManualTasks, ...nextSelectableEngineeringTasks].slice(0, 10);
+
+  const lastBatchExecutedCount = Number(latestBatchExec?.executedCount ?? 0) || 0;
+  const lastBatchCompletedCount = Number(latestBatchExec?.completedCount ?? 0) || 0;
+  const lastBatchFailedCount = Number(latestBatchExec?.failedCount ?? 0) || 0;
+  const queueThroughput = {
+    lastBatchExecutedCount,
+    lastBatchCompletedCount,
+    lastBatchFailedCount,
+    completionRate: lastBatchExecutedCount > 0
+      ? Number((lastBatchCompletedCount / lastBatchExecutedCount).toFixed(3))
+      : 0,
+    selectableNow: manualCounts.selectableCount ?? 0,
+  };
 
   const derivedState = {
     ...state,
@@ -96,6 +158,13 @@ export async function GET(req: Request) {
     blockedTaskCount: blockedTasks.length,
     latestExecutionTaskTitle: latestReadyForExecution?.title ?? null,
     latestExecutionStatus: latestReadyForExecution?.executionStatus ?? null,
+    autonomyEnabled,
+    latestBatchExecutionResult: latestBatchExec,
+    lastBatchExecutedCount,
+    lastBatchCompletedCount,
+    lastBatchFailedCount,
+    queueThroughput,
+    nextSelectableTasks,
     // Phase 4: Adaptive guardrails & execution autonomy
     githubWriteEnabled: ghCapability.writeEnabled,
     patchExecutorEnabled: ghCapability.writeEnabled,
@@ -232,6 +301,13 @@ export async function GET(req: Request) {
       ageMinutes: latestExecAgeMinutes,
       timestamp: latestExecTimestamp,
       status: latestExec?.executionStatus ?? null,
+    },
+    batchExecutionMeta: {
+      timestamp: latestBatchExec?.timestamp ?? latestBatchExec?.executedAt ?? null,
+      status: latestBatchExec?.executionStatus ?? null,
+      requestedMax: latestBatchExec?.requestedMax ?? null,
+      maxTasksPerRun,
+      autonomyEnabled,
     },
     stateReconciliation: stateConsistency,
   });

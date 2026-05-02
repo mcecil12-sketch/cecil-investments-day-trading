@@ -1,0 +1,49 @@
+name: agent-autonomous-loop
+
+'on':
+  schedule:
+    # Market hours (approx 9:30am-4:00pm ET): every 10 minutes on weekdays.
+    - cron: "*/10 13-20 * * 1-5"
+    # Weekday after-hours: every 30 minutes.
+    - cron: "*/30 0-12,21-23 * * 1-5"
+    # Weekends: every 30 minutes.
+    - cron: "*/30 * * * 6,0"
+  workflow_dispatch:
+
+jobs:
+  run-agent-loop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run all agents
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOW="$(date +%s)"
+          curl -4 -sS --max-time 120 -X POST \
+            "$BASE/api/agents/run?agent=all&_=$NOW" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            | jq '{ok,requested,ran,results}'
+
+      - name: Execute autonomy batch (safe)
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+          AGENT_AUTONOMY_ENABLED: ${{ vars.AGENT_AUTONOMY_ENABLED }}
+          AGENT_MAX_TASKS_PER_RUN: ${{ vars.AGENT_MAX_TASKS_PER_RUN }}
+        run: |
+          set -euo pipefail
+          NOW="$(date +%s)"
+          MAX_TASKS="${AGENT_MAX_TASKS_PER_RUN:-3}"
+
+          if [[ "${AGENT_AUTONOMY_ENABLED:-0}" == "1" ]]; then
+            EXEC_URL="$BASE/api/agents/execute?max=$MAX_TASKS&priorityOnly=1&_=$NOW"
+          else
+            EXEC_URL="$BASE/api/agents/execute?max=$MAX_TASKS&priorityOnly=1&dryRun=1&_=$NOW"
+          fi
+
+          curl -4 -sS --max-time 180 -X POST \
+            "$EXEC_URL" \
+            -H "x-cron-token: $CRON_TOKEN" \
+            | jq '{ok,executionStatus,requestedMax,effectiveRequestedMax,executedCount,completedCount,failedCount,skippedCount,stoppedReason,queueBefore,queueAfter,autonomyEnabled,envSafety}'

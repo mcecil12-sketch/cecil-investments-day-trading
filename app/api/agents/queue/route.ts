@@ -59,11 +59,29 @@ export async function GET(req: NextRequest) {
   // Partition critical tasks
   const { blocking: blockingCritical, synthetic: syntheticCritical } = partitionCriticalTasks(criticalTasks);
 
-  // Annotate tasks with selectability
-  const annotatedTasks = tasks.map((t) => ({
-    ...t,
-    _selectability: computeTaskSelectability(t),
-  }));
+  // Annotate tasks with selectability and readiness diagnostics
+  const annotatedTasks = tasks.map((t) => {
+    const selectability = computeTaskSelectability(t);
+    const readinessReasons = selectability.selectable
+      ? ["open_and_execution_ready"]
+      : [selectability.reason];
+    const riskLevel = t.priority === "CRITICAL"
+      ? "high"
+      : t.priority === "HIGH"
+        ? "medium"
+        : "low";
+    return {
+      ...t,
+      executionReady: selectability.selectable,
+      blockedReason: selectability.selectable ? null : selectability.reason,
+      readinessReasons,
+      requiresApproval: false,
+      riskLevel,
+      hasPatchPlan: Array.isArray(t.fileHints) && t.fileHints.length > 0,
+      hasVerificationPlan: Array.isArray(t.acceptanceCriteria) && t.acceptanceCriteria.length > 0,
+      _selectability: selectability,
+    };
+  });
 
   // Build diagnostic summary
   const diagnostics = {

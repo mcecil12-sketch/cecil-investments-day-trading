@@ -376,6 +376,23 @@ export interface BatchTaskResult {
 
 // ─── Priority-ordered engineering task selection ─────────────────────
 
+const TRADING_FILE_PREFIXES = [
+  "app/api/auto-entry",
+  "app/api/scan",
+  "app/api/ai",
+  "app/api/trades",
+  "lib/trading",
+  "lib/alpaca",
+  "lib/autoEntry",
+];
+
+const PRIORITY_BUCKET_RANK: Record<"CRITICAL" | "HIGH" | "MEDIUM" | "LOW", number> = {
+  CRITICAL: 0,
+  HIGH: 1,
+  MEDIUM: 2,
+  LOW: 3,
+};
+
 const BATCH_KEYWORD_BOOST_PATTERNS = [
   /underutilized.?funnel/i,
   /execution.?blocker/i,
@@ -386,7 +403,24 @@ const BATCH_KEYWORD_BOOST_PATTERNS = [
   /tier_?c_?high_?loss/i,
   /aiScore/i,
   /price.?drift/i,
+  /broker.?mismatch/i,
 ];
+
+function touchesTradingFiles(paths: string[] | undefined | null): boolean {
+  if (!Array.isArray(paths) || paths.length === 0) return false;
+  return paths.some((p) => {
+    const normalized = String(p || "").trim().replace(/^\/+/, "").toLowerCase();
+    return TRADING_FILE_PREFIXES.some((prefix) => normalized.startsWith(prefix.toLowerCase()));
+  });
+}
+
+function engineeringPriorityBucket(task: EngineeringTask): "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" {
+  if (task.incidentId) return "CRITICAL";
+  if (titleKeywordBoost(task.title) < 0) return "HIGH";
+  if (task.status === "READY_FOR_EXECUTION") return "HIGH";
+  if (task.status === "OPEN") return "MEDIUM";
+  return "LOW";
+}
 
 function titleKeywordBoost(title: string): number {
   for (const p of BATCH_KEYWORD_BOOST_PATTERNS) {
@@ -396,10 +430,11 @@ function titleKeywordBoost(title: string): number {
 }
 
 function batchEngineeringTaskRank(task: EngineeringTask): number {
+  const priorityRank = PRIORITY_BUCKET_RANK[engineeringPriorityBucket(task)] * 100;
   const statusRank = task.status === "READY_FOR_EXECUTION" ? 0 : task.status === "OPEN" ? 20 : 100;
   const kw = titleKeywordBoost(task.title);
   const age = Date.parse(task.createdAt) || 0; // older = lower number = better
-  return statusRank + kw + age / 1e12; // age contribution tiny vs status
+  return priorityRank + statusRank + kw + age / 1e12; // age contribution tiny vs status
 }
 
 /**
@@ -482,6 +517,11 @@ function computeEngineeringTaskReadiness(task: EngineeringTask): TaskReadinessDi
   let executionReady = false;
   let blockedReason: string | null = null;
   let requiresApproval = false;
+  const allowTradingFiles = process.env.AGENT_ALLOW_TRADING_FILES === "1";
+  const tradingFilesTouched = touchesTradingFiles([
+    ...(task.likelyFiles ?? []),
+    ...(task.patchPlan?.targetFiles ?? []),
+  ]);
 
   const hasPatchPlan =
     task.patchPlan?.mode === "GITHUB_COMMIT" &&
@@ -490,6 +530,11 @@ function computeEngineeringTaskReadiness(task: EngineeringTask): TaskReadinessDi
   const hasVerificationPlan = !!(task.validationPlan?.smokeChecks?.length || task.smokeTestBlock);
 
   if (task.status === "READY_FOR_EXECUTION") {
+    if (tradingFilesTouched && !allowTradingFiles) {
+      blockedReason = "trading_file_requires_human_approval";
+      requiresApproval = true;
+      reasons.push("task touches trading-sensitive files and AGENT_ALLOW_TRADING_FILES is not enabled");
+    } else {
     const guardrailError = validateExecutionGuardrails(task);
     if (guardrailError) {
       blockedReason = guardrailError;
@@ -501,12 +546,20 @@ function computeEngineeringTaskReadiness(task: EngineeringTask): TaskReadinessDi
       executionReady = true;
       reasons.push("ready_for_execution with valid patch + commit plan");
     }
+    }
   } else if (task.status === "OPEN") {
     const approval = approveExecution(task);
-    requiresApproval = !approval.ok;
+    if (tradingFilesTouched && !allowTradingFiles) {
+      requiresApproval = true;
+    } else {
+      requiresApproval = !approval.ok;
+    }
     if (!hasPatchPlan) {
       blockedReason = "missing_patch_plan";
       reasons.push("no GITHUB_COMMIT patch plan with pushDirect=true and commitMessage");
+    } else if (tradingFilesTouched && !allowTradingFiles) {
+      blockedReason = "trading_file_requires_human_approval";
+      reasons.push("task touches trading-sensitive files and AGENT_ALLOW_TRADING_FILES is not enabled");
     } else if (!approval.ok) {
       blockedReason = `governance_blocked: ${approval.reason}`;
       reasons.push(`governance approval failed: ${approval.reason}`);
@@ -792,6 +845,35 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
   const engPhases: ExecutionPhaseResult[] = [];
   engPhases.push(phaseResult("SELECT_TASK", "passed", `task: ${engTask.id}`));
 
+  const allowTradingFiles = process.env.AGENT_ALLOW_TRADING_FILES === "1";
+  const tradingFilesTouched = touchesTradingFiles([
+    ...(engTask.likelyFiles ?? []),
+    ...(engTask.patchPlan?.targetFiles ?? []),
+  ]);
+  if (tradingFilesTouched && !allowTradingFiles) {
+    engPhases.push(phaseResult("GENERATE_PATCH_PLAN", "failed", "trading_file_requires_human_approval"));
+    await updateEngineeringTaskById(engTask.id, {
+      status: "BLOCKED",
+      remediationAttempted: true,
+      remediationStatus: "failed",
+      remediationResultSummary: "Execution blocked: trading_file_requires_human_approval",
+      executionStatus: "BLOCKED",
+      executionError: "trading_file_requires_human_approval",
+      notes: appendNotes(engTask.notes, ["Execution blocked: trading_file_requires_human_approval"]),
+    });
+    return {
+      taskId: engTask.id,
+      title: engTask.title,
+      status: "BLOCKED",
+      source: "engineering-backlog",
+      patchApplied: false,
+      verification: { buildOk: true, smokeOk: true, details: {} },
+      resolution: { resolved: false, reason: "trading_file_requires_human_approval" },
+      executionPhases: engPhases,
+      safetyStopReason: "requires_approval",
+    };
+  }
+
   const ghCapability = checkGitHubWriteCapability();
 
   let taskToExecute: EngineeringTask = engTask;
@@ -929,7 +1011,11 @@ export async function POST(req: NextRequest) {
   const requestedMax = Math.max(1, Math.min(5,
     Number(url.searchParams.get("max") ?? url.searchParams.get("limit") ?? "1") || 1,
   ));
+  const envMaxTasks = Math.max(1, Math.min(5, Number(process.env.AGENT_MAX_TASKS_PER_RUN ?? "3") || 3));
+  const effectiveRequestedMax = Math.min(requestedMax, envMaxTasks);
   const priorityOnly = url.searchParams.get("priorityOnly") === "1";
+  const autonomyEnabled = process.env.AGENT_AUTONOMY_ENABLED === "1";
+  const requireVerification = process.env.AGENT_REQUIRE_VERIFICATION !== "0";
   const TIME_BUDGET_MS = 90_000;
   const batchStartMs = Date.now();
 
@@ -1384,14 +1470,78 @@ export async function POST(req: NextRequest) {
     // ─── Queue snapshot before ────────────────────────────────────────
     const queueBefore = await buildQueueSnapshot();
 
+    // ─── Autonomy hard stop when disabled ─────────────────────────────
+    if (!autonomyEnabled && !dryRun) {
+      const candidates = await collectDryRunCandidates(effectiveRequestedMax, priorityOnly);
+      const autonomyDisabledResponse = {
+        ok: true,
+        dryRun: false,
+        executionStatus: "NO_ELIGIBLE_TASKS" as const,
+        requestedMax,
+        effectiveRequestedMax,
+        executedCount: 0,
+        completedCount: 0,
+        failedCount: 0,
+        skippedCount: 0,
+        stoppedReason: "autonomy_disabled",
+        results: candidates.map((c) => ({
+          taskId: c.taskId,
+          title: c.title,
+          status: "SKIPPED" as const,
+          source: c.source,
+          patchApplied: false,
+          commitSha: null,
+          verification: { buildOk: true, smokeOk: true, details: {} },
+          resolution: { resolved: false, reason: "autonomy_disabled" },
+          executionPhases: [] as ExecutionPhaseResult[],
+        })),
+        queueBefore,
+        queueAfter: queueBefore,
+        autonomyEnabled,
+        envSafety: {
+          AGENT_AUTONOMY_ENABLED: process.env.AGENT_AUTONOMY_ENABLED ?? null,
+          AGENT_MAX_TASKS_PER_RUN: envMaxTasks,
+          AGENT_REQUIRE_VERIFICATION: process.env.AGENT_REQUIRE_VERIFICATION ?? "1",
+          AGENT_ALLOW_TRADING_FILES: process.env.AGENT_ALLOW_TRADING_FILES ?? "0",
+        },
+        proactiveDiagnostics,
+      };
+      await storeLatestExecution(autonomyDisabledResponse as Record<string, unknown>);
+      await storeLatestBatchExecution(autonomyDisabledResponse as Record<string, unknown>);
+      return NextResponse.json(autonomyDisabledResponse);
+    }
+
+    if (!dryRun && proactiveEscalation.attempted && proactiveEscalation.auditOk === false) {
+      const protectionBlocked = {
+        ok: true,
+        executionStatus: "NO_ELIGIBLE_TASKS" as const,
+        requestedMax,
+        effectiveRequestedMax,
+        executedCount: 0,
+        completedCount: 0,
+        failedCount: 0,
+        skippedCount: 0,
+        stoppedReason: "protection_audit_failed",
+        results: [] as BatchTaskResult[],
+        queueBefore,
+        queueAfter: queueBefore,
+        proactiveDiagnostics,
+        autonomyEnabled,
+      };
+      await storeLatestExecution(protectionBlocked as Record<string, unknown>);
+      await storeLatestBatchExecution(protectionBlocked as Record<string, unknown>);
+      return NextResponse.json(protectionBlocked);
+    }
+
     // ─── Dry run: collect top-N selectable candidates ─────────────────
     if (dryRun) {
-      const candidates = await collectDryRunCandidates(requestedMax, priorityOnly);
+      const candidates = await collectDryRunCandidates(effectiveRequestedMax, priorityOnly);
       const batchDryResult = {
         ok: true,
         dryRun: true,
         executionStatus: "DRY_RUN" as const,
         requestedMax,
+        effectiveRequestedMax,
         executedCount: 0,
         completedCount: 0,
         failedCount: 0,
@@ -1500,9 +1650,9 @@ export async function POST(req: NextRequest) {
     let failedCount = 0;
     let skippedCount = 0;
 
-    console.log(`[AGENT-EXECUTE] Batch loop: requestedMax=${requestedMax} priorityOnly=${priorityOnly}`);
+    console.log(`[AGENT-EXECUTE] Batch loop: requestedMax=${requestedMax} effectiveMax=${effectiveRequestedMax} priorityOnly=${priorityOnly}`);
 
-    for (let i = 0; i < requestedMax; i++) {
+    for (let i = 0; i < effectiveRequestedMax; i++) {
       if (Date.now() - batchStartMs > TIME_BUDGET_MS) {
         stoppedReason = "time_budget_exceeded";
         console.warn("[AGENT-EXECUTE] Batch loop: time budget exceeded after ${i} iterations");
@@ -1536,16 +1686,20 @@ export async function POST(req: NextRequest) {
       }
 
       if (cycle.safetyStopReason) {
+        if (!requireVerification && cycle.safetyStopReason === "verification_failed") {
+          console.warn("[AGENT-EXECUTE] Verification failed but AGENT_REQUIRE_VERIFICATION=0, continuing batch loop");
+          continue;
+        }
         stoppedReason = cycle.safetyStopReason;
         console.warn(`[AGENT-EXECUTE] Batch loop safety stop at iteration ${i + 1}: ${stoppedReason}`);
         break;
       }
 
-      console.log(`[AGENT-EXECUTE] Batch iteration ${i + 1}/${requestedMax}: task=${cycle.taskId} status=${cycle.status}`);
+      console.log(`[AGENT-EXECUTE] Batch iteration ${i + 1}/${effectiveRequestedMax}: task=${cycle.taskId} status=${cycle.status}`);
     }
 
     const queueAfter = await buildQueueSnapshot();
-    const batchExecStatus = computeBatchExecStatus(batchResults, stoppedReason, requestedMax);
+    const batchExecStatus = computeBatchExecStatus(batchResults, stoppedReason, effectiveRequestedMax);
     const firstResult = batchResults[0] ?? null;
 
     // Derive human-readable no-task reason
@@ -1566,6 +1720,7 @@ export async function POST(req: NextRequest) {
       ok: batchExecStatus !== "FAILED",
       executionStatus: batchExecStatus,
       requestedMax,
+      effectiveRequestedMax,
       executedCount,
       completedCount,
       failedCount,
@@ -1575,6 +1730,13 @@ export async function POST(req: NextRequest) {
       results: batchResults,
       queueBefore,
       queueAfter,
+      autonomyEnabled,
+      envSafety: {
+        AGENT_AUTONOMY_ENABLED: process.env.AGENT_AUTONOMY_ENABLED ?? null,
+        AGENT_MAX_TASKS_PER_RUN: envMaxTasks,
+        AGENT_REQUIRE_VERIFICATION: process.env.AGENT_REQUIRE_VERIFICATION ?? "1",
+        AGENT_ALLOW_TRADING_FILES: process.env.AGENT_ALLOW_TRADING_FILES ?? "0",
+      },
       // ─── Legacy single-task compat ───────────────────────────────────
       selectedSource: firstResult?.source ?? "none",
       selectedTaskId: firstResult?.taskId ?? null,
