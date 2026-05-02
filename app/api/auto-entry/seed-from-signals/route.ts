@@ -502,11 +502,6 @@ export async function POST(req: NextRequest) {
   const today = getEtDateString();
   const { startMs: dayStartMs, endMs: dayEndMs } = getEtDayBoundsMs(today);
   const guardConfig = getGuardrailConfig();
-  const maxSignalAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN))
-    ? Math.max(1, Number(process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN))
-    : 10;
-  const staleThresholdUsedMs = Math.round(maxSignalAgeMin * 60 * 1000);
-
   const [rawSignals, trades, overlay, brokerTruth, guardState, clock, allStoredSignals] = await Promise.all([
     fetchScoredSignalsFromInternalApi(),
     readTrades<any>(),
@@ -519,6 +514,41 @@ export async function POST(req: NextRequest) {
 
   const marketOpen = clock.ok ? Boolean(clock.is_open) : false;
   const allowAfterHoursCreate = debug;
+
+  // ─── Stale threshold: market-hours-aware ──────────────────────────────
+  const freshMsParam = url.searchParams.has("freshMs") ? Number(url.searchParams.get("freshMs")) : null;
+  const envFreshMs = process.env.AUTO_ENTRY_SIGNAL_FRESH_MS ? Number(process.env.AUTO_ENTRY_SIGNAL_FRESH_MS) : null;
+  const legacyMinEnv = process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN ? Number(process.env.AUTO_ENTRY_SEED_MAX_AGE_MIN) : null;
+  const nowEtHour = (() => {
+    try {
+      const etParts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "numeric", hour12: false }).formatToParts(new Date());
+      const h = Number(etParts.find(p => p.type === "hour")?.value ?? 0);
+      const m = Number(etParts.find(p => p.type === "minute")?.value ?? 0);
+      return h + m / 60;
+    } catch { return 10; }
+  })();
+  const isEodWindow = marketOpen && nowEtHour >= 14.5; // after 2:30 PM ET
+  let staleThresholdUsedMs: number;
+  let freshnessMode: string;
+  if (freshMsParam != null && Number.isFinite(freshMsParam) && freshMsParam > 0) {
+    staleThresholdUsedMs = freshMsParam;
+    freshnessMode = "param_override";
+  } else if (envFreshMs != null && Number.isFinite(envFreshMs) && envFreshMs > 0) {
+    staleThresholdUsedMs = envFreshMs;
+    freshnessMode = "env_override";
+  } else if (legacyMinEnv != null && Number.isFinite(legacyMinEnv) && legacyMinEnv > 0) {
+    staleThresholdUsedMs = Math.round(legacyMinEnv * 60_000);
+    freshnessMode = "legacy_env_min";
+  } else if (marketOpen && isEodWindow) {
+    staleThresholdUsedMs = 75 * 60_000;
+    freshnessMode = "eod_75m";
+  } else if (marketOpen) {
+    staleThresholdUsedMs = 60 * 60_000;
+    freshnessMode = "market_default_60m";
+  } else {
+    staleThresholdUsedMs = 10 * 60_000;
+    freshnessMode = "closed_default_10m";
+  }
   const nowMs = Date.now();
 
   const signals = (rawSignals || []).filter((s: RawSignal) => {
@@ -1203,7 +1233,12 @@ export async function POST(req: NextRequest) {
     entriesToday,
     limitReason,
     staleThresholdUsedMs,
+    freshnessMode,
   });
+
+  const freshAgeMsValues = qualifiedSignalAges.map(a => a.ageMs).filter(Number.isFinite);
+  const newestQualifiedAgeMs = freshAgeMsValues.length > 0 ? Math.min(...freshAgeMsValues) : null;
+  const oldestQualifiedAgeMs = freshAgeMsValues.length > 0 ? Math.max(...freshAgeMsValues) : null;
 
   return NextResponse.json({
     ok: true,
@@ -1226,6 +1261,9 @@ export async function POST(req: NextRequest) {
     minScore,
     effectiveMinScore,
     staleThresholdUsedMs,
+    freshnessMode,
+    newestQualifiedAgeMs,
+    oldestQualifiedAgeMs,
     totalSignals: (signals || []).length,
     totalQualifiedSignals: qualifiedSignals.length,
     freshQualifiedSignals,

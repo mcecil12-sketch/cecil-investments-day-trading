@@ -1484,9 +1484,8 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
 
   const shouldAttemptFallback =
     marketOpen !== false &&
-    topCandidates.length >= 10 &&
-    postedCount === 0 &&
-    (aiSeedMode || debugScan);
+    topCandidates.length >= 5 &&
+    postedCount === 0;
 
   console.log("[scan] fallback_check", {
     shouldAttemptFallback,
@@ -1605,9 +1604,9 @@ candidates.sort((a, b) => b.patternScore - a.patternScore);
         fallbackBlockerReason = "fallback_candidates_all_failed_to_post";
       }
     }
-  } else if (marketOpen !== false && topCandidates.length >= 10 && postedCount === 0) {
-    // Market open + eligible candidates + zero posts but fallback was not attempted (wrong mode).
-    fallbackBlockerReason = "mode_not_eligible_for_fallback";
+  } else if (marketOpen !== false && topCandidates.length >= 5 && postedCount === 0) {
+    // Market open + eligible candidates + zero posts but fallback was not attempted.
+    fallbackBlockerReason = "fallback_attempted_but_no_candidates_posted";
   }
 
   const status: ScanStatus = "RUN";

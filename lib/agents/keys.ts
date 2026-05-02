@@ -18,6 +18,9 @@ export const AGENT_LATEST_EXECUTION_KEY = "agents:latest_execution:v1";
 // Phase 5 keys
 export const AGENT_LEARNING_LEDGER_KEY = "agents:learning_ledger:v1";
 
+// Batch execution keys
+export const AGENT_LATEST_BATCH_EXECUTION_KEY = "agents:latest_batch_execution:v1";
+
 // Manual action queue
 export const AGENT_MANUAL_QUEUE_KEY = "agents:manual_queue:v1";
 
@@ -34,6 +37,7 @@ export const AGENT_STORE_KEYS = {
   emBrief: AGENT_EM_BRIEF_KEY,
   adaptiveGuardrails: AGENT_ADAPTIVE_GUARDRAILS_KEY,
   latestExecution: AGENT_LATEST_EXECUTION_KEY,
+  latestBatchExecution: AGENT_LATEST_BATCH_EXECUTION_KEY,
   learningLedger: AGENT_LEARNING_LEDGER_KEY,
   manualQueue: AGENT_MANUAL_QUEUE_KEY,
 } as const;
