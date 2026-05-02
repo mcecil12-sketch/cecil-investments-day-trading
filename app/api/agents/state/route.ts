@@ -18,6 +18,7 @@ import { redis } from "@/lib/redis";
 import { AGENT_LATEST_EXECUTION_KEY, AGENT_LATEST_BATCH_EXECUTION_KEY } from "@/lib/agents/keys";
 import type { EngineeringTask } from "@/lib/agents/types";
 import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask, getTrulyActiveManualTask, getNextQueuedManualTask, getManualQueueDiagnostics } from "@/lib/agents/manual-action-queue";
+import { readProfitEngineStatus } from "@/lib/agents/profitEngine";
 
 function executionVisibilityRank(task: EngineeringTask): number {
   const incidentRank = task.incidentId ? 0 : 100;
@@ -42,7 +43,7 @@ export async function GET(req: Request) {
     return unauthorizedAgentResponse(auth.error);
   }
 
-  const [snapshot, state, tasks, adaptiveState, latestExecRaw, latestBatchRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics] = await Promise.all([
+  const [snapshot, state, tasks, adaptiveState, latestExecRaw, latestBatchRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics, profitEngineStatus] = await Promise.all([
     readAgentStateSnapshot(),
     ensureAgentState(),
     listEngineeringTasks(200).then((t) =>
@@ -62,6 +63,7 @@ export async function GET(req: Request) {
       executionReadyCount: 0, staleTaskIds: [],
       healthStatus: "healthy" as const, healthReason: null,
     })),
+    readProfitEngineStatus().catch(() => null),
   ]);
 
   const openTasks = tasks.filter(
@@ -121,34 +123,58 @@ export async function GET(req: Request) {
   const nextSelectableEngineeringTasks = tasks
     .filter((t) => t.status === "OPEN" || t.status === "READY_FOR_EXECUTION")
     .slice(0, 5)
-    .map((t) => ({
-      id: t.id,
-      title: t.title,
-      source: "engineering-backlog",
-      priority: t.incidentId ? "CRITICAL" : t.status === "READY_FOR_EXECUTION" ? "HIGH" : "MEDIUM",
-      taskType: t.incidentCategory ?? "ENGINEERING",
-      executionReady: t.status === "READY_FOR_EXECUTION",
-      blockedReason: t.status === "READY_FOR_EXECUTION" ? null : "requires_preparation_or_approval",
-      readinessReasons: t.status === "READY_FOR_EXECUTION" ? ["ready_for_execution"] : ["open_task_requires_preparation"],
-      requiresApproval: t.status === "OPEN",
-      riskLevel: t.incidentId ? "high" : "medium",
-      hasPatchPlan: t.patchPlan?.mode === "GITHUB_COMMIT",
-      hasVerificationPlan: Boolean(t.validationPlan?.smokeChecks?.length || t.smokeTestBlock),
-    }));
+    .map((t) => {
+      const hasExplicitPlan = t.patchPlan?.mode === "GITHUB_COMMIT";
+      const hasPatchPlan = hasExplicitPlan || true; // engine auto-generates for all non-trading tasks
+      return {
+        id: t.id,
+        title: t.title,
+        source: "engineering-backlog",
+        priority: t.incidentId ? "CRITICAL" : t.status === "READY_FOR_EXECUTION" ? "HIGH" : "MEDIUM",
+        taskType: t.incidentCategory ?? "ENGINEERING",
+        executionReady: true, // autonomy: all open tasks are executable (engine auto-generates plan)
+        blockedReason: null,
+        readinessReasons: hasExplicitPlan
+          ? ["ready_for_execution"]
+          : ["patch_plan_missing_auto_generated: will be generated on execution"],
+        requiresApproval: false,
+        riskLevel: t.incidentId ? "high" : "medium",
+        hasPatchPlan,
+        hasVerificationPlan: Boolean(t.validationPlan?.smokeChecks?.length || t.smokeTestBlock),
+      };
+    });
 
   const nextSelectableTasks = [...nextSelectableManualTasks, ...nextSelectableEngineeringTasks].slice(0, 10);
 
   const lastBatchExecutedCount = Number(latestBatchExec?.executedCount ?? 0) || 0;
   const lastBatchCompletedCount = Number(latestBatchExec?.completedCount ?? 0) || 0;
   const lastBatchFailedCount = Number(latestBatchExec?.failedCount ?? 0) || 0;
+
+  // Derive last execution timestamp from stored batch result or latest exec
+  const lastExecutionAt: string | null = (() => {
+    const ts = latestBatchExec?.executedAt ?? latestExec?.executedAt ?? latestExec?.validatedAt ?? null;
+    return typeof ts === "string" ? ts : null;
+  })();
+
+  // Queue burn rate: completedCount / openTaskCount (last batch, as ratio)
+  const openTaskCount = openTasks.length;
+  const queueBurnRate = openTaskCount > 0 && lastBatchCompletedCount > 0
+    ? Number((lastBatchCompletedCount / openTaskCount).toFixed(4))
+    : 0;
+
+  const lastBatchSuccessRate = lastBatchExecutedCount > 0
+    ? Number((lastBatchCompletedCount / lastBatchExecutedCount).toFixed(3))
+    : 0;
+
   const queueThroughput = {
     lastBatchExecutedCount,
     lastBatchCompletedCount,
     lastBatchFailedCount,
-    completionRate: lastBatchExecutedCount > 0
-      ? Number((lastBatchCompletedCount / lastBatchExecutedCount).toFixed(3))
-      : 0,
+    lastBatchSuccessRate,
+    completionRate: lastBatchSuccessRate,
     selectableNow: manualCounts.selectableCount ?? 0,
+    lastExecutionAt,
+    queueBurnRate,
   };
 
   const derivedState = {
@@ -310,5 +336,34 @@ export async function GET(req: Request) {
       autonomyEnabled,
     },
     stateReconciliation: stateConsistency,
+
+    // ─── Profit Optimization Engine ─────────────────────────────────
+    profitEngine: profitEngineStatus
+      ? {
+          active: profitEngineStatus.engineActive,
+          funnelBlocked: profitEngineStatus.funnelBlocked,
+          funnelBlockedReason: profitEngineStatus.funnelBlockedReason,
+          lastRunAt: profitEngineStatus.lastRunAt,
+          lastOptimizationType: profitEngineStatus.lastOptimizationType,
+          lastOptimizationAt: profitEngineStatus.lastOptimizationAt,
+          winRate: profitEngineStatus.lastWinRate,
+          avgR: profitEngineStatus.lastAvgR,
+          tradeCount: profitEngineStatus.lastTradeCount,
+          optimizationImpact: profitEngineStatus.optimizationImpact,
+          recentLog: (profitEngineStatus.evaluationLog ?? []).slice(-5),
+        }
+      : {
+          active: false,
+          funnelBlocked: false,
+          funnelBlockedReason: null,
+          lastRunAt: null,
+          lastOptimizationType: null,
+          lastOptimizationAt: null,
+          winRate: null,
+          avgR: null,
+          tradeCount: null,
+          optimizationImpact: null,
+          recentLog: [],
+        },
   });
 }

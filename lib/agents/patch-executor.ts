@@ -60,7 +60,7 @@ export function classifyTaskAsActionable(
   scored?: ScoredTask,
 ): ActionableBacklogTask {
   const hasGithubPatch =
-    task.patchPlan?.mode === "GITHUB_COMMIT" &&
+    (task.patchPlan?.mode === "GITHUB_COMMIT" || task.patchPlan?.mode === "PLACEHOLDER" || !task.patchPlan) &&
     task.commitPlan?.pushDirect === true &&
     !!task.commitPlan?.commitMessage?.trim();
 

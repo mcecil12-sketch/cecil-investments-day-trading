@@ -24,6 +24,10 @@ export const AGENT_LATEST_BATCH_EXECUTION_KEY = "agents:latest_batch_execution:v
 // Manual action queue
 export const AGENT_MANUAL_QUEUE_KEY = "agents:manual_queue:v1";
 
+// Profit Optimization Engine keys
+export const AGENT_PROFIT_ENGINE_KEY = "agents:profit_engine:v1";
+export const AGENT_EXPERIMENT_TRACKER_KEY = "agents:experiments:v1";
+
 export const AGENT_STORE_KEYS = {
   state: AGENT_STATE_KEY,
   briefs: AGENT_BRIEFS_KEY,
