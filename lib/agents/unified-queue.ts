@@ -212,33 +212,39 @@ export async function buildUnifiedQueueSummary(
 
   // Unified counters
   const openCount = manualCounts.openCount + openEngTasks.length;
-  const executionReadyCount = selectableManual + openEngTasks.length;
-  const selectableCount = selectableManual + openEngTasks.length;
   const blockedCount = manualBlocked + engBlocked;
   const inProgressCount = manualInProgress + engInProgress;
   const doneToday = manualDoneToday + engDoneToday;
   const failedToday = manualFailedToday + engFailedToday;
 
-  // Build next selectable tasks (max 10, manual first)
-  const selectableManualItems = selectableManualTasks.slice(0, 5).map(manualTaskToSelectable);
-  const selectableEngItems = openEngTasks.slice(0, 5).map(engineeringTaskToSelectable);
-  const nextSelectableTasks = [...selectableManualItems, ...selectableEngItems].slice(0, 10);
+  // Build next selectable tasks — sorted by source priority:
+  // profit-engine > adaptive > engineering-backlog > manual-action-queue
+  const SOURCE_PRIORITY: Record<UnifiedSelectableTask["source"], number> = {
+    "profit-engine": 0,
+    "adaptive": 1,
+    "engineering-backlog": 2,
+    "manual-action-queue": 3,
+  };
+  const selectableManualItems = selectableManualTasks.map(manualTaskToSelectable);
+  const selectableEngItems = openEngTasks.map(engineeringTaskToSelectable);
+  const nextSelectableTasks = [...selectableProfitEngineTasks.map(engineeringTaskToSelectable),
+    ...selectableAdaptiveTasks.map(engineeringTaskToSelectable),
+    ...selectableEngBacklogTasks.map(engineeringTaskToSelectable),
+    ...selectableManualItems,
+  ].sort((a, b) => SOURCE_PRIORITY[a.source] - SOURCE_PRIORITY[b.source]).slice(0, 10);
 
-  // Compute idleReason — never contradict nextSelectableTasks
-  let idleReason: string | null = null;
-  if (selectableCount === 0) {
-    // Only use manualCounts.idleReason when engineering backlog is genuinely empty
-    idleReason = manualCounts.idleReason ?? "no_work_available";
-  }
-  // If engineering backlog has selectable tasks, reset any manual-only idleReason
-  if (selectableEngineeringBacklog > 0 || selectableAdaptive > 0 || selectableProfitEngine > 0) {
-    idleReason = null; // selectable tasks available from engineering-backlog
-  }
+  // executionReadyCount is the authoritative length of what can run right now
+  const executionReadyCountUnified = nextSelectableTasks.length;
+
+  // idleReason: "autonomous_queue_ready" when tasks exist, "no_tasks_available" otherwise
+  const idleReason: string | null = executionReadyCountUnified > 0
+    ? null // queue is ready — do not report idle
+    : (manualCounts.idleReason ?? "no_tasks_available");
 
   return {
     openCount,
-    executionReadyCount,
-    selectableCount,
+    executionReadyCount: executionReadyCountUnified,
+    selectableCount: executionReadyCountUnified,
     blockedCount,
     inProgressCount,
     doneToday,

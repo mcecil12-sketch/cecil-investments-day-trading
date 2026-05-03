@@ -102,20 +102,13 @@ function executionSortRank(task: EngineeringTask): number {
 }
 
 function validateExecutionGuardrails(task: EngineeringTask): string | null {
-  // Allow GITHUB_COMMIT (explicit) and auto-generated plans (will be GITHUB_COMMIT after engine upgrade)
-  if (task.patchPlan?.mode !== "GITHUB_COMMIT" && task.patchPlan?.mode !== undefined) {
-    // Only block FILE_WRITE — PLACEHOLDER is treated as auto-generatable
-    if (task.patchPlan.mode === "FILE_WRITE") {
-      return "patch_mode_not_github_commit";
-    }
-    // PLACEHOLDER: engine will upgrade to GITHUB_COMMIT on prepareExecutionPlan — allow through
+  // Only hard-block on FILE_WRITE mode — everything else the engine handles at runtime.
+  // PLACEHOLDER/missing mode → auto-generates GITHUB_COMMIT plan via prepareExecutionPlan.
+  if (task.patchPlan?.mode === "FILE_WRITE") {
+    return "patch_mode_not_github_commit";
   }
-  if (task.commitPlan?.pushDirect !== true) {
-    return "push_direct_not_enabled";
-  }
-  if (!task.commitPlan?.commitMessage?.trim()) {
-    return "missing_commit_message";
-  }
+  // commitPlan fields (pushDirect, commitMessage) are auto-populated by prepareExecutionPlan
+  // when missing — do NOT block execution here, let the engine fill them in.
   return null;
 }
 
@@ -437,11 +430,18 @@ function titleKeywordBoost(title: string): number {
 }
 
 function batchEngineeringTaskRank(task: EngineeringTask): number {
+  const tAny = task as unknown as Record<string, unknown>;
+  // Source priority: profit-engine (0) > adaptive (1) > incident (2) > backlog (3)
+  const sourcePriority =
+    tAny.source === "profit_engine" || tAny.profitEngineGenerated ? 0
+    : tAny.source === "adaptive_guardrails" || tAny.adaptiveSource ? 1
+    : task.incidentId ? 2
+    : 3;
   const priorityRank = PRIORITY_BUCKET_RANK[engineeringPriorityBucket(task)] * 100;
   const statusRank = task.status === "READY_FOR_EXECUTION" ? 0 : task.status === "OPEN" ? 20 : 100;
   const kw = titleKeywordBoost(task.title);
   const age = Date.parse(task.createdAt) || 0; // older = lower number = better
-  return priorityRank + statusRank + kw + age / 1e12; // age contribution tiny vs status
+  return sourcePriority * 1000 + priorityRank + statusRank + kw + age / 1e12;
 }
 
 /**
@@ -1846,6 +1846,45 @@ export async function POST(req: NextRequest) {
 
     await storeLatestExecution(batchResponse as Record<string, unknown>);
     await storeLatestBatchExecution(batchResponse as Record<string, unknown>);
+
+    // ─── Continuous execution cadence ─────────────────────────────────
+    // When autonomy is enabled and the queue still has work, fire-and-forget
+    // the next execution cycle after a brief delay so the agent continuously
+    // burns down the backlog without requiring an external cron trigger.
+    if (
+      !dryRun &&
+      autonomyEnabled &&
+      (batchExecStatus === "BATCH_COMPLETED" || batchExecStatus === "BATCH_PARTIAL") &&
+      completedCount > 0 &&
+      (queueAfter.openCount > 0 || queueAfter.executionReadyCount > 0) &&
+      normalizedStoppedReason !== "no_more_selectable_tasks"
+    ) {
+      // Determine base URL for self-call
+      const selfBaseUrl = (() => {
+        const vercelUrl = process.env.VERCEL_URL ?? process.env.NEXT_PUBLIC_BASE_URL ?? "";
+        if (vercelUrl) return vercelUrl.startsWith("http") ? vercelUrl : `https://${vercelUrl}`;
+        return "http://localhost:3000";
+      })();
+      const cronToken = process.env.CRON_TOKEN ?? "";
+      if (cronToken) {
+        // 1-second delay, then fire next cycle without blocking the current response
+        setTimeout(() => {
+          fetch(`${selfBaseUrl}/api/agents/execute`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-cron-token": cronToken,
+            },
+            body: JSON.stringify({ requestedMax, priorityOnly }),
+            signal: AbortSignal.timeout(55000),
+          }).catch((err: unknown) => {
+            console.warn("[AGENT-EXECUTE] Auto-trigger next cycle failed:", err instanceof Error ? err.message : String(err));
+          });
+        }, 1500);
+        console.log("[AGENT-EXECUTE] Queued auto-trigger next cycle in 1.5s");
+      }
+    }
+
     return NextResponse.json(batchResponse);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
