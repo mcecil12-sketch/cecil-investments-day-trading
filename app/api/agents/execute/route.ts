@@ -1752,6 +1752,18 @@ export async function POST(req: NextRequest) {
     const batchExecStatus = computeBatchExecStatus(batchResults, stoppedReason, effectiveRequestedMax);
     const firstResult = batchResults[0] ?? null;
 
+    // Normalize stoppedReason to documented external values
+    const normalizeStoppedReason = (r: string | null): string | null => {
+      if (!r) return null;
+      if (r === "safety_gate_blocked" || r === "safe_execution_gate_failed") return "safety_gate_failed";
+      if (r === "requires_approval" || r === "trading_file_requires_approval") return "approval_required";
+      if (r === "trading_file_requires_human_approval") return "trading_file_blocked";
+      if (r === "patch_executor_disabled") return "approval_required";
+      if (r === "no_open_tasks" || r === "no_eligible_tasks") return "no_more_selectable_tasks";
+      return r;
+    };
+    const normalizedStoppedReason = normalizeStoppedReason(stoppedReason);
+
     // Derive human-readable no-task reason
     let noEligibleReason: string | null = null;
     if (batchExecStatus === "NO_ELIGIBLE_TASKS") {
@@ -1766,16 +1778,19 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    const execTimestamp = new Date().toISOString();
     const batchResponse = {
       ok: batchExecStatus !== "FAILED",
       executionStatus: batchExecStatus,
+      timestamp: execTimestamp,
+      executedAt: execTimestamp,
       requestedMax,
       effectiveRequestedMax,
       executedCount,
       completedCount,
       failedCount,
       skippedCount,
-      stoppedReason,
+      stoppedReason: normalizedStoppedReason,
       noEligibleReason,
       results: batchResults,
       queueBefore,

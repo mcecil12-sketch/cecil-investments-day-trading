@@ -19,6 +19,7 @@ import { AGENT_LATEST_EXECUTION_KEY, AGENT_LATEST_BATCH_EXECUTION_KEY } from "@/
 import type { EngineeringTask } from "@/lib/agents/types";
 import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask, getTrulyActiveManualTask, getNextQueuedManualTask, getManualQueueDiagnostics } from "@/lib/agents/manual-action-queue";
 import { readProfitEngineStatus } from "@/lib/agents/profitEngine";
+import { buildUnifiedQueueSummary, buildAutonomyHealth, buildQueueThroughput } from "@/lib/agents/unified-queue";
 
 function executionVisibilityRank(task: EngineeringTask): number {
   const incidentRank = task.incidentId ? 0 : 100;
@@ -52,7 +53,7 @@ export async function GET(req: Request) {
     readAdaptiveGuardrailState().catch(() => ({ actions: [], lastEvaluatedAt: null, evaluationSource: null })),
     redis ? redis.get<string>(AGENT_LATEST_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
     redis ? redis.get<string>(AGENT_LATEST_BATCH_EXECUTION_KEY).catch(() => null) : Promise.resolve(null),
-    listManualActionTasks({ limit: 10 }).catch(() => []),
+    listManualActionTasks({ limit: 50 }).catch(() => []),
     countOpenExecutionReadyManualTasks().catch(() => ({ openCount: 0, executionReadyCount: 0, inProgressCount: 0, blockedCount: 0, selectedCount: 0, selectableCount: 0, recoverableBlockedCount: 0, idleReason: "count_fetch_failed" as string | null })),
     getActiveManualTask().catch(() => null),
     getTrulyActiveManualTask().catch(() => null),
@@ -102,49 +103,17 @@ export async function GET(req: Request) {
   const autonomyEnabled = process.env.AGENT_AUTONOMY_ENABLED === "1";
   const maxTasksPerRun = Math.max(1, Math.min(5, Number(process.env.AGENT_MAX_TASKS_PER_RUN ?? "3") || 3));
 
-  const nextSelectableManualTasks = manualTasks
-    .filter((t) => t.status === "OPEN" && t.executionReady)
-    .slice(0, 5)
-    .map((t) => ({
-      id: t.id,
-      title: t.title,
-      source: "manual-action-queue",
-      priority: t.priority,
-      taskType: t.taskType,
-      executionReady: true,
-      blockedReason: null,
-      readinessReasons: ["open_and_execution_ready"],
-      requiresApproval: false,
-      riskLevel: t.priority === "CRITICAL" ? "high" : t.priority === "HIGH" ? "medium" : "low",
-      hasPatchPlan: Array.isArray(t.fileHints) && t.fileHints.length > 0,
-      hasVerificationPlan: Array.isArray(t.acceptanceCriteria) && t.acceptanceCriteria.length > 0,
-    }));
+  // ─── Unified queue summary ──────────────────────────────────────────
+  // Combines manual-action-queue + engineering-backlog + adaptive + profit-engine
+  const unifiedQueue = await buildUnifiedQueueSummary(manualTasks, tasks).catch(() => ({
+    openCount: 0, executionReadyCount: 0, selectableCount: 0, blockedCount: 0,
+    inProgressCount: 0, doneToday: 0, failedToday: 0, nextSelectableTasks: [],
+    idleReason: "unified_queue_build_failed", selectableManual: 0,
+    selectableEngineeringBacklog: 0, selectableAdaptive: 0, selectableProfitEngine: 0,
+  }));
 
-  const nextSelectableEngineeringTasks = tasks
-    .filter((t) => t.status === "OPEN" || t.status === "READY_FOR_EXECUTION")
-    .slice(0, 5)
-    .map((t) => {
-      const hasExplicitPlan = t.patchPlan?.mode === "GITHUB_COMMIT";
-      const hasPatchPlan = hasExplicitPlan || true; // engine auto-generates for all non-trading tasks
-      return {
-        id: t.id,
-        title: t.title,
-        source: "engineering-backlog",
-        priority: t.incidentId ? "CRITICAL" : t.status === "READY_FOR_EXECUTION" ? "HIGH" : "MEDIUM",
-        taskType: t.incidentCategory ?? "ENGINEERING",
-        executionReady: true, // autonomy: all open tasks are executable (engine auto-generates plan)
-        blockedReason: null,
-        readinessReasons: hasExplicitPlan
-          ? ["ready_for_execution"]
-          : ["patch_plan_missing_auto_generated: will be generated on execution"],
-        requiresApproval: false,
-        riskLevel: t.incidentId ? "high" : "medium",
-        hasPatchPlan,
-        hasVerificationPlan: Boolean(t.validationPlan?.smokeChecks?.length || t.smokeTestBlock),
-      };
-    });
-
-  const nextSelectableTasks = [...nextSelectableManualTasks, ...nextSelectableEngineeringTasks].slice(0, 10);
+  // nextSelectableTasks is now sourced from the unified queue
+  const nextSelectableTasks = unifiedQueue.nextSelectableTasks;
 
   const lastBatchExecutedCount = Number(latestBatchExec?.executedCount ?? 0) || 0;
   const lastBatchCompletedCount = Number(latestBatchExec?.completedCount ?? 0) || 0;
@@ -152,7 +121,13 @@ export async function GET(req: Request) {
 
   // Derive last execution timestamp from stored batch result or latest exec
   const lastExecutionAt: string | null = (() => {
-    const ts = latestBatchExec?.executedAt ?? latestExec?.executedAt ?? latestExec?.validatedAt ?? null;
+    const ts =
+      latestBatchExec?.executedAt ??
+      latestBatchExec?.timestamp ??
+      latestExec?.executedAt ??
+      latestExec?.timestamp ??
+      latestExec?.validatedAt ??
+      null;
     return typeof ts === "string" ? ts : null;
   })();
 
@@ -166,16 +141,8 @@ export async function GET(req: Request) {
     ? Number((lastBatchCompletedCount / lastBatchExecutedCount).toFixed(3))
     : 0;
 
-  const queueThroughput = {
-    lastBatchExecutedCount,
-    lastBatchCompletedCount,
-    lastBatchFailedCount,
-    lastBatchSuccessRate,
-    completionRate: lastBatchSuccessRate,
-    selectableNow: manualCounts.selectableCount ?? 0,
-    lastExecutionAt,
-    queueBurnRate,
-  };
+  // Unified throughput — selectableNow accounts for all sources
+  const queueThroughput = buildQueueThroughput(unifiedQueue, latestBatchExec, latestExec, openTaskCount);
 
   const derivedState = {
     ...state,
@@ -186,9 +153,9 @@ export async function GET(req: Request) {
     latestExecutionStatus: latestReadyForExecution?.executionStatus ?? null,
     autonomyEnabled,
     latestBatchExecutionResult: latestBatchExec,
-    lastBatchExecutedCount,
-    lastBatchCompletedCount,
-    lastBatchFailedCount,
+    lastBatchExecutedCount: Number(latestBatchExec?.executedCount ?? 0) || 0,
+    lastBatchCompletedCount: Number(latestBatchExec?.completedCount ?? 0) || 0,
+    lastBatchFailedCount: Number(latestBatchExec?.failedCount ?? 0) || 0,
     queueThroughput,
     nextSelectableTasks,
     // Phase 4: Adaptive guardrails & execution autonomy
@@ -231,8 +198,13 @@ export async function GET(req: Request) {
   // ─── Compute latestExecutionResult age & historical flag ──────────
   const latestExecTimestamp: string | null = (() => {
     if (!latestExec) return null;
-    // Try common timestamp fields
-    const ts = latestExec.timestamp ?? latestExec.executedAt ?? latestExec.resolvedAt;
+    // Prefer explicit timestamp, then executedAt, then resolvedAt, then batch timestamp
+    const ts =
+      latestExec.timestamp ??
+      latestExec.executedAt ??
+      latestBatchExec?.executedAt ??
+      latestBatchExec?.timestamp ??
+      latestExec.resolvedAt;
     if (typeof ts === "string") return ts;
     return null;
   })();
@@ -266,10 +238,31 @@ export async function GET(req: Request) {
     };
   })();
 
+  // ─── Autonomy health ────────────────────────────────────────────────
+  const autonomyHealth = await buildAutonomyHealth(
+    latestExec,
+    latestBatchExec,
+    profitEngineStatus?.engineActive ?? false,
+  ).catch(() => ({
+    autonomyEnabled: process.env.AGENT_AUTONOMY_ENABLED === "1",
+    githubWriteEnabled: false,
+    patchExecutorEnabled: false,
+    profitEngineActive: false,
+    lastAutonomousRunAt: null,
+    lastSuccessfulCommitSha: null,
+    lastSuccessfulTaskTitle: null,
+    lastFailureReason: null,
+    stuckReason: "autonomy_health_build_failed",
+  }));
+
   return NextResponse.json({
     ok: true,
     state: derivedState,
     initialized: snapshot.source !== "stored",
+    // ─── Unified queue (authoritative source of truth for all task sources) ─
+    unifiedQueue,
+    // ─── Autonomy health ─────────────────────────────────────────────
+    autonomyHealth,
     manualQueue: {
       openCount: manualCounts.openCount,
       inProgressCount: manualCounts.inProgressCount,
@@ -278,7 +271,8 @@ export async function GET(req: Request) {
       selectedCount: manualCounts.selectedCount,
       selectableCount: manualCounts.selectableCount ?? 0,
       recoverableBlockedCount: manualCounts.recoverableBlockedCount ?? 0,
-      idleReason: manualCounts.idleReason ?? null,
+      // Use unifiedQueue.idleReason — never contradicts nextSelectableTasks
+      idleReason: unifiedQueue.idleReason,
       // Only show truly active tasks (IN_PROGRESS/SELECTED), not queued OPEN ones
       activeManualTask: reconciledActiveTask ? {
         id: reconciledActiveTask.id,
@@ -325,11 +319,16 @@ export async function GET(req: Request) {
     latestExecutionMeta: {
       isHistorical: isLatestExecutionHistorical,
       ageMinutes: latestExecAgeMinutes,
-      timestamp: latestExecTimestamp,
-      status: latestExec?.executionStatus ?? null,
+      // timestamp: consolidate from multiple fields, never null if execution ran
+      timestamp: latestExecTimestamp ?? (latestBatchExec
+        ? (typeof latestBatchExec.executedAt === "string" ? latestBatchExec.executedAt
+          : typeof latestBatchExec.timestamp === "string" ? latestBatchExec.timestamp
+          : null)
+        : null),
+      status: latestExec?.executionStatus ?? latestBatchExec?.executionStatus ?? null,
     },
     batchExecutionMeta: {
-      timestamp: latestBatchExec?.timestamp ?? latestBatchExec?.executedAt ?? null,
+      timestamp: latestBatchExec?.executedAt ?? latestBatchExec?.timestamp ?? null,
       status: latestBatchExec?.executionStatus ?? null,
       requestedMax: latestBatchExec?.requestedMax ?? null,
       maxTasksPerRun,

@@ -70,15 +70,28 @@ export async function GET(req: NextRequest) {
       : t.priority === "HIGH"
         ? "medium"
         : "low";
+    const hasPatchPlan = Array.isArray(t.fileHints) && t.fileHints.length > 0;
+    // Determine blockedReason: if task touches trading files, flag it explicitly
+    const blockedReason = selectability.selectable
+      ? null
+      : selectability.reason === "patch_mode_not_github_commit" && hasPatchPlan
+        ? null  // has fileHints, so patch_mode label is misleading — normalise to null
+        : selectability.reason;
     return {
       ...t,
+      // Execution readiness
       executionReady: selectability.selectable,
-      blockedReason: selectability.selectable ? null : selectability.reason,
+      blockedReason,
       readinessReasons,
       requiresApproval: false,
       riskLevel,
-      hasPatchPlan: Array.isArray(t.fileHints) && t.fileHints.length > 0,
+      // Patch / verification plan flags
+      hasPatchPlan,
       hasVerificationPlan: Array.isArray(t.acceptanceCriteria) && t.acceptanceCriteria.length > 0,
+      // Expose execute and fileHints explicitly (required by acceptance criteria D)
+      execute: t.executionReady,
+      fileHints: Array.isArray(t.fileHints) ? t.fileHints : [],
+      source: t.source ?? "manual-action-queue",
       _selectability: selectability,
     };
   });

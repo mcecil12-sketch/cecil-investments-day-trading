@@ -29,6 +29,7 @@ import { getTtlSeconds } from "@/lib/redis/ttl";
 import { AGENT_PROFIT_ENGINE_KEY } from "@/lib/agents/keys";
 import { readPerformanceLearning, computePerformanceLearning } from "@/lib/agents/performanceLearning";
 import { appendEngineeringTask } from "@/lib/agents/store";
+import { isRecentDuplicateTask } from "@/lib/agents/task-dedup";
 import { nowIso } from "@/lib/agents/time";
 import {
   openExperiment,
@@ -390,6 +391,11 @@ async function createFunnelFixTasks(
   }
 
   for (const fix of fixes) {
+    const isRecentDupe = await isRecentDuplicateTask(fix.title).catch(() => false);
+    if (isRecentDupe) {
+      console.log(`[PROFIT-ENGINE] Skipping duplicate funnel-fix task (24h window): ${fix.title}`);
+      continue;
+    }
     const task: EngineeringTask = {
       id: `profit-funnel-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       createdAt: nowIso(),
@@ -674,6 +680,11 @@ export async function runProfitEngine(
   for (const pattern of patterns) {
     const isDupe = await patternAlreadyHasOpenTask(pattern.id, existingTasks).catch(() => false);
     if (isDupe) continue;
+    const isRecentDupe = await isRecentDuplicateTask(pattern.title).catch(() => false);
+    if (isRecentDupe) {
+      console.log(`[PROFIT-ENGINE] Skipping duplicate task (24h window): ${pattern.title}`);
+      continue;
+    }
 
     const saved = await createOptimizationTask(pattern).catch(() => null);
     if (!saved) continue;

@@ -17,6 +17,7 @@ import { getTtlSeconds } from "@/lib/redis/ttl";
 import { AGENT_ADAPTIVE_GUARDRAILS_KEY } from "@/lib/agents/keys";
 import { readPerformanceLearning } from "@/lib/agents/performanceLearning";
 import { appendEngineeringTask } from "@/lib/agents/store";
+import { isRecentDuplicateTask } from "@/lib/agents/task-dedup";
 import { nowIso } from "@/lib/agents/time";
 import type {
   AdaptiveActionType,
@@ -350,12 +351,18 @@ export async function evaluateAdaptiveGuardrails(): Promise<AdaptiveEvaluationRe
     } else {
       // Create execution-ready task for non-safe changes
       try {
+        const taskTitle = `[Adaptive] ${pattern.reason}`;
+        const isDuplicate = await isRecentDuplicateTask(taskTitle);
+        if (isDuplicate) {
+          console.log(`[ADAPTIVE-GUARDRAILS] Skipping duplicate task for pattern: ${pattern.pattern}`);
+          continue;
+        }
         const task: EngineeringTask = {
           id: `adaptive-${pattern.pattern}-${Date.now().toString(36)}`,
           createdAt: nowIso(),
           updatedAt: nowIso(),
           status: "OPEN",
-          title: `[Adaptive] ${pattern.reason}`,
+          title: taskTitle,
           summary: `Performance-driven pattern detected: ${pattern.pattern}. Requires manual review — not auto-applicable. Triggered reason: ${pattern.reason}`,
           likelyFiles: [],
           copilotPrompt: `Review and address performance pattern: ${pattern.pattern}. ${pattern.reason}`,
