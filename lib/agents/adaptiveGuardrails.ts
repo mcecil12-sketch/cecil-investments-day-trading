@@ -17,7 +17,7 @@ import { getTtlSeconds } from "@/lib/redis/ttl";
 import { AGENT_ADAPTIVE_GUARDRAILS_KEY } from "@/lib/agents/keys";
 import { readPerformanceLearning } from "@/lib/agents/performanceLearning";
 import { appendEngineeringTask } from "@/lib/agents/store";
-import { isRecentDuplicateTask } from "@/lib/agents/task-dedup";
+import { buildDedupeKey, checkAndRecordTaskDedup } from "@/lib/agents/task-dedup";
 import { nowIso } from "@/lib/agents/time";
 import type {
   AdaptiveActionType,
@@ -352,13 +352,15 @@ export async function evaluateAdaptiveGuardrails(): Promise<AdaptiveEvaluationRe
       // Create execution-ready task for non-safe changes
       try {
         const taskTitle = `[Adaptive] ${pattern.reason}`;
-        const isDuplicate = await isRecentDuplicateTask(taskTitle);
-        if (isDuplicate) {
-          console.log(`[ADAPTIVE-GUARDRAILS] Skipping duplicate task for pattern: ${pattern.pattern}`);
+        const tentativeId = `adaptive-${pattern.pattern}-${Date.now().toString(36)}`;
+        const dedupeKey = buildDedupeKey(taskTitle, pattern.pattern, pattern.actionType);
+        const dedup = await checkAndRecordTaskDedup(dedupeKey, tentativeId, taskTitle).catch(() => ({ isDuplicate: false, duplicateOfTaskId: null, occurrenceCount: 1 }));
+        if (dedup.isDuplicate) {
+          console.log(`[ADAPTIVE-GUARDRAILS] Skipping duplicate task (occurrence #${dedup.occurrenceCount}) for pattern: ${pattern.pattern}`);
           continue;
         }
         const task: EngineeringTask = {
-          id: `adaptive-${pattern.pattern}-${Date.now().toString(36)}`,
+          id: tentativeId,
           createdAt: nowIso(),
           updatedAt: nowIso(),
           status: "OPEN",

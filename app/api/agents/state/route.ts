@@ -50,12 +50,17 @@ const STALE_PROBE_JSON_KEYS = new Set([
 ]);
 
 function sanitizeVerificationSummary(verification: unknown): unknown {
-  if (!verification || typeof verification !== "object") return verification;
+  return sanitizeVerificationSummaryWithCount(verification).result;
+}
+
+function sanitizeVerificationSummaryWithCount(verification: unknown): { result: unknown; sanitizedCount: number } {
+  if (!verification || typeof verification !== "object") return { result: verification, sanitizedCount: 0 };
   const v = verification as Record<string, unknown>;
   const details = v.details;
-  if (!details || typeof details !== "object") return verification;
+  if (!details || typeof details !== "object") return { result: verification, sanitizedCount: 0 };
   const d = details as Record<string, unknown>;
-  if (!Array.isArray(d.probes)) return verification;
+  if (!Array.isArray(d.probes)) return { result: verification, sanitizedCount: 0 };
+  let sanitizedCount = 0;
   const sanitizedProbes = (d.probes as unknown[]).map((probe) => {
     if (!probe || typeof probe !== "object") return probe;
     const p = probe as Record<string, unknown>;
@@ -64,13 +69,14 @@ function sanitizeVerificationSummary(verification: unknown): unknown {
     const json = p.json as Record<string, unknown>;
     const hasStaleState = Object.keys(json).some((k) => STALE_PROBE_JSON_KEYS.has(k));
     if (!hasStaleState) return p;
+    sanitizedCount++;
     // Replace with compact non-recursive summary
     const { route, ok, status, method, reason, checkedAt } = p as Record<string, unknown>;
     return { route, ok, status, method, reason, checkedAt };
   });
   return {
-    ...v,
-    details: { ...d, probes: sanitizedProbes },
+    result: { ...v, details: { ...d, probes: sanitizedProbes } },
+    sanitizedCount,
   };
 }
 
@@ -223,6 +229,9 @@ export async function GET(req: Request) {
   // Unified throughput — selectableNow accounts for all sources; canonical exec drives lastExecutionAt
   const queueThroughput = buildQueueThroughput(unifiedQueue, canon, canon, openTaskCount);
 
+  // Sanitize verification probes and capture count for diagnostics
+  const verificationSanitized = sanitizeVerificationSummaryWithCount(canon?.verification ?? null);
+
   const derivedState = {
     ...state,
     openEngineeringTaskCount: openTasks.length + blockedTasks.length,
@@ -243,7 +252,7 @@ export async function GET(req: Request) {
     patchExecutorEnabled: ghCapability.writeEnabled,
     latestExecutionTaskId: canon?.selectedTaskId ?? latestReadyForExecution?.id ?? null,
     latestCommitSha: canon?.commitSha ?? null,
-    latestVerificationSummary: sanitizeVerificationSummary(canon?.verification ?? null),
+    latestVerificationSummary: verificationSanitized.result,
     latestFailureReason: canon?.failure
       ? (canon.failure as Record<string, unknown>)?.reason ?? null
       : null,
@@ -442,6 +451,12 @@ export async function GET(req: Request) {
       autonomyEnabled,
     },
     stateReconciliation: stateConsistency,
+
+    // ─── Verification sanitization diagnostics ──────────────────────
+    verificationDiagnostics: {
+      verificationSummarySanitized: verificationSanitized.sanitizedCount > 0,
+      nestedProbeJsonRemovedCount: verificationSanitized.sanitizedCount,
+    },
 
     // ─── Profit Optimization Engine ─────────────────────────────────
     profitEngine: profitEngineStatus

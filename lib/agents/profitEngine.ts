@@ -29,7 +29,7 @@ import { getTtlSeconds } from "@/lib/redis/ttl";
 import { AGENT_PROFIT_ENGINE_KEY } from "@/lib/agents/keys";
 import { readPerformanceLearning, computePerformanceLearning } from "@/lib/agents/performanceLearning";
 import { appendEngineeringTask } from "@/lib/agents/store";
-import { isRecentDuplicateTask } from "@/lib/agents/task-dedup";
+import { buildDedupeKey, checkAndRecordTaskDedup } from "@/lib/agents/task-dedup";
 import { nowIso } from "@/lib/agents/time";
 import {
   openExperiment,
@@ -391,13 +391,15 @@ async function createFunnelFixTasks(
   }
 
   for (const fix of fixes) {
-    const isRecentDupe = await isRecentDuplicateTask(fix.title).catch(() => false);
-    if (isRecentDupe) {
+    const tentativeFunnelId = `profit-funnel-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const funnelDedupeKey = buildDedupeKey(fix.title);
+    const funnelDedup = await checkAndRecordTaskDedup(funnelDedupeKey, tentativeFunnelId, fix.title).catch(() => ({ isDuplicate: false, duplicateOfTaskId: null, occurrenceCount: 1 }));
+    if (funnelDedup.isDuplicate) {
       console.log(`[PROFIT-ENGINE] Skipping duplicate funnel-fix task (24h window): ${fix.title}`);
       continue;
     }
     const task: EngineeringTask = {
-      id: `profit-funnel-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      id: tentativeFunnelId,
       createdAt: nowIso(),
       updatedAt: nowIso(),
       status: "OPEN",
@@ -634,6 +636,18 @@ export async function runProfitEngine(
   const closedTrades = extractClosedTrades(Array.isArray(allTrades) ? allTrades : []);
   const analytics = buildAnalytics(closedTrades);
 
+  // ── Guard: require at least 3 new closed trades since last remediation ─────
+  const PROFIT_ENGINE_MIN_NEW_TRADES = 3;
+  const newTradesSinceLastFix = (() => {
+    if (!state.lastOptimizationAt) return closedTrades.length;
+    const cutoff = Date.parse(state.lastOptimizationAt);
+    if (!Number.isFinite(cutoff)) return closedTrades.length;
+    return closedTrades.filter((t) => {
+      const ts = Date.parse(t.closedAt ?? "");
+      return Number.isFinite(ts) && ts > cutoff;
+    }).length;
+  })();
+
   const tierWinRates: Record<string, number> = {};
   const tierAvgRs: Record<string, number> = {};
   const tierTradeCounts: Record<string, number> = {};
@@ -677,12 +691,21 @@ export async function runProfitEngine(
   const newTaskIds: string[] = [];
   const expIds: string[] = [];
 
+  // If insufficient new trades since last fix, skip pattern task generation
+  if (newTradesSinceLastFix < PROFIT_ENGINE_MIN_NEW_TRADES) {
+    console.log(
+      `[PROFIT-ENGINE] Skipping task generation: insufficient_new_data_for_reoptimization ` +
+        `(${newTradesSinceLastFix} trades since last fix, need ${PROFIT_ENGINE_MIN_NEW_TRADES})`,
+    );
+  } else {
   for (const pattern of patterns) {
     const isDupe = await patternAlreadyHasOpenTask(pattern.id, existingTasks).catch(() => false);
     if (isDupe) continue;
-    const isRecentDupe = await isRecentDuplicateTask(pattern.title).catch(() => false);
-    if (isRecentDupe) {
-      console.log(`[PROFIT-ENGINE] Skipping duplicate task (24h window): ${pattern.title}`);
+    const tentativeId = `profit-${pattern.id}-${Date.now().toString(36)}`;
+    const dedupeKey = buildDedupeKey(pattern.title, pattern.id, pattern.optimizationType, pattern.likelyFiles);
+    const dedup = await checkAndRecordTaskDedup(dedupeKey, tentativeId, pattern.title).catch(() => ({ isDuplicate: false, duplicateOfTaskId: null, occurrenceCount: 1 }));
+    if (dedup.isDuplicate) {
+      console.log(`[PROFIT-ENGINE] Skipping duplicate task (occurrence #${dedup.occurrenceCount}, 24h window): ${pattern.title}`);
       continue;
     }
 
@@ -702,6 +725,7 @@ export async function runProfitEngine(
     }).catch(() => null);
     if (exp) expIds.push(exp.id);
   }
+  } // end else (newTradesSinceLastFix >= PROFIT_ENGINE_MIN_NEW_TRADES)
 
   result.tasksCreated = newTaskIds;
   result.experimentsOpened = expIds;
