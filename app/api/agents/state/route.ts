@@ -38,6 +38,42 @@ function executionVisibilityRank(task: EngineeringTask): number {
   return incidentRank + statusRank;
 }
 
+// ─── Sanitize verification probes stored before the json-strip fix ──
+// Strips nested /api/agents/state JSON from any probe.json fields that
+// were persisted in Redis before verification-runner was patched.
+// Only keeps compact fields: route, ok, status, method, reason, checkedAt.
+const STALE_PROBE_JSON_KEYS = new Set([
+  "state", "manualQueue", "unifiedQueue", "autonomyHealth",
+  "latestExecutionMeta", "batchExecutionMeta", "latestBatchExecutionResult",
+  "latestExecutionResult", "queueThroughput", "nextSelectableTasks",
+  "profitEngine", "stateReconciliation",
+]);
+
+function sanitizeVerificationSummary(verification: unknown): unknown {
+  if (!verification || typeof verification !== "object") return verification;
+  const v = verification as Record<string, unknown>;
+  const details = v.details;
+  if (!details || typeof details !== "object") return verification;
+  const d = details as Record<string, unknown>;
+  if (!Array.isArray(d.probes)) return verification;
+  const sanitizedProbes = (d.probes as unknown[]).map((probe) => {
+    if (!probe || typeof probe !== "object") return probe;
+    const p = probe as Record<string, unknown>;
+    if (!p.json || typeof p.json !== "object") return p;
+    // Strip or compact the json field — keep only safe non-recursive fields
+    const json = p.json as Record<string, unknown>;
+    const hasStaleState = Object.keys(json).some((k) => STALE_PROBE_JSON_KEYS.has(k));
+    if (!hasStaleState) return p;
+    // Replace with compact non-recursive summary
+    const { route, ok, status, method, reason, checkedAt } = p as Record<string, unknown>;
+    return { route, ok, status, method, reason, checkedAt };
+  });
+  return {
+    ...v,
+    details: { ...d, probes: sanitizedProbes },
+  };
+}
+
 export async function GET(req: Request) {
   const auth = await checkAgentReadAuth(req);
   if (!auth.ok) {
@@ -130,6 +166,19 @@ export async function GET(req: Request) {
     return execTs >= batchTs ? latestExec : latestBatchExec;
   })();
 
+  // Strip any stale top-level recursive keys from the canonical exec record.
+  // These keys should never appear in stored batch results, but may have leaked
+  // from older Redis snapshots captured before the probe-sanitization fix.
+  const EXEC_RECORD_STRIP_KEYS = new Set([
+    "state", "manualQueue", "unifiedQueue", "autonomyHealth", "profitEngine",
+    "stateReconciliation", "initialized",
+  ]);
+  const sanitizedCanonicalExec: Record<string, unknown> | null = canonicalExec
+    ? Object.fromEntries(
+        Object.entries(canonicalExec).filter(([k]) => !EXEC_RECORD_STRIP_KEYS.has(k))
+      )
+    : null;
+
   const autonomyEnabled = process.env.AGENT_AUTONOMY_ENABLED === "1";
   const maxTasksPerRun = Math.max(1, Math.min(5, Number(process.env.AGENT_MAX_TASKS_PER_RUN ?? "3") || 3));
 
@@ -145,17 +194,18 @@ export async function GET(req: Request) {
   // nextSelectableTasks is now sourced from the unified queue
   const nextSelectableTasks = unifiedQueue.nextSelectableTasks;
 
-  // Use canonicalExec (freshest + highest-quality record) for all batch-level fields
-  const lastBatchExecutedCount = Number(canonicalExec?.executedCount ?? 0) || 0;
-  const lastBatchCompletedCount = Number(canonicalExec?.completedCount ?? 0) || 0;
-  const lastBatchFailedCount = Number(canonicalExec?.failedCount ?? 0) || 0;
+  // Use sanitizedCanonicalExec (stale recursive keys stripped) for all batch-level fields
+  const canon = sanitizedCanonicalExec;
+  const lastBatchExecutedCount = Number(canon?.executedCount ?? 0) || 0;
+  const lastBatchCompletedCount = Number(canon?.completedCount ?? 0) || 0;
+  const lastBatchFailedCount = Number(canon?.failedCount ?? 0) || 0;
 
   // Derive last execution timestamp from canonical exec
   const lastExecutionAt: string | null = (() => {
     const ts =
-      canonicalExec?.executedAt ??
-      canonicalExec?.timestamp ??
-      canonicalExec?.validatedAt ??
+      canon?.executedAt ??
+      canon?.timestamp ??
+      canon?.validatedAt ??
       null;
     return typeof ts === "string" ? ts : null;
   })();
@@ -171,7 +221,7 @@ export async function GET(req: Request) {
     : 0;
 
   // Unified throughput — selectableNow accounts for all sources; canonical exec drives lastExecutionAt
-  const queueThroughput = buildQueueThroughput(unifiedQueue, canonicalExec, canonicalExec, openTaskCount);
+  const queueThroughput = buildQueueThroughput(unifiedQueue, canon, canon, openTaskCount);
 
   const derivedState = {
     ...state,
@@ -182,7 +232,7 @@ export async function GET(req: Request) {
     latestExecutionStatus: latestReadyForExecution?.executionStatus ?? null,
     autonomyEnabled,
     // canonicalExec: freshest BATCH_COMPLETED+commitSha wins over stale BATCH_PARTIAL
-    latestBatchExecutionResult: canonicalExec,
+    latestBatchExecutionResult: canon,
     lastBatchExecutedCount: Number(latestBatchExec?.executedCount ?? 0) || 0,
     lastBatchCompletedCount: Number(latestBatchExec?.completedCount ?? 0) || 0,
     lastBatchFailedCount: Number(latestBatchExec?.failedCount ?? 0) || 0,
@@ -191,20 +241,20 @@ export async function GET(req: Request) {
     // Phase 4: Adaptive guardrails & execution autonomy
     githubWriteEnabled: ghCapability.writeEnabled,
     patchExecutorEnabled: ghCapability.writeEnabled,
-    latestExecutionTaskId: canonicalExec?.selectedTaskId ?? latestReadyForExecution?.id ?? null,
-    latestCommitSha: canonicalExec?.commitSha ?? null,
-    latestVerificationSummary: canonicalExec?.verification ?? null,
-    latestFailureReason: canonicalExec?.failure
-      ? (canonicalExec.failure as Record<string, unknown>)?.reason ?? null
+    latestExecutionTaskId: canon?.selectedTaskId ?? latestReadyForExecution?.id ?? null,
+    latestCommitSha: canon?.commitSha ?? null,
+    latestVerificationSummary: sanitizeVerificationSummary(canon?.verification ?? null),
+    latestFailureReason: canon?.failure
+      ? (canon.failure as Record<string, unknown>)?.reason ?? null
       : null,
-    latestExecutionResult: canonicalExec ? {
-      executionStatus: canonicalExec.executionStatus ?? null,
-      selectedSource: canonicalExec.selectedSource ?? null,
-      selectedTaskId: canonicalExec.selectedTaskId ?? null,
-      selectedTaskTitle: canonicalExec.selectedTaskTitle ?? null,
-      patchApplied: canonicalExec.patchApplied ?? false,
-      commitSha: canonicalExec.commitSha ?? null,
-      manualTaskStatus: canonicalExec.manualTaskStatus ?? null,
+    latestExecutionResult: canon ? {
+      executionStatus: canon.executionStatus ?? null,
+      selectedSource: canon.selectedSource ?? null,
+      selectedTaskId: canon.selectedTaskId ?? null,
+      selectedTaskTitle: canon.selectedTaskTitle ?? null,
+      patchApplied: canon.patchApplied ?? false,
+      commitSha: canon.commitSha ?? null,
+      manualTaskStatus: canon.manualTaskStatus ?? null,
     } : null,
     adaptiveGuardrails: {
       activeActionCount: activeAdaptiveActions.length,
@@ -227,12 +277,12 @@ export async function GET(req: Request) {
 
   // ─── Compute latestExecutionResult age & historical flag ──────────
   const latestExecTimestamp: string | null = (() => {
-    if (!canonicalExec) return null;
+    if (!canon) return null;
     // Use canonical exec timestamp — avoids stale probe data
     const ts =
-      canonicalExec.executedAt ??
-      canonicalExec.timestamp ??
-      canonicalExec.resolvedAt;
+      canon.executedAt ??
+      canon.timestamp ??
+      canon.resolvedAt;
     if (typeof ts === "string") return ts;
     return null;
   })();
@@ -243,7 +293,7 @@ export async function GET(req: Request) {
     return Math.round((Date.now() - t) / 60000);
   })();
   // Consider execution results older than 30 minutes as historical
-  const isLatestExecutionHistorical = latestExecAgeMinutes != null ? latestExecAgeMinutes > 30 : canonicalExec != null;
+  const isLatestExecutionHistorical = latestExecAgeMinutes != null ? latestExecAgeMinutes > 30 : canon != null;
 
   // ─── State reconciliation: detect and report inconsistencies ──────
   // Use trulyActiveTask (IN_PROGRESS/SELECTED only) for display
@@ -257,7 +307,7 @@ export async function GET(req: Request) {
     }
     // Check: latestExecutionResult is stale
     if (isLatestExecutionHistorical) {
-      const status = canonicalExec?.executionStatus ?? canonicalExec?.manualTaskStatus;
+      const status = canon?.executionStatus ?? canon?.manualTaskStatus;
       issues.push(`latestExecutionResult is historical (${latestExecAgeMinutes ?? "?"}m old, status=${status})`);
     }
     // Check: latestExec and latestBatchExec are out of sync
@@ -265,13 +315,29 @@ export async function GET(req: Request) {
     const batchStatus = latestBatchExec?.executionStatus;
     const execSyncOk = !execStatus || !batchStatus || execStatus === batchStatus;
     if (!execSyncOk) {
-      issues.push(`execution records inconsistent: latestExec.executionStatus=${execStatus} vs latestBatchExec.executionStatus=${batchStatus} — using canonical (${canonicalExec?.executionStatus})`);
+      issues.push(`execution records inconsistent: latestExec.executionStatus=${execStatus} vs latestBatchExec.executionStatus=${batchStatus} — using canonical (${canon?.executionStatus})`);
     }
-    // consistent=true means: canonical is fresh, non-historical, and exec records agree
-    const isConsistent = issues.length === 0 && !!canonicalExec && !isLatestExecutionHistorical;
+    // Check: no stale nested state in verification probes (recursive pollution)
+    const hasStaleVerificationProbes = (() => {
+      const v = canon?.verification as Record<string, unknown> | undefined;
+      const probes = (v?.details as Record<string, unknown> | undefined)?.probes;
+      if (!Array.isArray(probes)) return false;
+      return probes.some((p) => {
+        if (!p || typeof p !== "object") return false;
+        const pj = (p as Record<string, unknown>).json;
+        if (!pj || typeof pj !== "object") return false;
+        return Object.keys(pj as object).some((k) => STALE_PROBE_JSON_KEYS.has(k));
+      });
+    })();
+    if (hasStaleVerificationProbes) {
+      issues.push("verification probes contain stale nested state JSON — sanitized in this response");
+    }
+    // consistent=true means: canonical is fresh, non-historical, exec records agree, and no stale probes
+    const isConsistent = issues.length === 0 && !!canon && !isLatestExecutionHistorical;
     return {
       consistent: isConsistent,
       canonicalSource: canonicalExec === latestExec ? "latest_exec" : "latest_batch_exec",
+      staleProbeSanitized: hasStaleVerificationProbes,
       issues,
     };
   })();
@@ -360,18 +426,18 @@ export async function GET(req: Request) {
       ageMinutes: latestExecAgeMinutes,
       // timestamp from canonical exec — never null if execution ran
       timestamp: latestExecTimestamp,
-      status: canonicalExec?.executionStatus ?? null,
-      commitSha: canonicalExec?.commitSha ?? null,
-      stoppedReason: canonicalExec?.stoppedReason ?? null,
+      status: canon?.executionStatus ?? null,
+      commitSha: canon?.commitSha ?? null,
+      stoppedReason: canon?.stoppedReason ?? null,
     },
     batchExecutionMeta: {
-      timestamp: (canonicalExec?.executedAt ?? canonicalExec?.timestamp) as string | null ?? null,
-      status: canonicalExec?.executionStatus ?? null,
-      commitSha: canonicalExec?.commitSha ?? null,
-      executedCount: Number(canonicalExec?.executedCount ?? 0) || 0,
-      completedCount: Number(canonicalExec?.completedCount ?? 0) || 0,
-      stoppedReason: canonicalExec?.stoppedReason ?? null,
-      requestedMax: canonicalExec?.requestedMax ?? null,
+      timestamp: (canon?.executedAt ?? canon?.timestamp) as string | null ?? null,
+      status: canon?.executionStatus ?? null,
+      commitSha: canon?.commitSha ?? null,
+      executedCount: Number(canon?.executedCount ?? 0) || 0,
+      completedCount: Number(canon?.completedCount ?? 0) || 0,
+      stoppedReason: canon?.stoppedReason ?? null,
+      requestedMax: canon?.requestedMax ?? null,
       maxTasksPerRun,
       autonomyEnabled,
     },

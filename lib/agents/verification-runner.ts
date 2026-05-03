@@ -429,6 +429,17 @@ export async function runStructuredVerification(
 
   console.log(`[VERIFY] Overall: ${overall ? "PASS" : "FAIL"}${failureReasons.length ? ` — ${failureReasons.join("; ")}` : ""}`);
 
+  // Strip full JSON bodies from probe results — only keep compact summary fields.
+  // Storing full /api/agents/state responses causes recursive stale state pollution.
+  const compactProbeResult = (p: ProbeResult) => ({
+    route: p.route,
+    ok: p.ok,
+    status: p.status,
+    method: p.method,
+    reason: p.reason,
+    checkedAt: now,
+  });
+
   return {
     gateResult: {
       passed: overall,
@@ -436,7 +447,7 @@ export async function runStructuredVerification(
       smokeOk: smokeOk && taskOk,
       failureReason: overall ? null : failureReasons.join("; "),
     },
-    probeResults: [buildProbe, ...smokeProbes],
+    probeResults: [buildProbe, ...smokeProbes].map(compactProbeResult),
     taskSpecificResults: taskResults,
     overall,
     verifiedAt: now,
