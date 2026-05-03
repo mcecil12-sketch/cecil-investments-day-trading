@@ -39,6 +39,132 @@ const PATCHABLE_TYPES: Set<ManualActionTaskType> = new Set([
   // state via routeHints rather than code patches
 ]);
 
+// ─── FileHints diagnostics ───────────────────────────────────────────
+
+export type FileHintsSource = "provided" | "inferred" | "missing";
+
+export interface FileHintsDiagnostics {
+  fileHintsSource: FileHintsSource;
+  inferredFileHints: string[];
+  executionReadyBefore: boolean;
+  executionReadyAfter: boolean;
+}
+
+// ─── Trading files that must NEVER be inferred automatically ─────────
+
+const TRADING_BLOCKED_KEYWORDS = new Set([
+  "broker", "alpaca", "order", "trade execution", "auto-entry",
+  "auto_entry", "short entry", "long entry", "paper trading", "live trading",
+  "order book", "fill", "position sizing",
+]);
+
+// ─── Keyword → fileHint rules ────────────────────────────────────────
+
+interface FileHintRule {
+  /** All keywords matched case-insensitively against combined title+description */
+  keywords: string[];
+  hints: string[];
+}
+
+const FILE_HINT_RULES: FileHintRule[] = [
+  // Autonomous / last-mile agent infra — broad match triggers full agent suite
+  {
+    keywords: ["autonomous", "last-mile", "last mile"],
+    hints: [
+      "app/api/agents/execute/route.ts",
+      "app/api/agents/state/route.ts",
+      "app/api/agents/queue/route.ts",
+      "lib/agents/intake-pipeline.ts",
+      "lib/agents/manual-action-queue.ts",
+      "lib/agents/manual-task-executor.ts",
+    ],
+  },
+  // Agent execution specifically
+  {
+    keywords: ["agent execution", "execution route", "executor", "burn down", "burning down"],
+    hints: [
+      "app/api/agents/execute/route.ts",
+      "lib/agents/manual-task-executor.ts",
+    ],
+  },
+  // Agent queue / drain
+  {
+    keywords: ["agent queue", "task queue", "drain queue", "queue drain"],
+    hints: [
+      "app/api/agents/queue/route.ts",
+      "lib/agents/manual-action-queue.ts",
+    ],
+  },
+  // Agent state
+  {
+    keywords: ["agent state", "agent status", "state route"],
+    hints: ["app/api/agents/state/route.ts"],
+  },
+  // Intake / normalisation
+  {
+    keywords: ["intake", "chat intake", "normaliz", "task normaliz"],
+    hints: [
+      "app/api/agents/chat-intake-public/route.ts",
+      "lib/agents/intake-pipeline.ts",
+      "lib/agents/task-normalizer.ts",
+    ],
+  },
+  // Scoring
+  {
+    keywords: ["scoring", "scorer", "score weight", "ai scoring"],
+    hints: [
+      "lib/scoring/weights.ts",
+      "lib/scoring/thresholds.ts",
+    ],
+  },
+  // Incidents / critical tasks
+  {
+    keywords: ["incident", "critical incident", "incident route"],
+    hints: [
+      "app/api/agents/incidents/route.ts",
+      "lib/agents/incidents.ts",
+    ],
+  },
+  // General agent keyword — fallback infra files
+  {
+    keywords: ["agent"],
+    hints: [
+      "lib/agents/manual-action-queue.ts",
+      "lib/agents/manual-task-executor.ts",
+      "lib/agents/intake-pipeline.ts",
+    ],
+  },
+];
+
+/**
+ * Infer likely fileHints from task title + description keywords.
+ * Returns an empty array if trading-blocked keywords are detected
+ * OR if no rule matches.
+ *
+ * Exported for unit testing.
+ */
+export function inferFileHintsFromText(
+  title: string,
+  description: string,
+  taskType: ManualActionTaskType,
+): string[] {
+  const combined = `${title} ${description}`.toLowerCase();
+
+  // Safety gate: never auto-infer for trading-adjacent content
+  for (const blocked of TRADING_BLOCKED_KEYWORDS) {
+    if (combined.includes(blocked)) return [];
+  }
+
+  const collected = new Set<string>();
+  for (const rule of FILE_HINT_RULES) {
+    if (rule.keywords.some((kw) => combined.includes(kw.toLowerCase()))) {
+      rule.hints.forEach((h) => collected.add(h));
+    }
+  }
+
+  return Array.from(collected);
+}
+
 // ─── Internal execute trigger ───────────────────────────────────────
 
 function resolveBaseUrl(): string {
@@ -317,18 +443,45 @@ export async function runIntakePipeline(
   const { input } = normalized;
   let warning: string | null = null;
 
-  // 3. FileHints validation for patchable execution-ready tasks
-  if (
-    input.executionReady &&
-    PATCHABLE_TYPES.has(input.taskType) &&
-    (!input.fileHints || input.fileHints.length === 0)
-  ) {
-    input.executionReady = false;
-    warning =
-      "executionReady downgraded to false: patchable task type " +
-      input.taskType +
-      " requires fileHints for execution. Add fileHints and update the task to re-enable.";
+  // 3. FileHints: infer before downgrade for patchable tasks
+  const executionReadyBefore: boolean = input.executionReady ?? false;
+  let fileHintsSource: FileHintsSource = "missing";
+  let inferredFileHints: string[] = [];
+
+  if (input.fileHints && input.fileHints.length > 0) {
+    fileHintsSource = "provided";
+  } else if (input.executionReady && PATCHABLE_TYPES.has(input.taskType)) {
+    // Attempt inference before considering a downgrade
+    inferredFileHints = inferFileHintsFromText(input.title, input.description, input.taskType);
+    if (inferredFileHints.length > 0) {
+      input.fileHints = inferredFileHints;
+      fileHintsSource = "inferred";
+    } else {
+      // No hints found — downgrade executionReady
+      input.executionReady = false;
+      fileHintsSource = "missing";
+      warning =
+        "executionReady downgraded to false: patchable task type " +
+        input.taskType +
+        " requires fileHints for execution. Add fileHints and update the task to re-enable.";
+    }
+  } else if (!input.executionReady && PATCHABLE_TYPES.has(input.taskType)) {
+    // executionReady was already false — still try to populate fileHints for future use
+    const suggested = inferFileHintsFromText(input.title, input.description, input.taskType);
+    if (suggested.length > 0) {
+      input.fileHints = suggested;
+      inferredFileHints = suggested;
+      fileHintsSource = "inferred";
+    }
   }
+
+  const executionReadyAfter: boolean = input.executionReady ?? false;
+  const fileHintsDiagnostics: FileHintsDiagnostics = {
+    fileHintsSource,
+    inferredFileHints,
+    executionReadyBefore,
+    executionReadyAfter,
+  };
 
   // 4. Blocking incident check (early warning)
   let blockingIncidentCount = 0;
@@ -351,6 +504,8 @@ export async function runIntakePipeline(
     taskType: input.taskType,
     executionReady: input.executionReady,
     source: input.source,
+    fileHints: input.fileHints ?? [],
+    fileHintsSource,
   };
 
   // 5. Duplicate detection
@@ -384,6 +539,7 @@ export async function runIntakePipeline(
         },
         autoExecute: { attempted: false, triggered: false, skippedReason: "deduped_existing_active_task" },
         warning: warning ?? "Duplicate task already active — not re-created.",
+        fileHintsDiagnostics,
         ...state,
       },
     };
@@ -432,6 +588,7 @@ export async function runIntakePipeline(
       },
       autoExecute,
       warning,
+      fileHintsDiagnostics,
       ...state,
     },
   };
