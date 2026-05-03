@@ -369,7 +369,8 @@ export function buildQueueThroughput(
     : 0;
 
   return {
-    selectableNow: unifiedQueue.selectableCount,
+    // selectableNow: use max of both counts to handle any count/list discrepancy
+    selectableNow: Math.max(unifiedQueue.selectableCount, unifiedQueue.nextSelectableTasks.length),
     selectableManual: unifiedQueue.selectableManual,
     selectableEngineeringBacklog: unifiedQueue.selectableEngineeringBacklog,
     selectableAdaptive: unifiedQueue.selectableAdaptive,

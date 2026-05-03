@@ -100,6 +100,36 @@ export async function GET(req: Request) {
     } catch { return null; }
   })();
 
+  // ─── Canonical execution record ────────────────────────────────────
+  // Pick the best execution snapshot: prefer BATCH_COMPLETED+commitSha over
+  // BATCH_PARTIAL/null-commitSha; within a 1-hour window freshness + quality wins.
+  const canonicalExec: Record<string, unknown> | null = (() => {
+    if (!latestExec && !latestBatchExec) return null;
+    if (!latestExec) return latestBatchExec;
+    if (!latestBatchExec) return latestExec;
+    const tsOf = (r: Record<string, unknown>): number => {
+      const ts = r.executedAt ?? r.timestamp ?? r.validatedAt;
+      if (typeof ts !== "string") return 0;
+      const d = Date.parse(ts);
+      return Number.isFinite(d) ? d : 0;
+    };
+    const execTs = tsOf(latestExec);
+    const batchTs = tsOf(latestBatchExec);
+    const ONE_HOUR_MS = 60 * 60 * 1000;
+    const execCompleted = latestExec.executionStatus === "BATCH_COMPLETED";
+    const batchCompleted = latestBatchExec.executionStatus === "BATCH_COMPLETED";
+    const execHasCommit = typeof latestExec.commitSha === "string" && latestExec.commitSha.length > 0;
+    const batchHasCommit = typeof latestBatchExec.commitSha === "string" && latestBatchExec.commitSha.length > 0;
+    // Prefer whichever has a commitSha (within 1-hour window)
+    if (execHasCommit && !batchHasCommit && execTs > batchTs - ONE_HOUR_MS) return latestExec;
+    if (batchHasCommit && !execHasCommit && batchTs > execTs - ONE_HOUR_MS) return latestBatchExec;
+    // Prefer BATCH_COMPLETED over non-completed within 1-hour window
+    if (execCompleted && !batchCompleted && execTs > batchTs - ONE_HOUR_MS) return latestExec;
+    if (batchCompleted && !execCompleted && batchTs > execTs - ONE_HOUR_MS) return latestBatchExec;
+    // Fresher timestamp wins
+    return execTs >= batchTs ? latestExec : latestBatchExec;
+  })();
+
   const autonomyEnabled = process.env.AGENT_AUTONOMY_ENABLED === "1";
   const maxTasksPerRun = Math.max(1, Math.min(5, Number(process.env.AGENT_MAX_TASKS_PER_RUN ?? "3") || 3));
 
@@ -115,18 +145,17 @@ export async function GET(req: Request) {
   // nextSelectableTasks is now sourced from the unified queue
   const nextSelectableTasks = unifiedQueue.nextSelectableTasks;
 
-  const lastBatchExecutedCount = Number(latestBatchExec?.executedCount ?? 0) || 0;
-  const lastBatchCompletedCount = Number(latestBatchExec?.completedCount ?? 0) || 0;
-  const lastBatchFailedCount = Number(latestBatchExec?.failedCount ?? 0) || 0;
+  // Use canonicalExec (freshest + highest-quality record) for all batch-level fields
+  const lastBatchExecutedCount = Number(canonicalExec?.executedCount ?? 0) || 0;
+  const lastBatchCompletedCount = Number(canonicalExec?.completedCount ?? 0) || 0;
+  const lastBatchFailedCount = Number(canonicalExec?.failedCount ?? 0) || 0;
 
-  // Derive last execution timestamp from stored batch result or latest exec
+  // Derive last execution timestamp from canonical exec
   const lastExecutionAt: string | null = (() => {
     const ts =
-      latestBatchExec?.executedAt ??
-      latestBatchExec?.timestamp ??
-      latestExec?.executedAt ??
-      latestExec?.timestamp ??
-      latestExec?.validatedAt ??
+      canonicalExec?.executedAt ??
+      canonicalExec?.timestamp ??
+      canonicalExec?.validatedAt ??
       null;
     return typeof ts === "string" ? ts : null;
   })();
@@ -141,8 +170,8 @@ export async function GET(req: Request) {
     ? Number((lastBatchCompletedCount / lastBatchExecutedCount).toFixed(3))
     : 0;
 
-  // Unified throughput — selectableNow accounts for all sources
-  const queueThroughput = buildQueueThroughput(unifiedQueue, latestBatchExec, latestExec, openTaskCount);
+  // Unified throughput — selectableNow accounts for all sources; canonical exec drives lastExecutionAt
+  const queueThroughput = buildQueueThroughput(unifiedQueue, canonicalExec, canonicalExec, openTaskCount);
 
   const derivedState = {
     ...state,
@@ -152,7 +181,8 @@ export async function GET(req: Request) {
     latestExecutionTaskTitle: latestReadyForExecution?.title ?? null,
     latestExecutionStatus: latestReadyForExecution?.executionStatus ?? null,
     autonomyEnabled,
-    latestBatchExecutionResult: latestBatchExec,
+    // canonicalExec: freshest BATCH_COMPLETED+commitSha wins over stale BATCH_PARTIAL
+    latestBatchExecutionResult: canonicalExec,
     lastBatchExecutedCount: Number(latestBatchExec?.executedCount ?? 0) || 0,
     lastBatchCompletedCount: Number(latestBatchExec?.completedCount ?? 0) || 0,
     lastBatchFailedCount: Number(latestBatchExec?.failedCount ?? 0) || 0,
@@ -161,20 +191,20 @@ export async function GET(req: Request) {
     // Phase 4: Adaptive guardrails & execution autonomy
     githubWriteEnabled: ghCapability.writeEnabled,
     patchExecutorEnabled: ghCapability.writeEnabled,
-    latestExecutionTaskId: latestExec?.selectedTaskId ?? latestReadyForExecution?.id ?? null,
-    latestCommitSha: latestExec?.commitSha ?? null,
-    latestVerificationSummary: latestExec?.verification ?? null,
-    latestFailureReason: latestExec?.failure
-      ? (latestExec.failure as Record<string, unknown>)?.reason ?? null
+    latestExecutionTaskId: canonicalExec?.selectedTaskId ?? latestReadyForExecution?.id ?? null,
+    latestCommitSha: canonicalExec?.commitSha ?? null,
+    latestVerificationSummary: canonicalExec?.verification ?? null,
+    latestFailureReason: canonicalExec?.failure
+      ? (canonicalExec.failure as Record<string, unknown>)?.reason ?? null
       : null,
-    latestExecutionResult: latestExec ? {
-      executionStatus: latestExec.executionStatus ?? null,
-      selectedSource: latestExec.selectedSource ?? null,
-      selectedTaskId: latestExec.selectedTaskId ?? null,
-      selectedTaskTitle: latestExec.selectedTaskTitle ?? null,
-      patchApplied: latestExec.patchApplied ?? false,
-      commitSha: latestExec.commitSha ?? null,
-      manualTaskStatus: latestExec.manualTaskStatus ?? null,
+    latestExecutionResult: canonicalExec ? {
+      executionStatus: canonicalExec.executionStatus ?? null,
+      selectedSource: canonicalExec.selectedSource ?? null,
+      selectedTaskId: canonicalExec.selectedTaskId ?? null,
+      selectedTaskTitle: canonicalExec.selectedTaskTitle ?? null,
+      patchApplied: canonicalExec.patchApplied ?? false,
+      commitSha: canonicalExec.commitSha ?? null,
+      manualTaskStatus: canonicalExec.manualTaskStatus ?? null,
     } : null,
     adaptiveGuardrails: {
       activeActionCount: activeAdaptiveActions.length,
@@ -197,14 +227,12 @@ export async function GET(req: Request) {
 
   // ─── Compute latestExecutionResult age & historical flag ──────────
   const latestExecTimestamp: string | null = (() => {
-    if (!latestExec) return null;
-    // Prefer explicit timestamp, then executedAt, then resolvedAt, then batch timestamp
+    if (!canonicalExec) return null;
+    // Use canonical exec timestamp — avoids stale probe data
     const ts =
-      latestExec.timestamp ??
-      latestExec.executedAt ??
-      latestBatchExec?.executedAt ??
-      latestBatchExec?.timestamp ??
-      latestExec.resolvedAt;
+      canonicalExec.executedAt ??
+      canonicalExec.timestamp ??
+      canonicalExec.resolvedAt;
     if (typeof ts === "string") return ts;
     return null;
   })();
@@ -215,7 +243,7 @@ export async function GET(req: Request) {
     return Math.round((Date.now() - t) / 60000);
   })();
   // Consider execution results older than 30 minutes as historical
-  const isLatestExecutionHistorical = latestExecAgeMinutes != null ? latestExecAgeMinutes > 30 : latestExec != null;
+  const isLatestExecutionHistorical = latestExecAgeMinutes != null ? latestExecAgeMinutes > 30 : canonicalExec != null;
 
   // ─── State reconciliation: detect and report inconsistencies ──────
   // Use trulyActiveTask (IN_PROGRESS/SELECTED only) for display
@@ -229,11 +257,21 @@ export async function GET(req: Request) {
     }
     // Check: latestExecutionResult is stale
     if (isLatestExecutionHistorical) {
-      const status = latestExec?.executionStatus ?? latestExec?.manualTaskStatus;
+      const status = canonicalExec?.executionStatus ?? canonicalExec?.manualTaskStatus;
       issues.push(`latestExecutionResult is historical (${latestExecAgeMinutes ?? "?"}m old, status=${status})`);
     }
+    // Check: latestExec and latestBatchExec are out of sync
+    const execStatus = latestExec?.executionStatus;
+    const batchStatus = latestBatchExec?.executionStatus;
+    const execSyncOk = !execStatus || !batchStatus || execStatus === batchStatus;
+    if (!execSyncOk) {
+      issues.push(`execution records inconsistent: latestExec.executionStatus=${execStatus} vs latestBatchExec.executionStatus=${batchStatus} — using canonical (${canonicalExec?.executionStatus})`);
+    }
+    // consistent=true means: canonical is fresh, non-historical, and exec records agree
+    const isConsistent = issues.length === 0 && !!canonicalExec && !isLatestExecutionHistorical;
     return {
-      consistent: issues.length === 0,
+      consistent: isConsistent,
+      canonicalSource: canonicalExec === latestExec ? "latest_exec" : "latest_batch_exec",
       issues,
     };
   })();
@@ -272,7 +310,8 @@ export async function GET(req: Request) {
       selectableCount: manualCounts.selectableCount ?? 0,
       recoverableBlockedCount: manualCounts.recoverableBlockedCount ?? 0,
       // Use unifiedQueue.idleReason — never contradicts nextSelectableTasks
-      idleReason: unifiedQueue.idleReason,
+      // idleReason is null when ANY queue source has selectable tasks (req 6)
+      idleReason: nextSelectableTasks.length > 0 ? null : unifiedQueue.idleReason,
       // Only show truly active tasks (IN_PROGRESS/SELECTED), not queued OPEN ones
       activeManualTask: reconciledActiveTask ? {
         id: reconciledActiveTask.id,
@@ -319,18 +358,20 @@ export async function GET(req: Request) {
     latestExecutionMeta: {
       isHistorical: isLatestExecutionHistorical,
       ageMinutes: latestExecAgeMinutes,
-      // timestamp: consolidate from multiple fields, never null if execution ran
-      timestamp: latestExecTimestamp ?? (latestBatchExec
-        ? (typeof latestBatchExec.executedAt === "string" ? latestBatchExec.executedAt
-          : typeof latestBatchExec.timestamp === "string" ? latestBatchExec.timestamp
-          : null)
-        : null),
-      status: latestExec?.executionStatus ?? latestBatchExec?.executionStatus ?? null,
+      // timestamp from canonical exec — never null if execution ran
+      timestamp: latestExecTimestamp,
+      status: canonicalExec?.executionStatus ?? null,
+      commitSha: canonicalExec?.commitSha ?? null,
+      stoppedReason: canonicalExec?.stoppedReason ?? null,
     },
     batchExecutionMeta: {
-      timestamp: latestBatchExec?.executedAt ?? latestBatchExec?.timestamp ?? null,
-      status: latestBatchExec?.executionStatus ?? null,
-      requestedMax: latestBatchExec?.requestedMax ?? null,
+      timestamp: (canonicalExec?.executedAt ?? canonicalExec?.timestamp) as string | null ?? null,
+      status: canonicalExec?.executionStatus ?? null,
+      commitSha: canonicalExec?.commitSha ?? null,
+      executedCount: Number(canonicalExec?.executedCount ?? 0) || 0,
+      completedCount: Number(canonicalExec?.completedCount ?? 0) || 0,
+      stoppedReason: canonicalExec?.stoppedReason ?? null,
+      requestedMax: canonicalExec?.requestedMax ?? null,
       maxTasksPerRun,
       autonomyEnabled,
     },
