@@ -274,7 +274,7 @@ export async function runIntakePipeline(
   // 2. Normalise & validate
   const normalized: NormalizedIntakeResult | IntakeValidationError = normalizeIntakePayload(raw);
   if (!normalized.ok) {
-    const normalizedTitle = typeof (raw as any)?.title === "string" ? String((raw as any).title).trim() : "";
+    const normalizedTitle = (normalized.normalizedTitle ?? (typeof (raw as any)?.title === "string" ? String((raw as any).title).trim() : "")) || null;
     const normalizedDescription =
       typeof (raw as any)?.description === "string"
         ? String((raw as any).description).trim()
@@ -297,7 +297,10 @@ export async function runIntakePipeline(
         error: normalized.error,
         field: normalized.field,
         receivedKeys,
-        normalizedTitle: normalizedTitle || null,
+        normalizedTitle,
+        titleSource: normalized.titleSource ?? null,
+        acceptedFields: normalized.acceptedFields ?? [],
+        missingFields: normalized.missingFields ?? [],
         normalizedDescriptionPresent: Boolean(normalizedDescription),
         normalizedType,
         normalizedPriority,
@@ -364,6 +367,9 @@ export async function runIntakePipeline(
         deduped: true,
         duplicateTaskId: duplicate.id,
         normalizedTitle: input.title,
+        titleSource: normalized.titleSource,
+        acceptedFields: normalized.acceptedFields,
+        missingFields: normalized.missingFields,
         normalizedType: input.taskType,
         normalizedPriority: input.priority,
         execute: input.executionReady,
@@ -408,6 +414,9 @@ export async function runIntakePipeline(
       taskCreated: true,
       deduped: false,
       normalizedTitle: input.title,
+      titleSource: normalized.titleSource,
+      acceptedFields: normalized.acceptedFields,
+      missingFields: normalized.missingFields,
       normalizedType: input.taskType,
       normalizedPriority: input.priority,
       execute: input.executionReady,
