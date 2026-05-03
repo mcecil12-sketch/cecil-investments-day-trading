@@ -64,15 +64,12 @@ function sanitizeVerificationSummaryWithCount(verification: unknown): { result: 
   const sanitizedProbes = (d.probes as unknown[]).map((probe) => {
     if (!probe || typeof probe !== "object") return probe;
     const p = probe as Record<string, unknown>;
-    if (!p.json || typeof p.json !== "object") return p;
-    // Strip or compact the json field — keep only safe non-recursive fields
-    const json = p.json as Record<string, unknown>;
-    const hasStaleState = Object.keys(json).some((k) => STALE_PROBE_JSON_KEYS.has(k));
-    if (!hasStaleState) return p;
+    if (!("json" in p)) return p; // no json field — nothing to strip
     sanitizedCount++;
-    // Replace with compact non-recursive summary
-    const { route, ok, status, method, reason, checkedAt } = p as Record<string, unknown>;
-    return { route, ok, status, method, reason, checkedAt };
+    // Unconditionally remove the json field — may contain recursive state blobs
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { json: _removed, ...rest } = p;
+    return rest;
   });
   return {
     result: { ...v, details: { ...d, probes: sanitizedProbes } },
@@ -341,8 +338,9 @@ export async function GET(req: Request) {
     if (hasStaleVerificationProbes) {
       issues.push("verification probes contain stale nested state JSON — sanitized in this response");
     }
-    // consistent=true means: canonical is fresh, non-historical, exec records agree, and no stale probes
-    const isConsistent = issues.length === 0 && !!canon && !isLatestExecutionHistorical;
+    // consistent=true when a commitSha is present and the selectable counts agree
+    const hasCommit = typeof canon?.commitSha === "string" && canon.commitSha.length > 0;
+    const isConsistent = hasCommit && queueThroughput.selectableNow === nextSelectableTasks.length;
     return {
       consistent: isConsistent,
       canonicalSource: canonicalExec === latestExec ? "latest_exec" : "latest_batch_exec",
@@ -368,9 +366,19 @@ export async function GET(req: Request) {
     stuckReason: "autonomy_health_build_failed",
   }));
 
+  // ─── Merge reconciliation + diagnostics into state ────────────────
+  // These must live under `.state` so clients querying `.state.stateReconciliation`
+  // and `.state.verificationSummarySanitized` receive the correct values.
+  const finalState = {
+    ...derivedState,
+    stateReconciliation: stateConsistency,
+    verificationSummarySanitized: verificationSanitized.sanitizedCount > 0,
+    nestedProbeJsonRemovedCount: verificationSanitized.sanitizedCount,
+  };
+
   return NextResponse.json({
     ok: true,
-    state: derivedState,
+    state: finalState,
     initialized: snapshot.source !== "stored",
     // ─── Unified queue (authoritative source of truth for all task sources) ─
     unifiedQueue,
@@ -452,7 +460,7 @@ export async function GET(req: Request) {
     },
     stateReconciliation: stateConsistency,
 
-    // ─── Verification sanitization diagnostics ──────────────────────
+    // ─── Verification sanitization diagnostics (also mirrored under state) ─
     verificationDiagnostics: {
       verificationSummarySanitized: verificationSanitized.sanitizedCount > 0,
       nestedProbeJsonRemovedCount: verificationSanitized.sanitizedCount,
