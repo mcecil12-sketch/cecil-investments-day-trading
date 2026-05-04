@@ -27,6 +27,8 @@ import { getLedgerSummary, recordLedgerEntry } from "@/lib/agents/learning-ledge
 import {
   peekNextManualActionTask,
   claimNextManualActionTask,
+  claimManualActionTask,
+  releaseManualActionTask,
   startManualActionTask,
   completeManualActionTask,
   blockManualActionTask,
@@ -50,6 +52,15 @@ import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { readTrades } from "@/lib/tradesStore";
 import { isOpenTradeStatus } from "@/lib/trades/protection";
+// Agent Workflow v2
+import {
+  detectFunnelBlockedState,
+  isFunnelRecoveryTask,
+  createFunnelRecoveryTasks,
+  type FunnelRecoveryState,
+} from "@/lib/agents/funnel-recovery";
+import { buildRImpactQueue } from "@/lib/agents/r-impact";
+import { recordDuplicateExecutionSkip } from "@/lib/agents/task-dedup";
 import type {
   EngineeringTask,
   ExecutionPhase,
@@ -680,6 +691,7 @@ interface RunOneCycleOptions {
   adaptiveResult: { actionsApplied: { length: number }; activeActions: { length: number } } | null;
   excludedTaskIds: string[];
   priorityOnly: boolean;
+  funnelRecoveryMode: boolean;
 }
 
 /**
@@ -687,7 +699,7 @@ interface RunOneCycleOptions {
  * returning a NextResponse — the caller accumulates results for the batch.
  */
 async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
-  const { adaptiveResult: _adaptiveResult, excludedTaskIds, priorityOnly } = opts;
+  const { adaptiveResult: _adaptiveResult, excludedTaskIds, priorityOnly, funnelRecoveryMode } = opts;
 
   // ── Step A: Manual queue (priority) ───────────────────────────────
   const manualCounts = await countOpenExecutionReadyManualTasks().catch(() => ({
@@ -705,6 +717,20 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
     if (!manualTask) {
       // Queue drained between count and claim — fall through to engineering
     } else {
+      // ── Funnel Recovery Mode: release non-recovery tasks ─────────
+      if (funnelRecoveryMode && !isFunnelRecoveryTask(manualTask)) {
+        await releaseManualActionTask(manualTask.id).catch(() => {});
+        await recordDuplicateExecutionSkip().catch(() => {});
+        return {
+          taskId: manualTask.id, title: manualTask.title, status: "SKIPPED",
+          source: "manual-action-queue", patchApplied: false,
+          verification: { buildOk: true, smokeOk: true, details: {} },
+          resolution: { resolved: false, reason: "funnel_blocked_recovery_mode" },
+          executionPhases: [phaseResult("SELECT_TASK", "passed", "funnel_recovery_mode_skip")],
+          noTaskReason: "funnel_recovery_mode",
+        };
+      }
+
       manualPhases.push(phaseResult("SELECT_TASK", "passed", "manual_queue"));
       manualPhases.push(phaseResult("CLAIM_TASK", "passed", `claimed: ${manualTask.id}`));
 
@@ -842,7 +868,29 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
 
   // ── Step B: Engineering backlog ───────────────────────────────────
   const allEngTasks = await listEngineeringTasks(100);
-  const engTask = selectNextEngineeringTaskForBatch(allEngTasks, excludedTaskIds, priorityOnly);
+
+  // ── Agent Workflow v2: filter and rank engineering tasks ──────────
+  let eligibleEngTasks = allEngTasks;
+  if (funnelRecoveryMode) {
+    // Funnel Recovery Mode: only allow recovery-class tasks
+    eligibleEngTasks = allEngTasks.filter((t) => isFunnelRecoveryTask(t as unknown as ManualActionTask));
+  } else {
+    // Healthy funnel: build R-impact queue and prefer high-impact tasks
+    const pendingEngTasks = allEngTasks.filter((t) => !excludedTaskIds.includes(t.id));
+    if (pendingEngTasks.length > 1) {
+      const rImpactQueue = buildRImpactQueue([], pendingEngTasks, { maxResults: pendingEngTasks.length });
+      if (rImpactQueue.length > 0) {
+        const rImpactOrder = new Map(rImpactQueue.map((r, idx) => [r.taskId, idx]));
+        eligibleEngTasks = allEngTasks.slice().sort((a, b) => {
+          const aRank = rImpactOrder.get(a.id) ?? 9999;
+          const bRank = rImpactOrder.get(b.id) ?? 9999;
+          return aRank - bRank;
+        });
+      }
+    }
+  }
+
+  const engTask = selectNextEngineeringTaskForBatch(eligibleEngTasks, excludedTaskIds, priorityOnly);
 
   if (!engTask) {
     const noTaskReason = manualCounts.idleReason ?? "no_engineering_or_manual_tasks_available";
@@ -1110,6 +1158,28 @@ export async function POST(req: NextRequest) {
         }
       } catch (err) {
         console.warn("[AGENT-EXECUTE] Profit engine evaluation failed (non-fatal):", err);
+      }
+    }
+
+    // ─── Funnel Recovery Detection (Agent Workflow v2) ────────────────
+    // Detect whether the trading funnel is blocked. When blocked, execution
+    // is restricted to recovery-class tasks only (BUGFIX, SELF_HEAL, OPS, etc.).
+    // This runs after profit engine so we have an up-to-date funnel picture.
+    let funnelRecoveryState: FunnelRecoveryState | null = null;
+    let funnelRecoveryTasksCreated = 0;
+    if (!dryRun) {
+      try {
+        const baseUrl = resolveExecuteBaseUrl();
+        funnelRecoveryState = await detectFunnelBlockedState(baseUrl);
+        if (funnelRecoveryState.funnelBlocked) {
+          funnelRecoveryTasksCreated = await createFunnelRecoveryTasks(funnelRecoveryState);
+          console.log(
+            `[AGENT-EXECUTE] Funnel recovery mode active: stage=${funnelRecoveryState.funnelBlockedStage}` +
+            ` reason=${funnelRecoveryState.funnelBlockedReason} tasksCreated=${funnelRecoveryTasksCreated}`,
+          );
+        }
+      } catch (err) {
+        console.warn("[AGENT-EXECUTE] Funnel recovery detection failed (non-fatal):", err);
       }
     }
 
@@ -1699,7 +1769,12 @@ export async function POST(req: NextRequest) {
         break;
       }
 
-      const cycle = await runOneCycle({ adaptiveResult, excludedTaskIds: executedTaskIds, priorityOnly });
+      const cycle = await runOneCycle({
+        adaptiveResult,
+        excludedTaskIds: executedTaskIds,
+        priorityOnly,
+        funnelRecoveryMode: funnelRecoveryState?.funnelRecoveryMode ?? false,
+      });
 
       if (cycle.status === "NO_TASK") {
         stoppedReason = cycle.noTaskReason ?? "no_open_tasks";
@@ -1813,6 +1888,17 @@ export async function POST(req: NextRequest) {
       resolution: firstResult?.resolution ?? { resolved: false, reason: noEligibleReason ?? "no_task" },
       // ─── Diagnostics ─────────────────────────────────────────────────
       proactiveDiagnostics,
+      funnelRecovery: funnelRecoveryState
+        ? {
+            funnelBlocked: funnelRecoveryState.funnelBlocked,
+            funnelBlockedReason: funnelRecoveryState.funnelBlockedReason,
+            funnelBlockedStage: funnelRecoveryState.funnelBlockedStage,
+            funnelRecoveryMode: funnelRecoveryState.funnelRecoveryMode,
+            recoveryTasksCreated: funnelRecoveryTasksCreated,
+            lastFunnelBlockedAt: funnelRecoveryState.lastFunnelBlockedAt,
+            lastFunnelHealthyAt: funnelRecoveryState.lastFunnelHealthyAt,
+          }
+        : null,
       staleRecovery: staleRecovery.attempted ? staleRecovery : undefined,
       blockedRecovery: blockedRecovery
         ? {

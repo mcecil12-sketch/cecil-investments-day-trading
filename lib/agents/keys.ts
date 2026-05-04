@@ -28,6 +28,10 @@ export const AGENT_MANUAL_QUEUE_KEY = "agents:manual_queue:v1";
 export const AGENT_PROFIT_ENGINE_KEY = "agents:profit_engine:v1";
 export const AGENT_EXPERIMENT_TRACKER_KEY = "agents:experiments:v1";
 
+// Agent Workflow v2 keys
+export const AGENT_FUNNEL_RECOVERY_KEY = "agents:funnel_recovery:v2";
+export const AGENT_EXECUTION_DEDUP_STATS_KEY = "agents:execution_dedup_stats:v2";
+
 export const AGENT_STORE_KEYS = {
   state: AGENT_STATE_KEY,
   briefs: AGENT_BRIEFS_KEY,

@@ -20,6 +20,9 @@ import type { EngineeringTask } from "@/lib/agents/types";
 import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask, getTrulyActiveManualTask, getNextQueuedManualTask, getManualQueueDiagnostics } from "@/lib/agents/manual-action-queue";
 import { readProfitEngineStatus } from "@/lib/agents/profitEngine";
 import { buildUnifiedQueueSummary, buildAutonomyHealth, buildQueueThroughput } from "@/lib/agents/unified-queue";
+import { readFunnelRecoveryState } from "@/lib/agents/funnel-recovery";
+import { buildRImpactQueue, getTopRImpactTaskIds } from "@/lib/agents/r-impact";
+import { getDedupStats } from "@/lib/agents/task-dedup";
 
 function executionVisibilityRank(task: EngineeringTask): number {
   const incidentRank = task.incidentId ? 0 : 100;
@@ -83,7 +86,7 @@ export async function GET(req: Request) {
     return unauthorizedAgentResponse(auth.error);
   }
 
-  const [snapshot, state, tasks, adaptiveState, latestExecRaw, latestBatchRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics, profitEngineStatus] = await Promise.all([
+  const [snapshot, state, tasks, adaptiveState, latestExecRaw, latestBatchRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics, profitEngineStatus, funnelRecoveryState, dedupStats] = await Promise.all([
     readAgentStateSnapshot(),
     ensureAgentState(),
     listEngineeringTasks(200).then((t) =>
@@ -104,6 +107,8 @@ export async function GET(req: Request) {
       healthStatus: "healthy" as const, healthReason: null,
     })),
     readProfitEngineStatus().catch(() => null),
+    readFunnelRecoveryState().catch(() => null),
+    getDedupStats().catch(() => ({ activeLocks: 0, skippedDuplicateExecutionCount: 0, skippedInsufficientDataCount: 0 })),
   ]);
 
   const openTasks = tasks.filter(
@@ -228,6 +233,15 @@ export async function GET(req: Request) {
 
   // Sanitize verification probes and capture count for diagnostics
   const verificationSanitized = sanitizeVerificationSummaryWithCount(canon?.verification ?? null);
+
+  // ─── R-Impact queue (Agent Workflow v2) ────────────────────────────
+  // Build the R-impact ranked queue from all open tasks
+  const rImpactQueue = buildRImpactQueue(
+    manualTasks.filter((t) => t.status === "OPEN" || t.status === "SELECTED"),
+    tasks.filter((t) => t.status === "OPEN" || t.status === "READY_FOR_EXECUTION"),
+    { maxResults: 10 },
+  );
+  const topExpectedRTasks = getTopRImpactTaskIds(rImpactQueue, 3);
 
   const derivedState = {
     ...state,
@@ -494,5 +508,54 @@ export async function GET(req: Request) {
           optimizationImpact: null,
           recentLog: [],
         },
+
+    // ─── Agent Workflow v2: Funnel Recovery ─────────────────────────
+    funnelRecovery: funnelRecoveryState
+      ? {
+          funnelBlocked: funnelRecoveryState.funnelBlocked,
+          funnelBlockedReason: funnelRecoveryState.funnelBlockedReason,
+          funnelBlockedStage: funnelRecoveryState.funnelBlockedStage,
+          funnelRecoveryMode: funnelRecoveryState.funnelRecoveryMode,
+          lastFunnelBlockedAt: funnelRecoveryState.lastFunnelBlockedAt,
+          lastFunnelHealthyAt: funnelRecoveryState.lastFunnelHealthyAt,
+        }
+      : {
+          funnelBlocked: false,
+          funnelBlockedReason: null,
+          funnelBlockedStage: null,
+          funnelRecoveryMode: false,
+          lastFunnelBlockedAt: null,
+          lastFunnelHealthyAt: null,
+        },
+
+    // ─── Agent Workflow v2: R-Impact Queue ──────────────────────────
+    rImpactQueue: {
+      topExpectedRTasks,
+      queueLength: rImpactQueue.length,
+      lastRImpactExecution: canon?.executedAt ?? canon?.timestamp ?? null,
+      tasks: rImpactQueue.slice(0, 5).map((t) => ({
+        taskId: t.taskId,
+        title: t.title,
+        source: t.source,
+        expectedRImpact: t.expectedRImpact,
+        confidence: t.confidence,
+        evidenceFreshness: t.evidenceFreshness,
+        affectedMetric: t.affectedMetric,
+        rank: t.rank,
+      })),
+    },
+
+    // ─── Agent Workflow v2: Duplicate Suppression ────────────────────
+    duplicateSuppression: {
+      activeLocks: dedupStats.activeLocks,
+      skippedDuplicateExecutionCount: dedupStats.skippedDuplicateExecutionCount,
+      skippedInsufficientDataCount: dedupStats.skippedInsufficientDataCount,
+    },
+
+    // ─── Agent Workflow v2: Execution Stats ──────────────────────────
+    executionStats: {
+      skippedLowImpactCount: 0, // populated by execute route in future runs
+      skippedDuplicateFixClassCount: dedupStats.skippedDuplicateExecutionCount,
+    },
   });
 }

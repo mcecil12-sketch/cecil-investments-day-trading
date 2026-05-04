@@ -8,10 +8,32 @@
  *   - Hash-based dedupeKey from title + findingId + suggestedAction + targetFiles
  *   - Occurrence counting (increments on each duplicate attempt)
  *   - Execution lock (SET NX 24h) to prevent concurrent execution of same task
+ *   - Fix-class suppression: certain re-optimization classes require new trade data
+ *   - Dedup stats: counters for skipped duplicate / insufficient data executions
  */
 
 import { createHash } from "crypto";
 import { redis } from "@/lib/redis";
+import { AGENT_EXECUTION_DEDUP_STATS_KEY } from "@/lib/agents/keys";
+
+// ─── Fix-class suppression ────────────────────────────────────────────
+//
+// These fix classes perform re-optimization. They MUST NOT re-execute
+// within 24h unless at least REOPT_MIN_NEW_TRADES new closed trades exist
+// since the last fix. This prevents repeated low-value adaptive loops.
+
+/**
+ * Fix classes that require newClosedTradesSinceLastFix >= REOPT_MIN_NEW_TRADES
+ * before re-execution is allowed.
+ */
+export const REOPT_FIX_CLASSES: ReadonlySet<string> = new Set([
+  "tier_C_high_loss_rate",
+  "negative_avg_r",
+  "scoring_quality_degraded",
+  "win_rate_low",
+]);
+
+export const REOPT_MIN_NEW_TRADES = 3;
 
 const DEDUP_TTL_SECONDS = 24 * 60 * 60; // 24 hours
 const LOCK_TTL_SECONDS = 24 * 60 * 60;  // 24 hours
@@ -136,4 +158,88 @@ export async function isRecentDuplicateTask(title: string): Promise<boolean> {
   const key = buildDedupeKey(title);
   const result = await checkAndRecordTaskDedup(key, "unknown", title);
   return result.isDuplicate;
+}
+
+// ─── Dedup stats tracking ───────────────────────────────────────────────
+
+interface DedupStats {
+  skippedDuplicateExecutionCount: number;
+  skippedInsufficientDataCount: number;
+  updatedAt: string;
+}
+
+const STATS_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days (rolling)
+
+async function readDedupStats(): Promise<DedupStats> {
+  if (!redis) return { skippedDuplicateExecutionCount: 0, skippedInsufficientDataCount: 0, updatedAt: new Date().toISOString() };
+  try {
+    const raw = await redis.get<DedupStats>(AGENT_EXECUTION_DEDUP_STATS_KEY);
+    if (!raw || typeof raw !== "object") return { skippedDuplicateExecutionCount: 0, skippedInsufficientDataCount: 0, updatedAt: new Date().toISOString() };
+    return raw as DedupStats;
+  } catch {
+    return { skippedDuplicateExecutionCount: 0, skippedInsufficientDataCount: 0, updatedAt: new Date().toISOString() };
+  }
+}
+
+async function writeDedupStats(stats: DedupStats): Promise<void> {
+  if (!redis) return;
+  try {
+    await redis.set(AGENT_EXECUTION_DEDUP_STATS_KEY, stats, { ex: STATS_TTL_SECONDS });
+  } catch {
+    // non-fatal
+  }
+}
+
+/**
+ * Record a skipped duplicate execution event.
+ */
+export async function recordDuplicateExecutionSkip(): Promise<void> {
+  const stats = await readDedupStats();
+  await writeDedupStats({
+    ...stats,
+    skippedDuplicateExecutionCount: stats.skippedDuplicateExecutionCount + 1,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * Record a skipped-due-to-insufficient-trade-data event.
+ */
+export async function recordInsufficientDataSkip(): Promise<void> {
+  const stats = await readDedupStats();
+  await writeDedupStats({
+    ...stats,
+    skippedInsufficientDataCount: stats.skippedInsufficientDataCount + 1,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * Get dedup suppression stats including active lock count.
+ */
+export async function getDedupStats(): Promise<{
+  activeLocks: number;
+  skippedDuplicateExecutionCount: number;
+  skippedInsufficientDataCount: number;
+}> {
+  const stats = await readDedupStats();
+
+  // Count active locks via pattern scan (best-effort, non-fatal)
+  let activeLocks = 0;
+  if (redis) {
+    try {
+      // Use KEYS pattern scan for lock count estimation
+      // This is safe because the lock namespace is small and bounded
+      const keys = await (redis as any).keys(`${LOCK_PREFIX}*`).catch(() => [] as string[]);
+      activeLocks = Array.isArray(keys) ? keys.length : 0;
+    } catch {
+      // non-fatal — lock count is best-effort
+    }
+  }
+
+  return {
+    activeLocks,
+    skippedDuplicateExecutionCount: stats.skippedDuplicateExecutionCount,
+    skippedInsufficientDataCount: stats.skippedInsufficientDataCount,
+  };
 }
