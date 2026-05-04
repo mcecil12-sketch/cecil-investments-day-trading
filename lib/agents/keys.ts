@@ -31,6 +31,8 @@ export const AGENT_EXPERIMENT_TRACKER_KEY = "agents:experiments:v1";
 // Agent Workflow v2 keys
 export const AGENT_FUNNEL_RECOVERY_KEY = "agents:funnel_recovery:v2";
 export const AGENT_EXECUTION_DEDUP_STATS_KEY = "agents:execution_dedup_stats:v2";
+// Tracks the ISO timestamp when the market was first detected open for the current session
+export const AGENT_MARKET_OPEN_SINCE_KEY = "agents:market_open_since:v1";
 
 export const AGENT_STORE_KEYS = {
   state: AGENT_STATE_KEY,

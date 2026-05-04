@@ -20,7 +20,7 @@ import type { EngineeringTask } from "@/lib/agents/types";
 import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask, getTrulyActiveManualTask, getNextQueuedManualTask, getManualQueueDiagnostics } from "@/lib/agents/manual-action-queue";
 import { readProfitEngineStatus } from "@/lib/agents/profitEngine";
 import { buildUnifiedQueueSummary, buildAutonomyHealth, buildQueueThroughput } from "@/lib/agents/unified-queue";
-import { readFunnelRecoveryState } from "@/lib/agents/funnel-recovery";
+import { detectFunnelBlockedState, readFunnelRecoveryState, isFunnelRecoveryTask, isOptimizationOnlyTask } from "@/lib/agents/funnel-recovery";
 import { buildRImpactQueue, getTopRImpactTaskIds } from "@/lib/agents/r-impact";
 import { getDedupStats } from "@/lib/agents/task-dedup";
 
@@ -86,6 +86,10 @@ export async function GET(req: Request) {
     return unauthorizedAgentResponse(auth.error);
   }
 
+  // Resolve base URL for internal calls (e.g. funnel-health detection)
+  const reqUrl = new URL(req.url);
+  const stateBaseUrl = `${reqUrl.protocol}//${reqUrl.host}`;
+
   const [snapshot, state, tasks, adaptiveState, latestExecRaw, latestBatchRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics, profitEngineStatus, funnelRecoveryState, dedupStats] = await Promise.all([
     readAgentStateSnapshot(),
     ensureAgentState(),
@@ -107,7 +111,8 @@ export async function GET(req: Request) {
       healthStatus: "healthy" as const, healthReason: null,
     })),
     readProfitEngineStatus().catch(() => null),
-    readFunnelRecoveryState().catch(() => null),
+    // Detect live funnel blocked state (updates Redis cache); falls back to cached value
+    detectFunnelBlockedState(stateBaseUrl).catch(() => readFunnelRecoveryState().catch(() => null)),
     getDedupStats().catch(() => ({ activeLocks: 0, skippedDuplicateExecutionCount: 0, skippedInsufficientDataCount: 0 })),
   ]);
 
@@ -293,6 +298,59 @@ export async function GET(req: Request) {
         suppressedSides: getSuppressedSides(activeAdaptiveActions),
       },
     },
+
+    // ─── Agent Workflow v2: wired directly into state object ─────────
+    // These fields are exposed both here (under state.*) and at the top-level
+    // response for backward compatibility. Always non-null defaults.
+    funnelBlocked: funnelRecoveryState?.funnelBlocked ?? false,
+    funnelRecoveryMode: funnelRecoveryState?.funnelRecoveryMode ?? false,
+    funnelBlockedStage: funnelRecoveryState?.funnelBlockedStage ?? null,
+    funnelBlockedReason: funnelRecoveryState?.funnelBlockedReason ?? null,
+    // topExpectedRTasks at top level (non-null array) for direct access
+    topExpectedRTasks: topExpectedRTasks ?? [],
+    rImpactQueue: {
+      topExpectedRTasks: topExpectedRTasks ?? [],
+      queueLength: rImpactQueue.length,
+      lastRImpactExecution: canon?.executedAt ?? canon?.timestamp ?? null,
+      tasks: rImpactQueue.slice(0, 5).map((t) => ({
+        taskId: t.taskId,
+        title: t.title,
+        source: t.source,
+        expectedRImpact: t.expectedRImpact,
+        confidence: t.confidence,
+        evidenceFreshness: t.evidenceFreshness,
+        affectedMetric: t.affectedMetric,
+        rank: t.rank,
+      })),
+    },
+    duplicateSuppression: {
+      activeLocks: dedupStats.activeLocks,
+      skippedDuplicateExecutionCount: dedupStats.skippedDuplicateExecutionCount,
+      skippedInsufficientDataCount: dedupStats.skippedInsufficientDataCount,
+    },
+    executionStats: {
+      skippedLowImpactCount: 0,
+      skippedDuplicateFixClassCount: dedupStats.skippedDuplicateExecutionCount,
+    },
+    // Workflow v2 diagnostics
+    workflowV2Enabled: true,
+    workflowV2Source: "readiness+funnel-health",
+    workflowV2LastEvaluatedAt:
+      funnelRecoveryState?.lastFunnelBlockedAt ??
+      funnelRecoveryState?.lastFunnelHealthyAt ??
+      null,
+    recoveryEligibleTaskCount: (() => {
+      if (!funnelRecoveryState?.funnelBlocked) return null;
+      const mCount = manualTasks.filter((t) => isFunnelRecoveryTask(t)).length;
+      const eCount = tasks.filter((t) => isFunnelRecoveryTask(t as unknown as { taskType?: string | null; title: string; priority?: string | null })).length;
+      return mCount + eCount;
+    })(),
+    optimizationBlockedCount: (() => {
+      if (!funnelRecoveryState?.funnelBlocked) return null;
+      const mCount = manualTasks.filter((t) => isOptimizationOnlyTask(t)).length;
+      const eCount = tasks.filter((t) => isOptimizationOnlyTask(t as unknown as { title: string; taskType?: string | null })).length;
+      return mCount + eCount;
+    })(),
   };
 
   // ─── Compute latestExecutionResult age & historical flag ──────────

@@ -56,11 +56,12 @@ import { isOpenTradeStatus } from "@/lib/trades/protection";
 import {
   detectFunnelBlockedState,
   isFunnelRecoveryTask,
+  isOptimizationOnlyTask,
   createFunnelRecoveryTasks,
   type FunnelRecoveryState,
 } from "@/lib/agents/funnel-recovery";
-import { buildRImpactQueue } from "@/lib/agents/r-impact";
-import { recordDuplicateExecutionSkip } from "@/lib/agents/task-dedup";
+import { buildRImpactQueue, scoreManualTask, scoreEngineeringTask } from "@/lib/agents/r-impact";
+import { recordDuplicateExecutionSkip, buildDedupeKey } from "@/lib/agents/task-dedup";
 import type {
   EngineeringTask,
   ExecutionPhase,
@@ -615,6 +616,14 @@ interface DryRunCandidate {
   hasPatchPlan: boolean;
   hasVerificationPlan: boolean;
   createdAt: string;
+  // Agent Workflow v2: R-impact enrichment
+  dedupeKey: string;
+  expectedRImpact: number;
+  affectedMetric: string;
+  confidence: number;
+  evidenceFreshness: string;
+  isRecoveryTask: boolean;
+  isOptimizationTask: boolean;
 }
 
 async function collectDryRunCandidates(
@@ -630,6 +639,8 @@ async function collectDryRunCandidates(
       if (candidates.length >= max) break;
       if (priorityOnly && t.priority !== "CRITICAL" && t.priority !== "HIGH") continue;
       const sel = computeTaskSelectability(t);
+      const rImpact = scoreManualTask(t);
+      const dedupeKey = buildDedupeKey(t.title, undefined, t.taskType ?? undefined, t.fileHints ?? []);
       candidates.push({
         taskId: t.id,
         title: t.title,
@@ -643,6 +654,13 @@ async function collectDryRunCandidates(
         hasPatchPlan: !!(t.fileHints?.length),
         hasVerificationPlan: !!(t.acceptanceCriteria?.length),
         createdAt: t.createdAt,
+        dedupeKey,
+        expectedRImpact: rImpact.expectedRImpact,
+        affectedMetric: rImpact.affectedMetric,
+        confidence: rImpact.confidence,
+        evidenceFreshness: rImpact.evidenceFreshness,
+        isRecoveryTask: isFunnelRecoveryTask(t),
+        isOptimizationTask: isOptimizationOnlyTask(t),
       });
     }
   } catch {
@@ -663,6 +681,14 @@ async function collectDryRunCandidates(
       eligible.sort((a, b) => batchEngineeringTaskRank(a) - batchEngineeringTaskRank(b));
       for (const t of eligible.slice(0, remaining)) {
         const readiness = computeEngineeringTaskReadiness(t);
+        const rImpact = scoreEngineeringTask(t);
+        const dedupeKey = buildDedupeKey(
+          t.title,
+          undefined,
+          t.patchPlan?.mode ?? undefined,
+          t.patchPlan?.targetFiles ?? [],
+        );
+        const tAsTask = t as unknown as { taskType?: string | null; title: string; priority?: string | null };
         candidates.push({
           taskId: t.id,
           title: t.title,
@@ -675,6 +701,13 @@ async function collectDryRunCandidates(
           hasPatchPlan: readiness.hasPatchPlan,
           hasVerificationPlan: readiness.hasVerificationPlan,
           createdAt: t.createdAt,
+          dedupeKey,
+          expectedRImpact: rImpact.expectedRImpact,
+          affectedMetric: rImpact.affectedMetric,
+          confidence: rImpact.confidence,
+          evidenceFreshness: rImpact.evidenceFreshness,
+          isRecoveryTask: isFunnelRecoveryTask(tAsTask),
+          isOptimizationTask: isOptimizationOnlyTask(tAsTask),
         });
       }
     } catch {
@@ -1618,31 +1651,63 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(autonomyDisabledResponse);
     }
 
+    // ─── Protection integrity failure → recovery mode (not total block) ─
+    // When protection audit fails but critical-task resolution already ran/returned,
+    // activate funnel recovery mode so only repair/recovery tasks proceed.
+    // Optimization tasks are blocked; stop-repair and integrity tasks can run.
     if (!dryRun && proactiveEscalation.attempted && proactiveEscalation.auditOk === false) {
-      const protectionBlocked = {
-        ok: true,
-        executionStatus: "NO_ELIGIBLE_TASKS" as const,
-        requestedMax,
-        effectiveRequestedMax,
-        executedCount: 0,
-        completedCount: 0,
-        failedCount: 0,
-        skippedCount: 0,
-        stoppedReason: "protection_audit_failed",
-        results: [] as BatchTaskResult[],
-        queueBefore,
-        queueAfter: queueBefore,
-        proactiveDiagnostics,
-        autonomyEnabled,
-      };
-      await storeLatestExecution(protectionBlocked as Record<string, unknown>);
-      await storeLatestBatchExecution(protectionBlocked as Record<string, unknown>);
-      return NextResponse.json(protectionBlocked);
+      console.warn("[AGENT-EXECUTE] Protection audit failed — activating recovery mode to allow repair tasks");
+      if (!funnelRecoveryState?.funnelBlocked) {
+        funnelRecoveryState = {
+          funnelBlocked: true,
+          funnelRecoveryMode: true,
+          funnelBlockedStage: "unknown",
+          funnelBlockedReason: "protection_integrity_failed — stop repair or broker position protection missing",
+          lastFunnelBlockedAt: new Date().toISOString(),
+          lastFunnelHealthyAt: funnelRecoveryState?.lastFunnelHealthyAt ?? null,
+        };
+      }
     }
 
     // ─── Dry run: collect top-N selectable candidates ─────────────────
     if (dryRun) {
+      // Detect funnel recovery state for dry-run (read cached, then detect live)
+      let dryRunFunnelState: FunnelRecoveryState | null = null;
+      try {
+        const baseUrl = resolveExecuteBaseUrl();
+        dryRunFunnelState = await detectFunnelBlockedState(baseUrl);
+      } catch {
+        // non-fatal: funnel state detection failure should not block dry-run
+      }
+      const dryRunFunnelBlocked = dryRunFunnelState?.funnelBlocked ?? false;
+      const dryRunFunnelRecoveryMode = dryRunFunnelState?.funnelRecoveryMode ?? false;
+
       const candidates = await collectDryRunCandidates(effectiveRequestedMax, priorityOnly);
+
+      // Apply funnel recovery mode: block optimization tasks, sort recovery first
+      const enrichedCandidates = candidates.map((c) => {
+        const effectiveBlockedReason =
+          dryRunFunnelRecoveryMode && c.isOptimizationTask
+            ? "funnel_blocked_recovery_mode"
+            : c.blockedReason;
+        return { ...c, blockedReason: effectiveBlockedReason };
+      });
+
+      // Sort: if funnel blocked, recovery tasks rank before optimization tasks
+      if (dryRunFunnelBlocked) {
+        enrichedCandidates.sort((a, b) => {
+          const aRec = a.isRecoveryTask ? 0 : 1;
+          const bRec = b.isRecoveryTask ? 0 : 1;
+          if (aRec !== bRec) return aRec - bRec;
+          return b.expectedRImpact - a.expectedRImpact;
+        });
+      }
+
+      const recoveryEligibleCount = enrichedCandidates.filter((c) => c.isRecoveryTask).length;
+      const optimizationBlockedCount = dryRunFunnelRecoveryMode
+        ? enrichedCandidates.filter((c) => c.isOptimizationTask).length
+        : 0;
+
       const batchDryResult = {
         ok: true,
         dryRun: true,
@@ -1653,9 +1718,9 @@ export async function POST(req: NextRequest) {
         completedCount: 0,
         failedCount: 0,
         skippedCount: 0,
-        stoppedReason: candidates.length === 0 ? "no_eligible_tasks" : "dry_run",
-        noEligibleReason: candidates.length === 0 ? (queueBefore.idleReason ?? "no_open_tasks") : null,
-        results: candidates.map((c) => ({
+        stoppedReason: enrichedCandidates.length === 0 ? "no_eligible_tasks" : "dry_run",
+        noEligibleReason: enrichedCandidates.length === 0 ? (queueBefore.idleReason ?? "no_open_tasks") : null,
+        results: enrichedCandidates.map((c) => ({
           taskId: c.taskId,
           title: c.title,
           status: "SKIPPED" as const,
@@ -1665,13 +1730,24 @@ export async function POST(req: NextRequest) {
           patchApplied: false,
           commitSha: null,
           verification: { buildOk: true, smokeOk: true, details: {} },
-          resolution: { resolved: false, reason: "dry_run" },
+          resolution: {
+            resolved: false,
+            reason: c.blockedReason ?? "dry_run",
+          },
           executionReady: c.executionReady,
           blockedReason: c.blockedReason,
           readinessReasons: c.readinessReasons,
           requiresApproval: c.requiresApproval,
           hasPatchPlan: c.hasPatchPlan,
           hasVerificationPlan: c.hasVerificationPlan,
+          // Agent Workflow v2 fields
+          dedupeKey: c.dedupeKey,
+          expectedRImpact: c.expectedRImpact,
+          affectedMetric: c.affectedMetric,
+          confidence: c.confidence,
+          evidenceFreshness: c.evidenceFreshness,
+          isRecoveryTask: c.isRecoveryTask,
+          isOptimizationTask: c.isOptimizationTask,
           executionPhases: [],
         })),
         queueBefore,
@@ -1680,6 +1756,21 @@ export async function POST(req: NextRequest) {
         adaptiveGuardrails: adaptiveResult
           ? { actionsApplied: adaptiveResult.actionsApplied.length, activeActions: adaptiveResult.activeActions.length }
           : null,
+        // Agent Workflow v2 diagnostics
+        workflowV2: {
+          enabled: true,
+          source: "readiness+funnel-health",
+          lastEvaluatedAt:
+            dryRunFunnelState?.lastFunnelBlockedAt ??
+            dryRunFunnelState?.lastFunnelHealthyAt ??
+            null,
+          funnelBlocked: dryRunFunnelBlocked,
+          funnelRecoveryMode: dryRunFunnelRecoveryMode,
+          funnelBlockedStage: dryRunFunnelState?.funnelBlockedStage ?? null,
+          funnelBlockedReason: dryRunFunnelState?.funnelBlockedReason ?? null,
+          recoveryEligibleTaskCount: recoveryEligibleCount,
+          optimizationBlockedCount,
+        },
       };
       return NextResponse.json(batchDryResult);
     }

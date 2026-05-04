@@ -13,7 +13,8 @@
  */
 
 import { redis } from "@/lib/redis";
-import { AGENT_FUNNEL_RECOVERY_KEY } from "@/lib/agents/keys";
+import { saveCriticalTask } from "@/lib/redis";
+import { AGENT_FUNNEL_RECOVERY_KEY, AGENT_MARKET_OPEN_SINCE_KEY } from "@/lib/agents/keys";
 import {
   createManualActionTask,
   findDuplicateManualTask,
@@ -25,6 +26,24 @@ import { nowIso } from "@/lib/agents/time";
 
 export type FunnelBlockedStage = "scan" | "signals" | "scoring" | "entry" | "unknown";
 
+/**
+ * Enriched funnel context populated from live funnel-health data.
+ * Used by createFunnelRecoveryTasks to select the right recovery action.
+ */
+export interface FunnelRecoveryContext {
+  candidates: number;
+  signalsReceived: number;
+  scored: number;
+  marketOpen: boolean;
+  /** Minutes since the market was first detected open this session (null if unknown). */
+  minsMarketOpen: number | null;
+  /**
+   * Estimated ratio of signals that failed bars/data checks: (received - scored) / received.
+   * null when signalsReceived = 0 (no basis for estimation).
+   */
+  missingBarsRatio: number | null;
+}
+
 export interface FunnelRecoveryState {
   funnelBlocked: boolean;
   funnelBlockedReason: string | null;
@@ -32,6 +51,8 @@ export interface FunnelRecoveryState {
   funnelRecoveryMode: boolean;
   lastFunnelBlockedAt: string | null;
   lastFunnelHealthyAt: string | null;
+  /** Enriched live context for recovery action dispatch. Optional; absent in legacy stored states. */
+  context?: FunnelRecoveryContext | null;
 }
 
 const FUNNEL_RECOVERY_TTL = 24 * 60 * 60; // 24 hours
@@ -223,10 +244,47 @@ export async function detectFunnelBlockedState(baseUrl: string): Promise<FunnelR
     const timestamps = (data.timestamps ?? {}) as Record<string, unknown>;
     const marketOpen = Boolean(data.marketOpen);
 
+    // ── Track market-open since for duration-sensitive conditions ──────
+    // Record the ISO timestamp of first detection each session.
+    // Cleared when market closes so it resets cleanly each day.
+    let minsMarketOpen: number | null = null;
+    if (redis) {
+      if (marketOpen) {
+        try {
+          const storedOpenAt = await redis.get<string>(AGENT_MARKET_OPEN_SINCE_KEY).catch(() => null);
+          if (!storedOpenAt) {
+            const openAt = nowIso();
+            await redis.set(AGENT_MARKET_OPEN_SINCE_KEY, openAt, { ex: 60 * 60 * 14 }).catch(() => {});
+            minsMarketOpen = 0;
+          } else {
+            const openAtMs = Date.parse(storedOpenAt);
+            minsMarketOpen = Number.isFinite(openAtMs)
+              ? Math.round((Date.now() - openAtMs) / 60_000)
+              : null;
+          }
+        } catch {
+          // non-fatal
+        }
+      } else {
+        // Market closed — reset tracker for next session
+        await redis.del(AGENT_MARKET_OPEN_SINCE_KEY).catch(() => {});
+      }
+    }
+
+    const rawCandidates = Number(funnel.candidates ?? 0);
+    const rawSignalsReceived = Number(funnel.signalsReceived ?? 0);
+    const rawScored = Number(funnel.scored ?? 0);
+
+    // Missing-bars ratio: fraction of received signals that never reached scoring
+    const missingBarsRatio: number | null =
+      rawSignalsReceived > 0
+        ? Math.max(0, Math.min(1, (rawSignalsReceived - rawScored) / rawSignalsReceived))
+        : null;
+
     const d: FunnelStageData = {
-      candidates: Number(funnel.candidates ?? 0),
-      signalsReceived: Number(funnel.signalsReceived ?? 0),
-      scored: Number(funnel.scored ?? 0),
+      candidates: rawCandidates,
+      signalsReceived: rawSignalsReceived,
+      scored: rawScored,
       qualified: Number(funnel.qualified ?? 0),
       seeded: Number(funnel.seeded ?? 0),
       scoringErrors: 0, // estimated from incidents
@@ -252,6 +310,17 @@ export async function detectFunnelBlockedState(baseUrl: string): Promise<FunnelR
     // Determine if funnel is blocked
     // Only evaluate during market hours OR when there's scan activity
     const hasActivity = d.candidates > 0 || d.signalsReceived > 0 || d.scored > 0;
+
+    // Live context carried through to task creation
+    const liveContext: FunnelRecoveryContext = {
+      candidates: rawCandidates,
+      signalsReceived: rawSignalsReceived,
+      scored: rawScored,
+      marketOpen,
+      minsMarketOpen,
+      missingBarsRatio,
+    };
+
     if (!marketOpen && !hasActivity) {
       // Outside market hours with no activity — not blocked, just idle
       const idleState: FunnelRecoveryState = {
@@ -261,6 +330,7 @@ export async function detectFunnelBlockedState(baseUrl: string): Promise<FunnelR
         funnelRecoveryMode: false,
         lastFunnelBlockedAt: existing.lastFunnelBlockedAt,
         lastFunnelHealthyAt: existing.lastFunnelHealthyAt,
+        context: liveContext,
       };
       return idleState;
     }
@@ -293,6 +363,7 @@ export async function detectFunnelBlockedState(baseUrl: string): Promise<FunnelR
         funnelRecoveryMode: false,
         lastFunnelBlockedAt: existing.lastFunnelBlockedAt,
         lastFunnelHealthyAt: nowIso(),
+        context: liveContext,
       };
       await writeFunnelRecoveryState(healthy);
       return healthy;
@@ -308,6 +379,7 @@ export async function detectFunnelBlockedState(baseUrl: string): Promise<FunnelR
       funnelRecoveryMode: true,
       lastFunnelBlockedAt: nowIso(),
       lastFunnelHealthyAt: existing.lastFunnelHealthyAt,
+      context: liveContext,
     };
     await writeFunnelRecoveryState(blocked);
     return blocked;
@@ -431,13 +503,223 @@ const RECOVERY_TASK_MAP: Record<FunnelBlockedStage, RecoveryTaskDef> = {
 
 /**
  * Auto-create recovery tasks appropriate for the blocked funnel stage.
- * Deduplicates against existing tasks in the manual queue.
- * Returns count of tasks created.
+ *
+ * When funnelBlocked=true AND marketOpen=true, four specific action patterns
+ * are evaluated in priority order (highest severity first):
+ *
+ *   4. HARD_FAIL_ESCALATION  — zero signals for > 15 min → CRITICAL + critical queue
+ *   3. ZERO_SIGNAL_GUARDRAIL — zero signals for > 5 min  → force-post top candidates
+ *   1. SCAN_SIGNAL_FAILURE   — candidates > 0 but 0 posted → relax thresholds + fallback
+ *   2. MISSING_BARS_RECOVERY — scored/received < 0.8       → expand lookback + fallback
+ *
+ * A generic stage-based task is created as fallback when no pattern applies.
+ * All tasks deduplicate against existing OPEN/SELECTED/IN_PROGRESS/BLOCKED tasks.
+ * Returns total count of new tasks created.
  */
 export async function createFunnelRecoveryTasks(
   state: FunnelRecoveryState,
 ): Promise<number> {
-  if (!state.funnelBlocked || !state.funnelBlockedStage) return 0;
+  if (!state.funnelBlocked) return 0;
+
+  const ctx = state.context;
+  const marketOpen = ctx?.marketOpen ?? false;
+
+  // When market is closed, only create generic stage-based maintenance task
+  if (!marketOpen) {
+    return createStageRecoveryTask(state);
+  }
+
+  const candidates = ctx?.candidates ?? 0;
+  const signalsReceived = ctx?.signalsReceived ?? 0;
+  const scored = ctx?.scored ?? 0;
+  const minsMarketOpen = ctx?.minsMarketOpen ?? null;
+  const missingBarsRatio = ctx?.missingBarsRatio ?? null;
+  const blockedReason = state.funnelBlockedReason ?? "unknown";
+
+  let created = 0;
+
+  // ─── Action 4: HARD FAIL ESCALATION ──────────────────────────────────
+  // Conditions: signalsReceived=0 AND market open > 15 min
+  // Actions:    CRITICAL manual task + critical queue injection → bypasses all optimization
+  if (signalsReceived === 0 && minsMarketOpen !== null && minsMarketOpen > 15) {
+    const title = "CRITICAL: scanner_signal_generation_blocked — zero signals >15m";
+    const existing = await findDuplicateManualTask(title, "SELF_HEAL").catch(() => null);
+    if (!existing) {
+      const task = await createManualActionTask({
+        title,
+        description:
+          `[HARD FAIL ESCALATION] Zero signals received for ${minsMarketOpen} minutes during market hours.\n\n` +
+          `ALL signal generation has failed. This task bypasses all optimization work.\n\n` +
+          `Candidates found by scanner: ${candidates}\n\n` +
+          `Required actions:\n` +
+          `1. Check scanner authentication tokens (ALPACA_API_KEY, ALPACA_API_SECRET)\n` +
+          `2. Diagnose /api/signals POST endpoint for 4xx/5xx errors\n` +
+          `3. Verify signal persistence in Redis signalsStore\n` +
+          `4. Check /api/readiness for infrastructure failures (Redis, Alpaca connectivity)\n` +
+          `5. If scanner is running but signals not posting: inspect signal filter thresholds\n\n` +
+          `Blocked reason: ${blockedReason}`,
+        priority: "CRITICAL",
+        taskType: "SELF_HEAL",
+        executionReady: true,
+        fileHints: [
+          "app/api/signals/route.ts",
+          "lib/signalsStore.ts",
+          "app/api/scan/route.ts",
+          "app/api/readiness/route.ts",
+        ],
+        routeHints: ["/api/signals", "/api/readiness", "/api/funnel-health", "/api/scan"],
+        source: "funnel_recovery",
+        objective: "Restore signal generation immediately — CRITICAL funnel block",
+        acceptanceCriteria: [
+          "signalsReceived > 0 within next 5 minutes",
+          "funnel-health shows no zero-signal incident",
+        ],
+      }).catch(() => null);
+      if (task) created++;
+    }
+
+    // Also inject into critical task queue so execute route's resolver picks it up
+    await saveCriticalTask({
+      incidentCode: "SIGNAL_GENERATION_BLOCKED",
+      symbol: "SYSTEM",
+      severity: "CRITICAL",
+      detail: `Zero signals for ${minsMarketOpen}m during market hours. candidates=${candidates}. Funnel hard-blocked.`,
+    }).catch(() => {});
+  }
+
+  // ─── Action 3: ZERO SIGNAL DAY GUARDRAIL ─────────────────────────────
+  // Conditions: signalsReceived=0 AND market open > 5 min
+  // Actions:    Force-post top 1–2 candidates regardless of soft filters
+  if (signalsReceived === 0 && minsMarketOpen !== null && minsMarketOpen > 5) {
+    const title = "Zero-signal guardrail: force-post top candidates in recovery mode";
+    const existing = await findDuplicateManualTask(title, "SCANNER").catch(() => null);
+    if (!existing) {
+      const task = await createManualActionTask({
+        title,
+        description:
+          `[ZERO SIGNAL DAY GUARDRAIL] Market has been open ${minsMarketOpen} minutes with 0 signals received.\n\n` +
+          `Required actions:\n` +
+          `1. Force-post top 1–2 candidates regardless of soft filter thresholds\n` +
+          `2. Mark signals as recovery_mode=true to bypass quality gates\n` +
+          `3. Relax relVol threshold by 10–20% (e.g. minRelVol * 0.8)\n` +
+          `4. Log forcedPostFallback=true on every force-posted signal\n` +
+          `5. Target: get at least 1 signal into the store within next scan cycle\n\n` +
+          `Blocked reason: ${blockedReason}`,
+        priority: "CRITICAL",
+        taskType: "SCANNER",
+        executionReady: true,
+        fileHints: [
+          "app/api/scan/route.ts",
+          "app/api/signals/route.ts",
+          "lib/signals/since.ts",
+        ],
+        routeHints: ["/api/scan", "/api/signals", "/api/funnel-health"],
+        source: "funnel_recovery",
+        objective: "Force at least 1 signal into the store to unblock the zero-signal day",
+        acceptanceCriteria: [
+          "signalsReceived >= 1 after force-post",
+          "forcedPostFallback=true present on signal record",
+          "funnel-health signalsReceived > 0",
+        ],
+      }).catch(() => null);
+      if (task) created++;
+    }
+  }
+
+  // ─── Action 1: SCAN → SIGNAL POSTING FAILURE ─────────────────────────
+  // Conditions: candidates > 0 AND signalsReceived = 0
+  // Actions:    Relax thresholds + allow force-post fallback for top candidates
+  if (candidates > 0 && signalsReceived === 0) {
+    const title = "Fix scan→signal posting failure: relax thresholds + force-post fallback";
+    const existing = await findDuplicateManualTask(title, "SCANNER").catch(() => null);
+    if (!existing) {
+      const task = await createManualActionTask({
+        title,
+        description:
+          `[SCAN→SIGNAL POSTING FAILURE] ${candidates} candidate(s) found by scanner but 0 signals posted.\n\n` +
+          `Required actions:\n` +
+          `1. Relax relVol threshold by 10–20% (multiply current minRelVol threshold by 0.8)\n` +
+          `2. Relax trend strength requirement slightly (reduce minTrendScore by 0.1)\n` +
+          `3. Allow fallback posting for top 1–3 candidates when all soft filters reject\n` +
+          `4. Set forcedPostFallback=true on fallback-posted signals for audit trail\n` +
+          `5. Ensure fallback path does NOT bypass hard risk limits (minPrice, volatility caps)\n\n` +
+          `Blocked reason: ${blockedReason}`,
+        priority: "CRITICAL",
+        taskType: "SCANNER",
+        executionReady: true,
+        fileHints: [
+          "app/api/scan/route.ts",
+          "lib/scanner/prePostGating.ts",
+          "app/api/signals/route.ts",
+        ],
+        routeHints: ["/api/scan", "/api/signals", "/api/signals/all"],
+        source: "funnel_recovery",
+        objective: "Unblock scan→signal pipeline with threshold relaxation + force-post fallback",
+        acceptanceCriteria: [
+          "signalsReceived > 0 after next scan cycle",
+          "No candidates dropped when fallback is active and soft filters reject all",
+          "forcedPostFallback=true present in signal payload when fallback used",
+        ],
+      }).catch(() => null);
+      if (task) created++;
+    }
+  }
+
+  // ─── Action 2: MISSING BARS FAILURE ──────────────────────────────────
+  // Conditions: missingBarsRatio > 0.2 (>20% of signals fail bars fetch)
+  // Actions:    Expand lookback window + rolling-window fallback + prior-session bars
+  if (missingBarsRatio !== null && missingBarsRatio > 0.2) {
+    const missingPct = Math.round(missingBarsRatio * 100);
+    const title = "Recover missing bars: expand lookback + rolling window fallback";
+    const existing = await findDuplicateManualTask(title, "SCORING").catch(() => null);
+    if (!existing) {
+      const task = await createManualActionTask({
+        title,
+        description:
+          `[MISSING BARS FAILURE] ~${missingPct}% of signals are failing bars fetch ` +
+          `(signalsReceived=${signalsReceived}, scored=${scored}).\n\n` +
+          `Required actions:\n` +
+          `1. Re-fetch bars using rolling window fallback on any 404/empty response\n` +
+          `2. Expand lookback window: 1-min bars → 60 min window (from default 30 min)\n` +
+          `3. Fall back to prior session bars if intraday bars unavailable\n` +
+          `4. Log barsFallbackUsed=true on every signal that uses fallback bars\n` +
+          `5. Add retry with exponential backoff (max 3 attempts) before rejecting signal\n\n` +
+          `Blocked reason: ${blockedReason}`,
+        priority: "HIGH",
+        taskType: "SCORING",
+        executionReady: true,
+        fileHints: [
+          "lib/aiScoring.ts",
+          "lib/barWindow.ts",
+          "app/api/ai/score/drain/route.ts",
+        ],
+        routeHints: ["/api/ai/score/drain", "/api/ai/health", "/api/signals/all"],
+        source: "funnel_recovery",
+        objective: "Fix bars fetch failures to unblock the AI scoring pipeline",
+        acceptanceCriteria: [
+          `scored/signalsReceived ratio > 0.8 (currently ~${(1 - missingBarsRatio).toFixed(2)})`,
+          "barsFallbackUsed=true logged when fallback activates",
+          "No increase in BARS_UNAVAILABLE rejections after fix",
+        ],
+      }).catch(() => null);
+      if (task) created++;
+    }
+  }
+
+  // ─── Fallback: generic stage-based task if no pattern matched ─────────
+  if (created === 0) {
+    created += await createStageRecoveryTask(state);
+  }
+
+  return created;
+}
+
+/**
+ * Create the generic stage-based recovery task (original behaviour).
+ * Used as fallback when no specific action pattern applies, and during market-closed hours.
+ */
+async function createStageRecoveryTask(state: FunnelRecoveryState): Promise<number> {
+  if (!state.funnelBlockedStage) return 0;
 
   const def = RECOVERY_TASK_MAP[state.funnelBlockedStage];
   if (!def) return 0;

@@ -21,7 +21,7 @@ import {
   isOpenTradeStatus,
   normalizeTicker,
 } from "@/lib/trades/protection";
-import { createOrder } from "@/lib/alpaca";
+import { createOrder, alpacaRequest } from "@/lib/alpaca";
 import { forceFlattenPosition } from "@/lib/broker/forceFlattenPosition";
 import { verifyStopAtBroker } from "@/lib/risk/stop-verification";
 
@@ -56,9 +56,53 @@ async function submitRepairStop(opts: {
 
 // ─── Enforce logic ──────────────────────────────────────────────────
 
+/**
+ * Cancel all open sell-side orders for a symbol at broker.
+ * Used to release qty held by stale/conflicting orders before placing a stop.
+ */
+async function cancelConflictingOrders(
+  symbol: string,
+  side: "buy" | "sell",
+): Promise<{ canceled: number; attempted: number; error: string | null }> {
+  try {
+    const ordersResp = await alpacaRequest({
+      method: "GET",
+      path: `/v2/orders?status=open&symbols=${encodeURIComponent(symbol)}&limit=500`,
+    });
+    if (!ordersResp.ok) {
+      return { canceled: 0, attempted: 0, error: `fetch_orders_failed:${ordersResp.status}` };
+    }
+    let openOrders: any[] = [];
+    try {
+      const parsed = JSON.parse(ordersResp.text);
+      openOrders = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      openOrders = [];
+    }
+    // Cancel only orders on the same side (conflicting sell orders for a long position)
+    const conflicting = openOrders.filter(
+      (o) => String(o?.side || "").toLowerCase() === side,
+    );
+    let canceled = 0;
+    for (const order of conflicting) {
+      if (!order?.id) continue;
+      try {
+        await alpacaRequest({ method: "DELETE", path: `/v2/orders/${encodeURIComponent(String(order.id))}` });
+        canceled++;
+      } catch {
+        // best-effort
+      }
+    }
+    return { canceled, attempted: conflicting.length, error: null };
+  } catch (err: any) {
+    return { canceled: 0, attempted: 0, error: err?.message ?? String(err) };
+  }
+}
+
 async function enforceProtection(
   audit: AuditResult,
   brokerPositions: BrokerPosition[],
+  brokerOrders: BrokerOrder[],
 ): Promise<{ repaired: string[]; flattened: string[]; failed: string[]; diagnostics: any[] }> {
   const repaired: string[] = [];
   const flattened: string[] = [];
@@ -71,6 +115,16 @@ async function enforceProtection(
     if (sym) posBySymbol.set(sym, p);
   }
 
+  // Index open orders by symbol for stale-order detection
+  const ordersBySymbol = new Map<string, BrokerOrder[]>();
+  for (const o of brokerOrders) {
+    const sym = normalizeTicker(o.symbol);
+    if (!sym) continue;
+    const bucket = ordersBySymbol.get(sym) ?? [];
+    bucket.push(o);
+    ordersBySymbol.set(sym, bucket);
+  }
+
   for (const detail of audit.details) {
     const needsRepair = detail.incidents.some(
       (i) =>
@@ -81,8 +135,30 @@ async function enforceProtection(
     );
     if (!needsRepair) continue;
 
+    // ── Derive stale tracked stop order id ──────────────────────────
+    // The incident detail carries the tracked stopOrderId when present.
+    const missingStopIncident = detail.incidents.find((i) => i.code === "MISSING_STOP");
+    const staleTrackedStopOrderId: string | null = (() => {
+      if (!missingStopIncident) return null;
+      const m = missingStopIncident.detail.match(/tracked stopOrderId=(\S+)/);
+      return m ? m[1] : null;
+    })();
+
+    const symbolOrders = ordersBySymbol.get(detail.symbol) ?? [];
+    const activeBrokerStopFound = symbolOrders.some(
+      (o) =>
+        (o.type === "stop" || o.type === "stop_limit") &&
+        (o.status === "accepted" || o.status === "new" || o.status === "held"),
+    );
+
     const diag: Record<string, any> = {
       symbol: detail.symbol,
+      // ── Enhanced Workflow v2 diagnostics ────────
+      staleTrackedStopOrderId,
+      activeBrokerStopFound,
+      stopRepairRetryAttempted: false,
+      stopRepairFinalStatus: "failed" as "protected" | "flattened" | "failed",
+      // ── Legacy diagnostics (preserved for backward compat) ─────────
       stopRepairAttempted: false,
       stopRepairSucceeded: false,
       stopVerified: false,
@@ -90,6 +166,7 @@ async function enforceProtection(
       flattenSucceeded: false,
       cancelOrdersAttempted: false,
       cancelOrdersSucceeded: false,
+      canceledOrderCount: 0,
       brokerPositionExistsAfter: null,
       finalResolution: "failed" as "protected" | "flattened" | "failed",
       stopRepairError: null as string | null,
@@ -128,6 +205,26 @@ async function enforceProtection(
         ? Math.round(entryPrice * 0.98 * 100) / 100
         : Math.round(entryPrice * 1.02 * 100) / 100;
 
+    // ── Pre-repair: cancel conflicting same-side orders to free qty ──
+    // Stale sell limit orders hold qty and prevent stop placement for longs.
+    const conflictingOrders = symbolOrders.filter(
+      (o) =>
+        String(o?.side || "").toLowerCase() === stopSide &&
+        (o.status === "accepted" || o.status === "new" || o.status === "held") &&
+        (o.type === "limit" || o.type === "stop_limit"),
+    );
+    if (conflictingOrders.length > 0 || staleTrackedStopOrderId) {
+      diag.cancelOrdersAttempted = true;
+      const cancelResult = await cancelConflictingOrders(detail.symbol, stopSide);
+      diag.cancelOrdersSucceeded = cancelResult.error === null;
+      diag.canceledOrderCount = cancelResult.canceled;
+      if (cancelResult.error) {
+        console.warn("[protection-audit] pre-repair cancel failed (non-fatal)", {
+          symbol: detail.symbol, error: cancelResult.error,
+        });
+      }
+    }
+
     // ── A. Attempt stop repair directly via broker ──────────────────
     diag.stopRepairAttempted = true;
     const result = await submitRepairStop({
@@ -148,6 +245,7 @@ async function enforceProtection(
         diag.stopRepairSucceeded = true;
         diag.stopVerified = true;
         diag.finalResolution = "protected";
+        diag.stopRepairFinalStatus = "protected";
         repaired.push(detail.symbol);
         console.log("[protection-audit] stop repair verified", {
           symbol: detail.symbol,
@@ -164,7 +262,48 @@ async function enforceProtection(
       diag.stopRepairError = result.error ?? "stop_order_failed";
     }
 
-    // ── B. Repair failed → force flatten (cancels orders first) ────
+    // ── B. Retry: cancel ALL conflicting orders and retry stop once ─
+    // Only retry if we haven't already canceled orders, and there are open orders.
+    const hadCancelAttempt = diag.cancelOrdersAttempted as boolean;
+    if (!hadCancelAttempt || !diag.cancelOrdersSucceeded) {
+      // Cancel ALL open orders on the stop side (belt-and-suspenders)
+      diag.stopRepairRetryAttempted = true;
+      const retryCancelResult = await cancelConflictingOrders(detail.symbol, stopSide);
+      diag.cancelOrdersAttempted = true;
+      diag.cancelOrdersSucceeded = retryCancelResult.error === null;
+      diag.canceledOrderCount = (diag.canceledOrderCount as number) + retryCancelResult.canceled;
+
+      if (retryCancelResult.canceled > 0 || retryCancelResult.attempted > 0) {
+        console.log("[protection-audit] retry stop after canceling orders", {
+          symbol: detail.symbol,
+          canceled: retryCancelResult.canceled,
+          error: retryCancelResult.error,
+        });
+        // Retry stop creation
+        const retryResult = await submitRepairStop({ symbol: detail.symbol, qty: brokerQty, side: stopSide, stopPrice });
+        if (retryResult.ok && retryResult.orderId) {
+          const retryVerify = await verifyStopAtBroker({ symbol: detail.symbol, side: tradeSide, stopOrderId: retryResult.orderId });
+          if (retryVerify.verified) {
+            diag.stopRepairSucceeded = true;
+            diag.stopVerified = true;
+            diag.finalResolution = "protected";
+            diag.stopRepairFinalStatus = "protected";
+            diag.stopRepairError = null;
+            repaired.push(detail.symbol);
+            console.log("[protection-audit] stop repair verified on retry", {
+              symbol: detail.symbol, qty: brokerQty, stopPrice, orderId: retryResult.orderId,
+            });
+            diagnostics.push(diag);
+            continue;
+          }
+          diag.stopRepairError = `retry: stop placed but not verified (status=${retryVerify.stopStatus ?? "unknown"})`;
+        } else {
+          diag.stopRepairError = `retry: ${retryResult.error ?? "stop_order_failed"}`;
+        }
+      }
+    }
+
+    // ── C. Repair failed → force flatten (cancels orders first) ────
     diag.flattenAttempted = true;
     console.error("[protection-audit] repair failed, force-flattening", {
       symbol: detail.symbol,
@@ -172,13 +311,16 @@ async function enforceProtection(
     });
 
     const flatResult = await forceFlattenPosition(detail.symbol);
-    diag.cancelOrdersAttempted = flatResult.diagnostics.cancelOrdersAttempted;
-    diag.cancelOrdersSucceeded = flatResult.diagnostics.cancelOrdersSucceeded;
+    if (!diag.cancelOrdersAttempted) {
+      diag.cancelOrdersAttempted = flatResult.diagnostics.cancelOrdersAttempted;
+      diag.cancelOrdersSucceeded = flatResult.diagnostics.cancelOrdersSucceeded;
+    }
     diag.flattenSucceeded = flatResult.ok;
     diag.brokerPositionExistsAfter = flatResult.diagnostics.brokerPositionExistsAfter;
 
     if (flatResult.ok) {
       diag.finalResolution = "flattened";
+      diag.stopRepairFinalStatus = "flattened";
       flattened.push(detail.symbol);
       console.log("[protection-audit] force-flattened", { symbol: detail.symbol });
       await saveCriticalTask({
@@ -189,6 +331,7 @@ async function enforceProtection(
       }).catch(() => {});
     } else {
       diag.finalResolution = "failed";
+      diag.stopRepairFinalStatus = "failed";
       diag.stopRepairError =
         (diag.stopRepairError ? diag.stopRepairError + "; " : "") +
         `flatten failed at step=${flatResult.step}: ${flatResult.error ?? "unknown"}`;
@@ -331,7 +474,7 @@ export async function GET(req: Request) {
     | undefined;
   let observability: any = {};
   if (enforce && !audit.ok) {
-    enforcement = await enforceProtection(audit, positions);
+    enforcement = await enforceProtection(audit, positions, orders);
     const diagArr: any[] = (enforcement as any).diagnostics ?? [];
     observability = {
       unprotectedSymbols: audit.incidents.filter((i) => i.severity === "CRITICAL").map((i) => i.symbol),
@@ -347,6 +490,16 @@ export async function GET(req: Request) {
       repaired: enforcement.repaired,
       flattened: enforcement.flattened,
       failed: enforcement.failed,
+      // ── Workflow v2 diagnostics ───────────────────────────────────
+      stopRepairRetryAttempted: diagArr.some((d) => d.stopRepairRetryAttempted),
+      activeBrokerStopFound: diagArr.some((d) => d.activeBrokerStopFound),
+      staleTrackedStopOrderIds: diagArr
+        .filter((d) => d.staleTrackedStopOrderId)
+        .map((d) => ({ symbol: d.symbol, staleTrackedStopOrderId: d.staleTrackedStopOrderId })),
+      stopRepairFinalStatuses: diagArr.map((d) => ({
+        symbol: d.symbol,
+        stopRepairFinalStatus: d.stopRepairFinalStatus,
+      })),
       finalResolutions: diagArr.map((d) => ({ symbol: d.symbol, finalResolution: d.finalResolution })),
       details: diagArr,
     };
