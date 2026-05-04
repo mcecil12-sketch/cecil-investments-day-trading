@@ -248,6 +248,31 @@ export async function GET(req: Request) {
   );
   const topExpectedRTasks = getTopRImpactTaskIds(rImpactQueue, 3);
 
+  // ─── Approval-required queue ────────────────────────────────────────
+  // Tasks that would be blocked by AGENT_ALLOW_TRADING_FILES=0 at execution time.
+  // Exposed separately so callers can surface them without cluttering selectableQueue.
+  const APPROVAL_TRADING_FILE_PREFIXES = [
+    "app/api/auto-entry", "app/api/scan", "app/api/ai",
+    "app/api/trades", "lib/trading", "lib/alpaca", "lib/autoEntry",
+  ];
+  function taskTouchesTradingFiles(t: EngineeringTask): boolean {
+    const paths = [...(t.likelyFiles ?? []), ...(t.patchPlan?.targetFiles ?? [])];
+    return paths.some((p) => {
+      const norm = String(p || "").trim().replace(/^\/+/, "").toLowerCase();
+      return APPROVAL_TRADING_FILE_PREFIXES.some((prefix) => norm.startsWith(prefix.toLowerCase()));
+    });
+  }
+  const allowTradingFiles = process.env.AGENT_ALLOW_TRADING_FILES === "1";
+  const approvalRequiredQueue = allowTradingFiles
+    ? []
+    : tasks
+        .filter(
+          (t) =>
+            (t.status === "OPEN" || t.status === "READY_FOR_EXECUTION") &&
+            taskTouchesTradingFiles(t),
+        )
+        .map((t) => ({ id: t.id, title: t.title, status: t.status, reason: "trading_file_requires_approval" }));
+
   const derivedState = {
     ...state,
     openEngineeringTaskCount: openTasks.length + blockedTasks.length,
@@ -309,6 +334,7 @@ export async function GET(req: Request) {
     // topExpectedRTasks at top level (non-null array) for direct access
     topExpectedRTasks: topExpectedRTasks ?? [],
     rImpactQueue: {
+    approvalRequiredQueue,
       topExpectedRTasks: topExpectedRTasks ?? [],
       queueLength: rImpactQueue.length,
       lastRImpactExecution: canon?.executedAt ?? canon?.timestamp ?? null,

@@ -1847,6 +1847,7 @@ export async function POST(req: NextRequest) {
     let completedCount = 0;
     let failedCount = 0;
     let skippedCount = 0;
+    let approvalSkippedCount = 0;
     // Failure rate guard — stop batch if > 50% tasks fail after at least 2 attempts
     const FAILURE_RATE_THRESHOLD = 0.5;
     const FAILURE_RATE_MIN_ATTEMPTS = 2;
@@ -1876,6 +1877,17 @@ export async function POST(req: NextRequest) {
         stoppedReason = "manual_task_active_not_ready";
         batchResults.push(cycle);
         break;
+      }
+
+      // Approval-required tasks are skipped and excluded from future iterations so
+      // the batch can continue to the next eligible non-approval task.
+      if (cycle.safetyStopReason === "requires_approval") {
+        approvalSkippedCount++;
+        skippedCount++;
+        batchResults.push(cycle);
+        if (cycle.taskId) executedTaskIds.push(cycle.taskId);
+        console.log(`[AGENT-EXECUTE] Skipping approval-required task at iteration ${i + 1}: ${cycle.taskId ?? "(unknown)"}`);
+        continue;
       }
 
       batchResults.push(cycle);
@@ -1958,6 +1970,7 @@ export async function POST(req: NextRequest) {
       skippedCount,
       stoppedReason: normalizedStoppedReason,
       noEligibleReason,
+      approvalSkippedCount,
       results: batchResults,
       queueBefore,
       queueAfter,
