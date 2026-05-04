@@ -21,6 +21,7 @@ function tickerField(ticker: string) {
 export type GuardrailState = {
   entriesToday: number;
   lastEntryAt: string | null;
+  lastExecuteRunAt: string | null;
   lastLossAt: string | null;
   consecutiveFailures: number;
   autoDisabledReason: string | null;
@@ -36,6 +37,7 @@ export async function getGuardrailsState(etDate: string): Promise<GuardrailState
     return {
       entriesToday: 0,
       lastEntryAt: null,
+      lastExecuteRunAt: null,
       lastLossAt: null,
       consecutiveFailures: 0,
       autoDisabledReason: null,
@@ -59,6 +61,7 @@ export async function getGuardrailsState(etDate: string): Promise<GuardrailState
   });
 
   const lastEntryAt = typeof data.lastEntryAt === "string" ? data.lastEntryAt : null;
+  const lastExecuteRunAt = typeof data.lastExecuteRunAt === "string" ? data.lastExecuteRunAt : null;
   const lastLossAt = typeof data.lastLossAt === "string" ? data.lastLossAt : null;
   const autoDisabledReason =
     typeof data.autoDisabledReason === "string" ? data.autoDisabledReason : null;
@@ -74,6 +77,7 @@ export async function getGuardrailsState(etDate: string): Promise<GuardrailState
   return {
     entriesToday,
     lastEntryAt,
+    lastExecuteRunAt,
     lastLossAt,
     consecutiveFailures,
     autoDisabledReason,
@@ -92,6 +96,19 @@ export async function bumpEntry(etDate: string, ticker: string) {
   await redis.hincrby(key, "entriesToday", 1);
   await redis.hset(key, { lastEntryAt: now });
   await redis.hset(key, { [tickerField(ticker)]: now });
+  const ttl = getTtlSeconds("GUARDRAILS_DAYS");
+  await ensureExpire(redis, key, ttl);
+}
+
+/**
+ * Record execute route activity (called on every execute run, even if no trades execute).
+ * This prevents false NO_EXECUTION_ACTIVITY incidents when the cron runs but finds no work to do.
+ */
+export async function bumpExecuteActivity(etDate: string) {
+  if (!redis) return;
+  const now = new Date().toISOString();
+  const key = guardKey(etDate);
+  await redis.hset(key, { lastExecuteRunAt: now });
   const ttl = getTtlSeconds("GUARDRAILS_DAYS");
   await ensureExpire(redis, key, ttl);
 }

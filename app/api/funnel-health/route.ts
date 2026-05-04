@@ -334,15 +334,17 @@ function detectIncidents(params: {
     });
   }
 
-  // 4) NO_EXECUTION_ACTIVITY: market open but no recent execute activity
-  if (marketOpen && minsSinceLastExecute !== null && minsSinceLastExecute > 20) {
+  // 4) NO_EXECUTION_ACTIVITY: market open AND there is work to do (AUTO_PENDING trades or fresh signals)
+  //    BUT no recent execute route activity. Only raise if the execute cron should have done something.
+  const hasWorkToDo = freshUnresolvedPendingCount > 0 || freshQualifiedSignals > 0;
+  if (marketOpen && hasWorkToDo && minsSinceLastExecute !== null && minsSinceLastExecute > 20) {
     incidents.push({
       code: "NO_EXECUTION_ACTIVITY",
       severity: "MEDIUM",
       incidentType: "SYSTEM_BROKEN",
       recommendedAction: "Execute cron may not be running. Check execute route logs.",
-      message: `No execution activity for ${minsSinceLastExecute} minutes during market hours.`,
-      context: { minsSinceLastExecute, marketOpen },
+      message: `No execution activity for ${minsSinceLastExecute} minutes during market hours with work to do (${freshUnresolvedPendingCount} AUTO_PENDING, ${freshQualifiedSignals} fresh signals).`,
+      context: { minsSinceLastExecute, marketOpen, freshUnresolvedPendingCount, freshQualifiedSignals },
     });
   }
 
@@ -837,10 +839,11 @@ export async function GET() {
     const lastScanAt = funnelData.lastScanAt;
     const lastSeedAt = lastSeedRun?.runAt ?? lastScanAt;
     const lastEntryAt = guardState.lastEntryAt;
+    const lastExecuteRunAt = guardState.lastExecuteRunAt;
     
-    // We don't have exact lastSeed/lastExecute timestamps, use proxies
-    // lastEntryAt is bumped when trades execute, so use it for execute proxy
-    const minsSinceLastExecute = minutesSince(lastEntryAt);
+    // lastEntryAt: bumped when trades execute (entry activity)
+    // lastExecuteRunAt: bumped on every execute run, even if no trades to execute (execute cron activity)
+    const minsSinceLastExecute = minutesSince(lastExecuteRunAt);
     const minsSinceLastSeed = minutesSince(lastSeedAt);
 
     // -------------------------------------------------------------------------

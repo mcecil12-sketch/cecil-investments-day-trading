@@ -936,6 +936,11 @@ export async function POST(req: Request) {
   const etDate = getEtDateString();
   const guardKeyUsed = guardrailsStore.getGuardrailStateKey(etDate);
   const env = notificationEnv();
+
+  // Record execute route activity to prevent false NO_EXECUTION_ACTIVITY incidents
+  // This is called on every run, even if we skip due to no AUTO_PENDING trades
+  await guardrailsStore.bumpExecuteActivity(etDate).catch(() => null);
+
   const requestHost = (() => {
     try {
       const h = new URL(req.url).host;
