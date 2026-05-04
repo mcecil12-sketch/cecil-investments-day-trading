@@ -257,52 +257,184 @@ export interface RImpactQueueOptions {
   skipStale?: boolean;
 }
 
+export type RImpactSuppressionReason =
+  | "CANCELED_DUPLICATE"
+  | "BLOCKED_INSUFFICIENT_NEW_DATA"
+  | "terminal_failed_unrecoverable";
+
+export interface RImpactSuppressedTask {
+  taskId: string;
+  title: string;
+  source: "manual-action-queue" | "engineering-backlog";
+  reason: RImpactSuppressionReason;
+  evidenceFreshness: RImpactEvidenceFreshness;
+  newClosedTradesSinceLastFix: number;
+}
+
+export interface RImpactQueueWithSuppression {
+  queue: RImpactScore[];
+  suppressed: RImpactSuppressedTask[];
+}
+
+interface QueueCandidate {
+  score: RImpactScore;
+  newClosedTradesSinceLastFix: number;
+  sourceStatus: string;
+  rawTitle: string;
+}
+
+function normalizedTitleKey(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/\[.*?\]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function isAdaptiveOrProfitTask(title: string): boolean {
+  return /^\[(adaptive|profitengine)\]/i.test(title.trim());
+}
+
+function extractNewClosedTradesSinceLastFix(task: EngineeringTask): number {
+  const snap = task.linkedTelemetrySnapshot;
+  if (!snap || typeof snap !== "object") return 0;
+  const value = (snap as Record<string, unknown>).newClosedTradesSinceLastFix;
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function isRecoverableFailedManualTask(task: ManualActionTask): boolean {
+  const error = String(task.latestExecutionResult?.error ?? "").toLowerCase();
+  return /recoverable|timeout|rate[_ -]?limit|transient|temporary|retry/i.test(error);
+}
+
 /**
- * Build an R-impact ranked task queue combining manual and engineering tasks.
- *
- * Returns tasks sorted by expectedRImpact descending (highest impact first).
- * Only includes tasks with expectedRImpact > 0 and eligible statuses.
+ * Build an R-impact ranked task queue + suppression diagnostics.
  */
-export function buildRImpactQueue(
+export function buildRImpactQueueWithSuppression(
   manualTasks: ManualActionTask[],
   engineeringTasks: EngineeringTask[],
   opts?: RImpactQueueOptions,
-): RImpactScore[] {
+): RImpactQueueWithSuppression {
   const max = opts?.maxResults ?? 10;
   const minConf = opts?.minConfidence ?? 0.0;
   const skipStale = opts?.skipStale ?? false;
 
-  const scored: RImpactScore[] = [
-    ...manualTasks
-      .filter((t) => t.status === "OPEN" || t.status === "SELECTED")
-      .map(scoreManualTask),
-    ...engineeringTasks
-      .filter(
-        (t) => t.status === "OPEN" || t.status === "READY_FOR_EXECUTION",
-      )
-      .map(scoreEngineeringTask),
-  ];
+  const suppressed: RImpactSuppressedTask[] = [];
 
-  const eligible = scored.filter((t) => {
-    if (t.expectedRImpact <= 0) return false;
-    if (t.confidence < minConf) return false;
-    if (skipStale && t.evidenceFreshness === "stale") return false;
+  const manualCandidates: QueueCandidate[] = manualTasks
+    .filter((t) => {
+      if (t.status === "OPEN" || t.status === "SELECTED") return true;
+      if (t.status === "FAILED") {
+        if (isRecoverableFailedManualTask(t)) return true;
+        suppressed.push({
+          taskId: t.id,
+          title: t.title,
+          source: "manual-action-queue",
+          reason: "terminal_failed_unrecoverable",
+          evidenceFreshness: assessEvidenceFreshness(t.createdAt),
+          newClosedTradesSinceLastFix: 0,
+        });
+      }
+      return false;
+    })
+    .map((t) => ({
+      score: scoreManualTask(t),
+      newClosedTradesSinceLastFix: 0,
+      sourceStatus: t.status,
+      rawTitle: t.title,
+    }));
+
+  const engineeringCandidates: QueueCandidate[] = engineeringTasks
+    .filter((t) => t.status === "OPEN" || t.status === "READY_FOR_EXECUTION")
+    .map((t) => ({
+      score: scoreEngineeringTask(t),
+      newClosedTradesSinceLastFix: extractNewClosedTradesSinceLastFix(t),
+      sourceStatus: t.status,
+      rawTitle: t.title,
+    }));
+
+  const staleFiltered: QueueCandidate[] = [...manualCandidates, ...engineeringCandidates].filter((candidate) => {
+    const isOptimizationClass =
+      candidate.score.source === "engineering-backlog" && isAdaptiveOrProfitTask(candidate.rawTitle);
+    if (
+      isOptimizationClass &&
+      candidate.score.evidenceFreshness === "stale" &&
+      candidate.newClosedTradesSinceLastFix < 3
+    ) {
+      suppressed.push({
+        taskId: candidate.score.taskId,
+        title: candidate.score.title,
+        source: candidate.score.source,
+        reason: "BLOCKED_INSUFFICIENT_NEW_DATA",
+        evidenceFreshness: candidate.score.evidenceFreshness,
+        newClosedTradesSinceLastFix: candidate.newClosedTradesSinceLastFix,
+      });
+      return false;
+    }
     return true;
   });
 
-  // Sort: highest expectedRImpact first, then confidence as tiebreaker
+  // Duplicate suppression before ranking: keep the best candidate per title key.
+  const byKey = new Map<string, QueueCandidate>();
+  for (const candidate of staleFiltered) {
+    const key = normalizedTitleKey(candidate.rawTitle);
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, candidate);
+      continue;
+    }
+
+    const existingScore = existing.score.expectedRImpact + existing.score.confidence;
+    const currentScore = candidate.score.expectedRImpact + candidate.score.confidence;
+    const keepCurrent = currentScore > existingScore;
+    const dropped = keepCurrent ? existing : candidate;
+    const kept = keepCurrent ? candidate : existing;
+
+    byKey.set(key, kept);
+    suppressed.push({
+      taskId: dropped.score.taskId,
+      title: dropped.score.title,
+      source: dropped.score.source,
+      reason: "CANCELED_DUPLICATE",
+      evidenceFreshness: dropped.score.evidenceFreshness,
+      newClosedTradesSinceLastFix: dropped.newClosedTradesSinceLastFix,
+    });
+  }
+
+  const eligible = [...byKey.values()]
+    .map((c) => c.score)
+    .filter((t) => {
+      if (t.expectedRImpact <= 0) return false;
+      if (t.confidence < minConf) return false;
+      if (skipStale && t.evidenceFreshness === "stale") return false;
+      return true;
+    });
+
   eligible.sort((a, b) => {
     const impactDiff = b.expectedRImpact - a.expectedRImpact;
     if (Math.abs(impactDiff) > 0.001) return impactDiff;
     return b.confidence - a.confidence;
   });
 
-  // Assign ranks
   eligible.forEach((t, i) => {
     t.rank = i + 1;
   });
 
-  return eligible.slice(0, max);
+  return {
+    queue: eligible.slice(0, max),
+    suppressed,
+  };
+}
+
+/**
+ * Build an R-impact ranked task queue combining manual and engineering tasks.
+ */
+export function buildRImpactQueue(
+  manualTasks: ManualActionTask[],
+  engineeringTasks: EngineeringTask[],
+  opts?: RImpactQueueOptions,
+): RImpactScore[] {
+  return buildRImpactQueueWithSuppression(manualTasks, engineeringTasks, opts).queue;
 }
 
 /**

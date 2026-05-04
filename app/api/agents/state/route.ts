@@ -21,7 +21,7 @@ import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveMan
 import { readProfitEngineStatus } from "@/lib/agents/profitEngine";
 import { buildUnifiedQueueSummary, buildAutonomyHealth, buildQueueThroughput } from "@/lib/agents/unified-queue";
 import { detectFunnelBlockedState, readFunnelRecoveryState, isFunnelRecoveryTask, isOptimizationOnlyTask } from "@/lib/agents/funnel-recovery";
-import { buildRImpactQueue, getTopRImpactTaskIds } from "@/lib/agents/r-impact";
+import { buildRImpactQueueWithSuppression, getTopRImpactTaskIds } from "@/lib/agents/r-impact";
 import { getDedupStats } from "@/lib/agents/task-dedup";
 
 function executionVisibilityRank(task: EngineeringTask): number {
@@ -241,11 +241,12 @@ export async function GET(req: Request) {
 
   // ─── R-Impact queue (Agent Workflow v2) ────────────────────────────
   // Build the R-impact ranked queue from all open tasks
-  const rImpactQueue = buildRImpactQueue(
-    manualTasks.filter((t) => t.status === "OPEN" || t.status === "SELECTED"),
-    tasks.filter((t) => t.status === "OPEN" || t.status === "READY_FOR_EXECUTION"),
+  const rImpactDiagnostics = buildRImpactQueueWithSuppression(
+    manualTasks,
+    tasks,
     { maxResults: 10 },
   );
+  const rImpactQueue = rImpactDiagnostics.queue;
   const topExpectedRTasks = getTopRImpactTaskIds(rImpactQueue, 3);
 
   // ─── Approval-required queue ────────────────────────────────────────
@@ -272,6 +273,17 @@ export async function GET(req: Request) {
             taskTouchesTradingFiles(t),
         )
         .map((t) => ({ id: t.id, title: t.title, status: t.status, reason: "trading_file_requires_approval" }));
+
+  const staleSuppressedQueue = rImpactDiagnostics.suppressed
+    .filter((s) => s.reason === "CANCELED_DUPLICATE" || s.reason === "BLOCKED_INSUFFICIENT_NEW_DATA")
+    .map((s) => ({
+      taskId: s.taskId,
+      title: s.title,
+      source: s.source,
+      reason: s.reason,
+      evidenceFreshness: s.evidenceFreshness,
+      newClosedTradesSinceLastFix: s.newClosedTradesSinceLastFix,
+    }));
 
   const derivedState = {
     ...state,
@@ -333,8 +345,9 @@ export async function GET(req: Request) {
     funnelBlockedReason: funnelRecoveryState?.funnelBlockedReason ?? null,
     // topExpectedRTasks at top level (non-null array) for direct access
     topExpectedRTasks: topExpectedRTasks ?? [],
-    rImpactQueue: {
     approvalRequiredQueue,
+    staleSuppressedQueue,
+    rImpactQueue: {
       topExpectedRTasks: topExpectedRTasks ?? [],
       queueLength: rImpactQueue.length,
       lastRImpactExecution: canon?.executedAt ?? canon?.timestamp ?? null,

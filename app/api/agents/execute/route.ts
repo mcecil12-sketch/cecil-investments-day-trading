@@ -60,7 +60,12 @@ import {
   createFunnelRecoveryTasks,
   type FunnelRecoveryState,
 } from "@/lib/agents/funnel-recovery";
-import { buildRImpactQueue, scoreManualTask, scoreEngineeringTask } from "@/lib/agents/r-impact";
+import {
+  buildRImpactQueueWithSuppression,
+  scoreManualTask,
+  scoreEngineeringTask,
+  type RImpactSuppressedTask,
+} from "@/lib/agents/r-impact";
 import { recordDuplicateExecutionSkip, buildDedupeKey } from "@/lib/agents/task-dedup";
 import type {
   EngineeringTask,
@@ -286,6 +291,9 @@ async function executeReadyForGithubCommit(
       details: {
         probes: vResult.probeResults,
         taskSpecific: vResult.taskSpecificResults,
+        hardFailure: vResult.gateResult.hardFailure,
+        softWarning: vResult.gateResult.softWarning,
+        warningCode: vResult.gateResult.warningCode,
       },
     };
     phases.push(phaseResult("VERIFY", vResult.overall ? "passed" : "failed", vResult.gateResult.failureReason ?? undefined, verifyStart));
@@ -297,7 +305,8 @@ async function executeReadyForGithubCommit(
 
   // RESOLVE_OR_FAIL phase
   const resolveStart = Date.now();
-  const verificationPassed = verification.buildOk && verification.smokeOk;
+  const verificationHardFailure = (verification.details as { hardFailure?: boolean } | undefined)?.hardFailure === true;
+  const verificationPassed = !verificationHardFailure && verification.buildOk && verification.smokeOk;
   if (verificationPassed) {
     phases.push(phaseResult("RESOLVE_OR_FAIL", "passed", "verified_and_resolved", resolveStart));
   } else {
@@ -424,6 +433,47 @@ function touchesTradingFiles(paths: string[] | undefined | null): boolean {
     const normalized = String(p || "").trim().replace(/^\/+/, "").toLowerCase();
     return TRADING_FILE_PREFIXES.some((prefix) => normalized.startsWith(prefix.toLowerCase()));
   });
+}
+
+function isAdaptiveOrProfitTitle(title: string): boolean {
+  return /^\[(adaptive|profitengine)\]/i.test(title.trim());
+}
+
+async function persistSuppressedAdaptiveTasks(
+  suppressed: RImpactSuppressedTask[],
+  allEngTasks: EngineeringTask[],
+): Promise<void> {
+  const candidates = suppressed.filter((s) =>
+    s.source === "engineering-backlog" &&
+    (s.reason === "CANCELED_DUPLICATE" || s.reason === "BLOCKED_INSUFFICIENT_NEW_DATA"),
+  );
+  if (candidates.length === 0) return;
+
+  const byId = new Map(allEngTasks.map((t) => [t.id, t]));
+  for (const item of candidates) {
+    const task = byId.get(item.taskId);
+    if (!task) continue;
+    if (!isAdaptiveOrProfitTitle(task.title)) continue;
+    if (!(task.status === "OPEN" || task.status === "READY_FOR_EXECUTION")) continue;
+
+    await updateEngineeringTaskById(task.id, {
+      status: "BLOCKED",
+      remediationAttempted: true,
+      remediationStatus: "failed",
+      remediationResultSummary: `Execution suppressed: ${item.reason}`,
+      executionStatus: "BLOCKED",
+      executionError: item.reason,
+      notes: appendNotes(task.notes, [
+        `R-impact suppression applied: ${item.reason}`,
+        `evidenceFreshness=${item.evidenceFreshness} newClosedTradesSinceLastFix=${item.newClosedTradesSinceLastFix}`,
+      ]),
+      linkedTelemetrySnapshot: {
+        ...(task.linkedTelemetrySnapshot ?? {}),
+        newClosedTradesSinceLastFix: item.newClosedTradesSinceLastFix,
+        suppressionReason: item.reason,
+      },
+    }).catch(() => null);
+  }
 }
 
 function engineeringPriorityBucket(task: EngineeringTask): "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" {
@@ -908,12 +958,16 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
     // Funnel Recovery Mode: only allow recovery-class tasks
     eligibleEngTasks = allEngTasks.filter((t) => isFunnelRecoveryTask(t as unknown as ManualActionTask));
   } else {
-    // Healthy funnel: build R-impact queue and prefer high-impact tasks
+    // Healthy funnel: build R-impact queue and prefer high-impact tasks.
+    // Apply stale/duplicate suppression before ranking.
     const pendingEngTasks = allEngTasks.filter((t) => !excludedTaskIds.includes(t.id));
     if (pendingEngTasks.length > 1) {
-      const rImpactQueue = buildRImpactQueue([], pendingEngTasks, { maxResults: pendingEngTasks.length });
-      if (rImpactQueue.length > 0) {
-        const rImpactOrder = new Map(rImpactQueue.map((r, idx) => [r.taskId, idx]));
+      const rImpact = buildRImpactQueueWithSuppression([], pendingEngTasks, { maxResults: pendingEngTasks.length });
+      if (rImpact.suppressed.length > 0) {
+        await persistSuppressedAdaptiveTasks(rImpact.suppressed, allEngTasks);
+      }
+      if (rImpact.queue.length > 0) {
+        const rImpactOrder = new Map(rImpact.queue.map((r, idx) => [r.taskId, idx]));
         eligibleEngTasks = allEngTasks.slice().sort((a, b) => {
           const aRank = rImpactOrder.get(a.id) ?? 9999;
           const bRank = rImpactOrder.get(b.id) ?? 9999;
@@ -1069,7 +1123,8 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
     const verif = (responseBody.verification ?? { buildOk: true, smokeOk: true, details: {} }) as { buildOk: boolean; smokeOk: boolean; details: Record<string, unknown> };
     const resolved = (responseBody.resolution as { resolved?: boolean } | undefined)?.resolved ?? false;
     const taskStatus = resolved ? "COMPLETED" as const : "FAILED" as const;
-    const stopReason = (!verif.buildOk || !verif.smokeOk) ? "verification_failed" : undefined;
+    const hardFailure = (verif.details as { hardFailure?: boolean } | undefined)?.hardFailure === true;
+    const stopReason = hardFailure ? "verification_failed" : undefined;
     return {
       taskId: taskToExecute.id, title: taskToExecute.title, status: taskStatus,
       source: "engineering-backlog", patchApplied: responseBody.patchApplied as boolean ?? false,

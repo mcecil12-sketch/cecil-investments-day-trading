@@ -429,12 +429,16 @@ export interface StructuredVerificationResult {
     buildOk: boolean;
     smokeOk: boolean;
     failureReason: string | null;
+    hardFailure: boolean;
+    softWarning: boolean;
+    warningCode: string | null;
   };
   probeResults: Array<{
     route: string;
     ok: boolean;
     status: number | null;
     reason: string | null;
+    timedOut?: boolean;
   }>;
   taskSpecificResults: Array<{
     target: string;

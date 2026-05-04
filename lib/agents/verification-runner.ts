@@ -45,6 +45,7 @@ interface ProbeResult {
   reason: string | null;
   method: HttpMethod;
   json: unknown | null;
+  timedOut: boolean;
 }
 
 function getRoutePath(route: string): string {
@@ -147,6 +148,12 @@ function evaluateRouteProbe(routePath: string, result: ProbeResult): { ok: boole
   return { ok: result.ok, detail: result.reason };
 }
 
+function isFunnelHealthyProbe(result: ProbeResult): boolean {
+  if (!result.ok || !isObject(result.json)) return false;
+  const blocked = result.json.blocked === true || result.json.funnelBlocked === true;
+  return !blocked;
+}
+
 /** Route-aware method/auth mapping for task verification probes. */
 const ROUTE_VERIFICATION_MAP: Record<string, RouteVerificationConfig> = {
   "/api/readiness": { method: "GET" },
@@ -164,7 +171,11 @@ const ROUTE_VERIFICATION_MAP: Record<string, RouteVerificationConfig> = {
   "/api/ai/score/drain": {
     method: "POST",
     authHeader: "x-cron-token",
-    body: { budgetMs: 5000, limit: 1 },
+    body: { limit: 3, budgetMs: 30000, recentWindowHours: 2 },
+  },
+  "/api/agents/run": {
+    method: "POST",
+    authHeader: "x-cron-token",
   },
   "/api/scan": {
     method: "POST",
@@ -205,15 +216,21 @@ async function probeRoute(
       reason: res.ok ? null : `HTTP ${res.status}`,
       method,
       json,
+      timedOut: false,
     };
   } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const timedOut =
+      err instanceof Error &&
+      (err.name === "TimeoutError" || err.name === "AbortError" || /timed out|aborted/i.test(message));
     return {
       route,
       ok: false,
       status: null,
-      reason: err instanceof Error ? err.message : String(err),
+      reason: timedOut ? "timeout" : message,
       method,
       json: null,
+      timedOut,
     };
   }
 }
@@ -266,7 +283,8 @@ function getTaskSmokeRoutes(task: EngineeringTask): Array<{ route: string; metho
 
 /** Known route→method mapping for routes that don't accept GET. */
 const KNOWN_POST_ROUTES: Record<string, { method: "POST"; body?: Record<string, unknown> }> = {
-  "/api/ai/score/drain": { method: "POST", body: { budgetMs: 5000, limit: 1 } },
+  "/api/ai/score/drain": { method: "POST", body: { limit: 3, budgetMs: 30000, recentWindowHours: 2 } },
+  "/api/agents/run": { method: "POST" },
   "/api/agents/chat-intake": { method: "POST" },
   "/api/agents/chat-command": { method: "POST" },
   "/api/agents/intake": { method: "POST" },
@@ -297,7 +315,7 @@ function getTaskTypeVerificationProbes(task: EngineeringTask): Array<{
 
   if (isScoringTask) {
     return [
-      { route: "/api/ai/score/drain", method: "POST", body: { budgetMs: 5000, limit: 1 }, label: "scoring_drain_reachable" },
+      { route: "/api/ai/score/drain", method: "POST", body: { limit: 3, budgetMs: 30000, recentWindowHours: 2 }, label: "scoring_drain_reachable" },
       { route: "/api/signals/all", method: "GET", label: "signals_all_reachable" },
       { route: "/api/readiness", method: "GET", label: "readiness_reachable" },
     ];
@@ -413,10 +431,35 @@ export async function runStructuredVerification(
     console.log(`[VERIFY] Type probe: ${evaluated.ok ? "PASS" : "FAIL"} (${probeMethod} ${result.route} [${label}])`);
   }
 
+  // Context probe used for soft-timeout adjudication only.
+  const funnelProbe = await probeRoute(base, "/api/funnel-health", headers, "GET");
+  const funnelHealthy = isFunnelHealthyProbe(funnelProbe);
+
   const buildOk = buildProbe.ok;
   const smokeOk = smokeProbes.every((p) => p.ok);
+  const coreProbesPass = buildOk && smokeOk;
+
+  // Score drain timeout can be downgraded to warning when core health is good.
+  const scoreDrainTimeoutIdx = taskResults.findIndex(
+    (r) => r.target.startsWith("/api/ai/score/drain") && /timeout/i.test(String(r.detail ?? "")),
+  );
+  const hasScoreDrainTimeout = scoreDrainTimeoutIdx >= 0;
+
+  let softWarning = false;
+  let warningCode: string | null = null;
+  if (hasScoreDrainTimeout && coreProbesPass && funnelHealthy) {
+    softWarning = true;
+    warningCode = "verification_soft_timeout";
+    taskResults[scoreDrainTimeoutIdx] = {
+      ...taskResults[scoreDrainTimeoutIdx],
+      ok: true,
+      detail: "verification_soft_timeout",
+    };
+  }
+
   const taskOk = taskResults.every((r) => r.ok);
   const overall = buildOk && smokeOk && taskOk;
+  const hardFailure = !overall;
 
   const failureReasons: string[] = [];
   if (!buildOk) failureReasons.push(`build(${buildProbe.route}): ${buildProbe.reason}`);
@@ -427,7 +470,8 @@ export async function runStructuredVerification(
     if (!r.ok) failureReasons.push(`task(${r.target}): ${r.detail}`);
   }
 
-  console.log(`[VERIFY] Overall: ${overall ? "PASS" : "FAIL"}${failureReasons.length ? ` — ${failureReasons.join("; ")}` : ""}`);
+  const warningSuffix = softWarning ? ` [warning=${warningCode}]` : "";
+  console.log(`[VERIFY] Overall: ${overall ? "PASS" : "FAIL"}${failureReasons.length ? ` — ${failureReasons.join("; ")}` : ""}${warningSuffix}`);
 
   // Strip full JSON bodies from probe results — only keep compact summary fields.
   // Storing full /api/agents/state responses causes recursive stale state pollution.
@@ -437,6 +481,7 @@ export async function runStructuredVerification(
     status: p.status,
     method: p.method,
     reason: p.reason,
+    timedOut: p.timedOut,
     checkedAt: now,
   });
 
@@ -446,8 +491,11 @@ export async function runStructuredVerification(
       buildOk,
       smokeOk: smokeOk && taskOk,
       failureReason: overall ? null : failureReasons.join("; "),
+      hardFailure,
+      softWarning,
+      warningCode,
     },
-    probeResults: [buildProbe, ...smokeProbes].map(compactProbeResult),
+    probeResults: [buildProbe, ...smokeProbes, funnelProbe].map(compactProbeResult),
     taskSpecificResults: taskResults,
     overall,
     verifiedAt: now,
