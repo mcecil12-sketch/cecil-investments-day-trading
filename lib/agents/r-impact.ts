@@ -295,7 +295,7 @@ function isAdaptiveOrProfitTask(title: string): boolean {
   return /^\[(adaptive|profitengine)\]/i.test(title.trim());
 }
 
-function extractNewClosedTradesSinceLastFix(task: EngineeringTask): number {
+export function extractNewClosedTradesSinceLastFix(task: EngineeringTask): number {
   const snap = task.linkedTelemetrySnapshot;
   if (!snap || typeof snap !== "object") return 0;
   const value = (snap as Record<string, unknown>).newClosedTradesSinceLastFix;

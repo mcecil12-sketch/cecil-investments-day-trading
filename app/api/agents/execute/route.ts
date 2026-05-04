@@ -64,9 +64,17 @@ import {
   buildRImpactQueueWithSuppression,
   scoreManualTask,
   scoreEngineeringTask,
+  extractNewClosedTradesSinceLastFix,
   type RImpactSuppressedTask,
 } from "@/lib/agents/r-impact";
-import { recordDuplicateExecutionSkip, buildDedupeKey } from "@/lib/agents/task-dedup";
+import {
+  recordDuplicateExecutionSkip,
+  recordInsufficientDataSkip,
+  buildDedupeKey,
+  acquireExecutionLock,
+  releaseExecutionLock,
+  REOPT_MIN_NEW_TRADES,
+} from "@/lib/agents/task-dedup";
 import type {
   EngineeringTask,
   ExecutionPhase,
@@ -739,14 +747,29 @@ async function collectDryRunCandidates(
           t.patchPlan?.targetFiles ?? [],
         );
         const tAsTask = t as unknown as { taskType?: string | null; title: string; priority?: string | null };
+
+        // Stale adaptive/profit guard: override readiness when evidence is stale
+        // and insufficient new closed trades exist since last fix.
+        let effectiveReady = readiness.executionReady;
+        let effectiveBlocked = readiness.blockedReason;
+        let effectiveReasons = readiness.readinessReasons;
+        if (readiness.executionReady && isAdaptiveOrProfitTitle(t.title)) {
+          const newTrades = extractNewClosedTradesSinceLastFix(t);
+          if (rImpact.evidenceFreshness === "stale" && newTrades < REOPT_MIN_NEW_TRADES) {
+            effectiveReady = false;
+            effectiveBlocked = "stale_evidence_insufficient_new_trade_data";
+            effectiveReasons = ["requires_new_closed_trades", `newClosedTradesSinceLastFix=${newTrades} < ${REOPT_MIN_NEW_TRADES}`];
+          }
+        }
+
         candidates.push({
           taskId: t.id,
           title: t.title,
           source: "engineering-backlog",
           priority: t.incidentId ? "HIGH" : "MEDIUM",
-          executionReady: readiness.executionReady,
-          blockedReason: readiness.blockedReason,
-          readinessReasons: readiness.readinessReasons,
+          executionReady: effectiveReady,
+          blockedReason: effectiveBlocked,
+          readinessReasons: effectiveReasons,
           requiresApproval: readiness.requiresApproval,
           hasPatchPlan: readiness.hasPatchPlan,
           hasVerificationPlan: readiness.hasVerificationPlan,
@@ -990,6 +1013,52 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
     };
   }
 
+  // ── Stale adaptive/profit guard ────────────────────────────────────
+  // Block execution of adaptive/profit tasks when evidence is stale and
+  // insufficient new closed trades exist since last fix.
+  if (isAdaptiveOrProfitTitle(engTask.title)) {
+    const adaptiveRImpact = scoreEngineeringTask(engTask);
+    const newTrades = extractNewClosedTradesSinceLastFix(engTask);
+    if (adaptiveRImpact.evidenceFreshness === "stale" && newTrades < REOPT_MIN_NEW_TRADES) {
+      await recordInsufficientDataSkip().catch(() => null);
+      const dedupeKeyForLock = buildDedupeKey(
+        engTask.title,
+        undefined,
+        engTask.patchPlan?.mode ?? undefined,
+        engTask.patchPlan?.targetFiles ?? [],
+      );
+      await updateEngineeringTaskById(engTask.id, {
+        status: "BLOCKED",
+        remediationAttempted: false,
+        executionStatus: "BLOCKED",
+        executionError: "stale_evidence_insufficient_new_trade_data",
+        notes: appendNotes(engTask.notes, [
+          `Execution blocked: stale_evidence_insufficient_new_trade_data`,
+          `evidenceFreshness=${adaptiveRImpact.evidenceFreshness} newClosedTradesSinceLastFix=${newTrades} (requires >=${REOPT_MIN_NEW_TRADES})`,
+        ]),
+        linkedTelemetrySnapshot: {
+          ...(engTask.linkedTelemetrySnapshot ?? {}),
+          suppressionReason: "BLOCKED_INSUFFICIENT_NEW_DATA",
+          newClosedTradesSinceLastFix: newTrades,
+        },
+      }).catch(() => null);
+      // acquire a 24h execution lock to prevent same fix class re-execution
+      await acquireExecutionLock(dedupeKeyForLock).catch(() => null);
+      return {
+        taskId: engTask.id,
+        title: engTask.title,
+        status: "SKIPPED",
+        source: "engineering-backlog",
+        patchApplied: false,
+        verification: { buildOk: true, smokeOk: true, details: {} },
+        resolution: { resolved: false, reason: "stale_evidence_insufficient_new_trade_data" },
+        executionPhases: [phaseResult("SELECT_TASK", "failed", "stale_evidence_insufficient_new_trade_data")],
+        safetyStopReason: "stale_evidence_insufficient_new_trade_data",
+      };
+    }
+  }
+
+
   const engPhases: ExecutionPhaseResult[] = [];
   engPhases.push(phaseResult("SELECT_TASK", "passed", `task: ${engTask.id}`));
 
@@ -1125,6 +1194,19 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
     const taskStatus = resolved ? "COMPLETED" as const : "FAILED" as const;
     const hardFailure = (verif.details as { hardFailure?: boolean } | undefined)?.hardFailure === true;
     const stopReason = hardFailure ? "verification_failed" : undefined;
+
+    // After a successful adaptive/profit commit, set a 24h execution lock to
+    // prevent re-execution of the same fix class before new trade data arrives.
+    if (taskStatus === "COMPLETED" && isAdaptiveOrProfitTitle(taskToExecute.title)) {
+      const adaptiveLockKey = buildDedupeKey(
+        taskToExecute.title,
+        undefined,
+        taskToExecute.patchPlan?.mode ?? undefined,
+        taskToExecute.patchPlan?.targetFiles ?? [],
+      );
+      await acquireExecutionLock(adaptiveLockKey).catch(() => null);
+    }
+
     return {
       taskId: taskToExecute.id, title: taskToExecute.title, status: taskStatus,
       source: "engineering-backlog", patchApplied: responseBody.patchApplied as boolean ?? false,
@@ -1942,6 +2024,15 @@ export async function POST(req: NextRequest) {
         batchResults.push(cycle);
         if (cycle.taskId) executedTaskIds.push(cycle.taskId);
         console.log(`[AGENT-EXECUTE] Skipping approval-required task at iteration ${i + 1}: ${cycle.taskId ?? "(unknown)"}`);
+        continue;
+      }
+
+      // Stale adaptive/profit tasks are skipped and excluded — batch continues.
+      if (cycle.safetyStopReason === "stale_evidence_insufficient_new_trade_data") {
+        skippedCount++;
+        batchResults.push(cycle);
+        if (cycle.taskId) executedTaskIds.push(cycle.taskId);
+        console.log(`[AGENT-EXECUTE] Skipping stale adaptive task at iteration ${i + 1}: ${cycle.taskId ?? "(unknown)"}`);
         continue;
       }
 
