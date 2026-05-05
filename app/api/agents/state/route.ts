@@ -263,7 +263,13 @@ export async function GET(req: Request) {
       return APPROVAL_TRADING_FILE_PREFIXES.some((prefix) => norm.startsWith(prefix.toLowerCase()));
     });
   }
-  const allowTradingFiles = process.env.AGENT_ALLOW_TRADING_FILES === "1";
+  const allowTradingFilesExplicit = process.env.AGENT_ALLOW_TRADING_FILES === "1";
+  const isPaperModeForAutonomy = !(["0", "false", "no", "off"].includes(
+    String(process.env.AUTO_TRADING_PAPER_ONLY ?? "1").trim().toLowerCase(),
+  ));
+  const allowTradingFiles =
+    allowTradingFilesExplicit ||
+    (isPaperModeForAutonomy && process.env.AGENT_ALLOW_TRADING_FILES_PAPER !== "0");
   const approvalRequiredQueue = allowTradingFiles
     ? []
     : tasks
@@ -653,6 +659,18 @@ export async function GET(req: Request) {
     executionStats: {
       skippedLowImpactCount: 0, // populated by execute route in future runs
       skippedDuplicateFixClassCount: dedupStats.skippedDuplicateExecutionCount,
+    },
+
+    // ─── Trading file autonomy ──────────────────────────────────────
+    tradingFileAutonomy: {
+      autonomyEnabled: allowTradingFiles,
+      mode: isPaperModeForAutonomy
+        ? "paper_only"
+        : allowTradingFilesExplicit
+          ? "explicit"
+          : null,
+      // Guardrails are always active — patch plans require commit + verification gate
+      guardrailsActive: true,
     },
   });
 }

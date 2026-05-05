@@ -17,6 +17,7 @@ import {
   type SeedSkipReason,
 } from "@/lib/autoEntry/seedTelemetry";
 import { normalizeTradePlanForSide } from "@/lib/trades/planNormalization";
+import { getLatestQuote } from "@/lib/alpaca";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -728,6 +729,23 @@ export async function POST(req: NextRequest) {
   const allQualifyingCandidates: QualifiedCandidate[] = [];
   const candidateKey = (c: QualifiedCandidate) => `${c.signalId}:${c.symbol}:${c.side}:${c.createdAt}`;
 
+  // Tracks fresh qualified signals blocked only by SOFT overlay (grade C restriction).
+  // Used for the recovery seed logic when all fresh signals are SOFT-blocked.
+  const softOverlayBlockedCandidates: Array<{
+    signalId: string;
+    symbol: string;
+    side: "LONG" | "SHORT";
+    aiScore: number;
+    entryPrice: number;
+    stopPrice: number;
+    targetPrice: number;
+    tier: string;
+    ageMs: number;
+    blockRule: string;
+    blockValue: string;
+    blockThreshold: string;
+  }> = [];
+
   for (const s of qualifiedSignals || []) {
 
     const signalId = String(s?.id || "").trim();
@@ -833,7 +851,55 @@ export async function POST(req: NextRequest) {
     }
 
     if ((tier === "C" && !cfg.allowedTiers.includes("C")) || !overlay.allowedGrades.includes(tier as "A" | "B" | "C")) {
-      markSkip("overlay_block");
+      const blockRule = !overlay.allowedGrades.includes(tier as "A" | "B" | "C")
+        ? "grade_not_in_allowedGrades"
+        : "tier_c_not_in_allowedTiers";
+      const blockThreshold = overlay.allowedGrades.join(",");
+      // SOFT block = grade "C" restricted by overlay → eligible for recovery seed.
+      // HARD block = A/B grade excluded or config-level tier restriction → never bypass.
+      const blockClass: "HARD" | "SOFT" = tier === "C" ? "SOFT" : "HARD";
+
+      // Track soft-blocked fresh candidates for recovery logic
+      if (
+        blockClass === "SOFT" &&
+        Number.isFinite(ageMs) &&
+        ageMs <= staleThresholdUsedMs &&
+        Number.isFinite(aiScore) &&
+        (aiScore as number) > 0 &&
+        side &&
+        entryPrice != null && entryPrice > 0 &&
+        stopPrice != null && stopPrice > 0 &&
+        targetPrice != null && targetPrice > 0
+      ) {
+        softOverlayBlockedCandidates.push({
+          signalId,
+          symbol,
+          side: side as "LONG" | "SHORT",
+          aiScore: aiScore as number,
+          entryPrice: normalizedPlan.normalizedEntryPrice,
+          stopPrice: normalizedPlan.normalizedStopPrice,
+          targetPrice: normalizedPlan.normalizedTargetPrice,
+          tier: tier as string,
+          ageMs: ageMs as number,
+          blockRule,
+          blockValue: tier as string,
+          blockThreshold,
+        });
+      }
+
+      skipped.push({ signalId, symbol, reason: "overlay_block", side });
+      bumpSkipReason(skippedByReason, "overlay_block");
+      if (signalId) {
+        attributionBySignalId.set(signalId, {
+          symbol,
+          seedOutcome: "skipped",
+          seedReason: "overlay_block",
+          linkedTradeId: null,
+          createdAt,
+          ageMs,
+          side,
+        });
+      }
       continue;
     }
 
@@ -1082,6 +1148,276 @@ export async function POST(req: NextRequest) {
     });
   }
 
+  // ── SOFT-block recovery seed ─────────────────────────────────────────────
+  // When ALL fresh qualified signals were blocked by SOFT overlay grade restriction
+  // and no seeds were created, allow ONE recovery seed with tier cap = B and
+  // reduced position size (50% risk). This recovers throughput without bypassing
+  // hard safety checks.
+  let softRecoveryAttempted = false;
+  let softRecoveryExecuted = false;
+  let softRecoverySignalId: string | null = null;
+  if (
+    !dryRun &&
+    marketOpen &&
+    created.length === 0 &&
+    effectiveLimit > 0 &&
+    softOverlayBlockedCandidates.length > 0 &&
+    freshQualifiedSignals > 0 &&
+    softOverlayBlockedCandidates.length >= freshQualifiedSignals
+  ) {
+    softRecoveryAttempted = true;
+    // Pick best soft-blocked candidate by aiScore DESC
+    const sortedSoftCandidates = [...softOverlayBlockedCandidates].sort((a, b) => b.aiScore - a.aiScore);
+    const recoveryCand = sortedSoftCandidates[0];
+    // Only proceed if this signal isn't already active/terminal
+    const isAlreadyActive = activeSignalIds.has(recoveryCand.signalId) || activeSymbolSide.has(`${recoveryCand.symbol}:${recoveryCand.side}`);
+    const isAlreadyTerminal = terminalSignalIds.has(recoveryCand.signalId);
+    if (!isAlreadyActive && !isAlreadyTerminal) {
+      const recoveryTier: AutoTier = "B"; // cap at B per recovery rule
+      const sessionMeta = deriveSessionMeta(nowIso);
+      const recoveryTradeId = crypto.randomUUID();
+      const recoveryTrade = {
+        id: recoveryTradeId,
+        symbol: recoveryCand.symbol,
+        ticker: recoveryCand.symbol,
+        side: recoveryCand.side,
+        entryPrice: recoveryCand.entryPrice,
+        stopPrice: recoveryCand.stopPrice,
+        targetPrice: recoveryCand.targetPrice,
+        takeProfitPrice: recoveryCand.targetPrice,
+        status: "AUTO_PENDING",
+        source: "AUTO",
+        paper: true,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        etDate: sessionMeta.etDate,
+        sessionTag: sessionMeta.sessionTag,
+        signalId: recoveryCand.signalId,
+        aiScore: recoveryCand.aiScore,
+        tier: recoveryTier,
+        ai: {
+          score: recoveryCand.aiScore,
+          tier: recoveryTier,
+          grade: null,
+          riskMult: riskMultForTier(recoveryTier) * 0.5,
+          riskDollars: cfg.baseRiskDollars * riskMultForTier(recoveryTier) * 0.5,
+          qualified: true,
+          summary: "",
+        },
+        autoEntryStatus: "AUTO_PENDING",
+        seededAt: nowIso,
+        executeOutcome: "PENDING",
+        executeReason: null as null,
+        recoveryMode: true,
+        recoveryReason: "soft_overlay_block_recovery",
+        recoveryTierCap: recoveryTier,
+        recoveryReducedSize: true,
+        originalTier: recoveryCand.tier,
+      };
+      await upsertTrade(recoveryTrade);
+      if (recoveryCand.side === "LONG") seededLong += 1;
+      if (recoveryCand.side === "SHORT") seededShort += 1;
+      created.push({
+        id: recoveryTradeId,
+        symbol: recoveryCand.symbol,
+        side: recoveryCand.side,
+        signalId: recoveryCand.signalId,
+        aiScore: recoveryCand.aiScore,
+        effectiveScore: recoveryCand.aiScore,
+        tier: recoveryTier,
+        originalEntryPrice: recoveryCand.entryPrice,
+        originalStopPrice: recoveryCand.stopPrice,
+        originalTargetPrice: recoveryCand.targetPrice,
+        normalizedEntryPrice: recoveryCand.entryPrice,
+        normalizedStopPrice: recoveryCand.stopPrice,
+        normalizedTargetPrice: recoveryCand.targetPrice,
+        normalizedForSide: false,
+        recoveryMode: true,
+        dryRun: false,
+      });
+      attributionBySignalId.set(recoveryCand.signalId, {
+        symbol: recoveryCand.symbol,
+        seedOutcome: "created",
+        seedReason: "soft_overlay_block_recovery",
+        linkedTradeId: recoveryTradeId,
+        createdAt: String(recoveryCand.ageMs),
+        ageMs: recoveryCand.ageMs,
+        side: recoveryCand.side,
+      });
+      softRecoveryExecuted = true;
+      softRecoverySignalId = recoveryCand.signalId;
+    }
+  }
+
+  // ── Stale signal recovery seed ─────────────────────────────────────────
+  // When freshQualifiedSignals === 0 but staleQualifiedSignals > 0 and market is open
+  // with capacity available: widen to 90-min window and allow ONE A/B-tier stale seed
+  // if broker is flat, protection is clear, and the current quote validates the prices.
+  let staleRecoveryAttempted = false;
+  let staleRecoveryExecuted = false;
+  let staleRecoverySignalId: string | null = null;
+  let staleRecoveryFailReason: string | null = null;
+  const staleRecoveryFreshMs = 90 * 60_000; // 90-minute recovery window (absolute)
+  if (
+    !dryRun &&
+    marketOpen &&
+    created.length === 0 &&
+    effectiveLimit > 0 &&
+    freshQualifiedSignals === 0 &&
+    staleQualifiedSignals > 0
+  ) {
+    staleRecoveryAttempted = true;
+    const brokerIsFlat =
+      (brokerTruth.positionsCount ?? 0) === 0 &&
+      (brokerTruth.openOrdersCount ?? 0) === 0;
+    if (!brokerIsFlat) {
+      staleRecoveryFailReason = "broker_not_flat";
+    } else {
+      // Find stale-but-qualified A/B-tier signals in the recovery window
+      const staleRecoveryCandidates: QualifiedCandidate[] = [];
+      for (const s of qualifiedSignals || []) {
+        const signalId = String(s?.id || "").trim();
+        if (!signalId) continue;
+        if (activeSignalIds.has(signalId) || terminalSignalIds.has(signalId)) continue;
+        const tsMs = getSignalTimestampMs(s);
+        const ageMs = Number.isFinite(tsMs) ? Math.max(0, nowMs - (tsMs as number)) : Number.POSITIVE_INFINITY;
+        if (!Number.isFinite(ageMs)) continue;
+        // Must be stale according to normal threshold but within the 90-min recovery window
+        if (ageMs <= staleThresholdUsedMs || ageMs > staleRecoveryFreshMs) continue;
+        const aiScoreRaw = getNum(s, ["aiScore", "score", "ai.score"]);
+        const scoreTier = Number.isFinite(aiScoreRaw as number) ? tierForScore(aiScoreRaw as number) : null;
+        const gradeTierRaw = normalizeTier(getStr(s, ["aiGrade", "grade", "ai.grade"]));
+        const tier = scoreTier || gradeTierRaw;
+        // Only A and B tier in stale recovery
+        if (tier !== "A" && tier !== "B") continue;
+        const side = getDirection(s);
+        if (!side) continue;
+        if (activeSymbolSide.has(`${getSymbol(s) || "UNKNOWN"}:${side}`)) continue;
+        const entryPrice = getNum(s, ["entryPrice", "ai.entryPrice"]);
+        const stopPrice = getNum(s, ["stopPrice", "ai.stopPrice"]);
+        const targetPrice = getNum(s, ["targetPrice", "takeProfitPrice", "ai.targetPrice", "ai.takeProfitPrice"]);
+        if (!(entryPrice != null && entryPrice > 0 && stopPrice != null && stopPrice > 0 && targetPrice != null && targetPrice > 0)) continue;
+        const normalizedPlan = normalizeTradePlanForSide({ side, entryPrice, stopPrice, targetPrice, rewardMultiple: 2 });
+        if (!normalizedPlan.ok) continue;
+        staleRecoveryCandidates.push({
+          symbol: getSymbol(s) || "UNKNOWN",
+          side,
+          aiScore: aiScoreRaw as number,
+          entryPrice: normalizedPlan.normalizedEntryPrice,
+          stopPrice: normalizedPlan.normalizedStopPrice,
+          targetPrice: normalizedPlan.normalizedTargetPrice,
+          originalEntryPrice: normalizedPlan.originalEntryPrice,
+          originalStopPrice: normalizedPlan.originalStopPrice,
+          originalTargetPrice: normalizedPlan.originalTargetPrice,
+          normalizedForSide: normalizedPlan.normalizedForSide,
+          tier,
+          signalId,
+          createdAt: String(s?.createdAt || s?.updatedAt || nowIso),
+          shortPenalty: 0,
+          effectiveScore: aiScoreRaw as number,
+          actionabilityRank: getNum(s, ["actionabilityRank"]) ?? 5,
+          ageMs,
+        });
+      }
+      if (staleRecoveryCandidates.length === 0) {
+        staleRecoveryFailReason = "no_ab_tier_signals_in_recovery_window";
+      } else {
+        staleRecoveryCandidates.sort((a, b) => b.aiScore - a.aiScore);
+        const recoveryCand = staleRecoveryCandidates[0];
+        // Quote validation: verify current mid-price is within 10% of signal entry (best-effort)
+        let quoteValid = true;
+        let quoteMidPrice: number | null = null;
+        try {
+          const quote = await getLatestQuote(recoveryCand.symbol);
+          quoteMidPrice = ((quote.ask_price ?? 0) + (quote.bid_price ?? 0)) / 2;
+          if (quoteMidPrice > 0 && recoveryCand.entryPrice > 0) {
+            const driftPct = Math.abs(quoteMidPrice - recoveryCand.entryPrice) / recoveryCand.entryPrice;
+            quoteValid = driftPct <= 0.10;
+          }
+        } catch {
+          // Quote fetch failed — allow recovery (execute route will re-check drift)
+          quoteValid = true;
+        }
+        if (!quoteValid) {
+          staleRecoveryFailReason = `quote_price_drift_exceeded:mid=${quoteMidPrice}:entry=${recoveryCand.entryPrice}`;
+        } else {
+          const sessionMeta = deriveSessionMeta(nowIso);
+          const staleRecoveryTradeId = crypto.randomUUID();
+          const recoveryTier: AutoTier = recoveryCand.tier as AutoTier;
+          const staleRecoveryTrade = {
+            id: staleRecoveryTradeId,
+            symbol: recoveryCand.symbol,
+            ticker: recoveryCand.symbol,
+            side: recoveryCand.side,
+            entryPrice: recoveryCand.entryPrice,
+            stopPrice: recoveryCand.stopPrice,
+            targetPrice: recoveryCand.targetPrice,
+            takeProfitPrice: recoveryCand.targetPrice,
+            status: "AUTO_PENDING",
+            source: "AUTO",
+            paper: true,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            etDate: sessionMeta.etDate,
+            sessionTag: sessionMeta.sessionTag,
+            signalId: recoveryCand.signalId,
+            aiScore: recoveryCand.aiScore,
+            tier: recoveryTier,
+            ai: {
+              score: recoveryCand.aiScore,
+              tier: recoveryTier,
+              grade: null,
+              riskMult: riskMultForTier(recoveryTier),
+              riskDollars: cfg.baseRiskDollars * riskMultForTier(recoveryTier),
+              qualified: true,
+              summary: "",
+            },
+            autoEntryStatus: "AUTO_PENDING",
+            seededAt: nowIso,
+            executeOutcome: "PENDING",
+            executeReason: null as null,
+            recoveryMode: true,
+            recoveryReason: "stale_signal_recovery",
+            recoveryWindowMs: staleRecoveryFreshMs,
+            originalAgeMs: recoveryCand.ageMs,
+          };
+          await upsertTrade(staleRecoveryTrade);
+          if (recoveryCand.side === "LONG") seededLong += 1;
+          if (recoveryCand.side === "SHORT") seededShort += 1;
+          created.push({
+            id: staleRecoveryTradeId,
+            symbol: recoveryCand.symbol,
+            side: recoveryCand.side,
+            signalId: recoveryCand.signalId,
+            aiScore: recoveryCand.aiScore,
+            effectiveScore: recoveryCand.aiScore,
+            tier: recoveryTier,
+            originalEntryPrice: recoveryCand.originalEntryPrice,
+            originalStopPrice: recoveryCand.originalStopPrice,
+            originalTargetPrice: recoveryCand.originalTargetPrice,
+            normalizedEntryPrice: recoveryCand.entryPrice,
+            normalizedStopPrice: recoveryCand.stopPrice,
+            normalizedTargetPrice: recoveryCand.targetPrice,
+            normalizedForSide: recoveryCand.normalizedForSide,
+            recoveryMode: true,
+            dryRun: false,
+          });
+          attributionBySignalId.set(recoveryCand.signalId, {
+            symbol: recoveryCand.symbol,
+            seedOutcome: "created",
+            seedReason: "stale_signal_recovery",
+            linkedTradeId: staleRecoveryTradeId,
+            createdAt: recoveryCand.createdAt,
+            ageMs: recoveryCand.ageMs,
+            side: recoveryCand.side,
+          });
+          staleRecoveryExecuted = true;
+          staleRecoverySignalId = recoveryCand.signalId;
+        }
+      }
+    }
+  }
+
   const seedEvaluatedAt = new Date().toISOString();
   let updatedSignalsCount = 0;
   const updatedSignals: StoredSignal[] = (allStoredSignals || []).map((sig) => {
@@ -1327,6 +1663,30 @@ export async function POST(req: NextRequest) {
       minScoreAdjustment: overlay.minScoreAdjustment,
       maxEntriesOverride: overlay.maxEntriesOverride,
       stateAvailable: overlay.stateAvailable,
+    },
+    overlayBlockDiagnostics: softOverlayBlockedCandidates.slice(0, 20).map((c) => ({
+      signalId: c.signalId,
+      symbol: c.symbol,
+      side: c.side,
+      tier: c.tier,
+      aiScore: c.aiScore,
+      blockRule: c.blockRule,
+      blockClass: "SOFT",
+      blockValue: c.blockValue,
+      blockThreshold: c.blockThreshold,
+    })),
+    softOverlayBlockRecovery: {
+      attempted: softRecoveryAttempted,
+      executed: softRecoveryExecuted,
+      signalId: softRecoverySignalId,
+      reason: softRecoveryAttempted && !softRecoveryExecuted ? "signal_already_active_or_terminal" : null,
+    },
+    staleSignalRecovery: {
+      attempted: staleRecoveryAttempted,
+      executed: staleRecoveryExecuted,
+      signalId: staleRecoverySignalId,
+      recoveryWindowMs: staleRecoveryFreshMs,
+      reason: staleRecoveryAttempted && !staleRecoveryExecuted ? staleRecoveryFailReason : null,
     },
   }, { status: 200 });
 }

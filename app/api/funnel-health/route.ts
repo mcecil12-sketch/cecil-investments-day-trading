@@ -148,6 +148,12 @@ type FunnelHealthResponse = {
     stalePendingCount: number;
     executeSlaBreached: boolean;
   };
+  /** True when the final execution gate is actively blocking entries during market hours */
+  finalEntryGateBlocked?: boolean;
+  /** Primary reason the final entry gate is blocked */
+  topFinalGateReason?: "price_drift" | "overlay_block" | "stale_qualified_signal" | "no_pending" | null;
+  /** Operator-readable message for the top blocked gate reason */
+  finalGateActionableMessage?: string | null;
   error?: string;
   // DEBUG: Temporary field for attribution verification (can be removed later)
   _debug?: {
@@ -1090,6 +1096,39 @@ export async function GET() {
       // Stale/expired diagnostics
       ...(staleExpiredCount > 0 ? { staleExpiredCount } : {}),
       ...(staleTimingStats ? { staleTimingStats } : {}),
+      // ─── Final entry gate diagnostics ──────────────────────────────────
+      // Computed from existing per-trade counters; no extra queries needed.
+      ...(() => {
+        const isDriftBlocking = priceDriftSkippedCount > 0;
+        const isStaleSignalBlocking =
+          freshQualifiedSignals === 0 && staleQualifiedSignals > 0 && seeded === 0;
+        const isOverlayBlocking = scoreThresholdBlockedCount > 0;
+        const isNoPendingBlocking =
+          seeded > 0 && executed === 0 && freshUnresolvedPendingCount === 0;
+        const finalEntryGateBlocked =
+          marketOpen &&
+          (isDriftBlocking || isStaleSignalBlocking || isOverlayBlocking || isNoPendingBlocking);
+        const topFinalGateReason: "price_drift" | "overlay_block" | "stale_qualified_signal" | "no_pending" | null =
+          !finalEntryGateBlocked
+            ? null
+            : isDriftBlocking
+            ? "price_drift"
+            : isStaleSignalBlocking
+            ? "stale_qualified_signal"
+            : isOverlayBlocking
+            ? "overlay_block"
+            : "no_pending";
+        const finalGateActionableMessage: string | null = !finalEntryGateBlocked
+          ? null
+          : topFinalGateReason === "price_drift"
+          ? `${priceDriftSkippedCount} trade(s) archived for price drift — run seed-from-signals to create a fresh AUTO_PENDING.`
+          : topFinalGateReason === "stale_qualified_signal"
+          ? `${staleQualifiedSignals} qualified signal(s) are stale (>=${Math.round(staleThresholdUsedMs / 60_000)}min) and no fresh signals exist — trigger a scan + score drain to refresh, or rely on stale-signal recovery seed.`
+          : topFinalGateReason === "overlay_block"
+          ? `${scoreThresholdBlockedCount} trade(s) blocked by overlay/score thresholds — review overlay config or await score improvement.`
+          : `${seededButNotExecuted} AUTO_PENDING trade(s) seeded but no broker execution — check execute cron and broker connectivity.`;
+        return { finalEntryGateBlocked, topFinalGateReason, finalGateActionableMessage };
+      })(),
       // DEBUG: Temporary fields to verify source attribution
       _debug: {
         scope: dateET,

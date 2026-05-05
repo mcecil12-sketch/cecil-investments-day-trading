@@ -1447,7 +1447,7 @@ export async function POST(req: Request) {
         continue;
       }
 
-      // Validate price drift against current market
+      // Validate price drift against current market; attempt R-preserving recalculation
       if (carryoverQuote) {
         const currentPrice =
           carryoverQuote.last ??
@@ -1458,24 +1458,56 @@ export async function POST(req: Request) {
         if (currentPrice && currentPrice > 0) {
           const driftDiag = checkPriceDrift(currentPrice, safeNum(item.t.entryPrice, 0), safeNum(item.t.stopPrice, 0));
           if (!driftDiag.driftAllowed) {
-            trades[item.i] = {
-              ...trades[item.i],
-              status: "ARCHIVED",
-              autoEntryStatus: "AUTO_ARCHIVED",
-              reason: "invalid_after_revalidation",
-              error: undefined,
-              closedAt: trades[item.i]?.closedAt || nowForPending,
-              updatedAt: nowForPending,
-              executeAttemptedAt: nowForPending,
-              executeOutcome: "SKIPPED_PRICE_DRIFT",
-              executeReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple",
-              driftDiagnostics: driftDiag,
-            };
-            counts.carryoverArchivedCount += 1;
-            counts.skipped += 1;
-            tradesChanged = true;
-            notes.push(`carryover_revalidated:${carryoverTicker}:archived`);
-            continue;
+            // Attempt R-preserving recalculation
+            const coOrigRisk = Math.abs(safeNum(item.t.entryPrice, 0) - safeNum(item.t.stopPrice, 0));
+            const coOrigReward = Math.abs(safeNum(item.t.takeProfitPrice ?? item.t.targetPrice, 0) - safeNum(item.t.entryPrice, 0));
+            const coSide: "LONG" | "SHORT" = String(item.t.side || "LONG").toUpperCase() === "SHORT" ? "SHORT" : "LONG";
+            let coRecalcOk = false;
+            if (coOrigRisk > 0 && coOrigReward > 0) {
+              const coNewEntry = Number(currentPrice.toFixed(2));
+              const coNewStop = coSide === "LONG"
+                ? Number((coNewEntry - coOrigRisk).toFixed(2))
+                : Number((coNewEntry + coOrigRisk).toFixed(2));
+              const coNewTarget = coSide === "LONG"
+                ? Number((coNewEntry + coOrigReward).toFixed(2))
+                : Number((coNewEntry - coOrigReward).toFixed(2));
+              const coRecalcPlan = normalizeTradePlanForSide({ side: coSide, entryPrice: coNewEntry, stopPrice: coNewStop, targetPrice: coNewTarget, rewardMultiple: 2 });
+              if (coRecalcPlan.ok && coRecalcPlan.normalizedEntryPrice > 0 && coRecalcPlan.normalizedStopPrice > 0 && coRecalcPlan.normalizedTargetPrice > 0) {
+                trades[item.i] = {
+                  ...trades[item.i],
+                  entryPrice: coRecalcPlan.normalizedEntryPrice,
+                  stopPrice: coRecalcPlan.normalizedStopPrice,
+                  targetPrice: coRecalcPlan.normalizedTargetPrice,
+                  takeProfitPrice: coRecalcPlan.normalizedTargetPrice,
+                  executeOutcome: "RECALCULATED_ENTRY",
+                  driftRecalculatedAt: nowForPending,
+                  driftDiagnostics: driftDiag,
+                  originalEntryBeforeDrift: safeNum(item.t.entryPrice, 0),
+                  updatedAt: nowForPending,
+                };
+                coRecalcOk = true;
+              }
+            }
+            if (!coRecalcOk) {
+              trades[item.i] = {
+                ...trades[item.i],
+                status: "ARCHIVED",
+                autoEntryStatus: "AUTO_ARCHIVED",
+                reason: "invalid_after_revalidation",
+                error: undefined,
+                closedAt: trades[item.i]?.closedAt || nowForPending,
+                updatedAt: nowForPending,
+                executeAttemptedAt: nowForPending,
+                executeOutcome: "SKIPPED_PRICE_DRIFT",
+                executeReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple",
+                driftDiagnostics: driftDiag,
+              };
+              counts.carryoverArchivedCount += 1;
+              counts.skipped += 1;
+              tradesChanged = true;
+              notes.push(`carryover_revalidated:${carryoverTicker}:archived`);
+              continue;
+            }
           }
         }
       }
@@ -2465,25 +2497,79 @@ export async function POST(req: Request) {
 
   // Price drift guard: only reject if drift > 0.5R from planned entry.
   // When within tolerance, slide entryPrice to current market price.
+  // When drift exceeds tolerance, attempt R-preserving recalculation before archiving.
   let driftDiagnosticsForExec: PriceDriftDiagnostics | null = null;
   let executionAdjustments = false;
   if (decisionPriceForDrift) {
     const driftDiag = checkPriceDrift(decisionPriceForDrift, entryPrice, stopPrice);
     driftDiagnosticsForExec = driftDiag;
     if (!driftDiag.driftAllowed) {
-      counts.skipped += 1;
-      trades[idx] = archivePendingTrade(
-        trades[idx],
-        driftDiag.reason ?? "entry_price_drifted_risk_multiple",
-        "SKIPPED_PRICE_DRIFT",
-        { driftDiagnostics: driftDiag },
-      );
-      await writeTrades(trades);
-      await bumpAutoEntryFunnelSafe({ executeArchivedDrifted: 1 });
-      await recordOutcome({ outcome: "SKIP", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", ticker, tradeId });
-      perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_PRICE_DRIFT", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", aiScore: _tradeAiScore, tier: _tradeTier });
-      skippedTradeIds.push(tradeId);
-      continue;
+      // ── Attempt R-preserving recalculation using current market price ──
+      // Preserve original R-distance and reward-distance, slide entry to currentPrice.
+      // Only archive if the recalculated plan is structurally invalid.
+      let driftRecalcSucceeded = false;
+      const origRiskDist = Math.abs(entryPrice - stopPrice);
+      const origRewardDist = targetPrice != null ? Math.abs(targetPrice - entryPrice) : 0;
+      if (decisionPriceForDrift > 0 && origRiskDist > 0 && origRewardDist > 0) {
+        const recalcEntry = Number(decisionPriceForDrift.toFixed(2));
+        const recalcStop = sideEnum === "LONG"
+          ? Number((recalcEntry - origRiskDist).toFixed(2))
+          : Number((recalcEntry + origRiskDist).toFixed(2));
+        const recalcTarget = sideEnum === "LONG"
+          ? Number((recalcEntry + origRewardDist).toFixed(2))
+          : Number((recalcEntry - origRewardDist).toFixed(2));
+        const recalcPlan = normalizeTradePlanForSide({
+          side: sideEnum,
+          entryPrice: recalcEntry,
+          stopPrice: recalcStop,
+          targetPrice: recalcTarget,
+          rewardMultiple: 2,
+        });
+        if (
+          recalcPlan.ok &&
+          recalcPlan.normalizedEntryPrice > 0 &&
+          recalcPlan.normalizedStopPrice > 0 &&
+          recalcPlan.normalizedTargetPrice > 0
+        ) {
+          entryPrice = recalcPlan.normalizedEntryPrice;
+          stopPrice = recalcPlan.normalizedStopPrice;
+          targetPrice = recalcPlan.normalizedTargetPrice;
+          executionAdjustments = true;
+          driftRecalcSucceeded = true;
+          trades[idx] = {
+            ...trades[idx],
+            entryPrice,
+            stopPrice,
+            targetPrice,
+            takeProfitPrice: targetPrice,
+            executeOutcome: "RECALCULATED_ENTRY",
+            driftRecalculatedAt: nowIso(),
+            driftDiagnostics: driftDiag,
+            originalEntryBeforeDrift: safeNum(trade.entryPrice, 0),
+            originalStopBeforeDrift: safeNum(trade.stopPrice, 0),
+            originalTargetBeforeDrift: safeNum(trade.takeProfitPrice ?? trade.targetPrice, 0),
+            executionAdjustments: true,
+            updatedAt: nowIso(),
+          };
+          await writeTrades(trades);
+          notes.push(`drift_recalculated:${ticker}:newEntry=${entryPrice}:origEntry=${safeNum(trade.entryPrice, 0)}`);
+        }
+      }
+      if (!driftRecalcSucceeded) {
+        counts.skipped += 1;
+        trades[idx] = archivePendingTrade(
+          trades[idx],
+          driftDiag.reason ?? "entry_price_drifted_risk_multiple",
+          "SKIPPED_PRICE_DRIFT",
+          { driftDiagnostics: driftDiag },
+        );
+        await writeTrades(trades);
+        await bumpAutoEntryFunnelSafe({ executeArchivedDrifted: 1 });
+        await recordOutcome({ outcome: "SKIP", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", ticker, tradeId });
+        perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_PRICE_DRIFT", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", aiScore: _tradeAiScore, tier: _tradeTier });
+        skippedTradeIds.push(tradeId);
+        continue;
+      }
     }
     // Drift within tolerance — adjust entry to live price and preserve original R geometry.
     if (driftDiag.adjustedEntryPrice != null && driftDiag.adjustedEntryPrice !== entryPrice) {

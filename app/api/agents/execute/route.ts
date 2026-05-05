@@ -594,7 +594,13 @@ function computeEngineeringTaskReadiness(task: EngineeringTask): TaskReadinessDi
   let executionReady = false;
   let blockedReason: string | null = null;
   let requiresApproval = false;
-  const allowTradingFiles = process.env.AGENT_ALLOW_TRADING_FILES === "1";
+  const allowTradingFilesExplicit = process.env.AGENT_ALLOW_TRADING_FILES === "1";
+  const isPaperMode = !(["0", "false", "no", "off"].includes(
+    String(process.env.AUTO_TRADING_PAPER_ONLY ?? "1").trim().toLowerCase(),
+  ));
+  const allowTradingFiles =
+    allowTradingFilesExplicit ||
+    (isPaperMode && process.env.AGENT_ALLOW_TRADING_FILES_PAPER !== "0");
   const tradingFilesTouched = touchesTradingFiles([
     ...(task.likelyFiles ?? []),
     ...(task.patchPlan?.targetFiles ?? []),
@@ -1062,7 +1068,13 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
   const engPhases: ExecutionPhaseResult[] = [];
   engPhases.push(phaseResult("SELECT_TASK", "passed", `task: ${engTask.id}`));
 
-  const allowTradingFiles = process.env.AGENT_ALLOW_TRADING_FILES === "1";
+  const allowTradingFilesExplicit = process.env.AGENT_ALLOW_TRADING_FILES === "1";
+  const isPaperMode = !(["0", "false", "no", "off"].includes(
+    String(process.env.AUTO_TRADING_PAPER_ONLY ?? "1").trim().toLowerCase(),
+  ));
+  const allowTradingFiles =
+    allowTradingFilesExplicit ||
+    (isPaperMode && process.env.AGENT_ALLOW_TRADING_FILES_PAPER !== "0");
   const tradingFilesTouched = touchesTradingFiles([
     ...(engTask.likelyFiles ?? []),
     ...(engTask.patchPlan?.targetFiles ?? []),
