@@ -21,7 +21,7 @@ import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveMan
 import { readProfitEngineStatus } from "@/lib/agents/profitEngine";
 import { buildUnifiedQueueSummary, buildAutonomyHealth, buildQueueThroughput } from "@/lib/agents/unified-queue";
 import { detectFunnelBlockedState, readFunnelRecoveryState, isFunnelRecoveryTask, isOptimizationOnlyTask } from "@/lib/agents/funnel-recovery";
-import { buildRImpactQueueWithSuppression, getTopRImpactTaskIds } from "@/lib/agents/r-impact";
+import { buildRImpactQueueWithSuppression, getTopRImpactTaskIds, scoreEngineeringTask } from "@/lib/agents/r-impact";
 import { getDedupStats } from "@/lib/agents/task-dedup";
 
 function executionVisibilityRank(task: EngineeringTask): number {
@@ -278,7 +278,31 @@ export async function GET(req: Request) {
             (t.status === "OPEN" || t.status === "READY_FOR_EXECUTION") &&
             taskTouchesTradingFiles(t),
         )
-        .map((t) => ({ id: t.id, title: t.title, status: t.status, reason: "trading_file_requires_approval" }));
+        .map((t) => ({ id: t.id, title: t.title, status: t.status, reason: "trading_file_autonomy_disabled" }));
+
+  const lastTradingPatch = (() => {
+    if (!canon || canon.patchApplied !== true) return null;
+    const selectedTaskId = typeof canon.selectedTaskId === "string" ? canon.selectedTaskId : null;
+    if (!selectedTaskId) return null;
+    const task = tasks.find((t) => t.id === selectedTaskId) ?? null;
+    if (!task) return null;
+    const affectedFiles = Array.from(new Set([
+      ...(task.patchPlan?.targetFiles ?? []),
+      ...(task.likelyFiles ?? []),
+    ])).filter(Boolean);
+    if (affectedFiles.length === 0) return null;
+    if (!taskTouchesTradingFiles(task)) return null;
+    const expectedRImpact = Number(scoreEngineeringTask(task).expectedRImpact ?? 0);
+    const appliedAt = typeof (canon.executedAt ?? canon.timestamp ?? canon.validatedAt) === "string"
+      ? String(canon.executedAt ?? canon.timestamp ?? canon.validatedAt)
+      : null;
+    return {
+      taskId: selectedTaskId,
+      affectedFiles,
+      expectedRImpact: Number.isFinite(expectedRImpact) ? expectedRImpact : 0,
+      appliedAt,
+    };
+  })();
 
   const staleSuppressedQueue = rImpactDiagnostics.suppressed
     .filter((s) => s.reason === "CANCELED_DUPLICATE" || s.reason === "BLOCKED_INSUFFICIENT_NEW_DATA")
@@ -404,6 +428,7 @@ export async function GET(req: Request) {
         ? "explicit"
         : null,
     tradingFilePatchGuardrailsActive: true,
+    lastTradingPatch,
   };
 
   // ─── Compute latestExecutionResult age & historical flag ──────────
@@ -677,5 +702,6 @@ export async function GET(req: Request) {
         ? "explicit"
         : null,
     tradingFilePatchGuardrailsActive: true,
+    lastTradingPatch,
   });
 }

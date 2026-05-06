@@ -93,6 +93,77 @@ function resolveExecuteBaseUrl(): string {
   return "http://localhost:3000";
 }
 
+function getTradingFileAutonomyState(): {
+  enabled: boolean;
+  mode: "paper_only" | "explicit" | null;
+  patchGuardrailsActive: boolean;
+  isPaperMode: boolean;
+} {
+  const allowTradingFilesExplicit = process.env.AGENT_ALLOW_TRADING_FILES === "1";
+  const isPaperMode = !(["0", "false", "no", "off"].includes(
+    String(process.env.AUTO_TRADING_PAPER_ONLY ?? "1").trim().toLowerCase(),
+  ));
+  const enabled =
+    allowTradingFilesExplicit ||
+    (isPaperMode && process.env.AGENT_ALLOW_TRADING_FILES_PAPER !== "0");
+  const mode = isPaperMode ? "paper_only" : allowTradingFilesExplicit ? "explicit" : null;
+  return {
+    enabled,
+    mode,
+    patchGuardrailsActive: true,
+    isPaperMode,
+  };
+}
+
+function normalizePath(path: string): string {
+  return String(path || "").trim().replace(/^\/+/, "").toLowerCase();
+}
+
+async function fetchReadinessBrokerRisk(baseUrl: string): Promise<"CLEAR" | "WARNING" | "CRITICAL" | "UNKNOWN"> {
+  try {
+    const res = await fetch(`${baseUrl}/api/readiness`, {
+      headers: { "cache-control": "no-store" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return "UNKNOWN";
+    const json = await res.json().catch(() => ({}));
+    const brokerRisk = String(json?.operationalSummary?.brokerRisk ?? "UNKNOWN").toUpperCase();
+    if (brokerRisk === "CLEAR" || brokerRisk === "WARNING" || brokerRisk === "CRITICAL") {
+      return brokerRisk;
+    }
+    return "UNKNOWN";
+  } catch {
+    return "UNKNOWN";
+  }
+}
+
+async function readProtectionAuditCriticalCount(): Promise<number | null> {
+  try {
+    const brokerTruth = await fetchBrokerTruth();
+    if (brokerTruth.error) return null;
+    const allTrades = await readTrades<any>().catch(() => []);
+    const openTrades = (Array.isArray(allTrades) ? allTrades : [])
+      .filter((t) => isOpenTradeStatus(t?.status))
+      .map((t: any) => ({
+        id: String(t.id || ""),
+        ticker: String(t.ticker || ""),
+        side: String(t.side || ""),
+        status: String(t.status || ""),
+        qty: Number(t.size || t.qty || 0),
+        stopOrderId: t.stopOrderId || t.alpacaStopOrderId,
+        protectionStatus: t.protectionStatus,
+      }));
+    const protectionAudit = auditProtectionIntegrity({
+      openTrades,
+      brokerPositions: brokerTruth.positions || [],
+      brokerOrders: brokerTruth.openOrders || [],
+    });
+    return Number(protectionAudit.criticalCount ?? 0) || 0;
+  } catch {
+    return null;
+  }
+}
+
 function appendNotes(current: string[] | undefined, additions: string[]): string[] {
   return [...(current ?? []), ...additions].filter(Boolean).slice(-20);
 }
@@ -204,7 +275,9 @@ async function executeReadyForGithubCommit(
   task: EngineeringTask,
   phases: ExecutionPhaseResult[],
   dryRun: boolean,
+  opts?: { enforceHardVerification?: boolean },
 ): Promise<{ response: NextResponse; phases: ExecutionPhaseResult[]; commitSha?: string }> {
+  const enforceHardVerification = opts?.enforceHardVerification === true;
 
   // APPLY_PATCH phase
   const applyStart = Date.now();
@@ -252,6 +325,47 @@ async function executeReadyForGithubCommit(
   }
 
   if (!validationPassed && validationFailureReason) {
+    if (enforceHardVerification) {
+      phases.push(phaseResult("VERIFY", "failed", `pre_commit_smoke_failed:${validationFailureReason}`));
+      phases.push(phaseResult("RESOLVE_OR_FAIL", "failed", "trading_hard_verification_failed_pre_commit"));
+      await updateEngineeringTaskById(task.id, {
+        status: "FAILED",
+        remediationAttempted: true,
+        remediationStatus: "failed",
+        remediationResultSummary: `Pre-commit validation failed: ${validationFailureReason}`,
+        executionStatus: "FAILED",
+        executionError: "trading_hard_verification_failed_pre_commit",
+        notes: appendNotes(task.notes, [
+          `Pre-commit validation failed: ${validationFailureReason}`,
+          "Trading hard verification policy blocked patch apply.",
+        ]),
+      }).catch(() => null);
+      return {
+        response: NextResponse.json({
+          ok: true,
+          executedTaskId: task.id,
+          executionStatus: "FAILED",
+          selectedSource: "engineering-backlog",
+          selectedTaskId: task.id,
+          selectedTaskTitle: task.title,
+          patchApplied: false,
+          verification: {
+            buildOk: false,
+            smokeOk: false,
+            details: {
+              hardFailure: true,
+              failureReason: `pre_commit_smoke_failed:${validationFailureReason}`,
+            },
+          },
+          resolution: {
+            resolved: false,
+            reason: "trading_hard_verification_failed_pre_commit",
+          },
+          executionPhases: phases,
+        }),
+        phases,
+      };
+    }
     const blockedNotes = appendNotes(task.notes, [
       `Pre-commit validation failed: ${validationFailureReason}`,
       "Proceeding with execution — smoke check failure is advisory.",
@@ -311,18 +425,46 @@ async function executeReadyForGithubCommit(
     verification = { buildOk: false, smokeOk: false, details: { error: msg } };
   }
 
+  const readinessBrokerRisk = enforceHardVerification
+    ? await fetchReadinessBrokerRisk(resolveExecuteBaseUrl())
+    : "UNKNOWN";
+  if (enforceHardVerification) {
+    verification.details = {
+      ...verification.details,
+      readinessBrokerRisk,
+      readinessBrokerRiskClear: readinessBrokerRisk === "CLEAR",
+    };
+  }
+
   // RESOLVE_OR_FAIL phase
   const resolveStart = Date.now();
   const verificationHardFailure = (verification.details as { hardFailure?: boolean } | undefined)?.hardFailure === true;
-  const verificationPassed = !verificationHardFailure && verification.buildOk && verification.smokeOk;
+  const readinessPassed = !enforceHardVerification || readinessBrokerRisk === "CLEAR";
+  const verificationPassed = !verificationHardFailure && verification.buildOk && verification.smokeOk && readinessPassed;
   if (verificationPassed) {
     phases.push(phaseResult("RESOLVE_OR_FAIL", "passed", "verified_and_resolved", resolveStart));
   } else {
-    // Mark task as needing attention but don't revert the commit
-    await updateEngineeringTaskById(task.id, {
-      notes: appendNotes(task.notes, [`Post-commit verification failed: ${JSON.stringify(verification.details)}`]),
-    });
-    phases.push(phaseResult("RESOLVE_OR_FAIL", "failed", "verification_failed_post_commit", resolveStart));
+    if (enforceHardVerification) {
+      await updateEngineeringTaskById(task.id, {
+        status: "FAILED",
+        remediationAttempted: true,
+        remediationStatus: "failed",
+        remediationResultSummary: `Trading hard verification failed: ${JSON.stringify(verification.details)}`,
+        executionStatus: "FAILED",
+        executionError: "trading_hard_verification_failed_post_commit",
+        notes: appendNotes(task.notes, [
+          `Post-commit verification failed: ${JSON.stringify(verification.details)}`,
+          "Trading hard verification policy marked task FAILED.",
+        ]),
+      }).catch(() => null);
+      phases.push(phaseResult("RESOLVE_OR_FAIL", "failed", "trading_hard_verification_failed_post_commit", resolveStart));
+    } else {
+      // Mark task as needing attention but don't revert the commit
+      await updateEngineeringTaskById(task.id, {
+        notes: appendNotes(task.notes, [`Post-commit verification failed: ${JSON.stringify(verification.details)}`]),
+      });
+      phases.push(phaseResult("RESOLVE_OR_FAIL", "failed", "verification_failed_post_commit", resolveStart));
+    }
   }
 
   // Phase 3: close impact envelope after execution
@@ -351,7 +493,11 @@ async function executeReadyForGithubCommit(
       verification,
       resolution: {
         resolved: verificationPassed,
-        reason: verificationPassed ? undefined : "post_commit_verification_failed",
+        reason: verificationPassed
+          ? undefined
+          : enforceHardVerification
+            ? "trading_hard_verification_failed"
+            : "post_commit_verification_failed",
       },
       executionPhases: phases,
     }),
@@ -415,6 +561,26 @@ const TRADING_FILE_PREFIXES = [
   "lib/autoEntry",
 ];
 
+const ALLOWED_TRADING_PATCH_PREFIXES = [
+  "app/api/auto-entry/seed-from-signals",
+  "app/api/funnel-health",
+  "lib/agents/funnel-recovery",
+  "lib/agents/adaptiveguardrails",
+  "lib/autoentry/config",
+  "lib/agents/r-impact",
+];
+
+const DISALLOWED_TRADING_PATCH_PREFIXES = [
+  "lib/alpaca",
+  "app/api/auto-entry/execute",
+  "app/api/trades",
+  "lib/trades",
+  "lib/risk",
+  "lib/broker",
+  "app/api/broker",
+  "lib/trading",
+];
+
 const PRIORITY_BUCKET_RANK: Record<"CRITICAL" | "HIGH" | "MEDIUM" | "LOW", number> = {
   CRITICAL: 0,
   HIGH: 1,
@@ -438,9 +604,46 @@ const BATCH_KEYWORD_BOOST_PATTERNS = [
 function touchesTradingFiles(paths: string[] | undefined | null): boolean {
   if (!Array.isArray(paths) || paths.length === 0) return false;
   return paths.some((p) => {
-    const normalized = String(p || "").trim().replace(/^\/+/, "").toLowerCase();
+    const normalized = normalizePath(p);
     return TRADING_FILE_PREFIXES.some((prefix) => normalized.startsWith(prefix.toLowerCase()));
   });
+}
+
+function getTradingPatchScope(paths: string[] | undefined | null): {
+  touchesTradingFiles: boolean;
+  allowedFiles: string[];
+  disallowedFiles: string[];
+} {
+  const list = Array.isArray(paths) ? paths : [];
+  const touchesTrading = touchesTradingFiles(list);
+  if (!touchesTrading) {
+    return { touchesTradingFiles: false, allowedFiles: [], disallowedFiles: [] };
+  }
+
+  const allowedFiles: string[] = [];
+  const disallowedFiles: string[] = [];
+  for (const p of list) {
+    const normalized = normalizePath(p);
+    if (!normalized) continue;
+    if (DISALLOWED_TRADING_PATCH_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
+      disallowedFiles.push(p);
+      continue;
+    }
+    if (ALLOWED_TRADING_PATCH_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
+      allowedFiles.push(p);
+      continue;
+    }
+    // Trading file but outside explicit allowlist is considered disallowed.
+    if (TRADING_FILE_PREFIXES.some((prefix) => normalized.startsWith(prefix.toLowerCase()))) {
+      disallowedFiles.push(p);
+    }
+  }
+
+  return {
+    touchesTradingFiles: true,
+    allowedFiles: Array.from(new Set(allowedFiles)),
+    disallowedFiles: Array.from(new Set(disallowedFiles)),
+  };
 }
 
 function isAdaptiveOrProfitTitle(title: string): boolean {
@@ -594,11 +797,13 @@ function computeEngineeringTaskReadiness(task: EngineeringTask): TaskReadinessDi
   let executionReady = false;
   let blockedReason: string | null = null;
   let requiresApproval = false;
-  const allowTradingFiles = process.env.AGENT_ALLOW_TRADING_FILES === "1";
-  const tradingFilesTouched = touchesTradingFiles([
+  const tradingAutonomy = getTradingFileAutonomyState();
+  const candidatePaths = [
     ...(task.likelyFiles ?? []),
     ...(task.patchPlan?.targetFiles ?? []),
-  ]);
+  ];
+  const tradingPatchScope = getTradingPatchScope(candidatePaths);
+  const tradingFilesTouched = tradingPatchScope.touchesTradingFiles;
 
   // hasPatchPlan: true when an explicit GITHUB_COMMIT plan exists,
   // OR when the engine can auto-generate one (non-trading-file tasks from eligible sources).
@@ -606,15 +811,20 @@ function computeEngineeringTaskReadiness(task: EngineeringTask): TaskReadinessDi
     task.patchPlan?.mode === "GITHUB_COMMIT" &&
     task.commitPlan?.pushDirect === true &&
     !!task.commitPlan?.commitMessage?.trim();
-  const canAutoGeneratePatchPlan = !tradingFilesTouched || allowTradingFiles;
+  const canAutoGeneratePatchPlan = !tradingFilesTouched || tradingAutonomy.enabled;
   const hasPatchPlan = hasExplicitPatchPlan || canAutoGeneratePatchPlan;
   const hasVerificationPlan = !!(task.validationPlan?.smokeChecks?.length || task.smokeTestBlock);
 
   if (task.status === "READY_FOR_EXECUTION") {
-    if (tradingFilesTouched && !allowTradingFiles) {
-      blockedReason = "trading_file_requires_approval";
-      requiresApproval = true;
-      reasons.push("task touches trading-sensitive files and AGENT_ALLOW_TRADING_FILES is not enabled");
+    if (tradingFilesTouched && !tradingAutonomy.enabled) {
+      blockedReason = "trading_file_autonomy_disabled";
+      reasons.push("task touches trading files but trading file autonomy is disabled");
+    } else if (tradingFilesTouched && tradingAutonomy.mode !== "paper_only") {
+      blockedReason = "trading_file_autonomy_not_paper_only";
+      reasons.push("task touches trading files but autonomy mode is not paper_only");
+    } else if (tradingFilesTouched && tradingPatchScope.disallowedFiles.length > 0) {
+      blockedReason = "trading_patch_scope_disallowed";
+      reasons.push(`disallowed trading file scope: ${tradingPatchScope.disallowedFiles.join(", ")}`);
     } else {
     const guardrailError = validateExecutionGuardrails(task);
     if (guardrailError) {
@@ -630,15 +840,17 @@ function computeEngineeringTaskReadiness(task: EngineeringTask): TaskReadinessDi
     }
   } else if (task.status === "OPEN") {
     const approval = approveExecution(task);
-    if (tradingFilesTouched && !allowTradingFiles) {
-      requiresApproval = true;
-    } else {
-      requiresApproval = !approval.ok;
-    }
-    if (tradingFilesTouched && !allowTradingFiles) {
-      blockedReason = "trading_file_requires_approval";
-      reasons.push("task touches trading-sensitive files and AGENT_ALLOW_TRADING_FILES is not enabled");
-    } else if (!approval.ok) {
+    requiresApproval = !tradingFilesTouched && !approval.ok;
+    if (tradingFilesTouched && !tradingAutonomy.enabled) {
+      blockedReason = "trading_file_autonomy_disabled";
+      reasons.push("task touches trading files but trading file autonomy is disabled");
+    } else if (tradingFilesTouched && tradingAutonomy.mode !== "paper_only") {
+      blockedReason = "trading_file_autonomy_not_paper_only";
+      reasons.push("task touches trading files but autonomy mode is not paper_only");
+    } else if (tradingFilesTouched && tradingPatchScope.disallowedFiles.length > 0) {
+      blockedReason = "trading_patch_scope_disallowed";
+      reasons.push(`disallowed trading file scope: ${tradingPatchScope.disallowedFiles.join(", ")}`);
+    } else if (!tradingFilesTouched && !approval.ok) {
       blockedReason = `governance_blocked: ${approval.reason}`;
       reasons.push(`governance approval failed: ${approval.reason}`);
     } else if (!hasExplicitPatchPlan) {
@@ -1062,33 +1274,91 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
   const engPhases: ExecutionPhaseResult[] = [];
   engPhases.push(phaseResult("SELECT_TASK", "passed", `task: ${engTask.id}`));
 
-  const allowTradingFiles = process.env.AGENT_ALLOW_TRADING_FILES === "1";
-  const tradingFilesTouched = touchesTradingFiles([
+  const tradingCandidatePaths = [
     ...(engTask.likelyFiles ?? []),
     ...(engTask.patchPlan?.targetFiles ?? []),
-  ]);
-  if (tradingFilesTouched && !allowTradingFiles) {
-    engPhases.push(phaseResult("GENERATE_PATCH_PLAN", "failed", "trading_file_requires_human_approval"));
-    await updateEngineeringTaskById(engTask.id, {
-      status: "BLOCKED",
-      remediationAttempted: true,
-      remediationStatus: "failed",
-      remediationResultSummary: "Execution blocked: trading_file_requires_human_approval",
-      executionStatus: "BLOCKED",
-      executionError: "trading_file_requires_human_approval",
-      notes: appendNotes(engTask.notes, ["Execution blocked: trading_file_requires_human_approval"]),
-    });
-    return {
-      taskId: engTask.id,
-      title: engTask.title,
-      status: "BLOCKED",
-      source: "engineering-backlog",
-      patchApplied: false,
-      verification: { buildOk: true, smokeOk: true, details: {} },
-      resolution: { resolved: false, reason: "trading_file_requires_human_approval" },
-      executionPhases: engPhases,
-      safetyStopReason: "requires_approval",
-    };
+  ];
+  const tradingPatchScope = getTradingPatchScope(tradingCandidatePaths);
+  const tradingFilesTouched = tradingPatchScope.touchesTradingFiles;
+  const tradingAutonomy = getTradingFileAutonomyState();
+  const tradingDedupeKey = buildDedupeKey(
+    engTask.title,
+    undefined,
+    engTask.patchPlan?.mode ?? undefined,
+    engTask.patchPlan?.targetFiles ?? [],
+  );
+
+  if (tradingFilesTouched) {
+    const lockAcquired = await acquireExecutionLock(tradingDedupeKey).catch(() => true);
+    if (!lockAcquired) {
+      engPhases.push(phaseResult("GENERATE_PATCH_PLAN", "failed", "trading_patch_cooldown_active"));
+      await updateEngineeringTaskById(engTask.id, {
+        status: "BLOCKED",
+        remediationAttempted: true,
+        remediationStatus: "failed",
+        remediationResultSummary: "Execution blocked: trading_patch_cooldown_active",
+        executionStatus: "BLOCKED",
+        executionError: "trading_patch_cooldown_active",
+        notes: appendNotes(engTask.notes, ["Execution blocked: trading_patch_cooldown_active"]),
+      }).catch(() => null);
+      return {
+        taskId: engTask.id,
+        title: engTask.title,
+        status: "SKIPPED",
+        source: "engineering-backlog",
+        patchApplied: false,
+        verification: { buildOk: true, smokeOk: true, details: {} },
+        resolution: { resolved: false, reason: "trading_patch_cooldown_active" },
+        executionPhases: engPhases,
+        safetyStopReason: "trading_patch_cooldown_active",
+      };
+    }
+
+    let safetyBlockReason: string | null = null;
+    if (!tradingAutonomy.enabled) {
+      safetyBlockReason = "trading_file_autonomy_disabled";
+    } else if (tradingAutonomy.mode !== "paper_only") {
+      safetyBlockReason = "trading_file_autonomy_not_paper_only";
+    } else if (tradingPatchScope.disallowedFiles.length > 0) {
+      safetyBlockReason = `trading_patch_scope_disallowed:${tradingPatchScope.disallowedFiles.join(",")}`;
+    } else {
+      const baseUrl = resolveExecuteBaseUrl();
+      const brokerRisk = await fetchReadinessBrokerRisk(baseUrl);
+      if (brokerRisk !== "CLEAR") {
+        safetyBlockReason = `trading_readiness_broker_risk_not_clear:${brokerRisk}`;
+      } else {
+        const protectionCriticalCount = await readProtectionAuditCriticalCount();
+        if (protectionCriticalCount == null) {
+          safetyBlockReason = "trading_protection_audit_unavailable";
+        } else if (protectionCriticalCount > 0) {
+          safetyBlockReason = `trading_protection_audit_critical:${protectionCriticalCount}`;
+        }
+      }
+    }
+
+    if (safetyBlockReason) {
+      engPhases.push(phaseResult("GENERATE_PATCH_PLAN", "failed", safetyBlockReason));
+      await updateEngineeringTaskById(engTask.id, {
+        status: "BLOCKED",
+        remediationAttempted: true,
+        remediationStatus: "failed",
+        remediationResultSummary: `Execution blocked: ${safetyBlockReason}`,
+        executionStatus: "BLOCKED",
+        executionError: safetyBlockReason,
+        notes: appendNotes(engTask.notes, [`Execution blocked: ${safetyBlockReason}`]),
+      }).catch(() => null);
+      return {
+        taskId: engTask.id,
+        title: engTask.title,
+        status: "BLOCKED",
+        source: "engineering-backlog",
+        patchApplied: false,
+        verification: { buildOk: true, smokeOk: true, details: {} },
+        resolution: { resolved: false, reason: safetyBlockReason },
+        executionPhases: engPhases,
+        safetyStopReason: "trading_guardrail_blocked",
+      };
+    }
   }
 
   const ghCapability = checkGitHubWriteCapability();
@@ -1098,7 +1368,7 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
   // Governance approval for OPEN tasks
   if (engTask.status === "OPEN") {
     const approval = approveExecution(engTask);
-    if (!approval.ok) {
+    if (!approval.ok && !tradingFilesTouched) {
       engPhases.push(phaseResult("GENERATE_PATCH_PLAN", "failed", `governance_blocked: ${approval.reason}`));
       await updateEngineeringTaskById(engTask.id, {
         status: "BLOCKED", remediationAttempted: true, remediationStatus: "failed",
@@ -1120,7 +1390,9 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
     engPhases.push(phaseResult("GENERATE_PATCH_PLAN", "passed", `plan: ${prepared.nextTaskStatus} source: ${prepared.patchPlanSource ?? "explicit"}`));
 
     const approvedNotes = appendNotes(engTask.notes, [
-      "Execution approved by governance manager",
+      !approval.ok && tradingFilesTouched
+        ? "Governance approval bypassed for trading patch under paper-only safety guardrails"
+        : "Execution approved by governance manager",
       `Execution plan prepared for ${prepared.nextTaskStatus}`,
       prepared.patchPlanSource === "auto_generated"
         ? `Patch plan auto-generated (keyword inference): ${prepared.patchPlan.targetFiles.join(", ")}`
@@ -1187,13 +1459,19 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
   }
 
   try {
-    const execResult = await executeReadyForGithubCommit(taskToExecute, engPhases, false);
+    const execResult = await executeReadyForGithubCommit(taskToExecute, engPhases, false, {
+      enforceHardVerification: tradingFilesTouched,
+    });
     const responseBody = await execResult.response.json() as Record<string, unknown>;
     const verif = (responseBody.verification ?? { buildOk: true, smokeOk: true, details: {} }) as { buildOk: boolean; smokeOk: boolean; details: Record<string, unknown> };
     const resolved = (responseBody.resolution as { resolved?: boolean } | undefined)?.resolved ?? false;
     const taskStatus = resolved ? "COMPLETED" as const : "FAILED" as const;
     const hardFailure = (verif.details as { hardFailure?: boolean } | undefined)?.hardFailure === true;
-    const stopReason = hardFailure ? "verification_failed" : undefined;
+    const stopReason = hardFailure
+      ? "verification_failed"
+      : (!resolved && tradingFilesTouched)
+        ? "trading_verification_failed"
+        : undefined;
 
     // After a successful adaptive/profit commit, set a 24h execution lock to
     // prevent re-execution of the same fix class before new trade data arrives.
@@ -2080,8 +2358,10 @@ export async function POST(req: NextRequest) {
     const normalizeStoppedReason = (r: string | null): string | null => {
       if (!r) return null;
       if (r === "safety_gate_blocked" || r === "safe_execution_gate_failed") return "safety_gate_failed";
-      if (r === "requires_approval" || r === "trading_file_requires_approval") return "approval_required";
-      if (r === "trading_file_requires_human_approval") return "trading_file_blocked";
+      if (r === "requires_approval") return "approval_required";
+      if (r === "trading_guardrail_blocked") return "trading_guardrail_blocked";
+      if (r === "trading_patch_cooldown_active") return "trading_patch_cooldown_active";
+      if (r === "trading_verification_failed") return "trading_verification_failed";
       if (r === "patch_executor_disabled") return "approval_required";
       if (r === "no_open_tasks" || r === "no_eligible_tasks") return "no_more_selectable_tasks";
       return r;
@@ -2094,7 +2374,7 @@ export async function POST(req: NextRequest) {
       if (stoppedReason === "time_budget_exceeded") {
         noEligibleReason = "time_budget_exceeded";
       } else if (queueBefore.blockedCount > 0 && queueBefore.selectableCount === 0) {
-        noEligibleReason = "trading_file_requires_approval";
+        noEligibleReason = "trading_guardrail_blocked";
       } else if (!checkGitHubWriteCapability().writeEnabled) {
         noEligibleReason = "github_write_disabled";
       } else {
