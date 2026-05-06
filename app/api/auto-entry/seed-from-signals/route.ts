@@ -664,8 +664,13 @@ export async function POST(req: NextRequest) {
   const activeStatuses = new Set(["AUTO_PENDING", "OPEN", "NEW"]);
   const terminalStatuses = new Set(["CLOSED", "HIT", "STOPPED", "CANCELED", "CANCELLED", "REJECTED", "ARCHIVED", "ERROR"]);
   const activeSignalIds = new Set<string>();
+  // terminalSignalIds is retained for diagnostics but NO LONGER used as a hard block.
   const terminalSignalIds = new Set<string>();
   const activeSymbolSide = new Set<string>();
+
+  // Ticker-level cooldown: track most recent terminal trade timestamp per symbol+side.
+  // Used to enforce a short re-entry cooldown instead of a permanent block.
+  const terminalSymbolSideLatestMs = new Map<string, number>();
 
   for (const t of trades || []) {
     const sid = String(t?.signalId || "");
@@ -678,7 +683,26 @@ export async function POST(req: NextRequest) {
     if (activeStatuses.has(status) && symbol && side) {
       activeSymbolSide.add(`${symbol}:${side}`);
     }
+    // Track most recent terminal trade per symbol+side for cooldown
+    if (terminalStatuses.has(status) && symbol && side) {
+      const tTs = Date.parse(String(t?.closedAt || t?.updatedAt || ""));
+      if (Number.isFinite(tTs)) {
+        const key = `${symbol}:${side}`;
+        const existing = terminalSymbolSideLatestMs.get(key) ?? 0;
+        if (tTs > existing) terminalSymbolSideLatestMs.set(key, tTs);
+      }
+    }
   }
+
+  // Hard max stale window: signals older than 4 hours are never seeded regardless.
+  const HARD_MAX_STALE_MS = 4 * 60 * 60 * 1000;
+  // Ticker cooldown: how long to wait after a terminal trade before allowing re-entry.
+  const TICKER_COOLDOWN_MS = cfg.cooldownMin * 60_000;
+
+  // Diagnostic counters
+  let staleAllowedCount = 0;
+  let staleHardBlockedCount = 0;
+  let terminalBypassedCount = 0;
 
   const created: any[] = [];
   const skipped: Array<{
@@ -863,9 +887,17 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
-    if (!Number.isFinite(ageMs) || ageMs > effectiveFreshnessMs) {
+    // Stale check: hard-reject only signals older than HARD_MAX_STALE_MS (4 hours).
+    // Signals between effectiveFreshnessMs and 4h are allowed through with a score
+    // penalty so fresh signals always rank higher, but stale ones fill remaining capacity.
+    const isStaleSignal = Number.isFinite(ageMs) && (ageMs as number) > effectiveFreshnessMs;
+    if (!Number.isFinite(ageMs) || (ageMs as number) > HARD_MAX_STALE_MS) {
+      staleHardBlockedCount++;
       markSkip("stale_signal");
       continue;
+    }
+    if (isStaleSignal) {
+      staleAllowedCount++;
     }
 
     if (!tier) {
@@ -890,9 +922,20 @@ export async function POST(req: NextRequest) {
       markSkip("already_active_trade");
       continue;
     }
-    if (terminalSignalIds.has(signalId)) {
-      markSkip("already_terminal_trade");
-      continue;
+    // already_terminal_trade: replaced with ticker-level cooldown.
+    // A completed trade for the same signalId no longer permanently blocks re-entry.
+    // Instead, block only when a terminal trade for this symbol+side is within cooldownMin.
+    {
+      const symSideKey = `${symbol}:${side}`;
+      const lastTermMs = terminalSymbolSideLatestMs.get(symSideKey) ?? 0;
+      if (lastTermMs > 0 && nowMs - lastTermMs < TICKER_COOLDOWN_MS) {
+        markSkip("already_active_trade");
+        continue;
+      }
+      // Count bypassed terminal-signal blocks for diagnostics
+      if (terminalSignalIds.has(signalId)) {
+        terminalBypassedCount++;
+      }
     }
     if (activeSymbolSide.has(`${symbol}:${side}`)) {
       markSkip("already_active_trade");
@@ -949,6 +992,9 @@ export async function POST(req: NextRequest) {
     }
 
     const actionabilityRank = getNum(s, ["actionabilityRank"]) ?? 5;
+    // Stale signals get a 0.5 penalty so fresh signals always rank higher,
+    // but stale ones still fill remaining capacity slots.
+    const stalenessPenalty = isStaleSignal ? 0.5 : 0;
     allQualifyingCandidates.push({
       symbol,
       side,
@@ -964,7 +1010,7 @@ export async function POST(req: NextRequest) {
       signalId,
       createdAt,
       shortPenalty,
-      effectiveScore: (aiScore as number) - shortPenalty,
+      effectiveScore: (aiScore as number) - shortPenalty - stalenessPenalty,
       actionabilityRank,
       ageMs,
     });
@@ -1013,22 +1059,28 @@ export async function POST(req: NextRequest) {
   const cCandidates = uniqueCandidates.filter((c) => c.tier === "C");
   const sortedAbCandidates = [...abCandidates].sort((a, b) => {
     if (b.aiScore !== a.aiScore) return b.aiScore - a.aiScore;
-    return b.ageMs - a.ageMs;
+    return (a.ageMs ?? Infinity) - (b.ageMs ?? Infinity); // fresher first
   });
   const sortedCCandidates = [...cCandidates].sort((a, b) => {
     if (b.aiScore !== a.aiScore) return b.aiScore - a.aiScore;
-    return b.ageMs - a.ageMs;
+    return (a.ageMs ?? Infinity) - (b.ageMs ?? Infinity);
   });
 
-  const candidatesToSeed =
-    sortedAbCandidates.length > 0
-      ? sortedAbCandidates.slice(0, effectiveLimit)
-      : sortedCCandidates.slice(0, effectiveLimit);
+  // Prioritize A/B, then fill remaining capacity with C to maximize seeded count.
+  const candidatesToSeed = [
+    ...sortedAbCandidates,
+    ...sortedCCandidates,
+  ].slice(0, effectiveLimit);
 
-  const capacitySkippedCandidates =
-    sortedAbCandidates.length > 0
-      ? [...sortedAbCandidates.slice(effectiveLimit), ...sortedCCandidates]
-      : sortedCCandidates.slice(effectiveLimit);
+  // Track whether seeding stale signals was needed to hit our count
+  const forcedSeedApplied = candidatesToSeed.some((c) =>
+    Number.isFinite(c.ageMs) && (c.ageMs as number) > effectiveFreshnessMs
+  );
+
+  const selectedSignalIds = new Set(candidatesToSeed.map((c) => c.signalId));
+  const capacitySkippedCandidates = uniqueCandidates.filter(
+    (c) => !selectedSignalIds.has(c.signalId)
+  );
   for (const c of capacitySkippedCandidates) {
     skipped.push({
       signalId: c.signalId,
@@ -1276,6 +1328,9 @@ export async function POST(req: NextRequest) {
     totalQualifiedSignals: qualifiedSignals.length,
     freshQualifiedSignals,
     staleQualifiedSignals,
+    staleAllowedCount,
+    staleHardBlockedCount,
+    terminalBypassedCount,
     candidates: totalCandidates,
     skipReasonCounts: skippedByReason,
     effectiveLimit,
@@ -1290,6 +1345,7 @@ export async function POST(req: NextRequest) {
     freshnessDistribution: { fresh: freshQualifiedSignals, stale: staleQualifiedSignals },
     seededVsCapacity: { seeded: createdCount, capacity: effectiveLimit, remainingSlots: remainingPositionSlots },
     recoveryModeActive,
+    forcedSeedApplied,
   });
 
   const freshAgeMsValues = qualifiedSignalAges.map(a => a.ageMs).filter(Number.isFinite);
@@ -1320,10 +1376,17 @@ export async function POST(req: NextRequest) {
     effectiveFreshnessMs,
     freshnessMode,
     recoveryModeActive,
+    forcedSeedApplied,
     // Throughput diagnostics
     qualificationRate: signals.length > 0 ? Math.round((qualifiedSignals.length / signals.length) * 1000) / 1000 : 0,
     freshnessDistribution: { fresh: freshQualifiedSignals, stale: staleQualifiedSignals },
     seededVsCapacity: { seeded: dryRun ? 0 : created.length, capacity: effectiveLimit, remainingSlots: remainingPositionSlots },
+    // Block diagnostic flags
+    blockedByFreshness: staleHardBlockedCount > 0,
+    blockedByTerminalTrade: false, // terminal_signal no longer hard-blocks; cooldown applies instead
+    staleAllowedCount,
+    staleHardBlockedCount,
+    terminalBypassedCount,
     newestQualifiedAgeMs,
     oldestQualifiedAgeMs,
     totalSignals: (signals || []).length,
