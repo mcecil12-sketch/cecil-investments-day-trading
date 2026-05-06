@@ -35,6 +35,7 @@ const SKIP_OUTCOMES = new Set([
 export function isExecutionAttributionImmutable(trade: any): boolean {
   return (
     trade?.executeOutcome === "EXECUTED" ||
+    trade?.executeOutcome === "RECALCULATED_ENTRY_EXECUTED" ||
     Boolean(trade?.alpacaOrderId) ||
     Boolean(trade?.brokerOrderId)
   );

@@ -145,6 +145,9 @@ type FunnelHealthResponse = {
     rescoreRequiredCount: number;
     scoreThresholdBlockedCount: number;
     priceDriftSkippedCount: number;
+    recalcRejectedCount: number;
+    priceDriftRecoveryAttemptedCount: number;
+    priceDriftRecoverySucceededCount: number;
     stalePendingCount: number;
     executeSlaBreached: boolean;
   };
@@ -578,7 +581,7 @@ export async function GET() {
     const executedAndClosedCount = todayTrades.filter((t: any) =>
       (t?.source === "AUTO" || t?.source === "auto-entry") &&
       (t?.status === "CLOSED" || t?.status === "HIT" || t?.status === "STOPPED") &&
-      (t?.executeOutcome === "EXECUTED" || Boolean(t?.alpacaOrderId))
+      (t?.executeOutcome === "EXECUTED" || t?.executeOutcome === "RECALCULATED_ENTRY_EXECUTED" || Boolean(t?.alpacaOrderId))
     ).length;
 
     // SEEDED_BUT_NOT_EXECUTED: trades that are genuinely active AUTO_PENDING (not archived/errored/placed).
@@ -596,7 +599,8 @@ export async function GET() {
     const executeSkipReasonBreakdown: Record<string, number> = {};
     for (const t of todayTrades) {
       if (!t?.executeOutcome) continue;
-      if (t.executeOutcome === "EXECUTED" || t.executeOutcome === "PENDING") continue;
+      // EXECUTED and RECALCULATED_ENTRY_EXECUTED are successful — skip both
+      if (t.executeOutcome === "EXECUTED" || t.executeOutcome === "RECALCULATED_ENTRY_EXECUTED" || t.executeOutcome === "PENDING") continue;
       if (t?.source !== "AUTO" && t?.source !== "auto-entry") continue;
       // Do not count trades that actually reached the broker
       if (Boolean(t?.alpacaOrderId) || Boolean(t?.brokerOrderId)) continue;
@@ -656,6 +660,15 @@ export async function GET() {
       (t.executeReason === "score_threshold" || t.executeReason === "score_below_base_tier_threshold" || t.executeReason === "overlay_grade_excluded")
     ).length;
     const priceDriftSkippedCount = executeSkipReasonBreakdown["SKIPPED_PRICE_DRIFT"] ?? 0;
+    const recalcRejectedCount = executeSkipReasonBreakdown["RECALCULATED_ENTRY_REJECTED"] ?? 0;
+    const priceDriftRecoveryAttemptedCount = todayTrades.filter((t: any) =>
+      (t?.source === "AUTO" || t?.source === "auto-entry") &&
+      Boolean(t?.priceDriftRecoveryAttempted)
+    ).length;
+    const priceDriftRecoverySucceededCount = todayTrades.filter((t: any) =>
+      (t?.source === "AUTO" || t?.source === "auto-entry") &&
+      Boolean(t?.priceDriftRecoverySucceeded)
+    ).length;
     const stalePendingCount = todayTrades.filter((t: any) =>
       (t?.source === "AUTO" || t?.source === "auto-entry") &&
       t?.status === "AUTO_PENDING" &&
@@ -1090,6 +1103,9 @@ export async function GET() {
         rescoreRequiredCount,
         scoreThresholdBlockedCount,
         priceDriftSkippedCount,
+        recalcRejectedCount,
+        priceDriftRecoveryAttemptedCount,
+        priceDriftRecoverySucceededCount,
         stalePendingCount,
         executeSlaBreached,
       },
@@ -1097,9 +1113,9 @@ export async function GET() {
       ...(staleExpiredCount > 0 ? { staleExpiredCount } : {}),
       ...(staleTimingStats ? { staleTimingStats } : {}),
       // ─── Final entry gate diagnostics ──────────────────────────────────
-      // Computed from existing per-trade counters; no extra queries needed.
+      // Tells callers exactly which gate is still blocking, and clears once fixed.
       ...(() => {
-        const isDriftBlocking = priceDriftSkippedCount > 0;
+        const isDriftBlocking = priceDriftSkippedCount > 0 || recalcRejectedCount > 0;
         const isStaleSignalBlocking =
           freshQualifiedSignals === 0 && staleQualifiedSignals > 0 && seeded === 0;
         const isOverlayBlocking = scoreThresholdBlockedCount > 0;
@@ -1121,7 +1137,9 @@ export async function GET() {
         const finalGateActionableMessage: string | null = !finalEntryGateBlocked
           ? null
           : topFinalGateReason === "price_drift"
-          ? `${priceDriftSkippedCount} trade(s) archived for price drift — run seed-from-signals to create a fresh AUTO_PENDING.`
+          ? recalcRejectedCount > 0
+            ? `${recalcRejectedCount} trade(s) price drift recovery rejected — hard risk rule blocked recalculation. Check priceDriftRecoveryFailReason in executeSkipReasonBreakdown.`
+            : `${priceDriftSkippedCount} trade(s) archived for price drift — run seed-from-signals to create a fresh AUTO_PENDING.`
           : topFinalGateReason === "stale_qualified_signal"
           ? `${staleQualifiedSignals} qualified signal(s) are stale (>=${Math.round(staleThresholdUsedMs / 60_000)}min) and no fresh signals exist — trigger a scan + score drain to refresh, or rely on stale-signal recovery seed.`
           : topFinalGateReason === "overlay_block"

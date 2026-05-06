@@ -1447,7 +1447,7 @@ export async function POST(req: Request) {
         continue;
       }
 
-      // Validate price drift against current market; attempt R-preserving recalculation
+      // Validate price drift against current market
       if (carryoverQuote) {
         const currentPrice =
           carryoverQuote.last ??
@@ -1458,56 +1458,24 @@ export async function POST(req: Request) {
         if (currentPrice && currentPrice > 0) {
           const driftDiag = checkPriceDrift(currentPrice, safeNum(item.t.entryPrice, 0), safeNum(item.t.stopPrice, 0));
           if (!driftDiag.driftAllowed) {
-            // Attempt R-preserving recalculation
-            const coOrigRisk = Math.abs(safeNum(item.t.entryPrice, 0) - safeNum(item.t.stopPrice, 0));
-            const coOrigReward = Math.abs(safeNum(item.t.takeProfitPrice ?? item.t.targetPrice, 0) - safeNum(item.t.entryPrice, 0));
-            const coSide: "LONG" | "SHORT" = String(item.t.side || "LONG").toUpperCase() === "SHORT" ? "SHORT" : "LONG";
-            let coRecalcOk = false;
-            if (coOrigRisk > 0 && coOrigReward > 0) {
-              const coNewEntry = Number(currentPrice.toFixed(2));
-              const coNewStop = coSide === "LONG"
-                ? Number((coNewEntry - coOrigRisk).toFixed(2))
-                : Number((coNewEntry + coOrigRisk).toFixed(2));
-              const coNewTarget = coSide === "LONG"
-                ? Number((coNewEntry + coOrigReward).toFixed(2))
-                : Number((coNewEntry - coOrigReward).toFixed(2));
-              const coRecalcPlan = normalizeTradePlanForSide({ side: coSide, entryPrice: coNewEntry, stopPrice: coNewStop, targetPrice: coNewTarget, rewardMultiple: 2 });
-              if (coRecalcPlan.ok && coRecalcPlan.normalizedEntryPrice > 0 && coRecalcPlan.normalizedStopPrice > 0 && coRecalcPlan.normalizedTargetPrice > 0) {
-                trades[item.i] = {
-                  ...trades[item.i],
-                  entryPrice: coRecalcPlan.normalizedEntryPrice,
-                  stopPrice: coRecalcPlan.normalizedStopPrice,
-                  targetPrice: coRecalcPlan.normalizedTargetPrice,
-                  takeProfitPrice: coRecalcPlan.normalizedTargetPrice,
-                  executeOutcome: "RECALCULATED_ENTRY",
-                  driftRecalculatedAt: nowForPending,
-                  driftDiagnostics: driftDiag,
-                  originalEntryBeforeDrift: safeNum(item.t.entryPrice, 0),
-                  updatedAt: nowForPending,
-                };
-                coRecalcOk = true;
-              }
-            }
-            if (!coRecalcOk) {
-              trades[item.i] = {
-                ...trades[item.i],
-                status: "ARCHIVED",
-                autoEntryStatus: "AUTO_ARCHIVED",
-                reason: "invalid_after_revalidation",
-                error: undefined,
-                closedAt: trades[item.i]?.closedAt || nowForPending,
-                updatedAt: nowForPending,
-                executeAttemptedAt: nowForPending,
-                executeOutcome: "SKIPPED_PRICE_DRIFT",
-                executeReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple",
-                driftDiagnostics: driftDiag,
-              };
-              counts.carryoverArchivedCount += 1;
-              counts.skipped += 1;
-              tradesChanged = true;
-              notes.push(`carryover_revalidated:${carryoverTicker}:archived`);
-              continue;
-            }
+            trades[item.i] = {
+              ...trades[item.i],
+              status: "ARCHIVED",
+              autoEntryStatus: "AUTO_ARCHIVED",
+              reason: "invalid_after_revalidation",
+              error: undefined,
+              closedAt: trades[item.i]?.closedAt || nowForPending,
+              updatedAt: nowForPending,
+              executeAttemptedAt: nowForPending,
+              executeOutcome: "SKIPPED_PRICE_DRIFT",
+              executeReason: driftDiag.reason ?? "entry_price_drifted_risk_multiple",
+              driftDiagnostics: driftDiag,
+            };
+            counts.carryoverArchivedCount += 1;
+            counts.skipped += 1;
+            tradesChanged = true;
+            notes.push(`carryover_revalidated:${carryoverTicker}:archived`);
+            continue;
           }
         }
       }
@@ -2064,6 +2032,12 @@ export async function POST(req: Request) {
     reason: string;
     aiScore: number | null;
     tier: string | null;
+    priceDriftRecoveryAttempted?: boolean;
+    priceDriftRecoverySucceeded?: boolean;
+    priceDriftRecoveryFailReason?: string | null;
+    recalculatedEntryPrice?: number | null;
+    recalculatedStopPrice?: number | null;
+    recalculatedTargetPrice?: number | null;
   }> = [];
   const attemptedTradeIds: string[] = [];
   const skippedTradeIds: string[] = [];
@@ -2500,76 +2474,108 @@ export async function POST(req: Request) {
   // When drift exceeds tolerance, attempt R-preserving recalculation before archiving.
   let driftDiagnosticsForExec: PriceDriftDiagnostics | null = null;
   let executionAdjustments = false;
+  let priceDriftRecoveryAttempted = false;
+  let priceDriftRecoverySucceeded = false;
+  let priceDriftRecoveryRecalcEntry: number | null = null;
+  let priceDriftRecoveryRecalcStop: number | null = null;
+  let priceDriftRecoveryRecalcTarget: number | null = null;
+  let priceDriftRecoveryFailReason: string | null = null;
   if (decisionPriceForDrift) {
     const driftDiag = checkPriceDrift(decisionPriceForDrift, entryPrice, stopPrice);
     driftDiagnosticsForExec = driftDiag;
     if (!driftDiag.driftAllowed) {
-      // ── Attempt R-preserving recalculation using current market price ──
-      // Preserve original R-distance and reward-distance, slide entry to currentPrice.
-      // Only archive if the recalculated plan is structurally invalid.
-      let driftRecalcSucceeded = false;
+      // Attempt R-preserving recalculation: pivot entry to current price,
+      // shift stop and target by the same absolute distances.
+      // Only A/B tier signals qualify for recovery; C tier cannot be recalculated.
+      priceDriftRecoveryAttempted = true;
+      if (_tradeTier !== "A" && _tradeTier !== "B") {
+        priceDriftRecoveryFailReason = `tier_ineligible:${_tradeTier ?? "none"}`;
+      }
       const origRiskDist = Math.abs(entryPrice - stopPrice);
-      const origRewardDist = targetPrice != null ? Math.abs(targetPrice - entryPrice) : 0;
-      if (decisionPriceForDrift > 0 && origRiskDist > 0 && origRewardDist > 0) {
-        const recalcEntry = Number(decisionPriceForDrift.toFixed(2));
-        const recalcStop = sideEnum === "LONG"
-          ? Number((recalcEntry - origRiskDist).toFixed(2))
-          : Number((recalcEntry + origRiskDist).toFixed(2));
-        const recalcTarget = sideEnum === "LONG"
-          ? Number((recalcEntry + origRewardDist).toFixed(2))
-          : Number((recalcEntry - origRewardDist).toFixed(2));
+      const origRewardDist = Math.abs(targetPrice - entryPrice);
+      if (!priceDriftRecoveryFailReason && origRiskDist > 0 && origRewardDist >= origRiskDist * 1.5) {
+        const newEntry = decisionPriceForDrift;
+        const newStop = sideEnum === "LONG"
+          ? Number((newEntry - origRiskDist).toFixed(2))
+          : Number((newEntry + origRiskDist).toFixed(2));
+        const newTarget = sideEnum === "LONG"
+          ? Number((newEntry + origRewardDist).toFixed(2))
+          : Number((newEntry - origRewardDist).toFixed(2));
         const recalcPlan = normalizeTradePlanForSide({
           side: sideEnum,
-          entryPrice: recalcEntry,
-          stopPrice: recalcStop,
-          targetPrice: recalcTarget,
-          rewardMultiple: 2,
+          entryPrice: newEntry,
+          stopPrice: newStop,
+          targetPrice: newTarget,
+          rewardMultiple: 1.5,
         });
-        if (
-          recalcPlan.ok &&
-          recalcPlan.normalizedEntryPrice > 0 &&
-          recalcPlan.normalizedStopPrice > 0 &&
-          recalcPlan.normalizedTargetPrice > 0
-        ) {
+        if (recalcPlan.ok) {
           entryPrice = recalcPlan.normalizedEntryPrice;
           stopPrice = recalcPlan.normalizedStopPrice;
           targetPrice = recalcPlan.normalizedTargetPrice;
+          priceDriftRecoveryRecalcEntry = entryPrice;
+          priceDriftRecoveryRecalcStop = stopPrice;
+          priceDriftRecoveryRecalcTarget = targetPrice;
+          priceDriftRecoverySucceeded = true;
           executionAdjustments = true;
-          driftRecalcSucceeded = true;
           trades[idx] = {
             ...trades[idx],
             entryPrice,
             stopPrice,
             targetPrice,
             takeProfitPrice: targetPrice,
-            executeOutcome: "RECALCULATED_ENTRY",
-            driftRecalculatedAt: nowIso(),
-            driftDiagnostics: driftDiag,
-            originalEntryBeforeDrift: safeNum(trade.entryPrice, 0),
-            originalStopBeforeDrift: safeNum(trade.stopPrice, 0),
-            originalTargetBeforeDrift: safeNum(trade.takeProfitPrice ?? trade.targetPrice, 0),
             executionAdjustments: true,
+            priceDriftRecalculated: true,
+            priceDriftRecalculatedAt: nowIso(),
+            driftDiagnostics: driftDiag,
             updatedAt: nowIso(),
           };
           await writeTrades(trades);
-          notes.push(`drift_recalculated:${ticker}:newEntry=${entryPrice}:origEntry=${safeNum(trade.entryPrice, 0)}`);
+          console.log("[execute] price_drift_recovery_succeeded", {
+            tradeId, ticker, side: sideEnum,
+            origEntry: driftDiag.entryPrice, origStop: stopPrice,
+            newEntry: entryPrice, newStop: stopPrice, newTarget: targetPrice,
+            driftR: driftDiag.driftR,
+          });
+        } else {
+          priceDriftRecoveryFailReason = `plan_invalid:${recalcPlan.invalidReason ?? "unknown"}`;
         }
+      } else if (!priceDriftRecoveryFailReason && origRiskDist <= 0) {
+        priceDriftRecoveryFailReason = "zero_risk_distance";
+      } else if (!priceDriftRecoveryFailReason) {
+        priceDriftRecoveryFailReason = `rr_below_minimum:rr=${(origRewardDist / origRiskDist).toFixed(2)}`;
       }
-      if (!driftRecalcSucceeded) {
+
+      if (!priceDriftRecoverySucceeded) {
         counts.skipped += 1;
+        // Use RECALCULATED_ENTRY_REJECTED when recovery was attempted (A/B tier)
+        // so funnel-health can distinguish a hard-risk block from a plain stale-drift skip.
+        const archiveOutcome = "RECALCULATED_ENTRY_REJECTED";
         trades[idx] = archivePendingTrade(
           trades[idx],
           driftDiag.reason ?? "entry_price_drifted_risk_multiple",
-          "SKIPPED_PRICE_DRIFT",
-          { driftDiagnostics: driftDiag },
+          archiveOutcome,
+          {
+            driftDiagnostics: driftDiag,
+            priceDriftRecoveryAttempted: true,
+            priceDriftRecoverySucceeded: false,
+            priceDriftRecoveryFailReason,
+          },
         );
         await writeTrades(trades);
         await bumpAutoEntryFunnelSafe({ executeArchivedDrifted: 1 });
         await recordOutcome({ outcome: "SKIP", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", ticker, tradeId });
-        perTradeResults.push({ tradeId, symbol: ticker, outcome: "SKIPPED_PRICE_DRIFT", reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple", aiScore: _tradeAiScore, tier: _tradeTier });
+        perTradeResults.push({
+          tradeId, symbol: ticker, outcome: archiveOutcome,
+          reason: driftDiag.reason ?? "entry_price_drifted_risk_multiple",
+          aiScore: _tradeAiScore, tier: _tradeTier,
+          priceDriftRecoveryAttempted: true,
+          priceDriftRecoverySucceeded: false,
+          priceDriftRecoveryFailReason,
+        });
         skippedTradeIds.push(tradeId);
         continue;
       }
+      // Recovery succeeded — fall through to execution with recalculated prices.
     }
     // Drift within tolerance — adjust entry to live price and preserve original R geometry.
     if (driftDiag.adjustedEntryPrice != null && driftDiag.adjustedEntryPrice !== entryPrice) {
@@ -3154,8 +3160,15 @@ export async function POST(req: Request) {
       executedAt: startedAt,
       openedAt: startedAt,
       executeAttemptedAt: startedAt,
-      executeOutcome: "EXECUTED",
-      executeReason: "placed",
+      executeOutcome: priceDriftRecoverySucceeded ? "RECALCULATED_ENTRY_EXECUTED" : "EXECUTED",
+      executeReason: priceDriftRecoverySucceeded ? "recalculated_entry" : "placed",
+      ...(priceDriftRecoverySucceeded ? {
+        priceDriftRecoveryAttempted: true,
+        priceDriftRecoverySucceeded: true,
+        priceDriftRecoveryRecalcEntry,
+        priceDriftRecoveryRecalcStop,
+        priceDriftRecoveryRecalcTarget,
+      } : {}),
       ai: {
         ...(trade.ai || {}),
         score,
@@ -3214,7 +3227,19 @@ export async function POST(req: Request) {
     // Trade executed — record result and continue to process remaining candidates
     executedTradeIds.push(tradeId);
     attemptedTradeIds.push(tradeId);
-    perTradeResults.push({ tradeId, symbol: ticker, outcome: "EXECUTED", reason: "placed", aiScore: _tradeAiScore, tier: _tradeTier });
+    perTradeResults.push({
+      tradeId, symbol: ticker,
+      outcome: priceDriftRecoverySucceeded ? "RECALCULATED_ENTRY_EXECUTED" : "EXECUTED",
+      reason: priceDriftRecoverySucceeded ? "recalculated_entry" : "placed",
+      aiScore: _tradeAiScore, tier: _tradeTier,
+      ...(priceDriftRecoverySucceeded ? {
+        priceDriftRecoveryAttempted: true,
+        priceDriftRecoverySucceeded: true,
+        recalculatedEntryPrice: priceDriftRecoveryRecalcEntry,
+        recalculatedStopPrice: priceDriftRecoveryRecalcStop,
+        recalculatedTargetPrice: priceDriftRecoveryRecalcTarget,
+      } : {}),
+    });
     // Do not return here — the loop continues to the next eligible trade
   } catch (e: any) {
     const message = String(e?.message || e || "unknown_error");

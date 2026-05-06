@@ -264,12 +264,12 @@ export async function GET(req: Request) {
     });
   }
   const allowTradingFilesExplicit = process.env.AGENT_ALLOW_TRADING_FILES === "1";
-  const isPaperModeForAutonomy = !(["0", "false", "no", "off"].includes(
+  const isPaperModeState = !(["0", "false", "no", "off"].includes(
     String(process.env.AUTO_TRADING_PAPER_ONLY ?? "1").trim().toLowerCase(),
   ));
   const allowTradingFiles =
     allowTradingFilesExplicit ||
-    (isPaperModeForAutonomy && process.env.AGENT_ALLOW_TRADING_FILES_PAPER !== "0");
+    (isPaperModeState && process.env.AGENT_ALLOW_TRADING_FILES_PAPER !== "0");
   const approvalRequiredQueue = allowTradingFiles
     ? []
     : tasks
@@ -396,6 +396,14 @@ export async function GET(req: Request) {
       const eCount = tasks.filter((t) => isOptimizationOnlyTask(t as unknown as { title: string; taskType?: string | null })).length;
       return mCount + eCount;
     })(),
+    // ─── Trading-file autonomy (mirrored under state.* for direct access) ──
+    tradingFileAutonomyEnabled: allowTradingFiles,
+    tradingFileAutonomyMode: isPaperModeState
+      ? "paper_only"
+      : allowTradingFilesExplicit
+        ? "explicit"
+        : null,
+    tradingFilePatchGuardrailsActive: true,
   };
 
   // ─── Compute latestExecutionResult age & historical flag ──────────
@@ -661,16 +669,13 @@ export async function GET(req: Request) {
       skippedDuplicateFixClassCount: dedupStats.skippedDuplicateExecutionCount,
     },
 
-    // ─── Trading file autonomy ──────────────────────────────────────
-    tradingFileAutonomy: {
-      autonomyEnabled: allowTradingFiles,
-      mode: isPaperModeForAutonomy
-        ? "paper_only"
-        : allowTradingFilesExplicit
-          ? "explicit"
-          : null,
-      // Guardrails are always active — patch plans require commit + verification gate
-      guardrailsActive: true,
-    },
+    // ─── Trading-file autonomy ────────────────────────────────────────
+    tradingFileAutonomyEnabled: allowTradingFiles,
+    tradingFileAutonomyMode: isPaperModeState
+      ? "paper_only"
+      : allowTradingFilesExplicit
+        ? "explicit"
+        : null,
+    tradingFilePatchGuardrailsActive: true,
   });
 }
