@@ -2,10 +2,14 @@ export type AiGrade = "A+" | "A" | "A-" | "B+" | "B" | "B-" | "C+" | "C" | "C" |
 
 /**
  * Qualification Tier Thresholds (score-based):
- * - A tier: >= 8.5  (elite, high-conviction)
- * - B tier: 7.5-8.49 (good, solid setups)
- * - C tier: 7.0-7.49 (qualified, minimum threshold)
- * - Below 7.0: Not qualified for auto-entry
+ * - A tier: >= 8.0  (elite, high-conviction)
+ * - B tier: 7.0-7.99 (good, solid setups)
+ * - C tier: 6.0-6.99 (qualified, minimum threshold)
+ * - Below 6.0: Not qualified for auto-entry
+ *
+ * Thresholds are intentionally permissive to prioritize funnel throughput
+ * and learning velocity. Hard quality gates in seed-from-signals handle
+ * extreme structural issues.
  */
 export type QualificationTier = "A" | "B" | "C" | "REJECT";
 
@@ -38,7 +42,7 @@ function envGrade(name: string, fallback: AiGrade): AiGrade {
 }
 
 export function qualifyByScore(score: number): boolean {
-  const min = envNum("AI_MIN_SCORE_TO_QUALIFY", 6.5);
+  const min = envNum("AI_MIN_SCORE_TO_QUALIFY", 6.0);
   return Number.isFinite(score) && score >= min;
 }
 
@@ -50,10 +54,12 @@ export function qualifyByGrade(grade: AiGrade): boolean {
 /**
  * Single source of truth for the minimum score to qualify.
  * Both qualifyByScore and aiScoring.ts must use this same default.
- * Default 6.5: allows decent setups through after realistic penalty stack.
+ * Default 6.0: permissive threshold to maximize funnel throughput and
+ * learning velocity. Hard rejects only for extreme illiquidity or
+ * invalid price/stop structure.
  */
 export function minScoreToQualify() {
-  return envNum("AI_MIN_SCORE_TO_QUALIFY", 6.5);
+  return envNum("AI_MIN_SCORE_TO_QUALIFY", 6.0);
 }
 
 /**
@@ -65,9 +71,9 @@ export function minScoreToQualify() {
  */
 export function getQualificationTier(score: number): QualificationTier {
   if (!Number.isFinite(score)) return "REJECT";
-  if (score >= 8.5) return "A";
-  if (score >= 7.5) return "B";
-  if (score >= 7.0) return "C";
+  if (score >= 8.0) return "A";
+  if (score >= 7.0) return "B";
+  if (score >= 6.0) return "C";
   return "REJECT";
 }
 
@@ -77,10 +83,10 @@ export function getQualificationTier(score: number): QualificationTier {
  */
 export function getTierThresholds() {
   return {
-    A: { min: 8.5, max: 10.0, description: "Elite, high-conviction" },
-    B: { min: 7.5, max: 8.49, description: "Good, solid setups" },
-    C: { min: 7.0, max: 7.49, description: "Qualified, minimum threshold" },
-    REJECT: { min: 0, max: 6.99, description: "Not qualified for auto-entry" },
+    A: { min: 8.0, max: 10.0, description: "Elite, high-conviction" },
+    B: { min: 7.0, max: 7.99, description: "Good, solid setups" },
+    C: { min: 6.0, max: 6.99, description: "Qualified, minimum threshold" },
+    REJECT: { min: 0, max: 5.99, description: "Not qualified for auto-entry" },
   };
 }
 

@@ -171,9 +171,10 @@ type ShortQualityResult = {
 };
 
 /**
- * Strict short-side quality check.
- * Rejects shorts that are not below VWAP, not in lower-high/lower-low structure,
- * or lacking increasing volume on breakdown.
+ * Short-side quality check — throughput-optimized.
+ * Hard-rejects only truly contradictory shorts (explicit bullish structure with
+ * no bearish evidence, extreme above-VWAP entries, or explicitly bullish trend).
+ * Allows moderate volume, near-VWAP, and flat trend when bearish evidence exists.
  */
 function evaluateShortQuality(signal: RawSignal): ShortQualityResult {
   const reasons: string[] = [];
@@ -187,8 +188,8 @@ function evaluateShortQuality(signal: RawSignal): ShortQualityResult {
     return null;
   };
 
-  // 1. Trend structure: lower highs / lower lows and downtrend alignment
-  const trend = getStr(signal, ["trend", "ai.trend", "context.trend"]);
+  // 1. Trend structure: only hard-reject when BOTH lowerHighs AND lowerLows are
+  //    explicitly false (null/missing = unknown = allow through).
   const lowerHighs =
     toBool(signal?.lowerHighs) ??
     toBool(signal?.context?.lowerHighs) ??
@@ -198,74 +199,61 @@ function evaluateShortQuality(signal: RawSignal): ShortQualityResult {
     toBool(signal?.context?.lowerLows) ??
     toBool(signal?.structure?.lowerLows);
 
-  if (lowerHighs === false || lowerLows === false) {
+  if (lowerHighs === false && lowerLows === false) {
     return {
       pass: false,
-      reason: "missing_lower_highs_lows",
+      reason: "no_lower_highs_or_lows",
       blockReason: "flat_trend_block",
     };
   }
 
+  // 2. Trend: only hard-reject explicitly bullish trends.
+  //    Flat/neutral trends are allowed (bearish structure in AI summary redeems them).
+  const trend = getStr(signal, ["trend", "ai.trend", "context.trend"]);
   if (trend) {
     const trendLower = trend.toLowerCase();
-    if (
-      trendLower === "flat" ||
-      trendLower === "neutral" ||
-      trendLower === "up" ||
-      trendLower === "bullish"
-    ) {
+    if (trendLower === "bullish" || trendLower === "strong_up") {
       return {
         pass: false,
         reason: `trend=${trendLower}`,
         blockReason: "flat_trend_block",
       };
     }
+    // flat/neutral/up trend: allow through — AI score already penalizes these
   }
 
-  // 2. VWAP alignment: shorts must be below VWAP.
+  // 3. VWAP alignment: hard-reject only when clearly extended above VWAP (>1%).
+  //    Near-VWAP shorts and slightly-above shorts are allowed.
   const vwapPosition = getStr(signal, ["vwapPosition", "ai.vwapPosition", "context.vwapPosition"]);
   const price = getNum(signal, ["entryPrice", "price", "lastPrice"]);
   const vwap = getNum(signal, ["vwap", "context.vwap"]);
-  
-  if (vwapPosition) {
-    const vpLower = vwapPosition.toLowerCase();
-    if (vpLower === "above" || vpLower.includes("above")) {
-      return {
-        pass: false,
-        reason: "above_vwap",
-        blockReason: "vwap_alignment_block",
-      };
-    }
-  } else if (price && vwap && vwap > 0) {
+
+  if (price && vwap && vwap > 0) {
     const distPct = ((price - vwap) / vwap) * 100;
-    if (distPct >= 0) {
+    if (distPct > 1.0) {
       return {
         pass: false,
-        reason: `not_below_vwap:${distPct.toFixed(2)}%`,
+        reason: `well_above_vwap:${distPct.toFixed(2)}%`,
+        blockReason: "vwap_alignment_block",
+      };
+    }
+  } else if (vwapPosition) {
+    const vpLower = vwapPosition.toLowerCase();
+    if (vpLower === "well_above" || vpLower === "extended_above") {
+      return {
+        pass: false,
+        reason: "well_above_vwap",
         blockReason: "vwap_alignment_block",
       };
     }
   }
 
-  // 3. Breakdown volume: must be increasing on breakdown.
-  const breakdownVolumeIncreasing =
-    toBool(signal?.breakdownVolumeIncreasing) ??
-    toBool(signal?.context?.breakdownVolumeIncreasing) ??
-    toBool(signal?.volume?.breakdownIncreasing);
-  if (breakdownVolumeIncreasing === false) {
-    return {
-      pass: false,
-      reason: "breakdown_volume_not_increasing",
-      blockReason: "weak_volume_block",
-    };
-  }
-
-  // 4. Relative volume check: shorts need decent volume.
+  // 4. Relative volume: only hard-reject extremely low volume (extreme illiquidity).
   const relVol = getNum(signal, ["relVol", "relativeVolume", "context.relVol"]);
-  if (relVol != null && relVol < 1.5) {
+  if (relVol != null && relVol < 0.4) {
     return {
       pass: false,
-      reason: `relVol=${relVol.toFixed(2)}<1.5`,
+      reason: `relVol=${relVol.toFixed(2)}<0.4_extreme_illiquidity`,
       blockReason: "weak_volume_block",
     };
   }
@@ -313,14 +301,12 @@ function evaluateCTierQuality(
     return { pass: false, blockReason: "c_tier_quality_block", debugNote: `score ${aiScore.toFixed(2)} < cMinScore ${cfg.cMinScore}` };
   }
 
-  // relVol gate
+  // relVol gate — only block extreme illiquidity for C-tier
   const relVol = getNum(signal, ["relVol", "relativeVolume", "context.relVol", "signalContext.relVolume"]);
   if (relVol != null && relVol < cfg.cMinRelVol) {
     return { pass: false, blockReason: "weak_volume_block", debugNote: `relVol ${relVol.toFixed(2)} < cMinRelVol ${cfg.cMinRelVol}` };
   }
-  if (relVol == null) {
-    return { pass: false, blockReason: "weak_volume_block", debugNote: "relVol missing for C-tier" };
-  }
+  // Missing relVol: allow through (do not block on missing data)
 
   // Trend alignment gate
   if (cfg.requireTrendAlignment) {
@@ -763,6 +749,23 @@ export async function POST(req: NextRequest) {
     });
   }
 
+  // ── Recovery mode: expand freshness window when no fresh qualified signals ──
+  // When capacity is available but no fresh signals exist, allow "slightly stale"
+  // A/B setups to prevent complete funnel starvation.
+  let recoveryModeActive = false;
+  let effectiveFreshnessMs = staleThresholdUsedMs;
+  if (freshQualifiedSignals === 0 && staleQualifiedSignals > 0 && effectiveLimit > 0) {
+    recoveryModeActive = true;
+    effectiveFreshnessMs = staleThresholdUsedMs * 3; // expand window 3x
+    console.log("[seed-from-signals] recovery_mode_activated", {
+      reason: "no_fresh_qualified_signals",
+      expandedFreshnessMsTo: effectiveFreshnessMs,
+      staleQualifiedSignals,
+      effectiveLimit,
+      remainingPositionSlots,
+    });
+  }
+
   const allQualifyingCandidates: QualifiedCandidate[] = [];
   const candidateKey = (c: QualifiedCandidate) => `${c.signalId}:${c.symbol}:${c.side}:${c.createdAt}`;
 
@@ -860,7 +863,7 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
-    if (!Number.isFinite(ageMs) || ageMs > staleThresholdUsedMs) {
+    if (!Number.isFinite(ageMs) || ageMs > effectiveFreshnessMs) {
       markSkip("stale_signal");
       continue;
     }
@@ -919,15 +922,16 @@ export async function POST(req: NextRequest) {
       shortQualified += 1;
     }
 
-    // C-tier execution quality gate (v2 performance upgrade)
-    // A/B tier signals skip this gate entirely and proceed to execution.
+    // C-tier execution quality gate: use config values directly.
+    // Hard rejects only for extreme illiquidity or invalid price structure.
+    // A/B tier signals skip this gate entirely.
     if (tier === "C") {
       const cGate = evaluateCTierQuality(s, aiScore as number, side, {
         allowCTier: cfg.allowCTier,
-        cMinScore: Math.max(cfg.cMinScore, 7.2),
-        cMinRelVol: Math.max(cfg.cMinRelVol, 1.5),
-        requireTrendAlignment: true,
-        cMinRR: Math.max(cfg.cMinRR, 2.0),
+        cMinScore: cfg.cMinScore,
+        cMinRelVol: cfg.cMinRelVol,
+        requireTrendAlignment: cfg.requireTrendAlignment,
+        cMinRR: cfg.cMinRR,
       });
       if (!cGate.pass) {
         const blockReason = cGate.blockReason ?? "c_tier_quality_block";
@@ -999,10 +1003,10 @@ export async function POST(req: NextRequest) {
   const totalCandidates = allQualifyingCandidates.length;
 
   const effectiveCTierGate = {
-    cMinScore: Math.max(cfg.cMinScore, 7.2),
-    cMinRelVol: Math.max(cfg.cMinRelVol, 1.5),
-    requireTrendAlignment: true,
-    cMinRR: Math.max(cfg.cMinRR, 2.0),
+    cMinScore: cfg.cMinScore,
+    cMinRelVol: cfg.cMinRelVol,
+    requireTrendAlignment: cfg.requireTrendAlignment,
+    cMinRR: cfg.cMinRR,
   };
 
   const abCandidates = uniqueCandidates.filter((c) => c.tier === "A" || c.tier === "B");
@@ -1279,7 +1283,13 @@ export async function POST(req: NextRequest) {
     entriesToday,
     limitReason,
     staleThresholdUsedMs,
+    effectiveFreshnessMs,
     freshnessMode,
+    // Throughput diagnostics
+    qualificationRate: signals.length > 0 ? (qualifiedSignals.length / signals.length).toFixed(3) : "0",
+    freshnessDistribution: { fresh: freshQualifiedSignals, stale: staleQualifiedSignals },
+    seededVsCapacity: { seeded: createdCount, capacity: effectiveLimit, remainingSlots: remainingPositionSlots },
+    recoveryModeActive,
   });
 
   const freshAgeMsValues = qualifiedSignalAges.map(a => a.ageMs).filter(Number.isFinite);
@@ -1307,7 +1317,13 @@ export async function POST(req: NextRequest) {
     minScore,
     effectiveMinScore,
     staleThresholdUsedMs,
+    effectiveFreshnessMs,
     freshnessMode,
+    recoveryModeActive,
+    // Throughput diagnostics
+    qualificationRate: signals.length > 0 ? Math.round((qualifiedSignals.length / signals.length) * 1000) / 1000 : 0,
+    freshnessDistribution: { fresh: freshQualifiedSignals, stale: staleQualifiedSignals },
+    seededVsCapacity: { seeded: dryRun ? 0 : created.length, capacity: effectiveLimit, remainingSlots: remainingPositionSlots },
     newestQualifiedAgeMs,
     oldestQualifiedAgeMs,
     totalSignals: (signals || []).length,

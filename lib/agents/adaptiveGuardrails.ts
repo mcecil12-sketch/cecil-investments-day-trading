@@ -88,15 +88,17 @@ function detectPatterns(signals: PerformanceLearningSignals): DetectedPattern[] 
     });
   }
 
-  // 4. Low overall win rate — raise min score threshold
-  if (signals.winRate < 0.4 && signals.totalTrades >= 10) {
+  // 4. Low overall win rate — do NOT auto-raise minScore threshold.
+  //    Raising thresholds reduces funnel throughput and kills learning velocity.
+  //    Only flag for manual review at critically low rates (< 30%) with enough data.
+  if (signals.winRate < 0.3 && signals.totalTrades >= 15) {
     patterns.push({
       pattern: "low_overall_win_rate",
       actionType: "raise_min_score_threshold",
-      reason: `Overall win rate ${(signals.winRate * 100).toFixed(0)}% < 40% over ${signals.totalTrades} trades`,
-      appliedValue: 1.0, // raise threshold by +1.0
-      previousValue: 0,
-      safe: true,
+      reason: `Overall win rate critically low (${(signals.winRate * 100).toFixed(0)}%) over ${signals.totalTrades} trades — manual review needed before adjusting thresholds`,
+      appliedValue: "task_only",
+      previousValue: null,
+      safe: false, // creates task; does NOT auto-apply threshold raise
     });
   }
 
@@ -125,6 +127,19 @@ function detectPatterns(signals: PerformanceLearningSignals): DetectedPattern[] 
   }
 
   // ─── NON-SAFE patterns → create tasks instead ──────────────────────
+
+  // 7. Underutilized funnel: flag when very few trades are being executed.
+  //    Creates a task to investigate and reduce qualification barriers.
+  if (signals.totalTrades < 5 && signals.tradePeriodDays <= 30) {
+    patterns.push({
+      pattern: "underutilized_funnel",
+      actionType: "suppress_mode",
+      reason: `UNDERUTILIZED_FUNNEL: only ${signals.totalTrades} trade(s) in ${signals.tradePeriodDays}-day period — qualification thresholds may be too restrictive`,
+      appliedValue: "task_only",
+      previousValue: null,
+      safe: false,
+    });
+  }
 
   // Scoring prompt changes needed
   if (signals.winRate < 0.3 && signals.totalTrades >= 15) {

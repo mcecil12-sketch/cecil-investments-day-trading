@@ -191,8 +191,11 @@ export async function computePerformanceLearning(): Promise<PerformanceLearningS
   if (shortWinRate < 0.35 && shortCount >= 3) {
     corrections.push("Review short-side qualification criteria — win rate below 35%");
   }
+  // NOTE: Do NOT recommend raising minScore thresholds to fix low win rate.
+  // Raising thresholds reduces funnel throughput and destroys learning velocity.
+  // Instead, investigate setup quality while maintaining trade volume.
   if (winRate < 0.4 && total >= 10) {
-    corrections.push("Raise minimum score threshold — overall win rate below 40%");
+    corrections.push("Investigate setup quality — win rate below 40%; do NOT raise score thresholds as this reduces trade volume and learning velocity");
   }
   if (avgR < -0.2 && total >= 5) {
     corrections.push("Improve exit strategy — negative average R across trades");
@@ -219,6 +222,16 @@ export async function computePerformanceLearning(): Promise<PerformanceLearningS
     if (totalInTier >= 3 && v.count / totalInTier > 0.65) {
       growth.push(`Tier ${tier} producing well — focus on qualification quality here`);
     }
+  }
+  // Underutilized funnel: key growth signal
+  if (total < 5) {
+    growth.push(
+      `UNDERUTILIZED_FUNNEL: only ${total} trade(s) in analysis period — reduce qualification thresholds and freshness constraints to maximize executed trades per day`
+    );
+  } else if (total < 10) {
+    growth.push(
+      `Low trade volume (${total} trades) — ensure funnel conversion is maximized; prefer more trades at acceptable win rate over fewer highly-filtered trades`
+    );
   }
 
   const signals: PerformanceLearningSignals = {

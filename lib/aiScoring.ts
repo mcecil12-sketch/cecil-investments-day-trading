@@ -10,9 +10,11 @@ import { minScoreToQualify } from "@/lib/aiQualify";
 
 function dynamicMinScore(sessionMinutes: number) {
   const m = Number.isFinite(sessionMinutes) ? sessionMinutes : 60;
-  if (m <= 15) return { c: 6.3, b: 7.2, a: 8.4 };
-  if (m <= 90) return { c: 6.5, b: 7.5, a: 8.5 };
-  return { c: 6.8, b: 7.8, a: 8.7 };
+  // Permissive thresholds: prioritize funnel throughput over precision.
+  // Hard quality gates in seed-from-signals filter extreme cases.
+  if (m <= 15) return { c: 5.8, b: 6.8, a: 8.0 };
+  if (m <= 90) return { c: 6.0, b: 7.0, a: 8.2 };
+  return { c: 6.2, b: 7.2, a: 8.4 };
 }
 
 function tierFromScore(score: number, mins: {c:number;b:number;a:number}) {
@@ -359,8 +361,8 @@ export function formatAiSummary(grade: AiGrade, score: number) {
 
 const MIN_BARS_FOR_AI = Number(process.env.MIN_BARS_FOR_AI ?? 20);
 const MIN_AVG_DOLLAR_VOL_HARD = Number(process.env.MIN_AVG_DOLLAR_VOL_HARD ?? 300000);
-const MIN_LONG_SCORE = Number(process.env.MIN_LONG_SCORE ?? 7.0);
-const MIN_SHORT_SCORE = Number(process.env.MIN_SHORT_SCORE ?? 6.8);
+const MIN_LONG_SCORE = Number(process.env.MIN_LONG_SCORE ?? 6.0);
+const MIN_SHORT_SCORE = Number(process.env.MIN_SHORT_SCORE ?? 5.8);
 const MIN_EDGE = Number(process.env.MIN_EDGE ?? 0.5);
 const AI_SCORING_RETRY_MAX = Number(process.env.AI_SCORING_RETRY_MAX ?? 4);
 const AI_SCORING_BREAKER_ENABLED = String(process.env.AI_SCORING_BREAKER_ENABLED ?? "1") === "1";
