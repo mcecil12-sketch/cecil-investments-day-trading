@@ -10,7 +10,7 @@ import { getGuardrailsState } from "@/lib/autoEntry/guardrailsStore";
 import { getGuardrailConfig } from "@/lib/autoEntry/guardrails";
 import { fetchAlpacaClockSafe } from "@/lib/alpacaClock";
 import { readSignals, writeSignals, type StoredSignal } from "@/lib/jsonDb";
-import { upsertIncident, resolveIncident } from "@/lib/agents/store";
+import { upsertIncident, resolveIncident, findOpenIncident } from "@/lib/agents/store";
 import {
   recordSeedRunTelemetry,
   type SeedRunTelemetry,
@@ -486,6 +486,7 @@ export async function POST(req: NextRequest) {
   const bodyMinScore = typeof body?.minScore === "number" && Number.isFinite(body.minScore) ? body.minScore : undefined;
   const dryRun = parseBoolFlag(url.searchParams.get("dryRun")) || parseBoolFlag(body?.dryRun);
   const debug = parseBoolFlag(url.searchParams.get("debug")) || parseBoolFlag(body?.debug);
+  const funnelRecoveryModeParam = parseBoolFlag(url.searchParams.get("funnelRecoveryMode")) || parseBoolFlag(body?.funnelRecoveryMode);
 
   const limitParsed = Number(limitRawQuery) || bodyLimit;
   const minScoreParsed = Number(minScoreRawQuery) || bodyMinScore;
@@ -502,7 +503,7 @@ export async function POST(req: NextRequest) {
   const today = getEtDateString();
   const { startMs: dayStartMs, endMs: dayEndMs } = getEtDayBoundsMs(today);
   const guardConfig = getGuardrailConfig();
-  const [rawSignals, trades, overlay, brokerTruth, guardState, clock, allStoredSignals] = await Promise.all([
+  const [rawSignals, trades, overlay, brokerTruth, guardState, clock, allStoredSignals, openFunnelBlockIncident] = await Promise.all([
     fetchScoredSignalsFromInternalApi(),
     readTrades<any>(),
     readExecutionOverlays(),
@@ -510,10 +511,47 @@ export async function POST(req: NextRequest) {
     getGuardrailsState(today),
     fetchAlpacaClockSafe(),
     readSignals(),
+    findOpenIncident({ category: "FUNNEL_BLOCK", title: "Fresh qualified signals not seeded" }),
   ]);
 
   const marketOpen = clock.ok ? Boolean(clock.is_open) : false;
   const allowAfterHoursCreate = debug;
+
+  // ─── Paper mode + overlay override ───────────────────────────────────
+  // In paper mode or when a FUNNEL_BLOCK incident is open, relax DEFENSIVE
+  // A-only grade restriction to A+B. Hard structural checks are not affected.
+  const isPaperMode = !(["0", "false", "no", "off"].includes(
+    String(process.env.AUTO_TRADING_PAPER_ONLY ?? "1").trim().toLowerCase()));
+  const funnelRecoveryActive = funnelRecoveryModeParam || openFunnelBlockIncident !== null;
+  const overlayOriginalPosture = overlay.posture;
+  const overlayOriginalAllowedGrades = overlay.allowedGrades;
+  const overrideTriggered = (isPaperMode || funnelRecoveryActive) && !overlay.allowedGrades.includes("B");
+  const overlayOverrideApplied = overrideTriggered;
+  const overlayOverrideReason: string | null = overrideTriggered
+    ? (isPaperMode ? "paper_mode" : "funnel_recovery")
+    : null;
+  const effectiveOverlay = overrideTriggered
+    ? {
+        ...overlay,
+        allowedGrades: ["A", "B"] as Array<"A" | "B" | "C">,
+        minScoreAdjustment: isPaperMode ? 0 : overlay.minScoreAdjustment,
+      }
+    : overlay;
+  const overlayEffectivePosture =
+    overrideTriggered && overlay.posture === "DEFENSIVE" ? "NORMAL" : overlay.posture;
+  // Tracks signals rescued by the override (would have been overlay_block without it)
+  let overlayOverrideUnblockedCount = 0;
+  if (overrideTriggered) {
+    console.log("[seed-from-signals] overlay_override_applied", {
+      reason: overlayOverrideReason,
+      originalGrades: overlayOriginalAllowedGrades,
+      effectiveGrades: effectiveOverlay.allowedGrades,
+      isPaperMode,
+      funnelRecoveryActive,
+      funnelRecoveryModeParam,
+      hasFunnelBlockIncident: openFunnelBlockIncident !== null,
+    });
+  }
 
   // ─── Stale threshold: market-hours-aware ──────────────────────────────
   const freshMsParam = url.searchParams.has("freshMs") ? Number(url.searchParams.get("freshMs")) : null;
@@ -832,9 +870,17 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
-    if ((tier === "C" && !cfg.allowedTiers.includes("C")) || !overlay.allowedGrades.includes(tier as "A" | "B" | "C")) {
-      markSkip("overlay_block");
-      continue;
+    {
+      const _isBlockedByCfgCTier = tier === "C" && !cfg.allowedTiers.includes("C");
+      const _isBlockedByEffectiveOverlay = !effectiveOverlay.allowedGrades.includes(tier as "A" | "B" | "C");
+      if (_isBlockedByCfgCTier || _isBlockedByEffectiveOverlay) {
+        markSkip("overlay_block");
+        continue;
+      }
+      // Count signals rescued by the override (would have been blocked without it)
+      if (overrideTriggered && !overlayOriginalAllowedGrades.includes(tier as "A" | "B" | "C")) {
+        overlayOverrideUnblockedCount++;
+      }
     }
 
     if (activeSignalIds.has(signalId)) {
@@ -1327,6 +1373,18 @@ export async function POST(req: NextRequest) {
       minScoreAdjustment: overlay.minScoreAdjustment,
       maxEntriesOverride: overlay.maxEntriesOverride,
       stateAvailable: overlay.stateAvailable,
+    },
+    overlayOverride: {
+      overrideApplied: overlayOverrideApplied,
+      overrideReason: overlayOverrideReason,
+      isPaperMode,
+      funnelRecoveryActive,
+      originalPosture: overlayOriginalPosture,
+      originalAllowedGrades: overlayOriginalAllowedGrades,
+      effectivePosture: overlayEffectivePosture,
+      effectiveAllowedGrades: effectiveOverlay.allowedGrades,
+      unblockedCount: overlayOverrideUnblockedCount,
+      blockedByOverlayCount: overlayGradeSkippedCount,
     },
   }, { status: 200 });
 }
