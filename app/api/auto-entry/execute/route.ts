@@ -85,7 +85,7 @@ import { redis, saveCriticalTask } from "@/lib/redis";
 import { recordAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
 import { requireAuth } from "@/lib/auth";
 import { getGuardrailConfig, minutesSince } from "@/lib/autoEntry/guardrails";
-import { getAutoConfig, tierForScore, riskMultForTier } from "@/lib/autoEntry/config";
+import { getAutoConfig, tierForScore } from "@/lib/autoEntry/config";
 import { getAutoManageConfig } from "@/lib/autoManage/config";
 import { resolveDecisionPrice, type QuoteLike, type Side } from "@/lib/autoEntry/pricing";
 import { withRedisLock } from "@/lib/locks";
@@ -752,13 +752,6 @@ async function setnxLock(key: string, ttlSec: number) {
   return Boolean(ok);
 }
 
-
-function computeQty(entryPrice: number, stopPrice: number, riskDollars: number) {
-  const diff = Math.abs(entryPrice - stopPrice);
-  if (!diff || diff <= 0) return 1;
-  const qty = Math.floor(riskDollars / diff);
-  return Math.max(1, qty);
-}
 
 async function listOpenOrders(symbol: string) {
   const qs = `status=open&symbols=${encodeURIComponent(symbol)}`;
@@ -2032,6 +2025,10 @@ export async function POST(req: Request) {
     reason: string;
     aiScore: number | null;
     tier: string | null;
+    riskPerShare?: number | null;
+    maxRiskDollars?: number | null;
+    calculatedQuantity?: number | null;
+    actualRisk?: number | null;
     priceDriftRecoveryAttempted?: boolean;
     priceDriftRecoverySucceeded?: boolean;
     priceDriftRecoveryFailReason?: string | null;
@@ -2409,6 +2406,211 @@ export async function POST(req: Request) {
     continue;
   }
 
+  // ─── Hard Risk Enforcement (pre-execution) ────────────────────────────
+  // Never trust incoming quantity; always recompute from risk model.
+  const execAiScore = Number(trade.aiScore ?? trade.ai?.score);
+  const resolvedTierRaw = String(trade.tier ?? trade.ai?.tier ?? "").toUpperCase();
+  const resolvedTier =
+    resolvedTierRaw === "A" || resolvedTierRaw === "B" || resolvedTierRaw === "C"
+      ? (resolvedTierRaw as "A" | "B" | "C")
+      : (Number.isFinite(execAiScore) && execAiScore > 0 ? tierForScore(execAiScore) : null);
+
+  if (!(entryPrice > 0) || !(stopPrice > 0) || !resolvedTier || !(Number.isFinite(execAiScore) && execAiScore > 0)) {
+    const riskPerShareMissing = Math.abs(entryPrice - stopPrice);
+    trades[idx] = archivePendingTrade(trades[idx], "missing_required_fields", "MALFORMED", {
+      riskDiagnostics: {
+        riskPerShare: Number.isFinite(riskPerShareMissing) ? riskPerShareMissing : null,
+        maxRiskDollars: null,
+        calculatedQuantity: null,
+        actualRisk: null,
+        tier: resolvedTier,
+      },
+    });
+    await writeTrades(trades);
+    counts.invalidMarked += 1;
+    counts.skipped += 1;
+    await recordOutcome({ outcome: "FAIL", reason: "missing_required_fields", ticker, tradeId });
+    perTradeResults.push({
+      tradeId,
+      symbol: ticker,
+      outcome: "MALFORMED",
+      reason: "missing_required_fields",
+      aiScore: _tradeAiScore,
+      tier: _tradeTier,
+      riskPerShare: Number.isFinite(riskPerShareMissing) ? riskPerShareMissing : null,
+      maxRiskDollars: null,
+      calculatedQuantity: null,
+      actualRisk: null,
+    });
+    skippedTradeIds.push(tradeId);
+    continue;
+  }
+
+  const riskPerShare = Math.abs(entryPrice - stopPrice);
+  if (!Number.isFinite(riskPerShare) || riskPerShare <= 0) {
+    trades[idx] = archivePendingTrade(trades[idx], "invalid_risk_per_share", "MALFORMED", {
+      riskDiagnostics: {
+        riskPerShare: Number.isFinite(riskPerShare) ? riskPerShare : null,
+        maxRiskDollars: null,
+        calculatedQuantity: null,
+        actualRisk: null,
+        tier: resolvedTier,
+      },
+    });
+    await writeTrades(trades);
+    counts.invalidMarked += 1;
+    counts.skipped += 1;
+    await recordOutcome({ outcome: "FAIL", reason: "invalid_risk_per_share", ticker, tradeId });
+    perTradeResults.push({
+      tradeId,
+      symbol: ticker,
+      outcome: "MALFORMED",
+      reason: "invalid_risk_per_share",
+      aiScore: _tradeAiScore,
+      tier: _tradeTier,
+      riskPerShare,
+      maxRiskDollars: null,
+      calculatedQuantity: null,
+      actualRisk: null,
+    });
+    skippedTradeIds.push(tradeId);
+    continue;
+  }
+
+  if ((riskPerShare / entryPrice) < 0.001) {
+    counts.skipped += 1;
+    trades[idx] = archivePendingTrade(trades[idx], "stop_too_tight", "SKIPPED_NO_LONGER_ELIGIBLE", {
+      riskDiagnostics: {
+        riskPerShare,
+        maxRiskDollars: null,
+        calculatedQuantity: null,
+        actualRisk: null,
+        tier: resolvedTier,
+      },
+    });
+    await writeTrades(trades);
+    await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
+    await recordOutcome({ outcome: "SKIP", reason: "stop_too_tight", ticker, tradeId });
+    perTradeResults.push({
+      tradeId,
+      symbol: ticker,
+      outcome: "SKIPPED_NO_LONGER_ELIGIBLE",
+      reason: "stop_too_tight",
+      aiScore: _tradeAiScore,
+      tier: _tradeTier,
+      riskPerShare,
+      maxRiskDollars: null,
+      calculatedQuantity: null,
+      actualRisk: null,
+    });
+    skippedTradeIds.push(tradeId);
+    continue;
+  }
+
+  const baseRiskDollars = cfg.baseRiskDollars > 0 ? cfg.baseRiskDollars : 250;
+  const tierMultiplier = resolvedTier === "A" ? 2.0 : resolvedTier === "B" ? 1.5 : 1.0;
+  const maxRiskDollars = baseRiskDollars * tierMultiplier;
+  const calculatedQuantity = Math.floor(maxRiskDollars / riskPerShare);
+
+  if (!Number.isFinite(calculatedQuantity) || calculatedQuantity < 1) {
+    counts.skipped += 1;
+    trades[idx] = archivePendingTrade(trades[idx], "position_size_too_small", "SKIPPED_NO_LONGER_ELIGIBLE", {
+      riskDiagnostics: {
+        riskPerShare,
+        maxRiskDollars,
+        calculatedQuantity,
+        actualRisk: 0,
+        tier: resolvedTier,
+      },
+    });
+    await writeTrades(trades);
+    await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
+    await recordOutcome({ outcome: "SKIP", reason: "position_size_too_small", ticker, tradeId });
+    perTradeResults.push({
+      tradeId,
+      symbol: ticker,
+      outcome: "SKIPPED_NO_LONGER_ELIGIBLE",
+      reason: "position_size_too_small",
+      aiScore: _tradeAiScore,
+      tier: _tradeTier,
+      riskPerShare,
+      maxRiskDollars,
+      calculatedQuantity,
+      actualRisk: 0,
+    });
+    skippedTradeIds.push(tradeId);
+    continue;
+  }
+
+  if (calculatedQuantity > 10000) {
+    counts.skipped += 1;
+    const preCapActualRisk = calculatedQuantity * riskPerShare;
+    trades[idx] = archivePendingTrade(trades[idx], "position_size_too_large", "SKIPPED_NO_LONGER_ELIGIBLE", {
+      riskDiagnostics: {
+        riskPerShare,
+        maxRiskDollars,
+        calculatedQuantity,
+        actualRisk: preCapActualRisk,
+        tier: resolvedTier,
+      },
+    });
+    await writeTrades(trades);
+    await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
+    await recordOutcome({ outcome: "SKIP", reason: "position_size_too_large", ticker, tradeId });
+    perTradeResults.push({
+      tradeId,
+      symbol: ticker,
+      outcome: "SKIPPED_NO_LONGER_ELIGIBLE",
+      reason: "position_size_too_large",
+      aiScore: _tradeAiScore,
+      tier: _tradeTier,
+      riskPerShare,
+      maxRiskDollars,
+      calculatedQuantity,
+      actualRisk: preCapActualRisk,
+    });
+    skippedTradeIds.push(tradeId);
+    continue;
+  }
+
+  const actualRisk = calculatedQuantity * riskPerShare;
+  if (actualRisk > maxRiskDollars * 1.05) {
+    counts.skipped += 1;
+    trades[idx] = archivePendingTrade(trades[idx], "risk_exceeds_max", "SKIPPED_NO_LONGER_ELIGIBLE", {
+      riskDiagnostics: {
+        riskPerShare,
+        maxRiskDollars,
+        calculatedQuantity,
+        actualRisk,
+        tier: resolvedTier,
+      },
+    });
+    await writeTrades(trades);
+    await bumpAutoEntryFunnelSafe({ executeArchivedNoLongerEligible: 1 });
+    await recordOutcome({ outcome: "SKIP", reason: "risk_exceeds_max", ticker, tradeId });
+    perTradeResults.push({
+      tradeId,
+      symbol: ticker,
+      outcome: "SKIPPED_NO_LONGER_ELIGIBLE",
+      reason: "risk_exceeds_max",
+      aiScore: _tradeAiScore,
+      tier: _tradeTier,
+      riskPerShare,
+      maxRiskDollars,
+      calculatedQuantity,
+      actualRisk,
+    });
+    skippedTradeIds.push(tradeId);
+    continue;
+  }
+
+  // Hard overwrite quantity from risk model.
+  const qty = calculatedQuantity;
+  const score = execAiScore;
+  const tier = resolvedTier;
+  const riskMult = tierMultiplier;
+  const riskDollars = maxRiskDollars;
+
   const lockKey = `lock:auto-entry:${ticker}`;
   const locked = await setnxLock(lockKey, 60 * 10);
   if (!locked) {
@@ -2447,12 +2649,6 @@ export async function POST(req: Request) {
     skippedTradeIds.push(tradeId);
     continue;
   }
-
-  const score = safeNum(trade.ai?.score ?? trade.score ?? 0, 0);
-  const tier = tierForScore(score) || "C";
-  const riskMult = riskMultForTier(tier);
-  const riskDollars = cfg.baseRiskDollars * riskMult;
-  const qty = computeQty(entryPrice, stopPrice, riskDollars);
 
   const sideDirection = side === "LONG" ? "buy" : "sell";
   const redisLockKey = `lock:auto-entry:${ticker}`;
@@ -2653,6 +2849,11 @@ export async function POST(req: Request) {
     decisionPriceForDrift,
     sideEnum,
     qty,
+    riskPerShare,
+    maxRiskDollars,
+    calculatedQuantity,
+    actualRisk,
+    tier,
   });
 
   const dbg: any = {
@@ -2675,6 +2876,10 @@ export async function POST(req: Request) {
     bracketStopPrice: bracketStop,
     qty,
     riskDollars,
+    riskPerShare,
+    maxRiskDollars,
+    calculatedQuantity,
+    actualRisk,
     tier,
     score,
     replacement: replacementPlan,
@@ -3176,6 +3381,13 @@ export async function POST(req: Request) {
         riskMult,
         riskDollars,
       },
+      riskDiagnostics: {
+        riskPerShare,
+        maxRiskDollars,
+        calculatedQuantity,
+        actualRisk,
+        tier,
+      },
       paper: true,
     };
 
@@ -3232,6 +3444,10 @@ export async function POST(req: Request) {
       outcome: priceDriftRecoverySucceeded ? "RECALCULATED_ENTRY_EXECUTED" : "EXECUTED",
       reason: priceDriftRecoverySucceeded ? "recalculated_entry" : "placed",
       aiScore: _tradeAiScore, tier: _tradeTier,
+      riskPerShare,
+      maxRiskDollars,
+      calculatedQuantity,
+      actualRisk,
       ...(priceDriftRecoverySucceeded ? {
         priceDriftRecoveryAttempted: true,
         priceDriftRecoverySucceeded: true,
