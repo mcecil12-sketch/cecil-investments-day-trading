@@ -339,6 +339,54 @@ async function submitMarketCloseForTrade(trade: any, ticker: string): Promise<
   }
 }
 
+async function forceExitForRisk(args: {
+  trade: any;
+  tradeId: string;
+  ticker: string;
+  reason: "stop_triggered" | "circuit_breaker_triggered";
+  unrealizedR: number;
+  currentPrice: number;
+  now: string;
+}): Promise<
+  | { ok: true; qty: number; orderId: string; status?: string }
+  | { ok: false; error: string; detail?: string }
+> {
+  const closeRes = await submitMarketCloseForTrade(args.trade, args.ticker);
+  if (!closeRes.ok) {
+    console.error("[risk] forcedExit failed", {
+      tradeId: args.tradeId,
+      ticker: args.ticker,
+      reason: args.reason,
+      unrealizedR: args.unrealizedR,
+      currentPrice: args.currentPrice,
+      error: closeRes.error,
+      detail: closeRes.detail,
+    });
+    return closeRes;
+  }
+  console.warn("[risk] forcedExit", {
+    tradeId: args.tradeId,
+    ticker: args.ticker,
+    reason: args.reason,
+    unrealizedR: args.unrealizedR,
+    currentPrice: args.currentPrice,
+    orderId: closeRes.orderId,
+    qty: closeRes.qty,
+  });
+  return closeRes;
+}
+
+function upsertMaxRealizedR(trade: any, candidateR: number | null | undefined) {
+  const c = Number(candidateR);
+  if (!Number.isFinite(c)) return trade;
+  const prev = Number(trade?.maxRealizedR);
+  const nextWorst = Number.isFinite(prev) ? Math.min(prev, c) : c;
+  return {
+    ...trade,
+    maxRealizedR: r3(nextWorst),
+  };
+}
+
 async function emitProtectionEvent(args: {
   type: ProtectionEventType;
   tradeId: string;
@@ -756,6 +804,88 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
     }
 
     if (cfg.eodFlatten && (flattenAllowed || staleOpen.stale)) {
+      // Safety-first: stale cleanup must not be a blind close path.
+      // For stale trades, enforce stop/circuit logic first using live price.
+      if (staleOpen.stale && idx >= 0 && stop != null && stop > 0) {
+        let staleCurrentPrice: number | null = null;
+        const stalePosPx = num((brokerPos as any)?.current_price);
+        const stalePosMv = num((brokerPos as any)?.market_value);
+        if (stalePosPx != null && stalePosPx > 0) {
+          staleCurrentPrice = stalePosPx;
+        } else if (stalePosMv != null && stalePosMv > 0 && Number.isFinite(qty) && qty > 0) {
+          staleCurrentPrice = Math.abs(stalePosMv) / qty;
+        }
+        if (staleCurrentPrice == null) {
+          try {
+            const q: any = await getLatestQuote(ticker);
+            const qPx = midFromQuote(q);
+            if (qPx != null && qPx > 0) staleCurrentPrice = qPx;
+          } catch {}
+        }
+        if (staleCurrentPrice == null) {
+          const barClose = await fetchLatestBarClose(ticker);
+          if (barClose != null && barClose > 0) staleCurrentPrice = barClose;
+        }
+
+        const staleMetrics = await computeUnrealizedMetrics({
+          side,
+          entry,
+          stop,
+          qty,
+          currentPrice: staleCurrentPrice,
+        });
+
+        if (staleMetrics.ok) {
+          const stalePx = staleMetrics.px;
+          const staleR = staleMetrics.unrealizedR;
+          const stopTriggered = side === "LONG" ? stalePx <= stop : stalePx >= stop;
+          const circuitBreakerTriggered = staleR <= -1.2;
+          if (stopTriggered || circuitBreakerTriggered) {
+            const forced = await forceExitForRisk({
+              trade: next[idx],
+              tradeId: id,
+              ticker,
+              reason: circuitBreakerTriggered ? "circuit_breaker_triggered" : "stop_triggered",
+              unrealizedR: staleR,
+              currentPrice: stalePx,
+              now,
+            });
+            if (forced.ok) {
+              next[idx] = upsertMaxRealizedR({
+                ...next[idx],
+                status: "CLOSED",
+                autoEntryStatus: "CLOSED",
+                closedAt: now,
+                updatedAt: now,
+                closeReason: circuitBreakerTriggered ? "circuit_breaker_triggered" : "stop_triggered",
+                note: appendRuleNote(next[idx], circuitBreakerTriggered ? "rule:CIRCUIT_BREAKER_-1.2R" : "rule:STOP_TRIGGERED"),
+                unrealizedPnL: staleMetrics.unrealizedPnL,
+                unrealizedR: staleR,
+                realizedR: staleR,
+                lastPrice: r2(stalePx),
+                closeOrderId: forced.orderId,
+                closeOrderStatus: forced.status,
+                autoManage: {
+                  ...(next[idx].autoManage || {}),
+                  lastRunAt: now,
+                  lastRule: circuitBreakerTriggered ? "CIRCUIT_BREAKER_-1.2R" : "STOP_TRIGGERED",
+                  stopTriggered,
+                  forcedExit: true,
+                  circuitBreakerTriggered,
+                },
+                error: undefined,
+              }, staleR);
+              updated++;
+              flattened++;
+              pushNote(`forcedExit:${ticker}:${circuitBreakerTriggered ? "circuitBreakerTriggered" : "stopTriggered"}:r=${staleR.toFixed(3)}`);
+              continue;
+            }
+            hadFailures = true;
+            pushNote(`forcedExit_fail:${ticker}:${forced.error}${forced.detail ? ":" + forced.detail : ""}`);
+          }
+        }
+      }
+
       const flattenReason = flattenAllowedForce
         ? "forced_flatten"
         : flattenAllowedEod
@@ -915,6 +1045,78 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
       continue;
     }
 
+    // Mandatory hard stop enforcement independent of broker bracket reliability.
+    const stopTriggered = side === "LONG" ? px <= stopForCalc : px >= stopForCalc;
+    const circuitBreakerTriggered = unrealizedR <= -1.2;
+    if (stopTriggered || circuitBreakerTriggered) {
+      const forced = await forceExitForRisk({
+        trade: t,
+        tradeId: id,
+        ticker,
+        reason: circuitBreakerTriggered ? "circuit_breaker_triggered" : "stop_triggered",
+        unrealizedR,
+        currentPrice: px,
+        now,
+      });
+
+      if (!forced.ok) {
+        pushNote(`forcedExit_fail:${ticker}:${forced.error}${forced.detail ? ":" + forced.detail : ""}`);
+        hadFailures = true;
+        if (idx >= 0) {
+          next[idx] = {
+            ...next[idx],
+            autoManage: {
+              ...(next[idx].autoManage || {}),
+              lastRunAt: now,
+              lastRule: circuitBreakerTriggered ? "CIRCUIT_BREAKER_-1.2R" : "STOP_TRIGGERED",
+              lastForcedExitStatus: "FAIL",
+              lastForcedExitError: `${forced.error}${forced.detail ? ":" + forced.detail : ""}`,
+              stopTriggered,
+              forcedExit: true,
+              circuitBreakerTriggered,
+            },
+            updatedAt: now,
+          };
+          updated++;
+        }
+        continue;
+      }
+
+      if (idx >= 0) {
+        next[idx] = upsertMaxRealizedR({
+          ...next[idx],
+          status: "CLOSED",
+          autoEntryStatus: "CLOSED",
+          closedAt: now,
+          updatedAt: now,
+          closeReason: circuitBreakerTriggered ? "circuit_breaker_triggered" : "stop_triggered",
+          note: appendRuleNote(next[idx], circuitBreakerTriggered ? "rule:CIRCUIT_BREAKER_-1.2R" : "rule:STOP_TRIGGERED"),
+          unrealizedPnL,
+          unrealizedR,
+          realizedR: unrealizedR,
+          lastPrice: r2(px),
+          closeOrderId: forced.orderId,
+          closeOrderStatus: forced.status,
+          autoManage: {
+            ...(next[idx].autoManage || {}),
+            lastRunAt: now,
+            lastRule: circuitBreakerTriggered ? "CIRCUIT_BREAKER_-1.2R" : "STOP_TRIGGERED",
+            lastForcedExitAt: now,
+            lastForcedExitStatus: "OK",
+            stopTriggered,
+            forcedExit: true,
+            circuitBreakerTriggered,
+          },
+          error: undefined,
+        }, unrealizedR);
+      }
+
+      pushNote(`forcedExit:${ticker}:${circuitBreakerTriggered ? "circuitBreakerTriggered" : "stopTriggered"}:r=${unrealizedR.toFixed(3)} qty=${forced.qty}`);
+      flattened++;
+      updated++;
+      continue;
+    }
+
     const cutLossEvaluation = evaluateCutLoss({
       enabled: cfg.cutLossEnabled,
       thresholdR: cfg.cutLossR,
@@ -953,7 +1155,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
 
       if (idx >= 0) {
         const current = next[idx];
-        next[idx] = {
+        next[idx] = upsertMaxRealizedR({
           ...current,
           status: "CLOSED",
           autoEntryStatus: "CLOSED",
@@ -975,7 +1177,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
             cutLossR: cfg.cutLossR,
           },
           error: undefined,
-        };
+        }, unrealizedR);
       }
 
       pushNote(`cut_loss_exit:ticker=${ticker} r=${cutLossAction.r.toFixed(3)} qty=${closeRes.qty}`);
@@ -1261,6 +1463,8 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
         },
       };
 
+      next[idx] = upsertMaxRealizedR(next[idx], unrealizedR);
+
       if (!stopSyncOk) {
         pushNote(`stop_sync_fail:${ticker}:${stopSyncNote}`);
         hadFailures = true;
@@ -1273,6 +1477,28 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
   }
 
   if (updated > 0) await writeTrades(next);
+
+  // CRITICAL loss guardrail: emit when any trade breaches -1.5R.
+  for (const tr of next) {
+    const r = Number(tr?.realizedR ?? tr?.maxRealizedR);
+    if (!Number.isFinite(r) || r >= -1.5) continue;
+    console.error("[risk] CRITICAL_R_BREACH", {
+      tradeId: String(tr?.id || ""),
+      ticker: String(tr?.ticker || ""),
+      maxRealizedR: r,
+      threshold: -1.5,
+    });
+    pushNote(`CRITICAL:maxRealizedR_breach:${String(tr?.ticker || "")}=${r.toFixed(3)}`);
+    try {
+      await appendActivity({
+        type: "CRITICAL_R_BREACH",
+        tradeId: String(tr?.id || ""),
+        ticker: String(tr?.ticker || ""),
+        message: `Trade breached critical R threshold: ${r.toFixed(3)}R`,
+        meta: { maxRealizedR: r, threshold: -1.5 },
+      });
+    } catch {}
+  }
 
   if (eodFlattenAttempted > 0 || staleOpenTradesCount > 0) {
     try {

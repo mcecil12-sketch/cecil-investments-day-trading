@@ -3191,6 +3191,21 @@ export async function POST(req: Request) {
       // Verify the stop leg is active (not just submitted)
       const stopVerify = await verifyStopOrderDirect(stopOrderId);
       stopVerified = stopVerify.active;
+
+      // Stop activation grace period (~2s): re-check once before fallback recovery.
+      if (!stopVerified) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const stopVerifyRetry = await verifyStopOrderDirect(stopOrderId);
+        stopVerified = stopVerifyRetry.active;
+        if (stopVerified) {
+          console.log("[auto-entry] stop became active after grace period", {
+            ticker,
+            tradeId,
+            stopOrderId,
+            status: stopVerifyRetry.status,
+          });
+        }
+      }
       
       console.log("[auto-entry] stop verification result", {
         ticker,
@@ -3209,6 +3224,7 @@ export async function POST(req: Request) {
           stopOrderId,
           status: stopVerify.status,
         });
+        notes.push(`stopNotActiveFallback:${ticker}`);
 
         // Try to create emergency stop
         const recoveryResult = await recoverUnprotectedTrade({
