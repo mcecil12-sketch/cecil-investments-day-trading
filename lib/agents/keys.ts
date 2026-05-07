@@ -28,6 +28,9 @@ export const AGENT_MANUAL_QUEUE_KEY = "agents:manual_queue:v1";
 export const AGENT_PROFIT_ENGINE_KEY = "agents:profit_engine:v1";
 export const AGENT_EXPERIMENT_TRACKER_KEY = "agents:experiments:v1";
 
+// PnL Integrity
+export const AGENT_PNL_INTEGRITY_KEY = "agents:pnl_integrity:v1";
+
 // Agent Workflow v2 keys
 export const AGENT_FUNNEL_RECOVERY_KEY = "agents:funnel_recovery:v2";
 export const AGENT_EXECUTION_DEDUP_STATS_KEY = "agents:execution_dedup_stats:v2";

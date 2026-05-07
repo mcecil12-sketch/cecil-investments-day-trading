@@ -13,6 +13,7 @@ import {
   type AuditResult,
 } from "@/lib/risk/protection-integrity";
 import { fetchAlpacaClockSafe } from "@/lib/alpacaClock";
+import { readPnlIntegrityState } from "@/lib/agents/pnlIntegrity";
 
 import { readSignals } from "@/lib/jsonDb";
 import { readTodayFunnel } from "@/lib/funnelRedis";
@@ -74,10 +75,11 @@ export async function GET(req: Request) {
   const todayEt = getEtDateString();
   const guardKeyUsed = guardrailsStore.getGuardrailStateKey(todayEt);
   const guardConfig = getGuardrailConfig();
-  const [guardState, toggleState, brokerTruth] = await Promise.all([
+  const [guardState, toggleState, brokerTruth, pnlIntegrityState] = await Promise.all([
     guardrailsStore.getGuardrailsState(todayEt),
     guardrailsStore.getAutoEntryEnabledState(guardConfig),
     fetchBrokerTruth(),
+    readPnlIntegrityState().catch(() => null),
   ]);
 
   const trades = await readTrades<any>().catch(() => []);
@@ -476,5 +478,10 @@ export async function GET(req: Request) {
     checks,
     reasons,
     mode: publicMode ? "public" : "authed",
+    pnlIntegrity: {
+      ok: pnlIntegrityState?.pnlIntegrity ?? true,
+      checkedAt: pnlIntegrityState?.checkedAt ?? null,
+      issueCount: pnlIntegrityState?.issueCount ?? 0,
+    },
   });
 }

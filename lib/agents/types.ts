@@ -91,6 +91,7 @@ export interface AgentState {
   nextBacklogTitles?: string[];
   latestExecutionTaskTitle?: string | null;
   latestExecutionStatus?: EngineeringTaskStatus | null;
+  pnlIntegrity?: boolean;
   updatedBy: AgentName | "system";
 }
 

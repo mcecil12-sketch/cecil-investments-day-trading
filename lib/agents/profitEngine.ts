@@ -40,6 +40,7 @@ import {
 } from "@/lib/agents/experimentTracker";
 import { readTrades } from "@/lib/tradesStore";
 import { extractClosedTrades, buildAnalytics } from "@/lib/performance/tradeStats";
+import { runPnlIntegrityCheck } from "@/lib/agents/pnlIntegrity";
 import type { EngineeringTask } from "@/lib/agents/types";
 
 const STORE_TTL = getTtlSeconds("TELEMETRY_DAYS");
@@ -635,6 +636,28 @@ export async function runProfitEngine(
   const allTrades = await readTrades().catch(() => []);
   const closedTrades = extractClosedTrades(Array.isArray(allTrades) ? allTrades : []);
   const analytics = buildAnalytics(closedTrades);
+
+  // ── Step 2b: PnL Integrity Gate ────────────────────────────────────────────
+  // Run anomaly + broker fill validation before any optimization.
+  // Block profit engine and adaptive optimization if integrity fails.
+  const integrityCheck = await runPnlIntegrityCheck(closedTrades).catch(() => null);
+  if (integrityCheck && !integrityCheck.pnlIntegrity) {
+    console.error(
+      `[PROFIT-ENGINE] Blocked by PnL integrity failure — ${integrityCheck.issueCount} issue(s)`,
+      integrityCheck.issues,
+    );
+    await writeProfitEngineState({
+      ...state,
+      lastRunAt: nowIso(),
+      engineActive: false,
+      evaluationLog: [
+        ...state.evaluationLog.slice(-10),
+        `${nowIso()}: pnl_integrity_failure — ${integrityCheck.issueCount} issue(s)`,
+      ],
+    });
+    result.engineActive = false;
+    return result;
+  }
 
   // ── Guard: require at least 3 new closed trades since last remediation ─────
   const PROFIT_ENGINE_MIN_NEW_TRADES = 3;

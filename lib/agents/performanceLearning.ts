@@ -264,6 +264,39 @@ export async function computePerformanceLearning(): Promise<PerformanceLearningS
   return signals;
 }
 
+// ─── R Anomaly Detection ──────────────────────────────────────────────────────
+
+export interface RAnomalyResult {
+  type: "R_ANOMALY";
+  severity: "CRITICAL";
+  tradeId: string;
+  symbol: string;
+  realizedR: number;
+  message: string;
+}
+
+export function detectRAnomalies(trades: Array<{
+  id?: string;
+  symbol?: string;
+  ticker?: string;
+  realizedR?: number | null;
+}>): RAnomalyResult[] {
+  const anomalies: RAnomalyResult[] = [];
+  for (const t of trades) {
+    if (t.realizedR !== null && t.realizedR !== undefined && Math.abs(t.realizedR) > 3) {
+      anomalies.push({
+        type: "R_ANOMALY",
+        severity: "CRITICAL",
+        tradeId: t.id ?? "unknown",
+        symbol: t.symbol ?? t.ticker ?? "unknown",
+        realizedR: t.realizedR,
+        message: `Impossible R detected: ${t.realizedR}`,
+      });
+    }
+  }
+  return anomalies;
+}
+
 export async function readPerformanceLearning(): Promise<PerformanceLearningSignals | null> {
   if (!redis) return null;
   try {

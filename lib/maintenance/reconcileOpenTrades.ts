@@ -8,6 +8,7 @@ import { forceFlattenPosition } from "@/lib/broker/forceFlattenPosition";
 import { verifyStopAtBroker } from "@/lib/risk/stop-verification";
 import { findProtectiveStopOrder } from "@/lib/trades/protection";
 import { repairStaleTerminalTrades } from "@/lib/trades/lifecycle";
+import { getEtDateString } from "@/lib/time/etDate";
 
 const POSITION_OPEN_OVERRIDES_CANCELED_v1 = true;
 
@@ -178,39 +179,133 @@ function extractFillFromActivities(activities: any[]): { price: number | null; q
   return { price: null, qty: null, at: latestAt };
 }
 
-function computeRealizedFromClose(args: {
-  side: string;
-  entryPrice: any;
-  stopPrice: any;
-  closePrice: number | null;
-  qty: any;
-}): { realizedPnL?: number; realizedR?: number } {
-  const side = up(args.side);
-  const entry = num(args.entryPrice);
-  const stop = num(args.stopPrice);
-  const close = num(args.closePrice);
-  const qty = Math.abs(num(args.qty) ?? 0);
+function resolveRiskStopPrice(trade: any): number | null {
+  return (
+    num(trade?.originalStopPrice) ??
+    num(trade?.initialStopPrice) ??
+    num(trade?.seedStopPrice) ??
+    num(trade?.stopPrice)
+  );
+}
 
-  if (!(entry != null && entry > 0 && close != null && close > 0 && qty > 0)) {
+function aggregateActivitySide(activities: any[], side: "buy" | "sell") {
+  let notional = 0;
+  let qty = 0;
+  let latestAt: string | null = null;
+  let latestTs = 0;
+
+  for (const a of Array.isArray(activities) ? activities : []) {
+    const aSide = String(a?.side || "").toLowerCase();
+    if (aSide !== side) continue;
+    const px = num(a?.price);
+    const q = Math.abs(num(a?.qty) ?? 0);
+    const tsRaw = String(a?.transaction_time || a?.date || a?.settle_date || "");
+    const ts = Date.parse(tsRaw);
+    if (!(px != null && px > 0 && q > 0)) continue;
+    notional += px * q;
+    qty += q;
+    if (Number.isFinite(ts) && ts > latestTs) {
+      latestTs = ts;
+      latestAt = tsRaw;
+    }
+  }
+
+  return {
+    avgPrice: qty > 0 ? Number((notional / qty).toFixed(6)) : null,
+    qty: qty > 0 ? Number(qty.toFixed(6)) : 0,
+    at: latestAt,
+  };
+}
+
+function computeRealizedFromBrokerFills(args: {
+  side: string;
+  stopPrice: number | null;
+  activities: any[];
+  fallbackEntryPrice?: number | null;
+  fallbackExitPrice?: number | null;
+  fallbackQty?: number | null;
+  tradeId?: string;
+  ticker?: string;
+}): {
+  realizedPnL?: number;
+  realizedR?: number;
+  avgEntry?: number;
+  avgExit?: number;
+  entryQty?: number;
+  exitQty?: number;
+} {
+  const side = up(args.side);
+  const entrySide: "buy" | "sell" = side === "SHORT" ? "sell" : "buy";
+  const exitSide: "buy" | "sell" = side === "SHORT" ? "buy" : "sell";
+
+  const entryAgg = aggregateActivitySide(args.activities, entrySide);
+  const exitAgg = aggregateActivitySide(args.activities, exitSide);
+
+  const avgEntry = entryAgg.avgPrice ?? num(args.fallbackEntryPrice);
+  const avgExit = exitAgg.avgPrice ?? num(args.fallbackExitPrice);
+
+  // Use matched quantity to avoid double-counting and partial-fill distortions.
+  const fallbackQty = Math.abs(num(args.fallbackQty) ?? 0);
+  const matchedQty = Math.min(
+    entryAgg.qty > 0 ? entryAgg.qty : fallbackQty,
+    exitAgg.qty > 0 ? exitAgg.qty : fallbackQty,
+  );
+
+  if (!(avgEntry != null && avgEntry > 0 && avgExit != null && avgExit > 0 && matchedQty > 0)) {
     return {};
   }
 
-  const pnlPerShare = side === "SHORT" ? entry - close : close - entry;
-  const realizedPnL = Number((pnlPerShare * qty).toFixed(2));
+  const pnlPerShare = side === "SHORT" ? avgEntry - avgExit : avgExit - avgEntry;
+  const realizedPnL = Number((pnlPerShare * matchedQty).toFixed(2));
 
+  const stop = num(args.stopPrice);
   if (!(stop != null && stop > 0)) {
-    return { realizedPnL };
+    return {
+      realizedPnL,
+      avgEntry,
+      avgExit,
+      entryQty: entryAgg.qty,
+      exitQty: exitAgg.qty,
+    };
   }
 
-  const riskPerShare = Math.abs(entry - stop);
-  const riskAmount = riskPerShare * qty;
-  if (!(riskAmount > 0)) {
-    return { realizedPnL };
+  const riskPerShare =
+    side === "SHORT"
+      ? stop - avgEntry
+      : avgEntry - stop;
+  if (!(riskPerShare > 0)) {
+    return {
+      realizedPnL,
+      avgEntry,
+      avgExit,
+      entryQty: entryAgg.qty,
+      exitQty: exitAgg.qty,
+    };
+  }
+
+  const realizedR = Number((pnlPerShare / riskPerShare).toFixed(4));
+
+  if (Math.abs(realizedR) > 3) {
+    console.error("[reconcile] CRITICAL: R calculation anomaly — likely incorrect inputs", {
+      tradeId: args.tradeId || null,
+      ticker: args.ticker || null,
+      realizedR,
+      avgEntry,
+      avgExit,
+      stop,
+      entryQty: entryAgg.qty,
+      exitQty: exitAgg.qty,
+      matchedQty,
+    });
   }
 
   return {
     realizedPnL,
-    realizedR: Number((realizedPnL / riskAmount).toFixed(4)),
+    realizedR,
+    avgEntry,
+    avgExit,
+    entryQty: entryAgg.qty,
+    exitQty: exitAgg.qty,
   };
 }
 
@@ -278,6 +373,9 @@ export type ReconcileOpenTradesResult = {
   flattenedUnprotected: number;
   unresolvedCriticalCount: number;
   staleTerminalRepairedCount: number;
+  realizedBackfillChecked: number;
+  realizedBackfillUpdated: number;
+  realizedBackfillDiscrepancies: number;
   broker: {
     positionsCount: number;
     openOrdersCount: number;
@@ -341,6 +439,9 @@ export async function reconcileOpenTrades(
         flattenedUnprotected: 0,
         unresolvedCriticalCount: 0,
         staleTerminalRepairedCount: 0,
+        realizedBackfillChecked: 0,
+        realizedBackfillUpdated: 0,
+        realizedBackfillDiscrepancies: 0,
         broker: {
           positionsCount: 0,
           openOrdersCount: 0,
@@ -494,6 +595,18 @@ export async function reconcileOpenTrades(
                 num(orderObj?.filled_qty) ??
                 0;
 
+              const acts = await fetchFillActivitiesByOrderIds(allOrderIds);
+              const realized = computeRealizedFromBrokerFills({
+                side: t?.side,
+                stopPrice: resolveRiskStopPrice(t),
+                activities: acts,
+                fallbackEntryPrice: num(t?.entryFillPrice) ?? num(t?.avgFillPrice) ?? num(t?.entryPrice),
+                fallbackExitPrice: closePrice ?? null,
+                fallbackQty: qtyForCalc,
+                tradeId: String(t?.id || ""),
+                ticker,
+              });
+
               if (!dryRun) {
                 t.status = "CLOSED";
                 t.autoEntryStatus = "CLOSED";
@@ -506,13 +619,8 @@ export async function reconcileOpenTrades(
                 if (closePrice != null && closePrice > 0) {
                   t.closePrice = closePrice;
                 }
-                const realized = computeRealizedFromClose({
-                  side: t?.side,
-                  entryPrice: t?.entryPrice,
-                  stopPrice: t?.stopPrice,
-                  closePrice: closePrice ?? null,
-                  qty: qtyForCalc,
-                });
+                if (typeof realized.avgEntry === "number") t.entryFillPrice = realized.avgEntry;
+                if (typeof realized.avgExit === "number") t.exitFillPrice = realized.avgExit;
                 if (typeof realized.realizedPnL === "number") t.realizedPnL = realized.realizedPnL;
                 if (typeof realized.realizedR === "number") t.realizedR = realized.realizedR;
               }
@@ -577,6 +685,17 @@ export async function reconcileOpenTrades(
               num(t?.quantity) ??
               0;
 
+            const realized = computeRealizedFromBrokerFills({
+              side: t?.side,
+              stopPrice: resolveRiskStopPrice(t),
+              activities: fallbackActs,
+              fallbackEntryPrice: num(t?.entryFillPrice) ?? num(t?.avgFillPrice) ?? num(t?.entryPrice),
+              fallbackExitPrice: closePrice,
+              fallbackQty: qtyForCalc,
+              tradeId: String(t?.id || ""),
+              ticker,
+            });
+
             if (!dryRun) {
               t.status = "CLOSED";
               t.autoEntryStatus = "CLOSED";
@@ -587,13 +706,8 @@ export async function reconcileOpenTrades(
               t.brokerStatus = t.brokerStatus || "filled_activity_only";
               t.closeReason = t.closeReason || "reconciled_fill_activity";
               t.closePrice = closePrice;
-              const realized = computeRealizedFromClose({
-                side: t?.side,
-                entryPrice: t?.entryPrice,
-                stopPrice: t?.stopPrice,
-                closePrice,
-                qty: qtyForCalc,
-              });
+              if (typeof realized.avgEntry === "number") t.entryFillPrice = realized.avgEntry;
+              if (typeof realized.avgExit === "number") t.exitFillPrice = realized.avgExit;
               if (typeof realized.realizedPnL === "number") t.realizedPnL = realized.realizedPnL;
               if (typeof realized.realizedR === "number") t.realizedR = realized.realizedR;
             }
@@ -1315,10 +1429,77 @@ export async function reconcileOpenTrades(
       }
     }
 
+    const todayEt = getEtDateString();
+    let realizedBackfillChecked = 0;
+    let realizedBackfillUpdated = 0;
+    let realizedBackfillDiscrepancies = 0;
+
+    // Backfill today closed trades using broker fills as source of truth.
+    for (const t of trades) {
+      const status = up(t?.status);
+      if (status !== "CLOSED") continue;
+      const tradeEt = String(t?.etDate || "").trim();
+      const closedAtTs = Date.parse(String(t?.closedAt || ""));
+      const sameEtDay = tradeEt ? tradeEt === todayEt : Number.isFinite(closedAtTs);
+      if (!sameEtDay) continue;
+
+      const linkedOrderId = String(t?.alpacaOrderId || t?.brokerOrderId || "").trim();
+      const linkedLegIds = [
+        String(t?.stopOrderId || "").trim(),
+        String(t?.takeProfitOrderId || "").trim(),
+      ].filter(Boolean);
+      const allOrderIds = Array.from(new Set([linkedOrderId, ...linkedLegIds].filter(Boolean)));
+      if (allOrderIds.length === 0) continue;
+
+      realizedBackfillChecked += 1;
+      const acts = await fetchFillActivitiesByOrderIds(allOrderIds);
+      const recalculated = computeRealizedFromBrokerFills({
+        side: t?.side,
+        stopPrice: resolveRiskStopPrice(t),
+        activities: acts,
+        fallbackEntryPrice: num(t?.entryFillPrice) ?? num(t?.avgFillPrice) ?? num(t?.entryPrice),
+        fallbackExitPrice: num(t?.closePrice),
+        fallbackQty: num(t?.filledQty) ?? num(t?.qty) ?? num(t?.quantity),
+        tradeId: String(t?.id || ""),
+        ticker: up(t?.ticker),
+      });
+
+      const oldR = num(t?.realizedR);
+      const newR = num(recalculated.realizedR);
+      const oldP = num(t?.realizedPnL);
+      const newP = num(recalculated.realizedPnL);
+      const rDiff = oldR != null && newR != null ? Math.abs(oldR - newR) : 0;
+      const pDiff = oldP != null && newP != null ? Math.abs(oldP - newP) : 0;
+      const changed =
+        (newR != null && (oldR == null || rDiff > 0.01)) ||
+        (newP != null && (oldP == null || pDiff > 0.01));
+
+      if (changed) {
+        realizedBackfillDiscrepancies += 1;
+        console.warn("[reconcile] realized discrepancy detected", {
+          tradeId: String(t?.id || ""),
+          ticker: up(t?.ticker),
+          oldRealizedR: oldR,
+          newRealizedR: newR,
+          oldRealizedPnL: oldP,
+          newRealizedPnL: newP,
+        });
+      }
+
+      if (!dryRun && changed) {
+        if (typeof recalculated.avgEntry === "number") t.entryFillPrice = recalculated.avgEntry;
+        if (typeof recalculated.avgExit === "number") t.exitFillPrice = recalculated.avgExit;
+        if (typeof recalculated.realizedPnL === "number") t.realizedPnL = recalculated.realizedPnL;
+        if (typeof recalculated.realizedR === "number") t.realizedR = recalculated.realizedR;
+        t.updatedAt = nowIso;
+        realizedBackfillUpdated += 1;
+      }
+    }
+
     const shouldPersistProtectionPass =
       repairedStops > 0 || flattenedUnprotected > 0 || unresolvedCriticalCount > 0;
 
-    if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0 || cleanedPending > 0 || cleanedStaleBackfill > 0 || cleanedDuplicateBackfill > 0 || shouldPersistProtectionPass)) {
+    if (!dryRun && (closed > 0 || synced > 0 || backfilled > 0 || repairedOpenedAt > 0 || cleanedPending > 0 || cleanedStaleBackfill > 0 || cleanedDuplicateBackfill > 0 || shouldPersistProtectionPass || realizedBackfillUpdated > 0)) {
       await writeTrades(trades);
     }
 
@@ -1396,6 +1577,9 @@ export async function reconcileOpenTrades(
       flattenedUnprotected,
       unresolvedCriticalCount,
       staleTerminalRepairedCount,
+      realizedBackfillChecked,
+      realizedBackfillUpdated,
+      realizedBackfillDiscrepancies,
       broker: {
         positionsCount: finalBrokerTruth.positionsCount,
         openOrdersCount: finalBrokerTruth.openOrdersCount,
@@ -1462,6 +1646,9 @@ export async function reconcileOpenTrades(
       flattenedUnprotected: 0,
       unresolvedCriticalCount: 0,
       staleTerminalRepairedCount: 0,
+      realizedBackfillChecked: 0,
+      realizedBackfillUpdated: 0,
+      realizedBackfillDiscrepancies: 0,
       broker: {
         positionsCount: 0,
         openOrdersCount: 0,

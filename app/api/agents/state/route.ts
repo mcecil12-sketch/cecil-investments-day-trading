@@ -19,6 +19,7 @@ import { AGENT_LATEST_EXECUTION_KEY, AGENT_LATEST_BATCH_EXECUTION_KEY } from "@/
 import type { EngineeringTask } from "@/lib/agents/types";
 import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask, getTrulyActiveManualTask, getNextQueuedManualTask, getManualQueueDiagnostics } from "@/lib/agents/manual-action-queue";
 import { readProfitEngineStatus } from "@/lib/agents/profitEngine";
+import { readPnlIntegrityState } from "@/lib/agents/pnlIntegrity";
 import { buildUnifiedQueueSummary, buildAutonomyHealth, buildQueueThroughput } from "@/lib/agents/unified-queue";
 import { detectFunnelBlockedState, readFunnelRecoveryState, isFunnelRecoveryTask, isOptimizationOnlyTask } from "@/lib/agents/funnel-recovery";
 import { buildRImpactQueueWithSuppression, getTopRImpactTaskIds, scoreEngineeringTask } from "@/lib/agents/r-impact";
@@ -90,7 +91,7 @@ export async function GET(req: Request) {
   const reqUrl = new URL(req.url);
   const stateBaseUrl = `${reqUrl.protocol}//${reqUrl.host}`;
 
-  const [snapshot, state, tasks, adaptiveState, latestExecRaw, latestBatchRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics, profitEngineStatus, funnelRecoveryState, dedupStats] = await Promise.all([
+  const [snapshot, state, tasks, adaptiveState, latestExecRaw, latestBatchRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics, profitEngineStatus, funnelRecoveryState, dedupStats, pnlIntegrityState] = await Promise.all([
     readAgentStateSnapshot(),
     ensureAgentState(),
     listEngineeringTasks(200).then((t) =>
@@ -114,6 +115,7 @@ export async function GET(req: Request) {
     // Detect live funnel blocked state (updates Redis cache); falls back to cached value
     detectFunnelBlockedState(stateBaseUrl).catch(() => readFunnelRecoveryState().catch(() => null)),
     getDedupStats().catch(() => ({ activeLocks: 0, skippedDuplicateExecutionCount: 0, skippedInsufficientDataCount: 0 })),
+    readPnlIntegrityState().catch(() => null),
   ]);
 
   const openTasks = tasks.filter(
@@ -703,5 +705,15 @@ export async function GET(req: Request) {
         : null,
     tradingFilePatchGuardrailsActive: true,
     lastTradingPatch,
+
+    // ─── PnL Integrity ───────────────────────────────────────────────
+    pnlIntegrity: {
+      ok: pnlIntegrityState?.pnlIntegrity ?? true,
+      checkedAt: pnlIntegrityState?.checkedAt ?? null,
+      issueCount: pnlIntegrityState?.issueCount ?? 0,
+      issues: pnlIntegrityState?.issues ?? [],
+      taskCreated: pnlIntegrityState?.taskCreated ?? false,
+      taskId: pnlIntegrityState?.taskId ?? null,
+    },
   });
 }

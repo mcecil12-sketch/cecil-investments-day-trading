@@ -61,6 +61,99 @@ function inferTradeGrade(t: any): string | undefined {
   return typeof g === "string" && g ? g : undefined;
 }
 
+const toNum = (v: any): number | null => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+async function fetchFillActivitiesByOrderIds(orderIds: string[]): Promise<any[]> {
+  const seen = new Set<string>();
+  const fills: any[] = [];
+  for (const raw of orderIds) {
+    const id = String(raw || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    try {
+      const qs = new URLSearchParams();
+      qs.set("activity_types", "FILL");
+      qs.set("order_id", id);
+      qs.set("page_size", "100");
+      qs.set("direction", "desc");
+      const resp = await alpacaRequest({ method: "GET", path: `/v2/account/activities?${qs.toString()}` });
+      if (!resp.ok) continue;
+      const arr = JSON.parse(resp.text || "[]");
+      if (Array.isArray(arr)) fills.push(...arr);
+    } catch {}
+  }
+  return fills;
+}
+
+function aggregateFillSide(activities: any[], side: "buy" | "sell") {
+  let notional = 0;
+  let qty = 0;
+  for (const a of Array.isArray(activities) ? activities : []) {
+    if (String(a?.side || "").toLowerCase() !== side) continue;
+    const px = toNum(a?.price);
+    const q = Math.abs(toNum(a?.qty) ?? 0);
+    if (!(px != null && px > 0 && q > 0)) continue;
+    notional += px * q;
+    qty += q;
+  }
+  return {
+    avgPrice: qty > 0 ? Number((notional / qty).toFixed(6)) : null,
+    qty,
+  };
+}
+
+function computeRealizedFromActivities(args: {
+  side: string;
+  stopPrice: number | null;
+  activities: any[];
+  fallbackEntryPrice?: number | null;
+  fallbackExitPrice?: number | null;
+  fallbackQty?: number | null;
+}) {
+  const side = String(args.side || "").toUpperCase();
+  const entrySide = side === "SHORT" ? "sell" : "buy";
+  const exitSide = side === "SHORT" ? "buy" : "sell";
+  const entryAgg = aggregateFillSide(args.activities, entrySide as "buy" | "sell");
+  const exitAgg = aggregateFillSide(args.activities, exitSide as "buy" | "sell");
+  const avgEntry = entryAgg.avgPrice ?? toNum(args.fallbackEntryPrice);
+  const avgExit = exitAgg.avgPrice ?? toNum(args.fallbackExitPrice);
+  const fallbackQty = Math.abs(toNum(args.fallbackQty) ?? 0);
+  const matchedQty = Math.min(entryAgg.qty > 0 ? entryAgg.qty : fallbackQty, exitAgg.qty > 0 ? exitAgg.qty : fallbackQty);
+
+  if (!(avgEntry != null && avgEntry > 0 && avgExit != null && avgExit > 0 && matchedQty > 0)) {
+    return {} as { realizedPnL?: number; realizedR?: number; avgEntry?: number; avgExit?: number };
+  }
+
+  const pnlPerShare = side === "SHORT" ? avgEntry - avgExit : avgExit - avgEntry;
+  const realizedPnL = Number((pnlPerShare * matchedQty).toFixed(2));
+
+  const stop = toNum(args.stopPrice);
+  if (!(stop != null && stop > 0)) {
+    return { realizedPnL, avgEntry, avgExit };
+  }
+
+  const riskPerShare = side === "SHORT" ? (stop - avgEntry) : (avgEntry - stop);
+  if (!(riskPerShare > 0)) {
+    return { realizedPnL, avgEntry, avgExit };
+  }
+
+  const realizedR = Number((pnlPerShare / riskPerShare).toFixed(4));
+  if (Math.abs(realizedR) > 3) {
+    console.error("[manage] CRITICAL: R calculation anomaly — likely incorrect inputs", {
+      side,
+      avgEntry,
+      avgExit,
+      stop,
+      realizedR,
+    });
+  }
+
+  return { realizedPnL, realizedR, avgEntry, avgExit };
+}
+
 type TradeStatus = "OPEN" | "CLOSED" | "PENDING" | "PARTIAL" | string;
 
 type Trade = {
@@ -83,6 +176,9 @@ type Trade = {
   oneR?: number;
   unrealizedPnL?: number;
   unrealizedR?: number;
+  stopPrice?: number;
+  entryFillPrice?: number;
+  exitFillPrice?: number;
   suggestedStopPrice?: number;
   stopSuggestionReason?: string;
   lastStopAppliedAt?: string;
@@ -359,11 +455,16 @@ export async function GET() {
     for (const t of closedWithOrder) {
       try {
         const order = await getOrder(t.alpacaOrderId as string);
-        const entryPrice = order.filled_avg_price
-          ? Number(order.filled_avg_price)
-          : null;
+        const legs = Array.isArray(order?.legs) ? order.legs : [];
+        const orderIds = [
+          String(order?.id || ""),
+          ...legs.map((l: any) => String(l?.id || "")).filter(Boolean),
+          String((t as any)?.stopOrderId || ""),
+          String((t as any)?.takeProfitOrderId || ""),
+        ].filter(Boolean);
 
-        const legs = order.legs || [];
+        const activities = await fetchFillActivitiesByOrderIds(orderIds);
+
         const exitLeg = (legs as any[]).find(
           (leg: any) =>
             leg?.filled_avg_price &&
@@ -371,26 +472,30 @@ export async function GET() {
             leg.side &&
             leg.side.toLowerCase() !== order.side?.toLowerCase()
         );
-        const exitPrice = exitLeg?.filled_avg_price
+        const fallbackExitPrice = exitLeg?.filled_avg_price
           ? Number(exitLeg.filled_avg_price)
           : null;
 
-        if (entryPrice != null && exitPrice != null) {
-          const pnl =
-            t.side.toUpperCase() === "LONG"
-              ? (exitPrice - entryPrice) * t.size
-              : (entryPrice - exitPrice) * t.size;
-          const oneR = t.initialDollarRisk ?? undefined;
-          const realizedR =
-            oneR && oneR !== 0 ? pnl / oneR : undefined;
+        const computed = computeRealizedFromActivities({
+          side: t.side,
+          stopPrice: (t as any).originalStopPrice ?? (t as any).initialStopPrice ?? t.stopPrice,
+          activities,
+          fallbackEntryPrice: (t as any).entryFillPrice ?? (t as any).avgFillPrice ?? t.entryPrice,
+          fallbackExitPrice,
+          fallbackQty: (t as any).filledQty ?? (t as any).qty ?? t.size,
+        });
 
-          console.log("[manage] realizedPnL computed", {
+        const pnl = Number(computed.realizedPnL);
+        const realizedR = typeof computed.realizedR === "number" ? computed.realizedR : undefined;
+
+        if (Number.isFinite(pnl)) {
+          console.log("[manage] realizedPnL computed_from_fills", {
             id: t.id,
             ticker: t.ticker,
             pnl,
             realizedR,
-            entryPrice,
-            exitPrice,
+            avgEntry: computed.avgEntry,
+            avgExit: computed.avgExit,
           });
 
           // update in updatedTrades
@@ -415,6 +520,8 @@ export async function GET() {
 
             updatedTrades[idx] = {
               ...base,
+              entryFillPrice: computed.avgEntry ?? (base as any).entryFillPrice,
+              exitFillPrice: computed.avgExit ?? (base as any).exitFillPrice,
               realizedPnL: pnl,
               closedAt: base.closedAt ?? nowIso,
               realizedR,
@@ -454,7 +561,7 @@ export async function GET() {
               meta: {
                 realizedR,
                 realizedPnL: pnl,
-                exitPrice,
+                exitPrice: computed.avgExit,
               },
             };
             await fireNotification(closedEvent);
@@ -471,7 +578,7 @@ export async function GET() {
                 dedupeTtlSec: 86400,
                 meta: {
                   realizedPnL: pnl,
-                  exitPrice,
+                  exitPrice: computed.avgExit,
                 },
               };
               await fireNotification(stopEvent);
