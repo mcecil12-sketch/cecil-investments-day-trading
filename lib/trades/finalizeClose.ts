@@ -76,14 +76,6 @@ function etWindow(trade: AnyTrade) {
   return { start, end };
 }
 
-function riskPerShare(trade: AnyTrade): number | null {
-  const ep = num(trade.entryPrice);
-  const sp = num(trade.stopPrice);
-  if (!ep || !sp) return null;
-  const r = Math.abs(ep - sp);
-  return r > 0 ? r : null;
-}
-
 export async function finalizeTradeClose(trade: AnyTrade): Promise<FinalizeCloseResult> {
   try {
     const symbol = String(trade.ticker || trade.symbol || "").toUpperCase().trim();
@@ -99,11 +91,18 @@ export async function finalizeTradeClose(trade: AnyTrade): Promise<FinalizeClose
     const buys = fills.filter((f: any) => (f.side || f.order_side || "").toLowerCase() === "buy");
     const sells = fills.filter((f: any) => (f.side || f.order_side || "").toLowerCase() === "sell");
 
-    const entryAvg = avgPxFromFills(buys) ?? num(trade.avgFillPrice) ?? num(trade.entryPrice);
-    const entryQty = sumQty(buys) || num(trade.quantity) || num(trade.qty) || 0;
+    // ── Side-aware fill assignment ───────────────────────────────────────────
+    // LONG:  entry fills = buys,  exit fills = sells
+    // SHORT: entry fills = sells, exit fills = buys
+    const sideUpper = String(trade.side ?? "").toUpperCase();
+    const entryFills = sideUpper === "SHORT" ? sells : buys;
+    const exitFills  = sideUpper === "SHORT" ? buys  : sells;
+
+    const entryAvg = avgPxFromFills(entryFills) ?? num(trade.avgFillPrice) ?? num(trade.entryFillPrice) ?? num(trade.entryPrice);
+    const entryQty = sumQty(entryFills) || num(trade.quantity) || num(trade.qty) || 0;
 
     // If there was no entry fill, this should not be a CLOSED trade.
-    if (!buys.length || !entryAvg || !entryQty) {
+    if (!entryFills.length || !entryAvg || !entryQty) {
       // Try order lookup to see if it was canceled/expired.
       const ord = await getOrderMaybe(trade.alpacaOrderId || trade.brokerOrderId);
       const status = (ord.ok ? String(ord.json?.status || "") : "").toLowerCase();
@@ -112,21 +111,40 @@ export async function finalizeTradeClose(trade: AnyTrade): Promise<FinalizeClose
       return { ok: true, action: "VOIDED", reason };
     }
 
-    // Determine exit fills: sells after entry (simple rule—use all sells in window).
-    const exitQty = sumQty(sells);
-    const exitAvg = avgPxFromFills(sells);
+    // Determine exit fills: use side-aware exitFills slice.
+    const exitQtyVal = sumQty(exitFills);
+    const exitAvg = avgPxFromFills(exitFills);
 
-    if (!sells.length || !exitAvg || !exitQty) {
+    if (!exitFills.length || !exitAvg || !exitQtyVal) {
       // Entry filled but no exit found => trade is still OPEN (or close not executed).
       return { ok: true, action: "REOPENED", reason: "entry_fill_found_no_exit_fill" };
     }
 
-    const qty = Math.min(entryQty, exitQty);
-    const realizedPnL = (exitAvg - entryAvg) * qty; // LONG only for now
-    const rps = riskPerShare(trade);
-    const realizedR = rps ? realizedPnL / (rps * qty) : 0;
+    const qty = Math.min(entryQty, exitQtyVal);
 
-    // Heuristic close reason: prefer leg IDs if present in fills.
+    // ── PnL: side-aware, LONG and SHORT ─────────────────────────────────────
+    const pnlPerShare = sideUpper === "SHORT" ? entryAvg - exitAvg : exitAvg - entryAvg;
+    const realizedPnL = pnlPerShare * qty;
+
+    // ── R: use actual fill-based entry, not stored trade.entryPrice ──────────
+    // Prefer the original/initial stop (set at inception) for the risk denominator.
+    const sp = num(trade.originalStopPrice ?? trade.initialStopPrice ?? trade.stopPrice);
+    const riskPs = sp != null && sp > 0 ? Math.abs(entryAvg - sp) : null;
+    const realizedR = riskPs && riskPs > 0 ? pnlPerShare / riskPs : 0;
+
+    // ── R anomaly guard ──────────────────────────────────────────────────────
+    if (Math.abs(realizedR) > 3) {
+      console.error("R_ANOMALY", {
+        tradeId: trade.id ?? trade.alpacaOrderId ?? "unknown",
+        realizedR,
+        entryPrice: entryAvg,
+        avgExitPrice: exitAvg,
+        stopPrice: sp,
+      });
+    }
+
+    // Heuristic close reason: prefer leg IDs if present in exit fill order IDs.
+    // For SHORT, exit fills are buys; for LONG, exit fills are sells.
     let closeReason = "exit_fill";
     const legIds = new Set<string>([
       trade.stopOrderId,
@@ -134,10 +152,10 @@ export async function finalizeTradeClose(trade: AnyTrade): Promise<FinalizeClose
       trade.alpacaOrderId,
       trade.brokerOrderId,
     ].filter(Boolean));
-    const sellOrderIds = new Set<string>(sells.map((f: any) => String(f.order_id || f.orderId || f.id || "")));
-    if (trade.takeProfitOrderId && sellOrderIds.has(String(trade.takeProfitOrderId))) closeReason = "take_profit_hit";
-    if (trade.stopOrderId && sellOrderIds.has(String(trade.stopOrderId))) closeReason = "stop_hit";
-    if (legIds.size && [...sellOrderIds].some((id) => legIds.has(id))) closeReason = closeReason === "exit_fill" ? "broker_leg_fill" : closeReason;
+    const exitOrderIds = new Set<string>(exitFills.map((f: any) => String(f.order_id || f.orderId || f.id || "")));
+    if (trade.takeProfitOrderId && exitOrderIds.has(String(trade.takeProfitOrderId))) closeReason = "take_profit_hit";
+    if (trade.stopOrderId && exitOrderIds.has(String(trade.stopOrderId))) closeReason = "stop_hit";
+    if (legIds.size && [...exitOrderIds].some((id) => legIds.has(id))) closeReason = closeReason === "exit_fill" ? "broker_leg_fill" : closeReason;
 
     return { ok: true, action: "FINALIZED", closePrice: exitAvg, realizedPnL, realizedR, closeReason, qty };
   } catch (e: any) {

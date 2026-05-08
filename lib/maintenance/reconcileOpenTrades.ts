@@ -585,7 +585,9 @@ export async function reconcileOpenTrades(
                 }
               }
 
-              const closePrice = fill.price != null ? Number(fill.price) : num(t?.entryPrice);
+              // Never fall back to entryPrice — that would produce 0 PnL for failed fill lookups.
+              // Return null and let computeRealizedFromBrokerFills skip PnL if no fill found.
+              const closePrice = fill.price != null ? Number(fill.price) : null;
               const closeAt = fill.at || nowIso;
               const qtyForCalc =
                 fill.qty ??

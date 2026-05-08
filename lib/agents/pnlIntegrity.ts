@@ -64,24 +64,30 @@ interface TradeLike {
   id?: string;
   symbol?: string;
   ticker?: string;
+  side?: string;
   brokerOrderId?: string;
   exitOrderId?: string;
+  stopOrderId?: string;
+  takeProfitOrderId?: string;
   realizedPnL?: number | null;
   realizedR?: number | null;
   entryFillPrice?: number | null;
+  exitFillPrice?: number | null;
   entryPrice?: number | null;
+  qty?: number | null;
+  filledQty?: number | null;
 }
 
 export async function validatePnLIntegrity(trades: TradeLike[]): Promise<PnlMismatchResult[]> {
   const mismatches: PnlMismatchResult[] = [];
 
   for (const t of trades) {
-    // Need an exit order ID and a stored PnL to compare
-    const orderId = String(t.exitOrderId ?? t.brokerOrderId ?? "").trim();
-    if (!orderId) continue;
+    // Require an explicit exit order ID — brokerOrderId is the ENTRY order and would give wrong fills.
+    const exitOrderId = String(t.exitOrderId || "").trim();
+    if (!exitOrderId) continue;
     if (t.realizedPnL === null || t.realizedPnL === undefined) continue;
 
-    const fills = await fetchFillsForOrder(orderId);
+    const fills = await fetchFillsForOrder(exitOrderId);
     if (!fills.length) continue;
 
     const toNum = (v: unknown) => { const n = Number(v); return Number.isFinite(n) ? n : null; };
@@ -98,14 +104,20 @@ export async function validatePnLIntegrity(trades: TradeLike[]): Promise<PnlMism
 
     if (totalQty <= 0) continue;
 
-    const avgFillPrice = notional / totalQty;
+    const avgExitFill = notional / totalQty;
     const entryRef = toNum(t.entryFillPrice ?? t.entryPrice);
     if (entryRef === null) continue;
 
-    // estimatedPnL uses the exit fill vs stored entry fill
-    const estimatedPnL = (avgFillPrice - entryRef) * totalQty;
+    const qty = toNum(t.filledQty ?? t.qty) ?? totalQty;
+    // Side-aware PnL estimation: LONG = (exitFill - entry) * qty; SHORT = (entry - exitFill) * qty
+    const side = String(t.side || "LONG").toUpperCase();
+    const estimatedPnL = side === "SHORT"
+      ? (entryRef - avgExitFill) * qty
+      : (avgExitFill - entryRef) * qty;
 
-    if (Math.abs(estimatedPnL - t.realizedPnL) > 500) {
+    // Tighten threshold: 5% of trade value or $25 min (was a flat $500 which misses small accounts)
+    const threshold = Math.max(25, Math.abs(t.realizedPnL) * 0.05);
+    if (Math.abs(estimatedPnL - t.realizedPnL) > threshold) {
       mismatches.push({
         type: "PNL_MISMATCH",
         severity: "CRITICAL",
