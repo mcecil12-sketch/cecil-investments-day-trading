@@ -16,6 +16,8 @@ import { extractClosedTrades } from "@/lib/performance/tradeStats";
 import { nowIso } from "@/lib/agents/time";
 import { AGENT_PERF_LEARNING_KEY } from "@/lib/agents/keys";
 import type { LossPattern, PerformanceLearningSignals } from "@/lib/agents/types";
+import { evaluateTradingHealth } from "@/lib/agents/tradingSignals";
+import { createTask } from "@/lib/agents/taskFactory";
 
 const STORE_TTL = getTtlSeconds("TELEMETRY_DAYS");
 const DEEP_LOSS_R_THRESHOLD = -1.5; // trades below this R qualify as "deep losses"
@@ -52,6 +54,7 @@ export async function computePerformanceLearning(): Promise<PerformanceLearningS
   let wins = 0;
   let pnlSum = 0;
   let rSum = 0;
+  let minR: number | null = null;
   let longWins = 0;
   let longCount = 0;
   let shortWins = 0;
@@ -63,6 +66,7 @@ export async function computePerformanceLearning(): Promise<PerformanceLearningS
     const r = t.realizedR ?? 0;
     pnlSum += pnl;
     rSum += r;
+    if (minR === null || r < minR) minR = r;
     if (pnl > 0) wins += 1;
     if (r <= DEEP_LOSS_R_THRESHOLD) deepLossCount += 1;
 
@@ -259,6 +263,27 @@ export async function computePerformanceLearning(): Promise<PerformanceLearningS
     } catch {
       // non-fatal
     }
+  }
+
+  // ─── Agent trigger loop (PART 8) ─────────────────────────────────────────
+  // Evaluate trading health and fire tasks for any detected issues.
+  // CRITICAL issues always create tasks; HIGH issues are deduplicated.
+  try {
+    const healthIssues = evaluateTradingHealth({
+      avgR: total > 0 ? signals.avgR : null,
+      maxLossR: minR,
+      latencyMs: 0, // not computed here — covered by pipeline monitors
+      stalePct: 0,  // not computed here — covered by seed-from-signals metrics
+      executionRate: total > 0 ? 1.0 : 0, // default; precise value from funnel metrics
+    });
+
+    for (const issue of healthIssues) {
+      createTask(issue, { force: issue.severity === "CRITICAL" }).catch(() => {
+        // Non-fatal: task creation failure should not block learning computation
+      });
+    }
+  } catch {
+    // Non-fatal: health check failure should not interrupt signal persistence
   }
 
   return signals;

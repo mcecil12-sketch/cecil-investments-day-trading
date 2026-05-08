@@ -101,6 +101,26 @@ function parseBoolFlag(value: unknown): boolean {
   return ["1", "true", "yes", "on"].includes(v);
 }
 
+// -------------------------------------------------------------------------
+// Real-Time Freshness Guardrail
+// -------------------------------------------------------------------------
+
+/** Hard maximum age for a signal to be considered real-time fresh (5 minutes). */
+const MAX_SIGNAL_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * Returns true if the signal was created within MAX_SIGNAL_AGE_MS of now.
+ * Uses createdAt from the signal object.
+ */
+function isFresh(signal: RawSignal): boolean {
+  const tsMs =
+    parseTimestampMs(signal?.createdAt) ??
+    parseTimestampMs(signal?.scoredAt) ??
+    parseTimestampMs(signal?.updatedAt);
+  if (tsMs == null || !Number.isFinite(tsMs)) return false;
+  return Date.now() - tsMs < MAX_SIGNAL_AGE_MS;
+}
+
 function mapSkipReason(raw: string): SeedSkipReason | null {
   switch (raw) {
     case "already_active_trade":
@@ -121,6 +141,8 @@ function mapSkipReason(raw: string): SeedSkipReason | null {
     case "weak_volume_block":
     case "vwap_alignment_block":
     case "poor_rr_block":
+    // Real-time seeding guardrails
+    case "price_drift":
       return raw;
     default:
       return null;
@@ -995,6 +1017,44 @@ export async function POST(req: NextRequest) {
     // Stale signals get a 0.5 penalty so fresh signals always rank higher,
     // but stale ones still fill remaining capacity slots.
     const stalenessPenalty = isStaleSignal ? 0.5 : 0;
+
+    // ── Real-time freshness gate (PART 4/5) ──────────────────────────────
+    // Signals qualified and fresh within MAX_SIGNAL_AGE_MS seed immediately.
+    // Signals older than MAX_SIGNAL_AGE_MS are rejected here to ensure only
+    // real-time signals enter the seeding pipeline.
+    if (!isFresh(s)) {
+      markSkip("stale_signal");
+      continue;
+    }
+
+    // ── Price drift guardrail (PART 6) ───────────────────────────────────
+    // Reject signals where price has drifted more than 0.5R from the entry
+    // before seeding — these would immediately be at risk at execution time.
+    {
+      const currentPrice = getNum(s, ["lastPrice", "currentPrice", "price"]);
+      const ep = normalizedPlan.normalizedEntryPrice;
+      const sp = normalizedPlan.normalizedStopPrice;
+      if (currentPrice != null && ep != null && sp != null) {
+        const risk = Math.abs(ep - sp);
+        if (risk > 0) {
+          const driftR = Math.abs(currentPrice - ep) / risk;
+          if (driftR > 0.5) {
+            markSkip("price_drift");
+            console.log("[seed-from-signals] price_drift_rejected", {
+              signalId,
+              symbol,
+              side,
+              currentPrice,
+              entryPrice: ep,
+              stopPrice: sp,
+              driftR: driftR.toFixed(3),
+            });
+            continue;
+          }
+        }
+      }
+    }
+
     allQualifyingCandidates.push({
       symbol,
       side,
@@ -1067,10 +1127,12 @@ export async function POST(req: NextRequest) {
   });
 
   // Prioritize A/B, then fill remaining capacity with C to maximize seeded count.
+  // PART 7: seedCount <= qualifiedCount — never seed more than qualified unique candidates.
+  const safeLimit = Math.min(effectiveLimit, uniqueCandidates.length);
   const candidatesToSeed = [
     ...sortedAbCandidates,
     ...sortedCCandidates,
-  ].slice(0, effectiveLimit);
+  ].slice(0, safeLimit);
 
   // Track whether seeding stale signals was needed to hit our count
   const forcedSeedApplied = candidatesToSeed.some((c) =>

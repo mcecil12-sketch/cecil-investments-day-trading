@@ -353,9 +353,12 @@ export async function createTaskFromIncident(
     .replace("{code}", incident.code)
     .replace("{context}", incident.message);
 
-  // Check for existing active task with same title
+  // Check for existing active task with same title.
+  // CRITICAL severity incidents always force-create a new task regardless of dedup,
+  // ensuring no critical issue is silently swallowed by an existing stale task.
+  const forceCreateTask = incident.severity === "CRITICAL";
   const existing = await findDuplicateManualTask(title, defaults.taskType);
-  if (existing) {
+  if (existing && !forceCreateTask) {
     return {
       created: false,
       deduped: true,

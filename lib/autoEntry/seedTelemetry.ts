@@ -21,7 +21,9 @@ export type SeedSkipReason =
   | "flat_trend_block"
   | "weak_volume_block"
   | "vwap_alignment_block"
-  | "poor_rr_block";
+  | "poor_rr_block"
+  // Real-time seeding guardrails
+  | "price_drift";
 
 export type SeedSignalSkip = {
   signalId: string;
