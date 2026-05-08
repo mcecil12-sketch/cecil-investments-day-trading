@@ -36,6 +36,8 @@ export const AGENT_FUNNEL_RECOVERY_KEY = "agents:funnel_recovery:v2";
 export const AGENT_EXECUTION_DEDUP_STATS_KEY = "agents:execution_dedup_stats:v2";
 // Tracks the ISO timestamp when the market was first detected open for the current session
 export const AGENT_MARKET_OPEN_SINCE_KEY = "agents:market_open_since:v1";
+// Issue registry — individual string keys: agents:issue:v1:{issueKey}
+export const AGENT_ISSUE_REGISTRY_PREFIX = "agents:issue:v1:";
 
 export const AGENT_STORE_KEYS = {
   state: AGENT_STATE_KEY,

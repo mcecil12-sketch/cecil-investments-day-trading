@@ -17,7 +17,9 @@ import { nowIso } from "@/lib/agents/time";
 import { AGENT_PERF_LEARNING_KEY } from "@/lib/agents/keys";
 import type { LossPattern, PerformanceLearningSignals } from "@/lib/agents/types";
 import { evaluateTradingHealth } from "@/lib/agents/tradingSignals";
-import { createTask } from "@/lib/agents/taskFactory";
+import { createTask, TRADING_HEALTH_ISSUE_KEYS } from "@/lib/agents/taskFactory";
+import { resolveIssue } from "@/lib/agents/issue-registry";
+import type { TradingIssueType } from "@/lib/agents/tradingSignals";
 
 const STORE_TTL = getTtlSeconds("TELEMETRY_DAYS");
 const DEEP_LOSS_R_THRESHOLD = -1.5; // trades below this R qualify as "deep losses"
@@ -276,7 +278,15 @@ export async function computePerformanceLearning(): Promise<PerformanceLearningS
       stalePct: 0,  // not computed here — covered by seed-from-signals metrics
       executionRate: total > 0 ? 1.0 : 0, // default; precise value from funnel metrics
     });
-
+    // Auto-resolve registry entries for issue types that are no longer active.
+    // This lifts the IN_PROGRESS lock so future evaluations can re-claim them
+    // if the issue resurfaces after the cooldown window.
+    const activeIssueTypes = new Set<TradingIssueType>(healthIssues.map((i) => i.type));
+    for (const [issueType, issueKey] of Object.entries(TRADING_HEALTH_ISSUE_KEYS)) {
+      if (!activeIssueTypes.has(issueType as TradingIssueType)) {
+        resolveIssue(issueKey, "trading_health_monitor").catch(() => {});
+      }
+    }
     for (const issue of healthIssues) {
       createTask(issue, { force: issue.severity === "CRITICAL" }).catch(() => {
         // Non-fatal: task creation failure should not block learning computation

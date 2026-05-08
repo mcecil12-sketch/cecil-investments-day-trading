@@ -13,8 +13,20 @@ import {
   type ManualActionTaskType,
 } from "@/lib/agents/manual-action-queue";
 import type { TradingIssue, TradingIssueType } from "@/lib/agents/tradingSignals";
+import { checkIssue, claimIssue } from "@/lib/agents/issue-registry";
 
 // ─── Issue metadata ───────────────────────────────────────────────────────────
+
+/** Deterministic registry key for each trading health issue type. */
+export const TRADING_HEALTH_ISSUE_KEYS: Record<TradingIssueType, string> = {
+  NEGATIVE_R:    "negative_r",
+  RISK_BREACH:   "risk_breach",
+  LATENCY:       "latency_above_threshold",
+  STALE_SIGNALS: "stale_signals",
+  LOW_EXECUTION: "low_execution_rate",
+};
+
+const FACTORY_OWNER = "trading_health_monitor";
 
 interface IssueTaskConfig {
   priority: ManualActionPriority;
@@ -153,14 +165,27 @@ export async function createTask(
   options: CreateTaskOptions = {},
 ): Promise<CreateTaskResult> {
   const config = ISSUE_CONFIGS[issue.type];
+  const issueKey = TRADING_HEALTH_ISSUE_KEYS[issue.type];
   const isCritical = CRITICAL_ISSUE_TYPES.has(issue.type);
   const forceCreate = options.force === true || issue.severity === "CRITICAL";
 
+  // ── Issue registry gate — prevents duplicate patches within 30-min window ─
+  const gate = await checkIssue(issueKey, FACTORY_OWNER);
+  if (gate.action === "SKIP") {
+    return {
+      created: false,
+      deduped: true,
+      taskId: null,
+      issueType: issue.type,
+      reason: `registry_skip:${gate.reason}`,
+    };
+  }
+
   // CRITICAL issues are always execution-ready and bypass queue ordering
   const priority: ManualActionPriority = isCritical ? "CRITICAL" : config.priority;
-  const executionReady = isCritical ? true : true; // all health tasks are actionable
+  const executionReady = true; // all health tasks are actionable
 
-  // Dedup check: only skip for non-CRITICAL issues
+  // Task-level dedup check: only skip for non-CRITICAL issues
   if (!forceCreate) {
     const existing = await findDuplicateManualTask(config.title, config.taskType);
     if (existing) {
@@ -195,6 +220,9 @@ export async function createTask(
       reason: "redis_unavailable",
     };
   }
+
+  // Claim the issue after successful task creation (sets IN_PROGRESS + owner)
+  await claimIssue(issueKey, FACTORY_OWNER).catch(() => {});
 
   return {
     created: true,

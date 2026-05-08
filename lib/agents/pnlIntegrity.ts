@@ -15,6 +15,11 @@ import { nowIso } from "@/lib/agents/time";
 import type { EngineeringTask } from "@/lib/agents/types";
 
 import { AGENT_PNL_INTEGRITY_KEY } from "@/lib/agents/keys";
+import { checkIssue, claimIssue, resolveIssue } from "@/lib/agents/issue-registry";
+
+const PNL_INTEGRITY_ISSUE_KEY = "pnl_integrity_violation";
+const PNL_INTEGRITY_OWNER     = "pnl_integrity_agent";
+
 const STORE_TTL = getTtlSeconds("TELEMETRY_DAYS");
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -200,8 +205,20 @@ export async function runPnlIntegrityCheck(trades: TradeLike[]): Promise<PnlInte
   let taskCreated = false;
 
   if (!pnlIntegrity) {
-    taskId = await createIntegrityTask(integrityIssues).catch(() => null);
-    taskCreated = !!taskId;
+    // Issue registry gate — prevents duplicate integrity tasks within 30-min window
+    const gate = await checkIssue(PNL_INTEGRITY_ISSUE_KEY, PNL_INTEGRITY_OWNER);
+    if (gate.action === "PROCEED") {
+      taskId = await createIntegrityTask(integrityIssues).catch(() => null);
+      taskCreated = !!taskId;
+      if (taskCreated) {
+        await claimIssue(PNL_INTEGRITY_ISSUE_KEY, PNL_INTEGRITY_OWNER).catch(() => {});
+      }
+    } else {
+      console.log(`[pnl-integrity] registry_skip reason=${gate.reason} — integrity task suppressed`);
+    }
+  } else {
+    // No issues detected — resolve any outstanding IN_PROGRESS or OPEN registry entry
+    resolveIssue(PNL_INTEGRITY_ISSUE_KEY, PNL_INTEGRITY_OWNER).catch(() => {});
   }
 
   const state: PnlIntegrityState = {

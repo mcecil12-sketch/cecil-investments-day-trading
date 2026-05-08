@@ -20,6 +20,35 @@ import {
   type ManualActionPriority,
   type ManualActionTaskType,
 } from "@/lib/agents/manual-action-queue";
+import { checkIssue, claimIssue } from "@/lib/agents/issue-registry";
+
+// ─── Issue key builder ────────────────────────────────────────
+
+/**
+ * Protection/stop incidents are tracked per-symbol so a fix for one ticker
+ * does not suppress a separate missing-stop on a different ticker.
+ * All other incident codes share a single key per code.
+ */
+const PER_SYMBOL_CODES = new Set([
+  "PROTECTION_MISSING",
+  "MISSING_STOP",
+  "STOP_EXPIRED",
+  "MISSING_STOP_AT_ENTRY",
+  "FORCE_FLATTEN",
+]);
+
+function buildIncidentIssueKey(incident: FunnelIncident): string {
+  const code = incident.code.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  if (PER_SYMBOL_CODES.has(incident.code)) {
+    const ticker = String(
+      incident.context?.ticker ?? incident.context?.symbol ?? "",
+    ).toUpperCase().trim();
+    if (ticker) return `incident_${code}_${ticker.toLowerCase()}`;
+  }
+  return `incident_${code}`;
+}
+
+const BRIDGE_OWNER = "incident_bridge";
 
 // ─── Incident Code to Task Mapping ──────────────────────────────────
 
@@ -338,6 +367,7 @@ export interface BridgeResult {
 /**
  * Create a ManualActionTask from a funnel incident.
  * Deduplicates by title+taskType to prevent flooding the queue.
+ * Also enforces the issue registry (30-min ownership/cooldown gate).
  */
 export async function createTaskFromIncident(
   incident: FunnelIncident,
@@ -352,6 +382,19 @@ export async function createTaskFromIncident(
   const description = defaults.descriptionTemplate
     .replace("{code}", incident.code)
     .replace("{context}", incident.message);
+
+  // ── Issue registry gate — 30-min ownership / cooldown enforcement ─────
+  const issueKey = buildIncidentIssueKey(incident);
+  const gate = await checkIssue(issueKey, BRIDGE_OWNER);
+  if (gate.action === "SKIP") {
+    return {
+      created: false,
+      deduped: true,
+      taskId: null,
+      incidentCode: incident.code,
+      reason: `registry_skip:${gate.reason}`,
+    };
+  }
 
   // Check for existing active task with same title.
   // CRITICAL severity incidents always force-create a new task regardless of dedup,
@@ -391,6 +434,9 @@ export async function createTaskFromIncident(
       reason: "redis_unavailable",
     };
   }
+
+  // Claim the issue after successful task creation
+  await claimIssue(issueKey, BRIDGE_OWNER).catch(() => {});
 
   return {
     created: true,
