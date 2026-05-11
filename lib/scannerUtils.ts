@@ -1,5 +1,84 @@
 import { AlpacaBar } from "@/lib/alpaca";
 
+export type ScannerAssetLike = {
+  symbol?: string;
+  status?: string;
+  tradable?: boolean;
+  class?: string;
+  asset_class?: string;
+  name?: string;
+  attributes?: string[];
+};
+
+function hasInvalidSymbolPunctuation(symbol: string): boolean {
+  // Allow only letters and a single class separator dot, e.g. BRK.B / BF.B
+  if (!/^[A-Z.]+$/.test(symbol)) return true;
+  if (symbol.includes("/") || symbol.includes("^")) return true;
+  const dotCount = (symbol.match(/\./g) || []).length;
+  if (dotCount > 1) return true;
+  if (dotCount === 1 && !/^[A-Z]{1,5}\.[A-Z]$/.test(symbol)) return true;
+  return false;
+}
+
+export function getNonTradableInstrumentReason(
+  rawSymbol: string,
+  asset?: ScannerAssetLike
+): string | null {
+  const symbol = String(rawSymbol || "").trim().toUpperCase();
+  if (!symbol) return "empty_symbol";
+
+  // Preferred share style suffixes
+  if (symbol.includes(".PR") || symbol.includes(".PRE") || symbol.includes(".PRI")) {
+    return "preferred";
+  }
+
+  // Hard invalid symbol notation
+  if (hasInvalidSymbolPunctuation(symbol)) {
+    return "invalid_punctuation";
+  }
+
+  // Metadata-first filtering when asset is available
+  if (asset) {
+    const status = String(asset.status || "").toLowerCase();
+    const tradable = asset.tradable === true;
+    const assetClass = String(asset.asset_class || asset.class || "").toLowerCase();
+    if (!tradable) return "not_tradable";
+    if (status !== "active") return "inactive";
+    if (assetClass !== "us_equity") return "non_us_equity";
+
+    const metaText = [
+      String(asset.name || ""),
+      ...(Array.isArray(asset.attributes) ? asset.attributes.map((x) => String(x)) : []),
+    ]
+      .join(" ")
+      .toLowerCase();
+
+    if (/preferred/.test(metaText)) return "preferred";
+    if (/warrant/.test(metaText)) return "warrant";
+    if (/\bunit\b|units/.test(metaText)) return "unit";
+    if (/\bright\b|rights/.test(metaText)) return "rights";
+    if (/\bnote\b|\bnotes\b/.test(metaText)) return "note";
+    if (/\bbond\b|\bbonds\b/.test(metaText)) return "bond";
+
+    // With clean metadata, keep valid common stocks/classes (e.g. BRK.B, BF.B)
+    return null;
+  }
+
+  // Fallback symbol-only heuristic when metadata is unavailable
+  if (symbol.endsWith("WS") || symbol.endsWith("W")) return "warrant";
+  if (symbol.endsWith("U")) return "unit";
+  if (symbol.endsWith("R")) return "rights";
+
+  return null;
+}
+
+export function isTradableCommonInstrument(
+  symbol: string,
+  asset?: ScannerAssetLike
+): boolean {
+  return getNonTradableInstrumentReason(symbol, asset) === null;
+}
+
 /**
  * Compute VWAP from an array of bars.
  * Uses typical price (H+L+C)/3 * volume.

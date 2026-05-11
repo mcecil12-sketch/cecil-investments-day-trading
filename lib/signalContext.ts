@@ -10,7 +10,9 @@ export type SignalContext = {
   trendSlopePct: number;
   avgVolume: number | null;
   lastVolume: number | null;
-  relVolume: number;
+  relVolume: number | null;
+  // Alias to match downstream payload/diagnostic usage
+  relVol?: number | null;
   relVolumeNote?: string;
   rangePctAvg: number | null;
   liquidityNote: string;
@@ -22,6 +24,8 @@ export type SignalContext = {
   firstBarTime?: string;
   lastBarTime?: string;
   contextComplete?: boolean;
+  contextHasAllOptionalFields?: boolean;
+  contextWarnings?: string[];
   missingContextFields?: string[];
 };
 
@@ -68,13 +72,13 @@ function computeTrend(bars: AlpacaBar[]) {
 function computeVolumes(bars: AlpacaBar[]) {
   const vols = bars.map((b) => safeNum((b as any).v)).filter((v): v is number => v !== null);
   if (vols.length < 6) {
-    return { avg: null, last: null, rel: 1.0, relNote: "relVol defaulted (insufficient volume bars)" };
+    return { avg: null, last: null, rel: null, relNote: "relVol unavailable (insufficient volume bars)" };
   }
   const last = vols[vols.length - 1];
   const sample = vols.slice(-Math.min(30, vols.length));
   const avg = sample.reduce((a, b) => a + b, 0) / sample.length;
   if (!(avg > 0)) {
-    return { avg, last, rel: 1.0, relNote: "relVol defaulted (avg volume <= 0)" };
+    return { avg, last, rel: null, relNote: "relVol unavailable (avg volume <= 0)" };
   }
   // Use rolling 5-bar average for relVolume instead of single last bar.
   // Single-bar relVol is noisy for 1-minute bars — a single quiet bar kills the signal.
@@ -82,7 +86,7 @@ function computeVolumes(bars: AlpacaBar[]) {
   const recentSlice = vols.slice(-recentWindow);
   const recentAvg = recentSlice.reduce((a, b) => a + b, 0) / recentSlice.length;
   const rel = recentAvg / avg;
-  return { avg, last, rel, relNote: null };
+  return { avg, last, rel: Number.isFinite(rel) ? rel : null, relNote: null };
 }
 
 function computeAvgRangePct(bars: AlpacaBar[]) {
@@ -302,23 +306,36 @@ export async function buildSignalContext(params: {
   const liquidityNote = liquidityNoteFromContext(avg, lastClose ?? null);
   
   // Compute completeness metrics for context enrichment
-  const missingContextFields: string[] = [];
-  if (lastClose === null || !Number.isFinite(lastClose)) missingContextFields.push("price");
-  if (vwap === null || !Number.isFinite(vwap)) missingContextFields.push("vwap");
-  if (avg === null || !Number.isFinite(avg)) missingContextFields.push("avgDollarVol");
-  
-  const vwapDistancePct = 
-    vwap && lastClose && Number.isFinite(vwap) && Number.isFinite(lastClose)
+  const requiredMissing: string[] = [];
+  const optionalMissing: string[] = [];
+  const contextWarnings: string[] = [];
+
+  if (finalBars.length < 20) requiredMissing.push("barsUsed");
+  if (lastClose === null || !Number.isFinite(lastClose)) requiredMissing.push("price");
+  if (!trend) requiredMissing.push("trend");
+
+  const vwapDistancePct =
+    vwap != null && lastClose != null && Number.isFinite(vwap) && Number.isFinite(lastClose)
       ? ((lastClose - vwap) / vwap) * 100
       : null;
-  
-  const avgDollarVol = 
-    avg && lastClose && Number.isFinite(avg) && Number.isFinite(lastClose)
+  if (vwapDistancePct === null || !Number.isFinite(vwapDistancePct)) requiredMissing.push("vwapDistancePct");
+
+  const avgDollarVol =
+    avg != null && lastClose != null && Number.isFinite(avg) && Number.isFinite(lastClose)
       ? avg * lastClose
       : null;
-  
-  // Context is complete when we have barsUsed >= 20 and all key metrics computed
-  const contextComplete = finalBars.length >= 20 && missingContextFields.length === 0;
+  if (avgDollarVol === null || !Number.isFinite(avgDollarVol)) requiredMissing.push("avgDollarVol");
+
+  if (rel === null || !Number.isFinite(rel)) {
+    optionalMissing.push("relVol");
+    contextWarnings.push("relVol_unavailable");
+  }
+
+  const missingContextFields = [...requiredMissing, ...optionalMissing];
+
+  // Required fields completeness (allows scoring when optional relVol is unavailable)
+  const contextComplete = requiredMissing.length === 0;
+  const contextHasAllOptionalFields = contextComplete && optionalMissing.length === 0;
   
   // Detect SHORT bias when bearish structure indicators align
   const shortBias = detectShortBias({
@@ -336,7 +353,8 @@ export async function buildSignalContext(params: {
     trendSlopePct: slopePct,
     avgVolume: avg ?? null,
     lastVolume: last ?? null,
-    relVolume: Number.isFinite(rel) ? rel : 1.0,
+    relVolume: Number.isFinite(rel as number) ? (rel as number) : null,
+    relVol: Number.isFinite(rel as number) ? (rel as number) : null,
     relVolumeNote: relNote ?? undefined,
     rangePctAvg,
     liquidityNote,
@@ -348,6 +366,8 @@ export async function buildSignalContext(params: {
     firstBarTime,
     lastBarTime,
     contextComplete,
+    contextHasAllOptionalFields,
+    contextWarnings: contextWarnings.length > 0 ? contextWarnings : undefined,
     missingContextFields: missingContextFields.length > 0 ? missingContextFields : undefined,
   };
 }

@@ -102,23 +102,67 @@ function parseBoolFlag(value: unknown): boolean {
 }
 
 // -------------------------------------------------------------------------
-// Real-Time Freshness Guardrail
+// Freshness decisioning (single source of truth)
 // -------------------------------------------------------------------------
 
-/** Hard maximum age for a signal to be considered real-time fresh (5 minutes). */
-const MAX_SIGNAL_AGE_MS = 5 * 60 * 1000;
+export type FreshnessDecision = {
+  signalId: string;
+  symbol: string;
+  createdAt: string;
+  ageMs: number;
+  isFresh: boolean;
+  freshnessReason: "fresh_within_threshold" | "stale_over_threshold" | "missing_timestamp";
+};
 
-/**
- * Returns true if the signal was created within MAX_SIGNAL_AGE_MS of now.
- * Uses createdAt from the signal object.
- */
-function isFresh(signal: RawSignal): boolean {
-  const tsMs =
-    parseTimestampMs(signal?.createdAt) ??
-    parseTimestampMs(signal?.scoredAt) ??
-    parseTimestampMs(signal?.updatedAt);
-  if (tsMs == null || !Number.isFinite(tsMs)) return false;
-  return Date.now() - tsMs < MAX_SIGNAL_AGE_MS;
+export function evaluateSignalFreshnessDecision(
+  signal: RawSignal,
+  nowMs: number,
+  effectiveFreshnessMs: number
+): FreshnessDecision {
+  const signalId = String(signal?.id || "").trim();
+  const symbol = getSymbol(signal) || "UNKNOWN";
+  const createdAt = String(signal?.createdAt || signal?.updatedAt || new Date(nowMs).toISOString());
+  const tsMs = getSignalTimestampMs(signal);
+  const ageMs = Number.isFinite(tsMs) ? Math.max(0, nowMs - (tsMs as number)) : Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(ageMs)) {
+    return {
+      signalId,
+      symbol,
+      createdAt,
+      ageMs,
+      isFresh: false,
+      freshnessReason: "missing_timestamp",
+    };
+  }
+
+  const isFresh = ageMs <= effectiveFreshnessMs;
+  return {
+    signalId,
+    symbol,
+    createdAt,
+    ageMs,
+    isFresh,
+    freshnessReason: isFresh ? "fresh_within_threshold" : "stale_over_threshold",
+  };
+}
+
+export function getFreshnessThresholdSource(freshnessMode: string): string {
+  switch (freshnessMode) {
+    case "param_override":
+      return "query_param_freshMs";
+    case "env_override":
+      return "AUTO_ENTRY_SIGNAL_FRESH_MS";
+    case "legacy_env_min":
+      return "AUTO_ENTRY_SEED_MAX_AGE_MIN";
+    case "eod_75m":
+      return "eod_window_policy_75m";
+    case "market_default_60m":
+      return "market_open_default_60m";
+    case "closed_default_10m":
+      return "market_closed_default_10m";
+    default:
+      return "unknown";
+  }
 }
 
 function mapSkipReason(raw: string): SeedSkipReason | null {
@@ -716,8 +760,6 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // Hard max stale window: signals older than 4 hours are never seeded regardless.
-  const HARD_MAX_STALE_MS = 4 * 60 * 60 * 1000;
   // Ticker cooldown: how long to wait after a terminal trade before allowing re-entry.
   const TICKER_COOLDOWN_MS = cfg.cooldownMin * 60_000;
 
@@ -769,48 +811,55 @@ export async function POST(req: NextRequest) {
     return bTs - aTs;
   });
 
+  const preRecoveryFreshCount = qualifiedSignals.filter((s) => {
+    const d = evaluateSignalFreshnessDecision(s, nowMs, staleThresholdUsedMs);
+    return d.isFresh;
+  }).length;
+  const preRecoveryStaleCount = Math.max(0, qualifiedSignals.length - preRecoveryFreshCount);
+
+  // ── Recovery mode: expand freshness window when no fresh qualified signals ──
+  // When capacity is available but no fresh signals exist, widen freshness threshold.
+  let recoveryModeActive = false;
+  let effectiveFreshnessMs = staleThresholdUsedMs;
+  if (preRecoveryFreshCount === 0 && preRecoveryStaleCount > 0 && effectiveLimit > 0) {
+    recoveryModeActive = true;
+    effectiveFreshnessMs = staleThresholdUsedMs * 3; // expand window 3x
+    console.log("[seed-from-signals] recovery_mode_activated", {
+      reason: "no_fresh_qualified_signals",
+      expandedFreshnessMsTo: effectiveFreshnessMs,
+      preRecoveryStaleCount,
+      effectiveLimit,
+      remainingPositionSlots,
+    });
+  }
+
+  const freshnessThresholdSource = getFreshnessThresholdSource(freshnessMode);
+  const freshnessDecisionBySignal: FreshnessDecision[] = qualifiedSignals.map((s) =>
+    evaluateSignalFreshnessDecision(s, nowMs, effectiveFreshnessMs)
+  );
+  const freshnessDecisionMap = new Map(
+    freshnessDecisionBySignal
+      .filter((d) => d.signalId)
+      .map((d) => [d.signalId, d] as const)
+  );
   const qualifiedSignalAges: Array<{
     signalId: string;
     symbol: string;
     createdAt: string;
     ageMs: number;
     isFresh: boolean;
-  }> = [];
-  let freshQualifiedSignals = 0;
-  let staleQualifiedSignals = 0;
-  for (const s of qualifiedSignals) {
-    const signalId = String(s?.id || "").trim();
-    const symbol = getSymbol(s) || "UNKNOWN";
-    const tsMs = getSignalTimestampMs(s);
-    const ageMs = Number.isFinite(tsMs) ? Math.max(0, nowMs - (tsMs as number)) : Number.POSITIVE_INFINITY;
-    if (Number.isFinite(ageMs) && ageMs <= staleThresholdUsedMs) freshQualifiedSignals += 1;
-    else staleQualifiedSignals += 1;
-    if (!signalId) continue;
-    qualifiedSignalAges.push({
-      signalId,
-      symbol,
-      createdAt: String(s?.createdAt || s?.updatedAt || nowIso),
-      ageMs,
-      isFresh: Number.isFinite(ageMs) && ageMs <= staleThresholdUsedMs,
-    });
-  }
+  }> = freshnessDecisionBySignal
+    .filter((d) => d.signalId)
+    .map((d) => ({
+      signalId: d.signalId,
+      symbol: d.symbol,
+      createdAt: d.createdAt,
+      ageMs: d.ageMs,
+      isFresh: d.isFresh,
+    }));
 
-  // ── Recovery mode: expand freshness window when no fresh qualified signals ──
-  // When capacity is available but no fresh signals exist, allow "slightly stale"
-  // A/B setups to prevent complete funnel starvation.
-  let recoveryModeActive = false;
-  let effectiveFreshnessMs = staleThresholdUsedMs;
-  if (freshQualifiedSignals === 0 && staleQualifiedSignals > 0 && effectiveLimit > 0) {
-    recoveryModeActive = true;
-    effectiveFreshnessMs = staleThresholdUsedMs * 3; // expand window 3x
-    console.log("[seed-from-signals] recovery_mode_activated", {
-      reason: "no_fresh_qualified_signals",
-      expandedFreshnessMsTo: effectiveFreshnessMs,
-      staleQualifiedSignals,
-      effectiveLimit,
-      remainingPositionSlots,
-    });
-  }
+  const freshQualifiedSignals = freshnessDecisionBySignal.filter((d) => d.isFresh).length;
+  const staleQualifiedSignals = Math.max(0, freshnessDecisionBySignal.length - freshQualifiedSignals);
 
   const allQualifyingCandidates: QualifiedCandidate[] = [];
   const candidateKey = (c: QualifiedCandidate) => `${c.signalId}:${c.symbol}:${c.side}:${c.createdAt}`;
@@ -837,8 +886,10 @@ export async function POST(req: NextRequest) {
             ? cfg.tierCmin
             : null;
     const createdAt = String(s?.createdAt || s?.updatedAt || nowIso);
-    const createdAtMs = getSignalTimestampMs(s);
-    const ageMs = Number.isFinite(createdAtMs) ? Math.max(0, nowMs - (createdAtMs as number)) : Number.POSITIVE_INFINITY;
+    const freshnessDecision =
+      freshnessDecisionMap.get(signalId) ??
+      evaluateSignalFreshnessDecision(s, nowMs, effectiveFreshnessMs);
+    const ageMs = freshnessDecision.ageMs;
 
     const markSkip = (
       reason: SeedSkipReason,
@@ -909,17 +960,11 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
-    // Stale check: hard-reject only signals older than HARD_MAX_STALE_MS (4 hours).
-    // Signals between effectiveFreshnessMs and 4h are allowed through with a score
-    // penalty so fresh signals always rank higher, but stale ones fill remaining capacity.
-    const isStaleSignal = Number.isFinite(ageMs) && (ageMs as number) > effectiveFreshnessMs;
-    if (!Number.isFinite(ageMs) || (ageMs as number) > HARD_MAX_STALE_MS) {
+    // Single stale decision: reuse computed freshness decision for all stale handling.
+    if (!freshnessDecision.isFresh) {
       staleHardBlockedCount++;
       markSkip("stale_signal");
       continue;
-    }
-    if (isStaleSignal) {
-      staleAllowedCount++;
     }
 
     if (!tier) {
@@ -1014,18 +1059,7 @@ export async function POST(req: NextRequest) {
     }
 
     const actionabilityRank = getNum(s, ["actionabilityRank"]) ?? 5;
-    // Stale signals get a 0.5 penalty so fresh signals always rank higher,
-    // but stale ones still fill remaining capacity slots.
-    const stalenessPenalty = isStaleSignal ? 0.5 : 0;
-
-    // ── Real-time freshness gate (PART 4/5) ──────────────────────────────
-    // Signals qualified and fresh within MAX_SIGNAL_AGE_MS seed immediately.
-    // Signals older than MAX_SIGNAL_AGE_MS are rejected here to ensure only
-    // real-time signals enter the seeding pipeline.
-    if (!isFresh(s)) {
-      markSkip("stale_signal");
-      continue;
-    }
+    // Freshness already enforced above via freshnessDecision.
 
     // ── Price drift guardrail (PART 6) ───────────────────────────────────
     // Reject signals where price has drifted more than 0.5R from the entry
@@ -1070,7 +1104,7 @@ export async function POST(req: NextRequest) {
       signalId,
       createdAt,
       shortPenalty,
-      effectiveScore: (aiScore as number) - shortPenalty - stalenessPenalty,
+      effectiveScore: (aiScore as number) - shortPenalty,
       actionabilityRank,
       ageMs,
     });
@@ -1317,6 +1351,17 @@ export async function POST(req: NextRequest) {
     })
     .filter(Boolean) as SeedRunTelemetry["skippedQualifiedSignals"];
 
+  const staleSkippedSignalIds = new Set(
+    skippedQualifiedSignals
+      .filter((s) => s.reason === "stale_signal")
+      .map((s) => s.signalId)
+      .filter(Boolean)
+  );
+  const freshnessMismatchCount = freshnessDecisionBySignal.filter(
+    (d) => d.isFresh && d.signalId && staleSkippedSignalIds.has(d.signalId)
+  ).length;
+  const staleCheckConsistencyOk = freshnessMismatchCount === 0;
+
   let funnelBlockIncident: { created: boolean; incidentId: string } | null = null;
   const createdCount = dryRun ? 0 : created.length;
 
@@ -1402,6 +1447,9 @@ export async function POST(req: NextRequest) {
     staleThresholdUsedMs,
     effectiveFreshnessMs,
     freshnessMode,
+    freshnessThresholdSource,
+    staleCheckConsistencyOk,
+    freshnessMismatchCount,
     // Throughput diagnostics
     qualificationRate: signals.length > 0 ? (qualifiedSignals.length / signals.length).toFixed(3) : "0",
     freshnessDistribution: { fresh: freshQualifiedSignals, stale: staleQualifiedSignals },
@@ -1437,6 +1485,9 @@ export async function POST(req: NextRequest) {
     staleThresholdUsedMs,
     effectiveFreshnessMs,
     freshnessMode,
+    freshnessThresholdSource,
+    staleCheckConsistencyOk,
+    freshnessMismatchCount,
     recoveryModeActive,
     forcedSeedApplied,
     // Throughput diagnostics
@@ -1487,6 +1538,7 @@ export async function POST(req: NextRequest) {
       ? "NO_FRESH_SIGNALS"
       : "SYSTEM_ISSUE",
     skippedQualifiedSignals: skippedQualifiedSignals.slice(0, 250),
+    freshnessDecisionBySignal: freshnessDecisionBySignal.slice(0, 250),
     qualifiedSignalAges: qualifiedSignalAges.slice(0, 250),
     perSignalAgeMs: qualifiedSignalAges.slice(0, 250),
     attributedQualifiedSignals: updatedSignalsCount,

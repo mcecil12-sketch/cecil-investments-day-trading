@@ -11,6 +11,11 @@ import {
   type CandidateContext,
   type GatingStats,
 } from "@/lib/scanner/prePostGating";
+import {
+  isTradableCommonInstrument,
+  getNonTradableInstrumentReason,
+  type ScannerAssetLike,
+} from "@/lib/scannerUtils";
 
 const DEFAULT_WATCHLIST = ["SPY", "QQQ", "TSLA", "NVDA", "META", "AMD"];
 
@@ -62,6 +67,7 @@ interface CandidateSignal {
   avgDollarVol?: number;
   trendStrengthPct?: number;
   rangePct?: number;
+  barsUsed?: number;
   belowVwap?: boolean;
   lowerHighLowerLow?: boolean;
   breakdownVolumeIncreasing?: boolean;
@@ -176,6 +182,7 @@ type RejectKey =
   | "trendMismatch"
   | "missingBars"
   | "marketClosed"
+  | "nonTradableInstrument"
   | "other";
 
 type GateResult =
@@ -200,6 +207,7 @@ function createRejectTracker(sampleLimit = 12) {
     trendMismatch: 0,
     missingBars: 0,
     marketClosed: 0,
+    nonTradableInstrument: 0,
     other: 0,
   };
   const samples: Array<{ ticker: string; reason: RejectKey; note?: string; bars?: BarDiagnostics }> = [];
@@ -305,9 +313,12 @@ type AlpacaAsset = {
   tradable: boolean;
   class: string;
   asset_class?: string;
+  name?: string;
+  attributes?: string[];
 };
 
 let universeCache: { symbols: string[]; fetchedAt: number } | null = null;
+let universeAssetMapCache: { map: Record<string, AlpacaAsset>; fetchedAt: number } | null = null;
 const UNIVERSE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 function typicalPrice(bar: AlpacaBar): number {
@@ -338,6 +349,7 @@ async function fetchUniverseSymbols(): Promise<string[]> {
       symbols: DEFAULT_WATCHLIST,
       fetchedAt: now,
     };
+    universeAssetMapCache = { map: {}, fetchedAt: now };
     return universeCache.symbols;
   }
 
@@ -356,10 +368,17 @@ async function fetchUniverseSymbols(): Promise<string[]> {
       symbols: DEFAULT_WATCHLIST,
       fetchedAt: now,
     };
+    universeAssetMapCache = { map: {}, fetchedAt: now };
     return universeCache.symbols;
   }
 
   const assets = (await res.json()) as AlpacaAsset[];
+  const assetMap: Record<string, AlpacaAsset> = {};
+  for (const asset of assets) {
+    const sym = String(asset?.symbol || "").toUpperCase();
+    if (sym) assetMap[sym] = asset;
+  }
+
   const symbols = assets
     .filter(
       (a) =>
@@ -371,7 +390,14 @@ async function fetchUniverseSymbols(): Promise<string[]> {
 
   const merged = Array.from(new Set([...DEFAULT_WATCHLIST, ...symbols]));
   universeCache = { symbols: merged, fetchedAt: now };
+  universeAssetMapCache = { map: assetMap, fetchedAt: now };
   return merged;
+}
+
+function getUniverseAssetBySymbol(symbol: string): ScannerAssetLike | undefined {
+  const map = universeAssetMapCache?.map;
+  if (!map) return undefined;
+  return map[String(symbol || "").toUpperCase()];
 }
 
 // --- Mode-specific detectors -------------------------------------------------
@@ -619,6 +645,7 @@ function detectAiSeedCandidate(
     avgDollarVol,
     trendStrengthPct,
     rangePct,
+    barsUsed: bars.length,
   };
 }
 
@@ -726,6 +753,7 @@ function detectShortCandidate(
     avgDollarVol: avgDollarVolCalc,
     trendStrengthPct,
     rangePct,
+    barsUsed: bars.length,
     belowVwap,
     lowerHighLowerLow,
     breakdownVolumeIncreasing,
@@ -914,6 +942,7 @@ const rejectsAggregated: Record<RejectKey, number> = {
   trendMismatch: 0,
   missingBars: 0,
   marketClosed: 0,
+  nonTradableInstrument: 0,
   other: 0,
 };
 const aiSeedTracker = createRejectTracker(40);
@@ -927,6 +956,7 @@ const mapReasonToKey = (reason: string): RejectKey => {
     case "trendMismatch":
     case "missingBars":
     case "marketClosed":
+    case "nonTradableInstrument":
     case "other":
       return reason as RejectKey;
     case "noBars":
@@ -958,6 +988,36 @@ function clamp(n: number, lo: number, hi: number) {
       args.price >= 10 && args.price <= 150 ? 5 : args.price >= 5 ? 2 : 0;
     const score = relVolScore + vwapProxScore + trendScore + volScore + spreadScore + priceBonus;
     return Math.round(score);
+  }
+
+  function compareAiSeedCandidateQuality(a: CandidateSignal, b: CandidateSignal) {
+    // 1) Dollar volume first (liquidity)
+    const adv = Number(a.avgDollarVol ?? 0);
+    const bdv = Number(b.avgDollarVol ?? 0);
+    if (bdv !== adv) return bdv - adv;
+
+    // 2) barsUsed >= minBars then bars count
+    const aHasBars = (a.barsUsed ?? 0) >= AI_SEED_SCAN_MIN_BARS ? 1 : 0;
+    const bHasBars = (b.barsUsed ?? 0) >= AI_SEED_SCAN_MIN_BARS ? 1 : 0;
+    if (bHasBars !== aHasBars) return bHasBars - aHasBars;
+    if ((b.barsUsed ?? 0) !== (a.barsUsed ?? 0)) return (b.barsUsed ?? 0) - (a.barsUsed ?? 0);
+
+    // 3) Absolute VWAP distance tighter is better
+    const aVw = Math.abs(Number(a.distToVwapPct ?? Number.POSITIVE_INFINITY));
+    const bVw = Math.abs(Number(b.distToVwapPct ?? Number.POSITIVE_INFINITY));
+    if (aVw !== bVw) return aVw - bVw;
+
+    // 4) Trend alignment strength
+    const aTrend = Number(a.trendStrengthPct ?? 0);
+    const bTrend = Number(b.trendStrengthPct ?? 0);
+    if (bTrend !== aTrend) return bTrend - aTrend;
+
+    // 5) relVol when available
+    const aRv = Number(a.relVol ?? -1);
+    const bRv = Number(b.relVol ?? -1);
+    if (bRv !== aRv) return bRv - aRv;
+
+    return (b.patternScore ?? 0) - (a.patternScore ?? 0);
   }
 
   /**
@@ -1069,7 +1129,27 @@ const logSummary = () => {
   const delayMs = Number(search.get("delayMs") ?? "500");
 
   const universe = await fetchUniverseSymbols();
-  const slicedUniverse = universe.slice(0, Math.max(1, Math.min(limit, universe.length)));
+
+  // Universe cleanup before bars fetch: keep only tradable common instruments.
+  // Build up to `limit` symbols after exclusions so polluted names do not consume scan slots.
+  const slicedUniverse: string[] = [];
+  for (const symbol of universe) {
+    if (slicedUniverse.length >= Math.max(1, Math.min(limit, universe.length))) break;
+
+    if (aiSeedMode) {
+      aiSeedTracker.trackTicker(symbol);
+      totals.totalCandidates += 1;
+    }
+
+    const asset = getUniverseAssetBySymbol(symbol);
+    const reason = getNonTradableInstrumentReason(symbol, asset);
+    if (!isTradableCommonInstrument(symbol, asset)) {
+      reject(symbol, "nonTradableInstrument", `symbol excluded: ${reason ?? "unknown"}`);
+      continue;
+    }
+
+    slicedUniverse.push(symbol);
+  }
 
   let candidates: CandidateSignal[] = [];
   let postedCount = 0;
@@ -1079,21 +1159,6 @@ const logSummary = () => {
 
     const promises: Promise<CandidateSignal | null>[] = chunk.map(async (symbol) => {
       try {
-        if (aiSeedMode) {
-          aiSeedTracker.trackTicker(symbol);
-          totals.totalCandidates += 1;
-        }
-        const upper = symbol.toUpperCase();
-        if (
-  upper.includes(".") ||
-  upper.endsWith("-WS") ||
-  upper.endsWith("-W")  ||
-  upper.endsWith("-U")  ||
-  upper.endsWith("-R")
-        ) {
-          reject(symbol, "other", "ticker excluded before bars");
-          return null;
-        }
         const bars = await fetchRecentBars(symbol, "1Min", 60);
         const lastBar = bars?.[bars.length - 1];
         const barCount = bars?.length ?? 0;
@@ -1258,32 +1323,40 @@ const logSummary = () => {
     }
   }
 
-  // Sort by pattern strength and take top N, dropping zero/negative scores
   // Three-state market status: true (open), false (closed), null (unknown/clock failed)
   // Only return 999 sentinel if definitively closed; treat unknown as open to avoid false SKIPs
   const minutesSinceOpen = minutesSinceOpenFromBars(candidates as any, clock, marketOpen);
   const openingMode = minutesSinceOpen <= AI_SEED_OPENING_MINUTES;
 
-  const enriched = candidates.map((c: any) => {
-    const preScore = computePreScore({
-      relVol: Number(c.relVol ?? 0),
-      distToVwapPct: Number(c.distToVwapPct ?? 0),
-      vwapSlopePct: Number(c.vwapSlopePct ?? 0),
-      atrPct: Number(c.atrPct ?? 0),
-      spreadAbs: Number(c.spreadAbs ?? 0),
-      price: Number(c.price ?? 0),
+  if (aiSeedMode) {
+    // Rank higher-quality/liquid names before pre-post gates so GPT capacity is used on better symbols.
+    const qualityRanked = [...candidates].sort(compareAiSeedCandidateQuality);
+
+    const enriched = qualityRanked.map((c: any) => {
+      const preScore = computePreScore({
+        relVol: Number(c.relVol ?? 0),
+        distToVwapPct: Number(c.distToVwapPct ?? 0),
+        vwapSlopePct: Number(c.vwapSlopePct ?? 0),
+        atrPct: Number(c.atrPct ?? 0),
+        spreadAbs: Number(c.spreadAbs ?? 0),
+        price: Number(c.price ?? 0),
+      });
+      return { ...c, preScore, openingMode, minutesSinceOpen };
     });
-    return { ...c, preScore, openingMode, minutesSinceOpen };
-  });
 
-  const ranked = enriched
-    .filter((c: any) => (c.preScore ?? 0) >= AI_SEED_PRESCORE_MIN)
-    .sort((a: any, b: any) => (b.preScore ?? 0) - (a.preScore ?? 0))
-    .slice(0, AI_SEED_GPT_LIMIT);
+    const ranked = enriched
+      .filter((c: any) => (c.preScore ?? 0) >= AI_SEED_PRESCORE_MIN)
+      .sort((a: any, b: any) => {
+        const byScore = (b.preScore ?? 0) - (a.preScore ?? 0);
+        if (byScore !== 0) return byScore;
+        return compareAiSeedCandidateQuality(a, b);
+      })
+      .slice(0, AI_SEED_GPT_LIMIT);
 
-  candidates = ranked;
+    candidates = ranked;
+  }
 
-candidates.sort((a, b) => b.patternScore - a.patternScore);
+  candidates.sort((a, b) => b.patternScore - a.patternScore);
   const filtered = candidates.filter((c) => c.patternScore > 0);
   
   // Apply per-mode caps
