@@ -1611,7 +1611,18 @@ Return ONLY valid JSON:
     await bumpTodayFunnel({ aiDirectionNone: 1 }).catch(console.warn);
   }
 
+  // Track context completeness for all scored signals (NEW)
+  if (signal.signalContext) {
+    const isComplete = signal.signalContext.contextComplete === true;
+    if (isComplete) {
+      await bumpTodayFunnel({ scoredWithCompleteContext: 1 }).catch(console.warn);
+    } else {
+      await bumpTodayFunnel({ scoredWithIncompleteContext: 1 }).catch(console.warn);
+    }
+  }
+
   // Log with quality diagnostics
+
   const logData: any = {
     ticker: result.ticker,
     score: winnerScore,

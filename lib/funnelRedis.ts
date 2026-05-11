@@ -111,6 +111,9 @@ const NUMERIC_COUNTERS = [
   // Execute archive attribution
   "executeArchivedDrifted",
   "executeArchivedNoLongerEligible",
+  // Context completeness tracking (Signal Context Completeness Enhancement)
+  "scoredWithCompleteContext",
+  "scoredWithIncompleteContext",
 ] as const;
 
 type NumericCounterKey = (typeof NUMERIC_COUNTERS)[number];

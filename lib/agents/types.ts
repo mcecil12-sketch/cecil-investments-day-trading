@@ -179,6 +179,25 @@ export interface EngineeringTask {
   commitSha?: string | null;
   commitUrl?: string | null;
   notes?: string[];
+
+  // ─── Agent Performance Operating Model v2: R Impact ──────────────
+  /** Expected R impact from task completion: positive, neutral, negative, unknown */
+  expectedRImpact?: "positive" | "neutral" | "negative" | "unknown";
+  /** Estimated R delta: e.g., "+0.5R to +2R/day" or "+5% execution rate" */
+  estimatedImpactDescription?: string;
+
+  /** Actual measured R impact after completion */
+  actualRImpact?: "positive" | "neutral" | "negative" | "unknown";
+  /** Actual R delta measurement */
+  actualImpactDescription?: string;
+
+  /** Metrics before task execution */
+  beforeMetrics?: Record<string, number>;
+  /** Metrics after task execution */
+  afterMetrics?: Record<string, number>;
+
+  /** Task completion quality wrt trading impact */
+  completionQuality?: "SUCCESS" | "PARTIAL_SUCCESS" | "NO_IMPACT" | "REGRESSION";
 }
 
 export interface BacklogItem {
@@ -197,6 +216,25 @@ export interface BacklogItem {
   linkedIncidentId?: string | null;
   assignedAgent?: "engineering" | "engineering-manager" | "ops" | "pm" | null;
   notes?: string[];
+
+  // ─── Agent Performance Operating Model v2: R Impact ──────────────
+  /** Expected R impact: positive, neutral, negative, unknown */
+  expectedRImpact?: "positive" | "neutral" | "negative" | "unknown";
+  /** Estimated impact description */
+  estimatedImpactDescription?: string;
+
+  /** Actual measured R impact after implementation */
+  actualRImpact?: "positive" | "neutral" | "negative" | "unknown";
+  /** Actual impact measurement */
+  actualImpactDescription?: string;
+
+  /** Metrics before implementation */
+  beforeMetrics?: Record<string, number>;
+  /** Metrics after implementation */
+  afterMetrics?: Record<string, number>;
+
+  /** Item completion quality wrt trading impact */
+  completionQuality?: "SUCCESS" | "PARTIAL_SUCCESS" | "NO_IMPACT" | "REGRESSION";
 }
 
 export interface AgentRunnerResult {

@@ -15,6 +15,14 @@ export type SignalContext = {
   rangePctAvg: number | null;
   liquidityNote: string;
   shortBias?: boolean;
+  // Completeness enhancement (NEW)
+  price?: number | null;
+  vwapDistancePct?: number | null;
+  avgDollarVol?: number | null;
+  firstBarTime?: string;
+  lastBarTime?: string;
+  contextComplete?: boolean;
+  missingContextFields?: string[];
 };
 
 function safeNum(n: any): number | null {
@@ -289,7 +297,28 @@ export async function buildSignalContext(params: {
   const { avg, last, rel, relNote } = computeVolumes(finalBars);
   const rangePctAvg = computeAvgRangePct(finalBars);
   const lastClose = finalBars.length ? finalBars[finalBars.length - 1].c : null;
+  const firstBarTime = finalBars.length ? finalBars[0].t : undefined;
+  const lastBarTime = finalBars.length ? finalBars[finalBars.length - 1].t : undefined;
   const liquidityNote = liquidityNoteFromContext(avg, lastClose ?? null);
+  
+  // Compute completeness metrics for context enrichment
+  const missingContextFields: string[] = [];
+  if (lastClose === null || !Number.isFinite(lastClose)) missingContextFields.push("price");
+  if (vwap === null || !Number.isFinite(vwap)) missingContextFields.push("vwap");
+  if (avg === null || !Number.isFinite(avg)) missingContextFields.push("avgDollarVol");
+  
+  const vwapDistancePct = 
+    vwap && lastClose && Number.isFinite(vwap) && Number.isFinite(lastClose)
+      ? ((lastClose - vwap) / vwap) * 100
+      : null;
+  
+  const avgDollarVol = 
+    avg && lastClose && Number.isFinite(avg) && Number.isFinite(lastClose)
+      ? avg * lastClose
+      : null;
+  
+  // Context is complete when we have barsUsed >= 20 and all key metrics computed
+  const contextComplete = finalBars.length >= 20 && missingContextFields.length === 0;
   
   // Detect SHORT bias when bearish structure indicators align
   const shortBias = detectShortBias({
@@ -312,5 +341,13 @@ export async function buildSignalContext(params: {
     rangePctAvg,
     liquidityNote,
     shortBias,
+    // Completeness enhancement (NEW)
+    price: lastClose,
+    vwapDistancePct,
+    avgDollarVol,
+    firstBarTime,
+    lastBarTime,
+    contextComplete,
+    missingContextFields: missingContextFields.length > 0 ? missingContextFields : undefined,
   };
 }
