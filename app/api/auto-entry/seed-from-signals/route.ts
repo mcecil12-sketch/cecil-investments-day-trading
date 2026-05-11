@@ -17,6 +17,11 @@ import {
   type SeedSkipReason,
 } from "@/lib/autoEntry/seedTelemetry";
 import { normalizeTradePlanForSide } from "@/lib/trades/planNormalization";
+import {
+  evaluateSignalFreshnessDecision,
+  getFreshnessThresholdSource,
+  type FreshnessDecision,
+} from "./freshness";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -99,70 +104,6 @@ function parseBoolFlag(value: unknown): boolean {
   if (typeof value === "boolean") return value;
   const v = String(value || "").trim().toLowerCase();
   return ["1", "true", "yes", "on"].includes(v);
-}
-
-// -------------------------------------------------------------------------
-// Freshness decisioning (single source of truth)
-// -------------------------------------------------------------------------
-
-export type FreshnessDecision = {
-  signalId: string;
-  symbol: string;
-  createdAt: string;
-  ageMs: number;
-  isFresh: boolean;
-  freshnessReason: "fresh_within_threshold" | "stale_over_threshold" | "missing_timestamp";
-};
-
-export function evaluateSignalFreshnessDecision(
-  signal: RawSignal,
-  nowMs: number,
-  effectiveFreshnessMs: number
-): FreshnessDecision {
-  const signalId = String(signal?.id || "").trim();
-  const symbol = getSymbol(signal) || "UNKNOWN";
-  const createdAt = String(signal?.createdAt || signal?.updatedAt || new Date(nowMs).toISOString());
-  const tsMs = getSignalTimestampMs(signal);
-  const ageMs = Number.isFinite(tsMs) ? Math.max(0, nowMs - (tsMs as number)) : Number.POSITIVE_INFINITY;
-  if (!Number.isFinite(ageMs)) {
-    return {
-      signalId,
-      symbol,
-      createdAt,
-      ageMs,
-      isFresh: false,
-      freshnessReason: "missing_timestamp",
-    };
-  }
-
-  const isFresh = ageMs <= effectiveFreshnessMs;
-  return {
-    signalId,
-    symbol,
-    createdAt,
-    ageMs,
-    isFresh,
-    freshnessReason: isFresh ? "fresh_within_threshold" : "stale_over_threshold",
-  };
-}
-
-export function getFreshnessThresholdSource(freshnessMode: string): string {
-  switch (freshnessMode) {
-    case "param_override":
-      return "query_param_freshMs";
-    case "env_override":
-      return "AUTO_ENTRY_SIGNAL_FRESH_MS";
-    case "legacy_env_min":
-      return "AUTO_ENTRY_SEED_MAX_AGE_MIN";
-    case "eod_75m":
-      return "eod_window_policy_75m";
-    case "market_default_60m":
-      return "market_open_default_60m";
-    case "closed_default_10m":
-      return "market_closed_default_10m";
-    default:
-      return "unknown";
-  }
 }
 
 function mapSkipReason(raw: string): SeedSkipReason | null {

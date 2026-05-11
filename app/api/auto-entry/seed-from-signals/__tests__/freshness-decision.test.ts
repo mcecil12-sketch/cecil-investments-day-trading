@@ -3,7 +3,7 @@ import {
   evaluateSignalFreshnessDecision,
   getFreshnessThresholdSource,
   type FreshnessDecision,
-} from "../route";
+} from "../freshness";
 
 describe("seed-from-signals freshness decision", () => {
   it("marks signal fresh when age is below threshold", () => {
