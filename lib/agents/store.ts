@@ -866,7 +866,7 @@ export async function upsertEngineeringTask(
 
 export async function updateEngineeringTaskById(
   id: string,
-  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot" | "notes" | "backlogItemId" | "likelyFiles" | "patchPlan" | "validationPlan" | "commitPlan" | "executionStatus" | "executionError" | "commitSha" | "commitUrl">>,
+  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot" | "notes" | "backlogItemId" | "likelyFiles" | "patchPlan" | "validationPlan" | "commitPlan" | "executionStatus" | "executionError" | "commitSha" | "commitUrl" | "successCriteria" | "expectedRImpact" | "estimatedImpactDescription" | "beforeMetrics" | "afterMetrics" | "completionQuality">>,
 ): Promise<EngineeringTask | null> {
   const now = nowIso();
   const history = await listEngineeringTasks(HISTORY_LIMIT);

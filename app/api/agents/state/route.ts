@@ -34,6 +34,20 @@ function toNumber(value: unknown, fallback = 0): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function kpiOrNull(kpis: any, key: string, fallback = 0): number | null {
+  const status = kpis?.metricStatus?.[key];
+  if (status === "unavailable") return null;
+  const n = Number(kpis?.[key]);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function boolFromEnv(value: string | undefined | null, fallback = false): boolean {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
 function executionVisibilityRank(task: EngineeringTask): number {
   const incidentRank = task.incidentId ? 0 : 100;
   const statusRank =
@@ -207,7 +221,7 @@ export async function GET(req: Request) {
       )
     : null;
 
-  const autonomyEnabled = process.env.AGENT_AUTONOMY_ENABLED === "1";
+  const autonomyEnabled = boolFromEnv(process.env.AGENT_AUTONOMY_ENABLED, true);
   const maxTasksPerRun = Math.max(1, Math.min(5, Number(process.env.AGENT_MAX_TASKS_PER_RUN ?? "3") || 3));
 
   // ─── Unified queue summary ──────────────────────────────────────────
@@ -421,56 +435,79 @@ export async function GET(req: Request) {
         logs: null,
       };
 
+  const avgR = kpiOrNull(sharedKpis, "avgRealizedR");
+  const realizedR = kpiOrNull(sharedKpis, "actualRImpactRecent");
+  const winRate = kpiOrNull(sharedKpis, "winRate");
+  const expectancy = avgR;
+  const seededToExecutedPct = kpiOrNull(sharedKpis, "seededToExecutedPct");
+  const qualifiedToSeededPct = kpiOrNull(sharedKpis, "qualifiedToSeededPct");
+  const signalToQualifiedPct = kpiOrNull(sharedKpis, "signalToQualifiedPct");
+  const executionLatencySec = kpiOrNull(sharedKpis, "executionLatencySec");
+  const freshSignalPct = kpiOrNull(sharedKpis, "freshSignalPct");
+  const staleSignalPct = kpiOrNull(sharedKpis, "staleSignalPct");
+  const protectionIntegrity = kpiOrNull(sharedKpis, "protectionIntegrity", 1);
+  const brokerErrorRate = kpiOrNull(sharedKpis, "brokerErrorRate", 0);
+
   const agentKpis = {
     "engineering-manager": {
-      avgR: toNumber(sharedKpis?.avgRealizedR, 0),
-      realizedR: toNumber(sharedKpis?.actualRImpactRecent, 0),
-      expectedRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
-      actualRImpact: toNumber(sharedKpis?.actualRImpactRecent, 0),
-      healthScore: Math.max(0, Math.min(10, 5 + toNumber(sharedKpis?.avgRealizedR, 0) * 2)),
+      avgR,
+      realizedR,
+      expectedRImpact: kpiOrNull(sharedKpis, "expectedRImpactPending"),
+      actualRImpact: realizedR,
+      metricStatus: sharedKpis?.metricStatus ?? {},
+      metricNotes: sharedKpis?.metricNotes ?? [],
+      healthScore: Math.max(0, Math.min(10, 5 + (avgR ?? 0) * 2)),
     },
     engineering: {
-      expectedRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
-      actualRImpact: toNumber(sharedKpis?.actualRImpactRecent, 0),
+      expectedRImpact: kpiOrNull(sharedKpis, "expectedRImpactPending"),
+      actualRImpact: realizedR,
       buildSuccessRate: null,
+      scoringHealth: (kpiOrNull(sharedKpis, "scoringSuccessRate") ?? 0) >= 0.75 ? "healthy" : "degraded",
       healthScore: Math.max(0, Math.min(10, 6)),
     },
     execution: {
-      seededToExecutedPct: toNumber(sharedKpis?.seededToExecutedPct, 0),
-      latencySec: toNumber(sharedKpis?.executionLatencySec, 0),
-      freshSignalPct: toNumber(sharedKpis?.freshSignalPct, 0),
-      staleSignalPct: toNumber(sharedKpis?.staleSignalPct, 0),
-      expectedRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
-      actualRImpact: toNumber(sharedKpis?.actualRImpactRecent, 0),
+      seededToExecutedPct,
+      qualifiedToSeededPct,
+      signalToQualifiedPct,
+      executionLatencySec,
+      latencySec: executionLatencySec,
+      freshSignalPct,
+      staleSignalPct,
+      expectedRImpact: kpiOrNull(sharedKpis, "expectedRImpactPending"),
+      actualRImpact: realizedR,
+      metricStatus: sharedKpis?.metricStatus ?? {},
       healthScore: Math.max(0, Math.min(10, toNumber(executionBrief?.kpis?.totalScore, 5))),
     },
     risk: {
       maxLossR: Math.abs(toNumber(sharedKpis?.drawdown, 0)),
-      protectionIntegrity: toNumber(sharedKpis?.protectionIntegrity, 1),
+      protectionIntegrity,
       drawdown: toNumber(sharedKpis?.drawdown, 0),
-      expectedRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
-      actualRImpact: toNumber(sharedKpis?.actualRImpactRecent, 0),
-      healthScore: Math.max(0, Math.min(10, 10 * toNumber(sharedKpis?.protectionIntegrity, 1))),
+      expectedRImpact: kpiOrNull(sharedKpis, "expectedRImpactPending"),
+      actualRImpact: realizedR,
+      healthScore: Math.max(0, Math.min(10, 10 * (protectionIntegrity ?? 1))),
     },
     performance: {
-      avgR: toNumber(sharedKpis?.avgRealizedR, 0),
-      winRate: toNumber(sharedKpis?.winRate, 0),
-      expectancy: toNumber(sharedKpis?.avgRealizedR, 0),
-      expectedRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
-      actualRImpact: toNumber(sharedKpis?.actualRImpactRecent, 0),
-      healthScore: Math.max(0, Math.min(10, 5 + toNumber(sharedKpis?.avgRealizedR, 0) * 2.5)),
+      avgR,
+      realizedR,
+      winRate,
+      expectancy,
+      expectedRImpact: kpiOrNull(sharedKpis, "expectedRImpactPending"),
+      actualRImpact: realizedR,
+      metricStatus: sharedKpis?.metricStatus ?? {},
+      metricNotes: sharedKpis?.metricNotes ?? [],
+      healthScore: Math.max(0, Math.min(10, 5 + (avgR ?? 0) * 2.5)),
     },
     ops: {
-      readiness: toNumber(sharedKpis?.brokerErrorRate, 0) <= 0.1,
+      readiness: brokerErrorRate != null ? brokerErrorRate <= 0.1 : null,
       scannerHealth: toNumber(sharedKpis?.positionMismatchCount, 0) > 0 ? "degraded" : "healthy",
-      scoringHealth: toNumber(sharedKpis?.scoringSuccessRate, 0) >= 0.75 ? "healthy" : "degraded",
-      estimatedRLostToOutages: Number((toNumber(sharedKpis?.brokerErrorRate, 0) * 2).toFixed(3)),
-      healthScore: Math.max(0, Math.min(10, 7 - toNumber(sharedKpis?.brokerErrorRate, 0) * 10)),
+      scoringHealth: (kpiOrNull(sharedKpis, "scoringSuccessRate") ?? 0) >= 0.75 ? "healthy" : "degraded",
+      estimatedRLostToOutages: brokerErrorRate == null ? null : Number((brokerErrorRate * 2).toFixed(3)),
+      healthScore: Math.max(0, Math.min(10, 7 - (brokerErrorRate ?? 0) * 10)),
     },
     pm: {
-      backlogRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
+      backlogRImpact: kpiOrNull(sharedKpis, "expectedRImpactPending"),
       criticalBacklogCount: (openIncidents ?? []).filter((i) => i.severity === "CRITICAL").length,
-      healthScore: Math.max(0, Math.min(10, 6 + (toNumber(sharedKpis?.avgRealizedR, 0) >= 0 ? 1 : -1))),
+      healthScore: Math.max(0, Math.min(10, 6 + ((avgR ?? 0) >= 0 ? 1 : -1))),
     },
   };
 
@@ -548,6 +585,10 @@ export async function GET(req: Request) {
     latestExecutionTaskTitle: latestReadyForExecution?.title ?? null,
     latestExecutionStatus: latestReadyForExecution?.executionStatus ?? null,
     autonomyEnabled,
+    autonomyConfig: {
+      source: "AGENT_AUTONOMY_ENABLED",
+      raw: process.env.AGENT_AUTONOMY_ENABLED ?? null,
+    },
     // canonicalExec: freshest BATCH_COMPLETED+commitSha wins over stale BATCH_PARTIAL
     latestBatchExecutionResult: canon,
     lastBatchExecutedCount: Number(latestBatchExec?.executedCount ?? 0) || 0,
@@ -747,7 +788,7 @@ export async function GET(req: Request) {
     latestBatchExec,
     profitEngineStatus?.engineActive ?? false,
   ).catch(() => ({
-    autonomyEnabled: process.env.AGENT_AUTONOMY_ENABLED === "1",
+    autonomyEnabled: boolFromEnv(process.env.AGENT_AUTONOMY_ENABLED, true),
     githubWriteEnabled: false,
     patchExecutorEnabled: false,
     profitEngineActive: false,
@@ -859,6 +900,11 @@ export async function GET(req: Request) {
     stateReconciliation: stateConsistency,
 
     // ─── Phase 6A runtime visibility (top-level mirrors) ────────────
+    autonomyEnabled,
+    autonomyConfig: {
+      source: "AGENT_AUTONOMY_ENABLED",
+      raw: process.env.AGENT_AUTONOMY_ENABLED ?? null,
+    },
     ownershipModelActive,
     cooldownsEnabled,
     dedupeEnabled,

@@ -14,6 +14,8 @@ import {
   writeAgentState,
 } from "@/lib/agents/store";
 import { classifyIncident } from "@/lib/agents/incidents";
+import { buildPriorityFeed } from "@/lib/agents/opportunity-engine";
+import { getSharedTradingKpis } from "@/lib/agents/trading-kpis";
 import { nowIso } from "@/lib/agents/time";
 import type {
   AgentBrief,
@@ -185,6 +187,14 @@ function executionVisibilityRank(task: EngineeringTask): number {
               ? 30
               : 100;
   return incidentRank + statusRank;
+}
+
+function hasCoverageForOpportunity(tasks: EngineeringTask[], title: string): boolean {
+  const normalized = normalizeTitle(title);
+  return tasks.some((task) => {
+    if (task.status === "DONE" || task.status === "FAILED") return false;
+    return normalizeTitle(task.title) === normalized;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -712,13 +722,24 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
   const inProgressBacklogCount = refreshedBacklog.filter((item) => item.status === "IN_PROGRESS").length;
   const nextBacklogTitles = (await getNextBacklogItems(2)).map((item) => item.title);
 
+  const [priorityFeed, sharedKpis] = await Promise.all([
+    buildPriorityFeed(5).catch(() => ({ priorities: [] })),
+    getSharedTradingKpis().catch(() => null),
+  ]);
+  const criticalOpenOpportunity = (priorityFeed.priorities || []).find((p: any) => p.status === "OPEN" && p.priority === "CRITICAL") ?? null;
+  const opportunityCovered = criticalOpenOpportunity ? hasCoverageForOpportunity(refreshedTasks, criticalOpenOpportunity.title) : true;
+
   const taskSummary = upsertCreated
     ? `Created engineering task "${buildTaskTitle(candidate!)}" for incident ${candidate!.id}.`
     : createdBacklogTaskIds.length > 0
       ? `Created ${createdBacklogTaskIds.length} backlog task${createdBacklogTaskIds.length === 1 ? "" : "s"} for proactive engineering work.`
       : resolvedTaskUpdates > 0 || closedByIncident > 0
         ? `Closed ${resolvedTaskUpdates + closedByIncident} resolved incident-linked engineering task${resolvedTaskUpdates + closedByIncident === 1 ? "" : "s"}.`
-        : "No new engineering task was needed.";
+        : criticalOpenOpportunity && !opportunityCovered
+          ? `Top CRITICAL opportunity "${criticalOpenOpportunity.title}" is not yet execution-ready; engineering manager will upsert an opportunity task with baseline metrics (seededToExecutedPct=${Number(sharedKpis?.seededToExecutedPct ?? 0).toFixed(2)}).`
+          : criticalOpenOpportunity
+            ? `Existing task already covers top opportunity "${criticalOpenOpportunity.title}".`
+            : "Existing task already covers top opportunity.";
 
   const selectedTaskId = createdTaskId ?? createdBacklogTaskIds[0] ?? null;
 
@@ -778,6 +799,9 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
       blockedTaskCount,
       openBacklogCount,
       inProgressBacklogCount,
+      criticalOpportunityTitle: criticalOpenOpportunity?.title ?? null,
+      criticalOpportunityOwner: criticalOpenOpportunity?.owner ?? null,
+      criticalOpportunityCovered: opportunityCovered,
     },
   });
 

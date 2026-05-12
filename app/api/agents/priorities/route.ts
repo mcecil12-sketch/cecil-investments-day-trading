@@ -116,7 +116,6 @@ export async function GET(req: Request) {
   const fromOpportunities = (priorityFeed.priorities || []).map(opportunityToPriority);
   const rankedIncidentPriorities = rankIncidentPriorities(fromIncidents, openIncidents || []);
 
-  // Match state.currentTopPriorities behavior: use the ranked priority feed as primary source.
   const priorities = (fromOpportunities.length > 0 ? fromOpportunities : rankedIncidentPriorities).slice(0, limit);
 
   // Absolute non-empty guarantee
