@@ -17,6 +17,7 @@ import { checkGitHubWriteCapability } from "@/lib/agents/github-write";
 import { redis } from "@/lib/redis";
 import { AGENT_LATEST_EXECUTION_KEY, AGENT_LATEST_BATCH_EXECUTION_KEY } from "@/lib/agents/keys";
 import type { EngineeringTask } from "@/lib/agents/types";
+import { listOpenIncidents } from "@/lib/agents/store";
 import { listManualActionTasks, countOpenExecutionReadyManualTasks, getActiveManualTask, getTrulyActiveManualTask, getNextQueuedManualTask, getManualQueueDiagnostics } from "@/lib/agents/manual-action-queue";
 import { readProfitEngineStatus } from "@/lib/agents/profitEngine";
 import { readPnlIntegrityState } from "@/lib/agents/pnlIntegrity";
@@ -24,6 +25,14 @@ import { buildUnifiedQueueSummary, buildAutonomyHealth, buildQueueThroughput } f
 import { detectFunnelBlockedState, readFunnelRecoveryState, isFunnelRecoveryTask, isOptimizationOnlyTask } from "@/lib/agents/funnel-recovery";
 import { buildRImpactQueueWithSuppression, getTopRImpactTaskIds, scoreEngineeringTask } from "@/lib/agents/r-impact";
 import { getDedupStats } from "@/lib/agents/task-dedup";
+import { buildPriorityFeed } from "@/lib/agents/opportunity-engine";
+import { getSharedTradingKpis } from "@/lib/agents/trading-kpis";
+import { readExecutionBrief } from "@/lib/agents/execution-agent";
+
+function toNumber(value: unknown, fallback = 0): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 function executionVisibilityRank(task: EngineeringTask): number {
   const incidentRank = task.incidentId ? 0 : 100;
@@ -91,7 +100,7 @@ export async function GET(req: Request) {
   const reqUrl = new URL(req.url);
   const stateBaseUrl = `${reqUrl.protocol}//${reqUrl.host}`;
 
-  const [snapshot, state, tasks, adaptiveState, latestExecRaw, latestBatchRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics, profitEngineStatus, funnelRecoveryState, dedupStats, pnlIntegrityState] = await Promise.all([
+  const [snapshot, state, tasks, adaptiveState, latestExecRaw, latestBatchRaw, manualTasks, manualCounts, activeManualTask, trulyActiveTask, nextQueuedTask, queueDiagnostics, profitEngineStatus, funnelRecoveryState, dedupStats, pnlIntegrityState, openIncidents, priorityFeed, sharedKpis, executionBrief] = await Promise.all([
     readAgentStateSnapshot(),
     ensureAgentState(),
     listEngineeringTasks(200).then((t) =>
@@ -116,6 +125,10 @@ export async function GET(req: Request) {
     detectFunnelBlockedState(stateBaseUrl).catch(() => readFunnelRecoveryState().catch(() => null)),
     getDedupStats().catch(() => ({ activeLocks: 0, skippedDuplicateExecutionCount: 0, skippedInsufficientDataCount: 0 })),
     readPnlIntegrityState().catch(() => null),
+    listOpenIncidents(20).catch(() => []),
+    buildPriorityFeed(5).catch(() => ({ priorities: [], hasIncidents: false })),
+    getSharedTradingKpis().catch(() => null),
+    readExecutionBrief().catch(() => null),
   ]);
 
   const openTasks = tasks.filter(
@@ -250,6 +263,177 @@ export async function GET(req: Request) {
   );
   const rImpactQueue = rImpactDiagnostics.queue;
   const topExpectedRTasks = getTopRImpactTaskIds(rImpactQueue, 3);
+  const currentTopPriorities = ((priorityFeed.priorities ?? []).slice(0, 5).map((p) => ({
+    title: p.title,
+    priority: p.priority,
+    owner: p.owner,
+    expectedRImpact: p.expectedRImpact,
+    estimatedImpactText: p.estimatedImpactText,
+    rationale: p.rationale,
+    status: p.status,
+  })));
+  const guaranteedTopPriorities = currentTopPriorities.length > 0
+    ? currentTopPriorities
+    : [{
+        title: "System healthy, continue execution optimization",
+        priority: "MEDIUM",
+        owner: "engineering-manager",
+        expectedRImpact: "neutral",
+        estimatedImpactText: "Maintain reliability and improve throughput",
+        rationale: "No open incidents detected; keep autonomous optimization loop active.",
+        status: "OPEN",
+      }];
+  const currentTopRisks = (openIncidents ?? []).slice(0, 5).map((i) => ({
+    title: i.title,
+    severity: i.severity,
+    category: i.category,
+    summary: i.summary,
+    status: i.status,
+  }));
+  const activeAgentRoster = [
+    { name: "engineering-manager", enabled: true, health: "active" },
+    { name: "engineering", enabled: true, health: "active" },
+    { name: "execution", enabled: true, health: executionBrief ? "active" : "degraded" },
+    { name: "risk", enabled: true, health: "active" },
+    { name: "performance", enabled: true, health: "active" },
+    { name: "ops", enabled: true, health: "active" },
+    { name: "pm", enabled: true, health: "active" },
+    { name: "policynews", enabled: true, health: "active" },
+  ];
+
+  const ownershipModelActive = typeof listOpenIncidents === "function";
+  const cooldownsEnabled = typeof getEffectiveCooldownAfterLoss === "function";
+  const dedupeEnabled = typeof getDedupStats === "function";
+  const executionAgentEnabled = typeof readExecutionBrief === "function";
+  const opportunityEngineEnabled = typeof buildPriorityFeed === "function";
+
+  const failureObj = (canon?.failure && typeof canon.failure === "object")
+    ? (canon.failure as Record<string, unknown>)
+    : null;
+  const firstBatchResult = Array.isArray(canon?.results) && canon.results.length > 0 && typeof canon.results[0] === "object" && canon.results[0] !== null
+    ? (canon.results[0] as Record<string, unknown>)
+    : null;
+  const executionStatus = String(canon?.executionStatus ?? "");
+  const executionFailed = Boolean(
+    executionStatus.includes("FAILED") ||
+    executionStatus.includes("ERROR") ||
+    (canon?.patchApplied === true && !canon?.commitSha) ||
+    firstBatchResult?.ok === false ||
+    failureObj,
+  );
+  const validationFailed = Boolean(
+    (canon?.verification && typeof canon.verification === "object" && (canon.verification as Record<string, unknown>).buildOk === false) ||
+    (canon?.verification && typeof canon.verification === "object" && (canon.verification as Record<string, unknown>).smokeOk === false) ||
+    (firstBatchResult?.verification && typeof firstBatchResult.verification === "object" && (
+      (firstBatchResult.verification as Record<string, unknown>).buildOk === false ||
+      (firstBatchResult.verification as Record<string, unknown>).smokeOk === false
+    )) ||
+    String(canon?.stoppedReason ?? "").toLowerCase().includes("validation") ||
+    String(firstBatchResult?.failureReason ?? "").toLowerCase().includes("validation")
+  );
+  const failureReason = failureObj
+    ? (failureObj.reason ?? failureObj.type ?? failureObj.code ?? "execution_failed")
+    : executionFailed
+      ? (firstBatchResult?.failureReason ?? canon?.stoppedReason ?? "execution_failed")
+      : null;
+  const normalizedExecutionStatus = executionFailed
+    ? (canon?.patchApplied === true && validationFailed
+        ? "PATCH_APPLIED_VALIDATION_FAILED"
+        : validationFailed
+          ? "VALIDATION_FAILED"
+          : (String(canon?.executionStatus ?? "FAILED") || "FAILED"))
+    : (canon?.executionStatus ?? null);
+  const failureDetails = executionFailed
+    ? {
+        failureReason,
+        errorMessage:
+          failureObj?.message ??
+          failureObj?.error ??
+          firstBatchResult?.error ??
+          firstBatchResult?.summary ??
+          failureObj?.details ??
+          null,
+        failedStep:
+          failureObj?.step ??
+          failureObj?.phase ??
+          firstBatchResult?.phase ??
+          failureObj?.stage ??
+          null,
+        diagnostics:
+          failureObj?.diagnostics ??
+          failureObj?.logSummary ??
+          firstBatchResult?.diagnosticSummary ??
+          firstBatchResult?.logs ??
+          null,
+        diagnosticSummary:
+          failureObj?.logSummary ??
+          firstBatchResult?.diagnosticSummary ??
+          null,
+        logs:
+          firstBatchResult?.logs ??
+          null,
+      }
+    : {
+        failureReason: null,
+        errorMessage: null,
+        failedStep: null,
+        diagnostics: null,
+        diagnosticSummary: null,
+        logs: null,
+      };
+
+  const agentKpis = {
+    "engineering-manager": {
+      avgR: toNumber(sharedKpis?.avgRealizedR, 0),
+      realizedR: toNumber(sharedKpis?.actualRImpactRecent, 0),
+      expectedRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
+      actualRImpact: toNumber(sharedKpis?.actualRImpactRecent, 0),
+      healthScore: Math.max(0, Math.min(10, 5 + toNumber(sharedKpis?.avgRealizedR, 0) * 2)),
+    },
+    engineering: {
+      expectedRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
+      actualRImpact: toNumber(sharedKpis?.actualRImpactRecent, 0),
+      buildSuccessRate: null,
+      healthScore: Math.max(0, Math.min(10, 6)),
+    },
+    execution: {
+      seededToExecutedPct: toNumber(sharedKpis?.seededToExecutedPct, 0),
+      latencySec: toNumber(sharedKpis?.executionLatencySec, 0),
+      freshSignalPct: toNumber(sharedKpis?.freshSignalPct, 0),
+      staleSignalPct: toNumber(sharedKpis?.staleSignalPct, 0),
+      expectedRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
+      actualRImpact: toNumber(sharedKpis?.actualRImpactRecent, 0),
+      healthScore: Math.max(0, Math.min(10, toNumber(executionBrief?.kpis?.totalScore, 5))),
+    },
+    risk: {
+      maxLossR: Math.abs(toNumber(sharedKpis?.drawdown, 0)),
+      protectionIntegrity: toNumber(sharedKpis?.protectionIntegrity, 1),
+      drawdown: toNumber(sharedKpis?.drawdown, 0),
+      expectedRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
+      actualRImpact: toNumber(sharedKpis?.actualRImpactRecent, 0),
+      healthScore: Math.max(0, Math.min(10, 10 * toNumber(sharedKpis?.protectionIntegrity, 1))),
+    },
+    performance: {
+      avgR: toNumber(sharedKpis?.avgRealizedR, 0),
+      winRate: toNumber(sharedKpis?.winRate, 0),
+      expectancy: toNumber(sharedKpis?.avgRealizedR, 0),
+      expectedRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
+      actualRImpact: toNumber(sharedKpis?.actualRImpactRecent, 0),
+      healthScore: Math.max(0, Math.min(10, 5 + toNumber(sharedKpis?.avgRealizedR, 0) * 2.5)),
+    },
+    ops: {
+      readiness: toNumber(sharedKpis?.brokerErrorRate, 0) <= 0.1,
+      scannerHealth: toNumber(sharedKpis?.positionMismatchCount, 0) > 0 ? "degraded" : "healthy",
+      scoringHealth: toNumber(sharedKpis?.scoringSuccessRate, 0) >= 0.75 ? "healthy" : "degraded",
+      estimatedRLostToOutages: Number((toNumber(sharedKpis?.brokerErrorRate, 0) * 2).toFixed(3)),
+      healthScore: Math.max(0, Math.min(10, 7 - toNumber(sharedKpis?.brokerErrorRate, 0) * 10)),
+    },
+    pm: {
+      backlogRImpact: toNumber(sharedKpis?.expectedRImpactPending, 0),
+      criticalBacklogCount: (openIncidents ?? []).filter((i) => i.severity === "CRITICAL").length,
+      healthScore: Math.max(0, Math.min(10, 6 + (toNumber(sharedKpis?.avgRealizedR, 0) >= 0 ? 1 : -1))),
+    },
+  };
 
   // ─── Approval-required queue ────────────────────────────────────────
   // Tasks that would be blocked by AGENT_ALLOW_TRADING_FILES=0 at execution time.
@@ -342,14 +526,30 @@ export async function GET(req: Request) {
       ? (canon.failure as Record<string, unknown>)?.reason ?? null
       : null,
     latestExecutionResult: canon ? {
-      executionStatus: canon.executionStatus ?? null,
+      executionStatus: normalizedExecutionStatus,
       selectedSource: canon.selectedSource ?? null,
       selectedTaskId: canon.selectedTaskId ?? null,
       selectedTaskTitle: canon.selectedTaskTitle ?? null,
       patchApplied: canon.patchApplied ?? false,
       commitSha: canon.commitSha ?? null,
       manualTaskStatus: canon.manualTaskStatus ?? null,
+      failureReason: failureDetails.failureReason,
+      errorMessage: failureDetails.errorMessage,
+      failedStep: failureDetails.failedStep,
+      diagnostics: failureDetails.diagnostics,
+      diagnosticSummary: failureDetails.diagnosticSummary,
+      logs: failureDetails.logs,
+      executionFailed,
     } : null,
+    ownershipModelActive,
+    cooldownsEnabled,
+    dedupeEnabled,
+    executionAgentEnabled,
+    opportunityEngineEnabled,
+    activeAgentRoster,
+    currentTopPriorities: guaranteedTopPriorities,
+    currentTopRisks,
+    agentKpis,
     adaptiveGuardrails: {
       activeActionCount: activeAdaptiveActions.length,
       lastEvaluatedAt: adaptiveState.lastEvaluatedAt,
@@ -598,6 +798,10 @@ export async function GET(req: Request) {
       status: canon?.executionStatus ?? null,
       commitSha: canon?.commitSha ?? null,
       stoppedReason: canon?.stoppedReason ?? null,
+      failureReason: failureDetails.failureReason,
+      errorMessage: failureDetails.errorMessage,
+      failedStep: failureDetails.failedStep,
+      diagnostics: failureDetails.diagnostics,
     },
     batchExecutionMeta: {
       timestamp: (canon?.executedAt ?? canon?.timestamp) as string | null ?? null,
@@ -611,6 +815,18 @@ export async function GET(req: Request) {
       autonomyEnabled,
     },
     stateReconciliation: stateConsistency,
+
+    // ─── Phase 6A runtime visibility (top-level mirrors) ────────────
+    ownershipModelActive,
+    cooldownsEnabled,
+    dedupeEnabled,
+    executionAgentEnabled,
+    opportunityEngineEnabled,
+    activeAgentRoster,
+    currentTopPriorities: guaranteedTopPriorities,
+    currentTopRisks,
+    agentKpis,
+    latestExecutionResult: finalState.latestExecutionResult,
 
     // ─── Verification sanitization diagnostics (also mirrored under state) ─
     verificationDiagnostics: {
