@@ -343,6 +343,39 @@ export async function GET(req: Request) {
           ? "VALIDATION_FAILED"
           : (String(canon?.executionStatus ?? "FAILED") || "FAILED"))
     : (canon?.executionStatus ?? null);
+  const normalizedStatusText = String(normalizedExecutionStatus ?? "").toUpperCase();
+  const needsDiagnosticEnvelope =
+    normalizedStatusText === "FAILED" ||
+    normalizedStatusText === "VALIDATION_FAILED" ||
+    normalizedStatusText === "PATCH_APPLIED_VALIDATION_FAILED";
+  const verificationObj = (canon?.verification && typeof canon.verification === "object")
+    ? (canon.verification as Record<string, unknown>)
+    : null;
+  const firstBatchVerificationObj = (firstBatchResult?.verification && typeof firstBatchResult.verification === "object")
+    ? (firstBatchResult.verification as Record<string, unknown>)
+    : null;
+  const validationSummary = {
+    buildOk: verificationObj?.buildOk ?? firstBatchVerificationObj?.buildOk ?? null,
+    smokeOk: verificationObj?.smokeOk ?? firstBatchVerificationObj?.smokeOk ?? null,
+    warningCode:
+      (verificationObj?.warningCode as string | null | undefined) ??
+      (firstBatchVerificationObj?.warningCode as string | null | undefined) ??
+      null,
+    hardFailure:
+      (verificationObj?.hardFailure as boolean | null | undefined) ??
+      (firstBatchVerificationObj?.hardFailure as boolean | null | undefined) ??
+      null,
+  };
+  const synthesizedDiagnosticSummary = (() => {
+    if (!needsDiagnosticEnvelope) return null;
+    if (normalizedStatusText === "PATCH_APPLIED_VALIDATION_FAILED") {
+      return "Patch was applied but validation failed. Check build, smoke tests, and task verification output.";
+    }
+    if (normalizedStatusText === "VALIDATION_FAILED") {
+      return "Validation failed before completion. Review build status, smoke checks, and verification probes.";
+    }
+    return "Execution failed before successful validation. Review failure reason, failed phase, and verification details.";
+  })();
   const failureDetails = executionFailed
     ? {
         failureReason,
@@ -352,26 +385,31 @@ export async function GET(req: Request) {
           firstBatchResult?.error ??
           firstBatchResult?.summary ??
           failureObj?.details ??
-          null,
+          (needsDiagnosticEnvelope
+            ? "Execution failed without explicit error text; inspect verification and execution metadata."
+            : null),
         failedStep:
           failureObj?.step ??
           failureObj?.phase ??
           firstBatchResult?.phase ??
           failureObj?.stage ??
-          null,
+          (needsDiagnosticEnvelope
+            ? (normalizedStatusText.includes("VALIDATION") ? "VERIFY" : "APPLY_PATCH")
+            : null),
         diagnostics:
           failureObj?.diagnostics ??
           failureObj?.logSummary ??
           firstBatchResult?.diagnosticSummary ??
           firstBatchResult?.logs ??
-          null,
+          synthesizedDiagnosticSummary,
         diagnosticSummary:
           failureObj?.logSummary ??
           firstBatchResult?.diagnosticSummary ??
-          null,
+          synthesizedDiagnosticSummary,
+        validationSummary,
         logs:
           firstBatchResult?.logs ??
-          null,
+          [],
       }
     : {
         failureReason: null,
@@ -379,6 +417,7 @@ export async function GET(req: Request) {
         failedStep: null,
         diagnostics: null,
         diagnosticSummary: null,
+        validationSummary: null,
         logs: null,
       };
 
@@ -538,6 +577,7 @@ export async function GET(req: Request) {
       failedStep: failureDetails.failedStep,
       diagnostics: failureDetails.diagnostics,
       diagnosticSummary: failureDetails.diagnosticSummary,
+      validationSummary: failureDetails.validationSummary,
       logs: failureDetails.logs,
       executionFailed,
     } : null,
@@ -802,6 +842,8 @@ export async function GET(req: Request) {
       errorMessage: failureDetails.errorMessage,
       failedStep: failureDetails.failedStep,
       diagnostics: failureDetails.diagnostics,
+      diagnosticSummary: failureDetails.diagnosticSummary,
+      validationSummary: failureDetails.validationSummary,
     },
     batchExecutionMeta: {
       timestamp: (canon?.executedAt ?? canon?.timestamp) as string | null ?? null,

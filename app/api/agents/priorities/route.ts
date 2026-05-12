@@ -13,6 +13,7 @@ import { buildPriorityFeed, type PerformanceOpportunity } from "@/lib/agents/opp
 type RuntimePriority = {
   title: string;
   priority: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
+  severity: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
   owner: string;
   expectedRImpact: "positive" | "neutral" | "negative" | "unknown";
   estimatedImpactText: string;
@@ -51,6 +52,7 @@ function incidentToPriority(incident: any): RuntimePriority {
   return {
     title: String(incident?.title || "Open incident"),
     priority,
+    severity: priority,
     owner: String(incident?.source || "ops"),
     expectedRImpact: priority === "CRITICAL" || priority === "HIGH" ? "positive" : "unknown",
     estimatedImpactText: priority === "CRITICAL" ? "Prevents major R leakage" : "Reduces execution/funnel risk",
@@ -86,6 +88,7 @@ function opportunityToPriority(opp: PerformanceOpportunity): RuntimePriority {
   return {
     title: opp.title,
     priority: opp.priority,
+    severity: opp.priority,
     owner: opp.owner,
     expectedRImpact: opp.expectedRImpact,
     estimatedImpactText: opp.estimatedImpactText,
@@ -98,16 +101,23 @@ export async function GET(req: Request) {
   const auth = checkAgentCronAuth(req);
   if (!auth.ok) return unauthorizedAgentResponse(auth.error);
 
+  const url = new URL(req.url);
+  const limitParam = Number(url.searchParams.get("limit") ?? "5");
+  const limit = Number.isFinite(limitParam) && limitParam > 0
+    ? Math.min(25, Math.floor(limitParam))
+    : 5;
+
   const [openIncidents, priorityFeed] = await Promise.all([
     listOpenIncidents(50).catch(() => []),
-    buildPriorityFeed(5).catch(() => ({ priorities: [] as PerformanceOpportunity[], hasIncidents: false })),
+    buildPriorityFeed(Math.max(5, limit)).catch(() => ({ priorities: [] as PerformanceOpportunity[], hasIncidents: false })),
   ]);
 
   const fromIncidents = (openIncidents || []).map(incidentToPriority);
   const fromOpportunities = (priorityFeed.priorities || []).map(opportunityToPriority);
   const rankedIncidentPriorities = rankIncidentPriorities(fromIncidents, openIncidents || []);
 
-  const priorities = (rankedIncidentPriorities.length > 0 ? rankedIncidentPriorities : fromOpportunities).slice(0, 5);
+  // Match state.currentTopPriorities behavior: use the ranked priority feed as primary source.
+  const priorities = (fromOpportunities.length > 0 ? fromOpportunities : rankedIncidentPriorities).slice(0, limit);
 
   // Absolute non-empty guarantee
   const guaranteedPriorities: RuntimePriority[] =
@@ -117,6 +127,7 @@ export async function GET(req: Request) {
           {
             title: "System healthy, continue execution optimization",
             priority: "MEDIUM",
+            severity: "MEDIUM",
             owner: "engineering-manager",
             expectedRImpact: "neutral",
             estimatedImpactText: "Maintain reliability and improve throughput",
@@ -129,7 +140,7 @@ export async function GET(req: Request) {
     ok: true,
     priorityCount: guaranteedPriorities.length,
     priorities: guaranteedPriorities,
-    source: fromIncidents.length > 0 ? "incidents" : "opportunity_engine",
+    source: "priority_feed",
     hasOpenIncidents: fromIncidents.length > 0,
   });
 }
