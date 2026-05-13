@@ -117,6 +117,7 @@ export async function POST(req: NextRequest) {
   let canceledOrRejected = 0;
   let missingAtBroker = 0;
   let closedGhosts = 0;
+  let closedAfterFlatten = 0;
 
   const nowIso = new Date().toISOString();
 
@@ -230,6 +231,31 @@ export async function POST(req: NextRequest) {
       canceledOrRejected++;
       changed = true;
     } else if (!orderId && !brokerHasPosition) {
+      const protectionStatus = String(t?.protectionStatus || "").toUpperCase();
+      const hadFlattenLifecycle =
+        protectionStatus === "FLATTEN_PENDING" ||
+        protectionStatus === "FLATTEN_IN_PROGRESS" ||
+        protectionStatus === "FLATTEN_PARTIALLY_FILLED" ||
+        protectionStatus === "FLATTEN_FAILED" ||
+        protectionStatus === "FLATTENED" ||
+        protectionStatus === "EMERGENCY_EXIT_COMPLETE";
+
+      if (hadFlattenLifecycle) {
+        t.status = "CLOSED";
+        t.autoEntryStatus = "CLOSED";
+        t.closeReason = t.closeReason ?? "broker_flat_after_flatten_attempt";
+        t.closedAt = t.closedAt ?? nowIso;
+        t.stopOrderId = null;
+        t.protectionStatus = "FLATTENED";
+        t.protectionIssue = null;
+        t.brokerSyncedAt = nowIso;
+        t.updatedAt = nowIso;
+        closedAfterFlatten++;
+        changed = true;
+        if (changed) updated++;
+        continue;
+      }
+
       // Ghost detection: trade is alive but has no broker position and no order
       // Apply safety delay: only if trade is older than 15 minutes
       const timestamp = t?.updatedAt ?? t?.createdAt;
@@ -447,6 +473,7 @@ export async function POST(req: NextRequest) {
     canceledOrRejected,
     missingAtBroker,
     closedGhosts,
+    closedAfterFlatten,
     closedProtectionNormalized,
     staleTerminalRepairedCount,
     closeNotificationsSent,

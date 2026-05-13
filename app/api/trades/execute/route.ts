@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { normalizeAlpacaPrice } from "@/lib/alpaca";
 
 const API_KEY = process.env.ALPACA_API_KEY ?? process.env.ALPACA_API_KEY_ID;
 const API_SECRET = process.env.ALPACA_API_SECRET ?? process.env.ALPACA_API_SECRET_KEY;
@@ -50,7 +51,7 @@ export async function POST(req: Request) {
   };
 
   if (type === "LMT" && entryPrice) {
-    orderPayload.limit_price = entryPrice;
+    orderPayload.limit_price = normalizeAlpacaPrice(Number(entryPrice));
   }
 
   try {

@@ -21,7 +21,7 @@ import {
   isOpenTradeStatus,
   normalizeTicker,
 } from "@/lib/trades/protection";
-import { createOrder, alpacaRequest } from "@/lib/alpaca";
+import { createOrder, alpacaRequest, normalizeAlpacaPrice } from "@/lib/alpaca";
 import { forceFlattenPosition } from "@/lib/broker/forceFlattenPosition";
 import { verifyStopAtBroker } from "@/lib/risk/stop-verification";
 
@@ -36,19 +36,20 @@ async function submitRepairStop(opts: {
   qty: number;
   side: "buy" | "sell";
   stopPrice: number;
-}): Promise<{ ok: boolean; orderId?: string; error?: string }> {
+}): Promise<{ ok: boolean; orderId?: string; submittedStopPrice?: number; error?: string }> {
   try {
+    const submittedStopPrice = normalizeAlpacaPrice(Number(opts.stopPrice));
     const order = await createOrder({
       symbol: opts.symbol,
       qty: String(opts.qty),
       side: opts.side,
       type: "stop",
-      stop_price: String(opts.stopPrice),
+      stop_price: submittedStopPrice,
       time_in_force: "gtc",
     });
     const id = String((order as any)?.id || "");
     if (!id) return { ok: false, error: "stop order returned without id" };
-    return { ok: true, orderId: id };
+    return { ok: true, orderId: id, submittedStopPrice };
   } catch (err: any) {
     return { ok: false, error: err?.message || String(err) };
   }
@@ -204,6 +205,7 @@ async function enforceProtection(
       activeBrokerStopFound,
       stopRepairRetryAttempted: false,
       stopRepairFinalStatus: "failed" as "protected" | "flattened" | "failed",
+      submittedStopPrice: null as number | null,
       // ── Legacy diagnostics (preserved for backward compat) ─────────
       stopRepairAttempted: false,
       stopRepairSucceeded: false,
@@ -294,6 +296,7 @@ async function enforceProtection(
     });
 
     if (result.ok && result.orderId) {
+      diag.submittedStopPrice = Number(result.submittedStopPrice ?? stopPrice);
       const orderState = await readOrderStatus(result.orderId);
       if (orderState.status === "canceled" || orderState.status === "cancelled" || orderState.status === "rejected" || orderState.status === "expired") {
         diag.cancelReason = orderState.cancelReason;
@@ -304,6 +307,7 @@ async function enforceProtection(
         symbol: detail.symbol,
         side: tradeSide,
         stopOrderId: result.orderId,
+        expectedStopPrice: result.submittedStopPrice ?? stopPrice,
       });
       if (verify.verified) {
         diag.stopRepairSucceeded = true;
@@ -327,7 +331,7 @@ async function enforceProtection(
         console.log("[protection-audit] stop repair verified", {
           symbol: detail.symbol,
           qty: brokerQty,
-          stopPrice,
+          stopPrice: result.submittedStopPrice ?? stopPrice,
           orderId: result.orderId,
         });
         diagnostics.push(diag);
@@ -352,11 +356,17 @@ async function enforceProtection(
 
     const retryResult = await submitRepairStop({ symbol: detail.symbol, qty: brokerQty, side: stopSide, stopPrice });
     if (retryResult.ok && retryResult.orderId) {
+      diag.submittedStopPrice = Number(retryResult.submittedStopPrice ?? stopPrice);
       const retryOrderState = await readOrderStatus(retryResult.orderId);
       if (retryOrderState.status === "canceled" || retryOrderState.status === "cancelled" || retryOrderState.status === "rejected" || retryOrderState.status === "expired") {
         diag.cancelReason = retryOrderState.cancelReason;
       }
-      const retryVerify = await verifyStopAtBroker({ symbol: detail.symbol, side: tradeSide, stopOrderId: retryResult.orderId });
+      const retryVerify = await verifyStopAtBroker({
+        symbol: detail.symbol,
+        side: tradeSide,
+        stopOrderId: retryResult.orderId,
+        expectedStopPrice: retryResult.submittedStopPrice ?? stopPrice,
+      });
       if (retryVerify.verified) {
         diag.stopRepairSucceeded = true;
         diag.stopVerified = true;
@@ -378,7 +388,10 @@ async function enforceProtection(
           });
         }
         console.log("[protection-audit] stop repair verified on retry", {
-          symbol: detail.symbol, qty: brokerQty, stopPrice, orderId: retryResult.orderId,
+          symbol: detail.symbol,
+          qty: brokerQty,
+          stopPrice: retryResult.submittedStopPrice ?? stopPrice,
+          orderId: retryResult.orderId,
         });
         diagnostics.push(diag);
         continue;
@@ -673,7 +686,7 @@ export async function GET(req: Request) {
   }
 
   return NextResponse.json({
-    ok: finalAudit.ok,
+    ok: brokerIsFlat ? true : finalAudit.ok,
     source: "broker-truth",
     brokerFetchedAt: brokerTruth.fetchedAt,
     auditedAt: finalAudit.auditedAt,

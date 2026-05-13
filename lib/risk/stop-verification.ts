@@ -5,7 +5,7 @@
  * Part of the production hardening initiative.
  */
 
-import { alpacaRequest, getOrder, createOrder } from "@/lib/alpaca";
+import { alpacaRequest, getOrder, createOrder, normalizeAlpacaPrice } from "@/lib/alpaca";
 import { fetchBrokerTruth, type BrokerTruth } from "@/lib/broker/truth";
 import { findProtectiveStopOrder } from "@/lib/trades/protection";
 import { normalizeStopPrice, tickForEquityPrice } from "@/lib/tickSize";
@@ -42,10 +42,14 @@ export async function verifyStopAtBroker(params: {
   symbol: string;
   side: "LONG" | "SHORT";
   stopOrderId?: string | null;
+  expectedStopPrice?: number | null;
   brokerTruth?: BrokerTruth;
 }): Promise<VerifyStopResult> {
-  const { symbol, side, stopOrderId } = params;
+  const { symbol, side, stopOrderId, expectedStopPrice } = params;
   const ticker = symbol.toUpperCase();
+  const expectedNormalized = Number.isFinite(Number(expectedStopPrice))
+    ? normalizeAlpacaPrice(Number(expectedStopPrice))
+    : null;
 
   // Fetch fresh broker truth if not provided
   const brokerTruth = params.brokerTruth ?? await fetchBrokerTruth();
@@ -72,12 +76,28 @@ export async function verifyStopAtBroker(params: {
       // Use the full set of active statuses — Alpaca uses pending_new, not just pending
       const isActive = ["new", "accepted", "pending_new", "pending_replace", "held", "accepted_for_bidding"].includes(status);
       if (isActive) {
+        const brokerStopPriceRaw = Number((trackedOrder as any)?.stop_price);
+        const brokerStopPrice = Number.isFinite(brokerStopPriceRaw)
+          ? normalizeAlpacaPrice(brokerStopPriceRaw)
+          : null;
+        if (expectedNormalized != null && brokerStopPrice !== expectedNormalized) {
+          return {
+            ok: true,
+            verified: false,
+            stopOrderId,
+            stopStatus: status,
+            brokerStopPrice: brokerStopPrice ?? undefined,
+            reason: "stop_price_mismatch",
+            detail: `expected_stop=${expectedNormalized} broker_stop=${brokerStopPrice ?? "missing"}`,
+          };
+        }
         console.log("[stop-verify] tracked stop verified active", { ticker, stopOrderId, status });
         return {
           ok: true,
           verified: true,
           stopOrderId,
           stopStatus: status,
+          brokerStopPrice: brokerStopPrice ?? undefined,
         };
       }
     }
@@ -102,12 +122,27 @@ export async function verifyStopAtBroker(params: {
   });
 
   if (protectiveStop) {
+    const brokerStopPrice = Number.isFinite(Number(protectiveStop.stopPrice))
+      ? normalizeAlpacaPrice(Number(protectiveStop.stopPrice))
+      : null;
+    if (expectedNormalized != null && brokerStopPrice !== expectedNormalized) {
+      return {
+        ok: true,
+        verified: false,
+        stopOrderId: protectiveStop.id,
+        stopStatus: "active",
+        brokerStopPrice: brokerStopPrice ?? undefined,
+        reason: "stop_price_mismatch",
+        detail: `expected_stop=${expectedNormalized} broker_stop=${brokerStopPrice ?? "missing"}`,
+      };
+    }
     console.log("[stop-verify] found protective stop via scan", { ticker, stopOrderId: protectiveStop.id });
     return {
       ok: true,
       verified: true,
       stopOrderId: protectiveStop.id,
       stopStatus: "active", // We found it in open orders, so it's active
+      brokerStopPrice: brokerStopPrice ?? undefined,
     };
   }
 

@@ -11,7 +11,7 @@
  *   - MUST NOT resolve the Redis critical task (caller does that)
  */
 
-import { alpacaHeaders, tradingUrl } from "@/lib/alpaca";
+import { alpacaHeaders, tradingUrl, createOrder } from "@/lib/alpaca";
 import { fetchBrokerTruth, type BrokerTruth } from "@/lib/broker/truth";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import {
@@ -46,23 +46,14 @@ async function submitRepairStop(opts: {
   stopPrice: number;
 }): Promise<{ ok: boolean; orderId?: string; error?: string }> {
   try {
-    const resp = await fetch(tradingUrl("/v2/orders"), {
-      method: "POST",
-      headers: { ...alpacaHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({
-        symbol: opts.symbol,
-        qty: String(opts.qty),
-        side: opts.side,
-        type: "stop",
-        stop_price: String(opts.stopPrice),
-        time_in_force: "gtc",
-      }),
+    const order = await createOrder({
+      symbol: opts.symbol,
+      qty: String(opts.qty),
+      side: opts.side,
+      type: "stop",
+      stop_price: opts.stopPrice,
+      time_in_force: "gtc",
     });
-    if (!resp.ok) {
-      const text = await resp.text();
-      return { ok: false, error: `${resp.status}: ${text}` };
-    }
-    const order = await resp.json();
     return { ok: true, orderId: order.id };
   } catch (err: any) {
     return { ok: false, error: err?.message || String(err) };

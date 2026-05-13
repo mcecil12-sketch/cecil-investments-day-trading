@@ -713,7 +713,7 @@ async function handleRepair(trade: Trade, allTrades: Trade[], nowIso: string) {
       qty: String(brokerQty),
       side: stopSide,
       type: "stop",
-      stop_price: String(stopPrice),
+      stop_price: stopPrice,
       time_in_force: "gtc",
     });
 

@@ -1,5 +1,60 @@
 import { normalizeStopPrice, normalizeLimitPrice, tickForEquityPrice } from "@/lib/tickSize";
 
+function asFiniteNumber(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function normalizeAlpacaPrice(price: number): number {
+  const tick = tickForEquityPrice(price);
+  const normalized = normalizeLimitPrice({ price, tick });
+  const decimals = tick < 0.01 ? 4 : 2;
+  return Number(normalized.toFixed(decimals));
+}
+
+export function normalizeAlpacaOrderPayloadPrices(payload: Record<string, any>): Record<string, any> {
+  if (!payload || typeof payload !== "object") return payload;
+
+  const out: Record<string, any> = { ...payload };
+
+  const normalizeField = (target: Record<string, any>, key: string) => {
+    if (!target || typeof target !== "object") return;
+    if (!(key in target)) return;
+    const n = asFiniteNumber(target[key]);
+    if (n == null) return;
+    target[key] = normalizeAlpacaPrice(n);
+  };
+
+  normalizeField(out, "limit_price");
+  normalizeField(out, "stop_price");
+
+  if (out.take_profit && typeof out.take_profit === "object") {
+    out.take_profit = { ...out.take_profit };
+    normalizeField(out.take_profit, "limit_price");
+  }
+
+  if (out.stop_loss && typeof out.stop_loss === "object") {
+    out.stop_loss = { ...out.stop_loss };
+    normalizeField(out.stop_loss, "stop_price");
+    normalizeField(out.stop_loss, "limit_price");
+  }
+
+  if (Array.isArray(out.legs)) {
+    out.legs = out.legs.map((leg: any) =>
+      leg && typeof leg === "object" ? normalizeAlpacaOrderPayloadPrices(leg) : leg
+    );
+  }
+
+  return out;
+}
+
+function shouldNormalizeOrderWritePayload(method: string, path: string): boolean {
+  const m = String(method || "").toUpperCase();
+  if (m !== "POST" && m !== "PATCH") return false;
+  const basePath = String(path || "").split("?")[0];
+  return basePath === "/v2/orders" || basePath.startsWith("/v2/orders/");
+}
+
 function stripV2(base: string) {
   return base.replace(/\/+$/, "").replace(/\/v2$/, "");
 }
@@ -300,13 +355,15 @@ export async function submitOrder(
   };
 
   if (params.type === "limit" && params.limitPrice) {
-    body.limit_price = params.limitPrice;
+    body.limit_price = normalizeAlpacaPrice(params.limitPrice);
   }
+
+  const normalizedBody = normalizeAlpacaOrderPayloadPrices(body);
 
   const res = await alpacaFetch(tradingUrl("/orders"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(normalizedBody),
   });
 
   const text = await res.text();
@@ -318,10 +375,11 @@ export async function submitOrder(
 export async function createOrder(
   payload: Record<string, any>
 ): Promise<AlpacaOrder> {
+  const normalizedPayload = normalizeAlpacaOrderPayloadPrices(payload);
   const res = await alpacaFetch(tradingUrl("/orders"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(normalizedPayload),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -359,12 +417,13 @@ export async function replaceOrder(
   orderId: string,
   body: Record<string, any>
 ): Promise<AlpacaOrder> {
+  const normalizedBody = normalizeAlpacaOrderPayloadPrices(body);
   const res = await alpacaFetch(
     tradingUrl(`/orders/${encodeURIComponent(orderId)}`),
     {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(normalizedBody),
     }
   );
   if (!res.ok) {
@@ -429,10 +488,16 @@ export async function alpacaRequest(args: {
 }): Promise<{ ok: boolean; status: number; text: string }> {
   const path = args.path.startsWith("/") ? args.path : `/${args.path}`;
   const baseUrl = resolveAlpacaBaseUrl(path);
+  const maybeNormalizedBody =
+    args.body &&
+    shouldNormalizeOrderWritePayload(args.method, path) &&
+    typeof args.body === "object"
+      ? normalizeAlpacaOrderPayloadPrices(args.body)
+      : args.body;
   const res = await alpacaFetch(`${baseUrl}${path}`, {
     method: args.method,
     headers: { "Content-Type": "application/json" },
-    body: args.body ? JSON.stringify(args.body) : undefined,
+    body: maybeNormalizedBody ? JSON.stringify(maybeNormalizedBody) : undefined,
   });
   const text = await res.text().catch(() => "");
   return { ok: res.ok, status: res.status, text };

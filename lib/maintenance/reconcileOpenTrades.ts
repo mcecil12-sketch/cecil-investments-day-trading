@@ -1351,7 +1351,7 @@ export async function reconcileOpenTrades(
             qty: String(brokerQty),
             side: closeSide,
             type: "stop",
-            stop_price: String(stopPrice),
+            stop_price: stopPrice,
             time_in_force: "gtc",
           });
           repairOrderId = String((created as any)?.id || "") || null;

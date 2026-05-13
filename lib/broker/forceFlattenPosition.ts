@@ -100,6 +100,9 @@ export interface ForceFlattenDiagnostics {
   qtyAvailableBefore?: number | null;
   qtyAvailableAfterCancel?: number | null;
   flattenRetries?: number;
+  closeOrderId?: string | null;
+  closeOrderStatus?: string | null;
+  verifyPolls?: number;
 }
 
 export interface ForceFlattenResult {
@@ -128,6 +131,9 @@ export async function forceFlattenPosition(
     qtyAvailableBefore: null,
     qtyAvailableAfterCancel: null,
     flattenRetries: 0,
+    closeOrderId: null,
+    closeOrderStatus: null,
+    verifyPolls: 0,
   };
 
   const prePos = await fetchPositionSnapshot(ticker).catch(() => ({ qty: 0, qtyAvailable: null, heldForOrders: null }));
@@ -203,6 +209,15 @@ export async function forceFlattenPosition(
         path: `/v2/positions/${encodeURIComponent(ticker)}`,
       });
 
+      if (flattenResp.ok) {
+        const parsed = parseJsonSafe(flattenResp.text);
+        const maybeOrderId = String(parsed?.id ?? parsed?.order_id ?? "");
+        diagnostics.closeOrderId = maybeOrderId || null;
+        diagnostics.closeOrderStatus = maybeOrderId
+          ? String(parsed?.status || "").toLowerCase() || null
+          : null;
+      }
+
       // 404 means position is already gone — treat as success
       if (flattenResp.ok || flattenResp.status === 404) {
         diagnostics.flattenSucceeded = true;
@@ -242,44 +257,59 @@ export async function forceFlattenPosition(
 
   // ── Step 3: Verify the position is gone ──────────────────────────
   try {
-    const verifyResp = await alpacaRequest({
-      method: "GET",
-      path: `/v2/positions/${encodeURIComponent(ticker)}`,
-    });
+    const pendingStatuses = new Set([
+      "new",
+      "accepted",
+      "pending_new",
+      "pending_replace",
+      "accepted_for_bidding",
+      "held",
+      "partially_filled",
+    ]);
 
-    // 404 → position gone → success
-    if (verifyResp.status === 404) {
-      diagnostics.brokerPositionExistsAfter = false;
-      return { ok: true, step: "verify", diagnostics };
+    let lastQty: number | null = null;
+    let lastOrderStatus: string | null = diagnostics.closeOrderStatus ?? null;
+    const maxVerifyPolls = 8;
+
+    for (let poll = 1; poll <= maxVerifyPolls; poll++) {
+      diagnostics.verifyPolls = poll;
+
+      const posSnapshot = await fetchPositionSnapshot(ticker);
+      lastQty = posSnapshot.qty;
+      if (posSnapshot.qty <= 0) {
+        diagnostics.brokerPositionExistsAfter = false;
+        return { ok: true, step: "verify", diagnostics };
+      }
+
+      diagnostics.brokerPositionExistsAfter = true;
+
+      if (diagnostics.closeOrderId) {
+        const ordResp = await alpacaRequest({
+          method: "GET",
+          path: `/v2/orders/${encodeURIComponent(String(diagnostics.closeOrderId))}`,
+        });
+        if (ordResp.ok) {
+          const ord = parseJsonSafe(ordResp.text) ?? {};
+          lastOrderStatus = String(ord?.status || "").toLowerCase() || null;
+          diagnostics.closeOrderStatus = lastOrderStatus;
+        }
+      }
+
+      if (poll < maxVerifyPolls && lastOrderStatus && pendingStatuses.has(lastOrderStatus)) {
+        await sleep(500);
+        continue;
+      }
+
+      if (poll < maxVerifyPolls && (!diagnostics.closeOrderId || lastOrderStatus == null)) {
+        await sleep(500);
+        continue;
+      }
     }
 
-    if (verifyResp.ok) {
-      let qty = 0;
-      try {
-        const pos = JSON.parse(verifyResp.text);
-        qty = Math.abs(Number(pos?.qty ?? 0));
-      } catch {
-        qty = 0;
-      }
-      diagnostics.brokerPositionExistsAfter = qty > 0;
-      if (qty > 0) {
-        return {
-          ok: false,
-          step: "verify",
-          error: `Position still exists after flatten: qty=${qty}`,
-          diagnostics,
-        };
-      }
-      // qty === 0 → effectively gone
-      return { ok: true, step: "verify", diagnostics };
-    }
-
-    // Non-200 non-404 verify response — uncertain
-    diagnostics.brokerPositionExistsAfter = null;
     return {
       ok: false,
       step: "verify",
-      error: `Verify request returned HTTP ${verifyResp.status}: ${verifyResp.text}`,
+      error: `Position still exists after flatten retries: qty=${lastQty ?? "unknown"}; close_order_status=${lastOrderStatus ?? "unknown"}`,
       diagnostics,
     };
   } catch (err: any) {
