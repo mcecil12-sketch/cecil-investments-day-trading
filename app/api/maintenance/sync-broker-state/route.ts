@@ -11,6 +11,7 @@ import {
   shouldSendCloseNotification,
   markCloseNotificationSent,
 } from "@/lib/trades/lifecycle";
+import { findProtectiveStopOrder } from "@/lib/trades/protection";
 import { sendNotification } from "@/lib/notifications/notify";
 import { buildTradeClosedPayload } from "@/lib/notifications/tradeClose";
 
@@ -18,12 +19,32 @@ type AlpacaPosition = { symbol: string };
 type AlpacaOrder = {
   id: string;
   symbol: string;
+  side?: string;
   status: string;
+  type?: string;
+  stop_price?: number | string | null;
   filled_avg_price?: string | null;
   filled_qty?: string | null;
   filled_at?: string | null;
   legs?: { id: string; status: string }[] | null;
 };
+
+function protectiveStopForTrade(args: { ticker: string; side: string; openOrders: AlpacaOrder[] }) {
+  const side = String(args.side || "LONG").toUpperCase() === "SHORT" ? "SHORT" : "LONG";
+  const found = findProtectiveStopOrder({
+    ticker: args.ticker,
+    tradeSide: side,
+    openOrders: (args.openOrders || []).map((o) => ({
+      id: o.id,
+      symbol: o.symbol,
+      side: o.side,
+      status: o.status,
+      type: o.type,
+      stop_price: o.stop_price ?? undefined,
+    })),
+  });
+  return found;
+}
 
 function isoHoursAgo(hours: number) {
   return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
@@ -133,8 +154,31 @@ export async function POST(req: NextRequest) {
     if ((brokerStatus === "filled" || brokerHasPosition) && prevStatus !== "OPEN") {
       t.status = "OPEN";
       t.autoEntryStatus = "OPEN";
-      if (!t.entryFillPrice && filledAvg != null) t.entryFillPrice = filledAvg;
-      if (!t.entryPrice && filledAvg != null) t.entryPrice = filledAvg;
+      const pos = (positions || []).find((p: any) => String(p?.symbol || "").toUpperCase() === String(ticker || "").toUpperCase());
+      const brokerEntry = Number(pos?.avg_entry_price ?? filledAvg ?? 0);
+      const brokerQty = Math.abs(Number(pos?.qty ?? t.filledQty ?? t.size ?? 0));
+      if (Number.isFinite(brokerEntry) && brokerEntry > 0) {
+        t.entryFillPrice = brokerEntry;
+        t.entryPrice = brokerEntry;
+      }
+      if (Number.isFinite(brokerQty) && brokerQty > 0) {
+        t.filledQty = brokerQty;
+        t.size = brokerQty;
+      }
+      t.brokerSyncedAt = nowIso;
+
+      const symbolOrders = (openOrders || []).filter((o: any) => String(o?.symbol || "").toUpperCase() === String(ticker || "").toUpperCase());
+      const activeStop = protectiveStopForTrade({ ticker: String(ticker || ""), side: String(t.side || "LONG"), openOrders: symbolOrders });
+      if (activeStop?.id) {
+        t.stopOrderId = activeStop.id;
+        t.protectionStatus = "VERIFIED";
+        t.protectionIssue = null;
+        t.protectionVerifiedAt = nowIso;
+      } else {
+        t.stopOrderId = null;
+        t.protectionStatus = "MISSING_STOP";
+        t.protectionIssue = "missing_active_broker_stop";
+      }
       t.alpacaStatus = "filled";
       t.updatedAt = nowIso;
       // Preserve / repair execution attribution: if a prior execute-route run wrote
@@ -156,8 +200,15 @@ export async function POST(req: NextRequest) {
       t.closeReason = t.closeReason ?? "broker_sync_position_closed";
       t.closedAt = t.closedAt ?? nowIso;
       t.updatedAt = nowIso;
-      if (!t.entryFillPrice && filledAvg != null) t.entryFillPrice = filledAvg;
-      if (!t.entryPrice && filledAvg != null) t.entryPrice = filledAvg;
+      const brokerEntry = Number(filledAvg ?? 0);
+      if (Number.isFinite(brokerEntry) && brokerEntry > 0) {
+        t.entryFillPrice = brokerEntry;
+        t.entryPrice = brokerEntry;
+      }
+      t.stopOrderId = null;
+      t.protectionStatus = null;
+      t.protectionIssue = null;
+      t.brokerSyncedAt = nowIso;
       // Repair execution attribution if needed
       const execPatch2 = buildBrokerSyncExecutedPatch(t, nowIso);
       if (Object.keys(execPatch2).length > 0) Object.assign(t, execPatch2);
@@ -201,6 +252,44 @@ export async function POST(req: NextRequest) {
         t.alpacaStatus = brokerStatus;
         t.updatedAt = nowIso;
         changed = true;
+      }
+
+      if (brokerHasPosition) {
+        const pos = (positions || []).find((p: any) => String(p?.symbol || "").toUpperCase() === String(ticker || "").toUpperCase());
+        const brokerEntry = Number(pos?.avg_entry_price ?? 0);
+        const brokerQty = Math.abs(Number(pos?.qty ?? t.filledQty ?? t.size ?? 0));
+        const symbolOrders = (openOrders || []).filter((o: any) => String(o?.symbol || "").toUpperCase() === String(ticker || "").toUpperCase());
+        const activeStop = protectiveStopForTrade({ ticker: String(ticker || ""), side: String(t.side || "LONG"), openOrders: symbolOrders });
+
+        if (Number.isFinite(brokerEntry) && brokerEntry > 0 && Number(t.entryPrice) !== brokerEntry) {
+          t.entryPrice = brokerEntry;
+          t.entryFillPrice = brokerEntry;
+          changed = true;
+        }
+        if (Number.isFinite(brokerQty) && brokerQty > 0 && Number(t.filledQty) !== brokerQty) {
+          t.filledQty = brokerQty;
+          t.size = brokerQty;
+          changed = true;
+        }
+        t.brokerSyncedAt = nowIso;
+
+        if (activeStop?.id) {
+          if (String(t.stopOrderId || "") !== String(activeStop.id)) {
+            t.stopOrderId = activeStop.id;
+            changed = true;
+          }
+          if (t.protectionStatus !== "VERIFIED") {
+            t.protectionStatus = "VERIFIED";
+            t.protectionIssue = null;
+            t.protectionVerifiedAt = nowIso;
+            changed = true;
+          }
+        } else if (t.stopOrderId) {
+          t.stopOrderId = null;
+          t.protectionStatus = "MISSING_STOP";
+          t.protectionIssue = "tracked_stop_not_active_at_broker";
+          changed = true;
+        }
       }
     }
 
