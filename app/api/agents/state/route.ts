@@ -1022,6 +1022,39 @@ export async function GET(req: Request) {
       skippedDuplicateFixClassCount: dedupStats.skippedDuplicateExecutionCount,
     },
 
+    // ─── Agent Execution Health (verification + suppression observability) ─
+    // Surfaces auth-verification failures, skipped auth routes, and stale/duplicate
+    // suppression counts so dashboards can diagnose agent loop degradation.
+    agentExecutionHealth: {
+      // Auth probe failures: count probes that returned 401/403 in latest exec
+      authVerificationFailures: (() => {
+        const probes = (verificationObj?.details as Record<string, unknown>)?.probes;
+        if (!Array.isArray(probes)) return 0;
+        return (probes as Record<string, unknown>[]).filter(
+          (p) => p?.status === 401 || p?.status === 403,
+        ).length;
+      })(),
+      // Skipped auth-required: probes classified SKIPPED_AUTH_REQUIRED (not hard failures)
+      skippedAuthRequiredCount: (() => {
+        const taskSpecific = (verificationObj?.details as Record<string, unknown>)?.taskSpecific;
+        if (!Array.isArray(taskSpecific)) return 0;
+        return (taskSpecific as Record<string, unknown>[]).filter(
+          (r) =>
+            r?.skippedAuthRequired === true ||
+            String(r?.detail ?? "").includes("SKIPPED_AUTH_REQUIRED"),
+        ).length;
+      })(),
+      // Stale suppression: tasks blocked due to insufficient new trade data
+      staleTaskSuppressions: staleSuppressedQueue.filter(
+        (s) => s.reason === "BLOCKED_INSUFFICIENT_NEW_DATA",
+      ).length,
+      // Duplicate suppression: tasks skipped due to same-class execution dedup
+      duplicateTaskSuppressions: dedupStats.skippedDuplicateExecutionCount,
+      // Evidence hash matches: tasks deduped by unchanged evidence hash
+      evidenceHashMatches: dedupStats.skippedInsufficientDataCount,
+      avgTaskExecutionMinutes: null as number | null,
+    },
+
     // ─── Trading-file autonomy ────────────────────────────────────────
     tradingFileAutonomyEnabled: allowTradingFiles,
     tradingFileAutonomyMode: isPaperModeState

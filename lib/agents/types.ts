@@ -497,9 +497,12 @@ export interface StructuredVerificationResult {
     retriedAfter405?: boolean;
     authHeaderUsed?: string | null;
     status?: number | null;
+    skippedAuthRequired?: boolean;
   }>;
   overall: boolean;
   verifiedAt: string;
+  authVerificationFailures?: number;
+  skippedAuthRequiredCount?: number;
 }
 
 export interface ActionableBacklogTask {

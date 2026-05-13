@@ -71,6 +71,17 @@ type FunnelHealthResponse = {
   staleQualifiedSignals?: number;
   qualifiedToSeedLatencyMaxMs?: number | null;
   qualifiedToSeedLatencyAvgMs?: number | null;
+  medianQualifiedToSeedLatencyMs?: number | null;
+  seedFreshnessBuckets?: {
+    under10min: number;
+    under20min: number;
+    under45min: number;
+    over45min: number;
+    over90min: number;
+    over180min: number;
+  };
+  staleDropCount?: number;
+  executionRejectReasons?: Record<string, number>;
   seedSlaBreached?: boolean;
   seedSlaBreachSignals?: Array<{
     signalId: string;
@@ -563,6 +574,26 @@ export async function GET() {
               qualifiedToSeedLatencyValuesMs.length,
           )
         : null;
+    const medianQualifiedToSeedLatencyMs = (() => {
+      if (qualifiedToSeedLatencyValuesMs.length === 0) return null;
+      const sorted = [...qualifiedToSeedLatencyValuesMs].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2 === 0
+        ? Math.round((sorted[mid - 1] + sorted[mid]) / 2)
+        : sorted[mid];
+    })();
+    const seedFreshnessBuckets = (() => {
+      const buckets = { under10min: 0, under20min: 0, under45min: 0, over45min: 0, over90min: 0, over180min: 0 };
+      for (const ms of qualifiedToSeedLatencyValuesMs) {
+        if (ms < 10 * 60_000) buckets.under10min++;
+        else if (ms < 20 * 60_000) buckets.under20min++;
+        else if (ms < 45 * 60_000) buckets.under45min++;
+        else if (ms < 90 * 60_000) buckets.over45min++;
+        else if (ms < 180 * 60_000) buckets.over90min++;
+        else buckets.over180min++;
+      }
+      return buckets;
+    })();
     const seedSlaBreached = seedSlaBreachSignals.length > 0;
 
     // SEEDED: from funnelStats (seedCreatedCount is bumped by seed-from-signals)
@@ -995,6 +1026,10 @@ export async function GET() {
       staleQualifiedSignals,
       qualifiedToSeedLatencyMaxMs,
       qualifiedToSeedLatencyAvgMs,
+      medianQualifiedToSeedLatencyMs,
+      seedFreshnessBuckets,
+      staleDropCount: staleExpiredCount + (executeSkipReasonBreakdown["SKIPPED_STALE"] ?? 0),
+      ...(Object.keys(executeSkipReasonBreakdown).length > 0 ? { executionRejectReasons: executeSkipReasonBreakdown } : {}),
       seedSlaBreached,
       seedSlaBreachSignals: seedSlaBreachSignals.slice(0, 50),
       ...(Object.keys(seedSkipReasonBreakdown).length > 0 ? { seedSkipReasonBreakdown } : {}),

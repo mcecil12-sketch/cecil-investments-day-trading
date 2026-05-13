@@ -347,6 +347,13 @@ export async function evaluateAdaptiveGuardrails(): Promise<AdaptiveEvaluationRe
       .filter((a) => a.status === "ACTIVE" && new Date(a.expiresAt).getTime() > now)
       .map((a) => a.triggerPattern),
   );
+  // Prevent same actionType from stacking via different patterns (e.g. two patterns
+  // both triggering max_open_position_reduction compounds the effect unexpectedly).
+  const activeActionTypes = new Set(
+    state.actions
+      .filter((a) => a.status === "ACTIVE" && new Date(a.expiresAt).getTime() > now)
+      .map((a) => a.actionType),
+  );
 
   for (const pattern of patterns) {
     if (activePatterns.has(pattern.pattern)) {
@@ -358,9 +365,21 @@ export async function evaluateAdaptiveGuardrails(): Promise<AdaptiveEvaluationRe
         console.log(`[ADAPTIVE-GUARDRAILS] Max active actions reached, skipping ${pattern.pattern}`);
         continue;
       }
+      // Prevent stacking the same remediation from a different trigger pattern.
+      if (activeActionTypes.has(pattern.actionType)) {
+        console.log(`[ADAPTIVE-GUARDRAILS] ActionType ${pattern.actionType} already active, skipping stacking for ${pattern.pattern}`);
+        continue;
+      }
+      // Volume guard: never tighten scoring thresholds when trade data is sparse.
+      // Raising thresholds on thin data kills learning velocity with no R benefit.
+      if (pattern.actionType === "raise_min_score_threshold" && signals.totalTrades < 10) {
+        console.log(`[ADAPTIVE-GUARDRAILS] Skipping ${pattern.pattern}: raise_min_score_threshold suppressed (totalTrades=${signals.totalTrades} < 10)`);
+        continue;
+      }
 
       const action = createAction(pattern);
       state.actions.push(action);
+      activeActionTypes.add(pattern.actionType); // prevent same-run stacking
       result.actionsApplied.push(action);
       console.log(`[ADAPTIVE-GUARDRAILS] Applied action ${action.id}: ${action.reason} (expires ${action.expiresAt})`);
     } else {
