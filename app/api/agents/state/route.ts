@@ -281,6 +281,12 @@ export async function GET(req: Request) {
     title: p.title,
     priority: p.priority,
     owner: p.owner,
+    dedupeKey: p.dedupeKey ?? null,
+    rootCauseKey: p.rootCauseKey ?? null,
+    taskId: p.taskId ?? null,
+    beforeMetrics: p.beforeMetrics ?? null,
+    cooldownActive: Boolean(p.cooldownActive),
+    cooldownUntil: p.cooldownUntil ?? null,
     expectedRImpact: p.expectedRImpact,
     estimatedImpactText: p.estimatedImpactText,
     rationale: p.rationale,
@@ -292,6 +298,12 @@ export async function GET(req: Request) {
         title: "System healthy, continue execution optimization",
         priority: "MEDIUM",
         owner: "engineering-manager",
+        dedupeKey: null,
+        rootCauseKey: null,
+        taskId: null,
+        beforeMetrics: null,
+        cooldownActive: false,
+        cooldownUntil: null,
         expectedRImpact: "neutral",
         estimatedImpactText: "Maintain reliability and improve throughput",
         rationale: "No open incidents detected; keep autonomous optimization loop active.",
@@ -825,6 +837,16 @@ export async function GET(req: Request) {
       selectedCount: manualCounts.selectedCount,
       selectableCount: manualCounts.selectableCount ?? 0,
       recoverableBlockedCount: manualCounts.recoverableBlockedCount ?? 0,
+      duplicateSuppressedCount: dedupStats.skippedDuplicateExecutionCount ?? 0,
+      cooldownBlockedCount: manualTasks.filter((t) => !!t.cooldownUntil && Date.parse(String(t.cooldownUntil)) > Date.now()).length,
+      selectableAfterDedupeCount: Math.max(0, (manualCounts.selectableCount ?? 0) - (dedupStats.skippedDuplicateExecutionCount ?? 0)),
+      topSuppressedReasons: Array.from(new Set([
+        ...staleSuppressedQueue.slice(0, 3).map((s) => s.reason),
+        ...manualTasks
+          .filter((t) => t.blockedReason && /cooldown|duplicate/i.test(String(t.blockedReason)))
+          .slice(0, 3)
+          .map((t) => String(t.blockedReason)),
+      ])).slice(0, 5),
       // Use unifiedQueue.idleReason — never contradicts nextSelectableTasks
       // idleReason is null when ANY queue source has selectable tasks (req 6)
       idleReason: nextSelectableTasks.length > 0 ? null : unifiedQueue.idleReason,

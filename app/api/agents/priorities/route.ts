@@ -16,6 +16,12 @@ type RuntimePriority = {
   severity: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
   owner: string;
   expectedRImpact: "positive" | "neutral" | "negative" | "unknown";
+  dedupeKey: string | null;
+  rootCauseKey: string | null;
+  taskId: string | null;
+  beforeMetrics: Record<string, number | null> | null;
+  cooldownActive: boolean;
+  cooldownUntil: string | null;
   estimatedImpactText: string;
   rationale: string;
   status: string;
@@ -55,6 +61,12 @@ function incidentToPriority(incident: any): RuntimePriority {
     severity: priority,
     owner: String(incident?.source || "ops"),
     expectedRImpact: priority === "CRITICAL" || priority === "HIGH" ? "positive" : "unknown",
+    dedupeKey: null,
+    rootCauseKey: null,
+    taskId: null,
+    beforeMetrics: null,
+    cooldownActive: false,
+    cooldownUntil: null,
     estimatedImpactText: priority === "CRITICAL" ? "Prevents major R leakage" : "Reduces execution/funnel risk",
     rationale: `${String(incident?.category || "UNKNOWN")} incident remains open and should be resolved before lower-priority optimization work.`,
     status: String(incident?.status || "OPEN"),
@@ -91,6 +103,12 @@ function opportunityToPriority(opp: PerformanceOpportunity): RuntimePriority {
     severity: opp.priority,
     owner: opp.owner,
     expectedRImpact: opp.expectedRImpact,
+    dedupeKey: opp.dedupeKey ?? null,
+    rootCauseKey: opp.rootCauseKey ?? null,
+    taskId: opp.taskId ?? null,
+    beforeMetrics: opp.beforeMetrics ?? null,
+    cooldownActive: Boolean(opp.cooldownActive),
+    cooldownUntil: opp.cooldownUntil ?? null,
     estimatedImpactText: opp.estimatedImpactText,
     rationale: opp.rationale,
     status: opp.status,
@@ -129,6 +147,12 @@ export async function GET(req: Request) {
             severity: "MEDIUM",
             owner: "engineering-manager",
             expectedRImpact: "neutral",
+            dedupeKey: null,
+            rootCauseKey: null,
+            taskId: null,
+            beforeMetrics: null,
+            cooldownActive: false,
+            cooldownUntil: null,
             estimatedImpactText: "Maintain reliability and improve throughput",
             rationale: "No open incidents detected; keep autonomous optimization loop active.",
             status: "OPEN",

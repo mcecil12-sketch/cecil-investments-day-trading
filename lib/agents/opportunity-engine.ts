@@ -1,5 +1,8 @@
 import { listOpenIncidents } from "@/lib/agents/store";
+import { listEngineeringTasks } from "@/lib/agents/store";
 import { getSharedTradingKpis, type SharedTradingKpis } from "@/lib/agents/trading-kpis";
+import { buildAgentOpportunityDedupeKey, normalizeAgentIssueKey } from "@/lib/agents/root-cause";
+import { readRootCauseExecutionState } from "@/lib/agents/task-dedup";
 
 export type OpportunityCategory =
   | "P0_TRADING_BLOCKERS"
@@ -23,9 +26,47 @@ export interface PerformanceOpportunity {
   estimatedImpactText: string;
   confidence: number;
   owner: string;
+  rootCauseKey: string;
+  dedupeKey: string;
+  taskId?: string | null;
+  beforeMetrics?: Record<string, number | null>;
+  completionRequirements?: string[];
+  cooldownActive?: boolean;
+  cooldownUntil?: string | null;
   rationale: string;
   createdAt: string;
   status: "OPEN" | "MONITORING" | "RESOLVED";
+}
+
+function buildBeforeMetrics(kpis: SharedTradingKpis | null): Record<string, number | null> {
+  const src = kpis as unknown as Record<string, unknown> | null;
+  const num = (key: string): number | null => {
+    const n = Number(src?.[key]);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  return {
+    qualifiedToSeedLatencyAvgMs: num("qualifiedToSeedLatencyAvgMs"),
+    qualifiedToSeedLatencyMaxMs: num("qualifiedToSeedLatencyMaxMs"),
+    seededToExecutedPct: num("seededToExecutedPct"),
+    freshSignalPct: num("freshSignalPct"),
+    staleSignalPct: num("staleSignalPct"),
+    avgR: num("avgRealizedR"),
+    realizedR: num("actualRImpactRecent"),
+  };
+}
+
+function completionRequirementsFor(title: string): string[] {
+  const t = title.toLowerCase();
+  if (t.includes("latency") || t.includes("seeded to executed") || t.includes("stale signal")) {
+    return [
+      "latency improves",
+      "freshSignalPct improves",
+      "seededToExecutedPct improves",
+      "no execution regression",
+    ];
+  }
+  return ["measurable KPI improvement", "no trading-flow regression"];
 }
 
 function nowIso() {
@@ -49,6 +90,8 @@ function defaultOpportunities(now: string): PerformanceOpportunity[] {
       estimatedImpactText: "+0.4R to +1.2R/day",
       confidence: 0.65,
       owner: "execution",
+      rootCauseKey: normalizeAgentIssueKey("Reduce qualified to execute latency"),
+      dedupeKey: buildAgentOpportunityDedupeKey(normalizeAgentIssueKey("Reduce qualified to execute latency")),
       rationale: "Latency optimization has direct R capture impact and reduces decay before execution.",
       createdAt: now,
       status: "OPEN",
@@ -63,6 +106,8 @@ function defaultOpportunities(now: string): PerformanceOpportunity[] {
       estimatedImpactText: "+0.3R to +0.9R/day",
       confidence: 0.6,
       owner: "performance",
+      rootCauseKey: normalizeAgentIssueKey("Eliminate stale signal drag"),
+      dedupeKey: buildAgentOpportunityDedupeKey(normalizeAgentIssueKey("Eliminate stale signal drag")),
       rationale: "Fresh signals are more likely to execute at intended prices with better expectancy.",
       createdAt: now,
       status: "OPEN",
@@ -77,6 +122,8 @@ function defaultOpportunities(now: string): PerformanceOpportunity[] {
       estimatedImpactText: "Indirect, improves optimization velocity",
       confidence: 0.55,
       owner: "ops",
+      rootCauseKey: normalizeAgentIssueKey("Harden performance observability"),
+      dedupeKey: buildAgentOpportunityDedupeKey(normalizeAgentIssueKey("Harden performance observability")),
       rationale: "Better observability shortens diagnosis and remediation loops for revenue-impacting issues.",
       createdAt: now,
       status: "OPEN",
@@ -100,6 +147,7 @@ function inferRImpactFromIncident(severity: string): ExpectedRImpact {
 
 function opportunitiesFromKpis(kpis: SharedTradingKpis, now: string): PerformanceOpportunity[] {
   const out: PerformanceOpportunity[] = [];
+  const baseline = buildBeforeMetrics(kpis);
 
   if (kpis.executionLatencySec > 60) {
     out.push({
@@ -112,6 +160,10 @@ function opportunitiesFromKpis(kpis: SharedTradingKpis, now: string): Performanc
       estimatedImpactText: "+0.8R to +2.0R/day",
       confidence: clamp01(kpis.executionLatencySec > 300 ? 0.9 : 0.75),
       owner: "execution",
+      rootCauseKey: normalizeAgentIssueKey("Reduce qualified to execute latency"),
+      dedupeKey: buildAgentOpportunityDedupeKey(normalizeAgentIssueKey("Reduce qualified to execute latency")),
+      beforeMetrics: baseline,
+      completionRequirements: completionRequirementsFor("Reduce qualified to execute latency"),
       rationale: "High execution latency causes signal decay and worse entry prices.",
       createdAt: now,
       status: "OPEN",
@@ -129,6 +181,10 @@ function opportunitiesFromKpis(kpis: SharedTradingKpis, now: string): Performanc
       estimatedImpactText: "+0.6R to +1.8R/day",
       confidence: 0.8,
       owner: "execution",
+      rootCauseKey: normalizeAgentIssueKey("Improve seeded to executed conversion"),
+      dedupeKey: buildAgentOpportunityDedupeKey(normalizeAgentIssueKey("Improve seeded to executed conversion")),
+      beforeMetrics: baseline,
+      completionRequirements: completionRequirementsFor("Improve seeded to executed conversion"),
       rationale: "Conversion collapse directly reduces realized opportunity capture.",
       createdAt: now,
       status: "OPEN",
@@ -146,6 +202,10 @@ function opportunitiesFromKpis(kpis: SharedTradingKpis, now: string): Performanc
       estimatedImpactText: "+0.4R to +1.1R/day",
       confidence: 0.7,
       owner: "performance",
+      rootCauseKey: normalizeAgentIssueKey("Eliminate stale signal drag"),
+      dedupeKey: buildAgentOpportunityDedupeKey(normalizeAgentIssueKey("Eliminate stale signal drag")),
+      beforeMetrics: baseline,
+      completionRequirements: completionRequirementsFor("Eliminate stale signal drag"),
       rationale: "Signal freshness strongly correlates with valid setup persistence at execution time.",
       createdAt: now,
       status: "OPEN",
@@ -163,6 +223,10 @@ function opportunitiesFromKpis(kpis: SharedTradingKpis, now: string): Performanc
       estimatedImpactText: "+0.3R to +1.0R/day",
       confidence: 0.65,
       owner: "pm",
+      rootCauseKey: normalizeAgentIssueKey("Improve expectancy and R quality"),
+      dedupeKey: buildAgentOpportunityDedupeKey(normalizeAgentIssueKey("Improve expectancy and R quality")),
+      beforeMetrics: baseline,
+      completionRequirements: completionRequirementsFor("Improve expectancy and R quality"),
       rationale: "Expectancy improvements compound across execution throughput.",
       createdAt: now,
       status: "OPEN",
@@ -180,6 +244,10 @@ function opportunitiesFromKpis(kpis: SharedTradingKpis, now: string): Performanc
       estimatedImpactText: "+0.2R to +0.6R/day",
       confidence: 0.55,
       owner: "engineering",
+      rootCauseKey: normalizeAgentIssueKey("Increase scoring throughput reliability"),
+      dedupeKey: buildAgentOpportunityDedupeKey(normalizeAgentIssueKey("Increase scoring throughput reliability")),
+      beforeMetrics: baseline,
+      completionRequirements: completionRequirementsFor("Increase scoring throughput reliability"),
       rationale: "Throughput bottlenecks suppress candidate flow into profitable execution stages.",
       createdAt: now,
       status: "OPEN",
@@ -197,6 +265,10 @@ function opportunitiesFromKpis(kpis: SharedTradingKpis, now: string): Performanc
       estimatedImpactText: "Prevents R leakage and missed fills",
       confidence: 0.8,
       owner: "ops",
+      rootCauseKey: normalizeAgentIssueKey("Stabilize broker sync and execution integrity"),
+      dedupeKey: buildAgentOpportunityDedupeKey(normalizeAgentIssueKey("Stabilize broker sync and execution integrity")),
+      beforeMetrics: baseline,
+      completionRequirements: completionRequirementsFor("Stabilize broker sync and execution integrity"),
       rationale: "Broker sync integrity is required for reliable autonomous execution.",
       createdAt: now,
       status: "OPEN",
@@ -214,6 +286,10 @@ function opportunitiesFromKpis(kpis: SharedTradingKpis, now: string): Performanc
       estimatedImpactText: "Indirect optimization uplift",
       confidence: 0.5,
       owner: "ops",
+      rootCauseKey: normalizeAgentIssueKey("System healthy, optimize diagnostics quality"),
+      dedupeKey: buildAgentOpportunityDedupeKey(normalizeAgentIssueKey("System healthy, optimize diagnostics quality")),
+      beforeMetrics: baseline,
+      completionRequirements: completionRequirementsFor("System healthy, optimize diagnostics quality"),
       rationale: "Healthy state still benefits from proactive diagnostics and maintenance.",
       createdAt: now,
       status: "OPEN",
@@ -252,6 +328,7 @@ export async function generatePerformanceOpportunities(limit = 5): Promise<Perfo
     getSharedTradingKpis().catch(() => null),
   ]);
 
+  const baseline = buildBeforeMetrics(kpis);
   const incidentOpportunities: PerformanceOpportunity[] = (openIncidents || []).map((incident) => ({
     id: `opp-incident-${incident.id}`,
     title: incident.title,
@@ -262,6 +339,10 @@ export async function generatePerformanceOpportunities(limit = 5): Promise<Perfo
     estimatedImpactText: incident.severity === "CRITICAL" ? "Prevents major R leakage" : "Reduces execution risk",
     confidence: incident.severity === "CRITICAL" ? 0.9 : 0.75,
     owner: incident.source,
+    rootCauseKey: normalizeAgentIssueKey(incident.title),
+    dedupeKey: buildAgentOpportunityDedupeKey(normalizeAgentIssueKey(incident.title)),
+    beforeMetrics: baseline,
+    completionRequirements: completionRequirementsFor(incident.title),
     rationale: `${incident.category} incident is open and should be addressed before lower-value work.`,
     createdAt: incident.updatedAt || incident.createdAt || now,
     status: incident.status,
@@ -273,7 +354,7 @@ export async function generatePerformanceOpportunities(limit = 5): Promise<Perfo
   const seen = new Set<string>();
   const unique: PerformanceOpportunity[] = [];
   for (const opp of combined) {
-    const key = `${opp.title}::${opp.owner}`;
+    const key = opp.rootCauseKey || `${opp.title}::${opp.owner}`;
     if (seen.has(key)) continue;
     seen.add(key);
     unique.push(opp);
@@ -286,8 +367,34 @@ export async function generatePerformanceOpportunities(limit = 5): Promise<Perfo
 export async function buildPriorityFeed(limit = 5): Promise<{ priorities: PerformanceOpportunity[]; hasIncidents: boolean; }> {
   const openIncidents = await listOpenIncidents(50).catch(() => []);
   const priorities = await generatePerformanceOpportunities(limit);
+  const tasks = await listEngineeringTasks(200).catch(() => []);
+
+  const enrichedPriorities = await Promise.all(priorities.map(async (priority) => {
+    const rootCauseKey = priority.rootCauseKey || normalizeAgentIssueKey(priority.title);
+    const activeTask = tasks.find((task) => {
+      if (task.status === "DONE" || task.status === "FAILED" || task.status === "CANCELED" || task.status === "SUPERSEDED") {
+        return false;
+      }
+      const taskRoot = task.rootCauseKey || normalizeAgentIssueKey(task.title);
+      return taskRoot === rootCauseKey;
+    });
+    const rootState = await readRootCauseExecutionState(rootCauseKey);
+    const cooldownUntil = rootState?.cooldownUntil ?? null;
+    const cooldownActive = !!cooldownUntil && Date.parse(cooldownUntil) > Date.now();
+
+    return {
+      ...priority,
+      rootCauseKey,
+      dedupeKey: priority.dedupeKey || buildAgentOpportunityDedupeKey(rootCauseKey),
+      taskId: activeTask?.id ?? null,
+      beforeMetrics: priority.beforeMetrics ?? (activeTask?.beforeMetrics as Record<string, number | null> | undefined),
+      cooldownActive,
+      cooldownUntil,
+    };
+  }));
+
   return {
-    priorities,
+    priorities: enrichedPriorities,
     hasIncidents: (openIncidents?.length ?? 0) > 0,
   };
 }

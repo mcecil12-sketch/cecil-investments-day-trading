@@ -39,6 +39,11 @@ const DEDUP_TTL_SECONDS = 24 * 60 * 60; // 24 hours
 const LOCK_TTL_SECONDS = 24 * 60 * 60;  // 24 hours
 const META_PREFIX = "agents:task_dedup_meta:";
 const LOCK_PREFIX = "agents:execution_lock:";
+const ROOT_CAUSE_PREFIX = "agents:root_cause_state:v1:";
+const ROOT_CAUSE_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+
+const FAILED_VALIDATION_COOLDOWN_MINUTES = 6 * 60;
+const DUPLICATE_ATTEMPT_COOLDOWN_MINUTES = 2 * 60;
 
 interface DedupMeta {
   taskId: string;
@@ -47,6 +52,30 @@ interface DedupMeta {
   firstSeenAt: string;
   lastSeenAt: string;
   lastExecutedAt?: string;
+}
+
+export interface RootCauseExecutionState {
+  rootCauseKey: string;
+  lastEvidenceHash: string | null;
+  lastAttemptAt: string | null;
+  lastCommitSha: string | null;
+  lastStatus: string | null;
+  lastValidationStatus: string | null;
+  cooldownUntil: string | null;
+}
+
+export interface RootCauseLockoutDecision {
+  blocked: boolean;
+  reason: string | null;
+  cooldownActive: boolean;
+  cooldownUntil: string | null;
+}
+
+interface RootCauseLockoutOptions {
+  rootCauseKey: string;
+  evidenceHash: string;
+  hasActiveTaskWithSameRootCause?: boolean;
+  force?: boolean;
 }
 
 /**
@@ -61,6 +90,27 @@ function normaliseTitle(title: string): string {
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "")
     .slice(0, 80);
+}
+
+function rootCauseKey(key: string): string {
+  return ROOT_CAUSE_PREFIX + key;
+}
+
+function configuredCooldownMinutes(defaultMinutes: number): number {
+  const configured = Number(process.env.AGENT_ROOT_CAUSE_COOLDOWN_MINUTES ?? "");
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.floor(configured);
+  }
+  return defaultMinutes;
+}
+
+function toIsoFromNow(minutes: number): string {
+  return new Date(Date.now() + minutes * 60_000).toISOString();
+}
+
+function validationFailed(status: string | null | undefined): boolean {
+  const s = String(status ?? "").toUpperCase();
+  return s.includes("VALIDATION_FAILED") || s === "FAILED";
 }
 
 /**
@@ -79,6 +129,108 @@ export function buildDedupeKey(
     .join("|");
   const raw = extra ? `${normalized}|${extra}` : normalized;
   return createHash("sha256").update(raw).digest("hex").slice(0, 24);
+}
+
+export async function readRootCauseExecutionState(rootCause: string): Promise<RootCauseExecutionState | null> {
+  if (!redis) return null;
+  try {
+    const raw = await redis.get<RootCauseExecutionState | string>(rootCauseKey(rootCause));
+    if (!raw) return null;
+    return typeof raw === "string" ? (JSON.parse(raw) as RootCauseExecutionState) : (raw as RootCauseExecutionState);
+  } catch {
+    return null;
+  }
+}
+
+export async function writeRootCauseExecutionState(state: RootCauseExecutionState): Promise<void> {
+  if (!redis) return;
+  try {
+    await redis.set(rootCauseKey(state.rootCauseKey), JSON.stringify(state), { ex: ROOT_CAUSE_TTL_SECONDS });
+  } catch {
+    // non-fatal
+  }
+}
+
+export async function evaluateRootCauseLockout(opts: RootCauseLockoutOptions): Promise<RootCauseLockoutDecision> {
+  if (opts.force) {
+    return { blocked: false, reason: null, cooldownActive: false, cooldownUntil: null };
+  }
+  if (opts.hasActiveTaskWithSameRootCause) {
+    return {
+      blocked: true,
+      reason: "recent_patch_validation_failed_for_same_root_cause",
+      cooldownActive: true,
+      cooldownUntil: null,
+    };
+  }
+
+  const prior = await readRootCauseExecutionState(opts.rootCauseKey);
+  if (!prior) {
+    return { blocked: false, reason: null, cooldownActive: false, cooldownUntil: null };
+  }
+
+  const now = Date.now();
+  const cooldownUntilMs = prior.cooldownUntil ? Date.parse(prior.cooldownUntil) : NaN;
+  const cooldownActive = Number.isFinite(cooldownUntilMs) && cooldownUntilMs > now;
+  const evidenceUnchanged = !!prior.lastEvidenceHash && prior.lastEvidenceHash === opts.evidenceHash;
+  const priorValidationFailed = validationFailed(prior.lastValidationStatus);
+  const priorPatchValidationFailed = String(prior.lastStatus ?? "").toUpperCase() === "PATCH_APPLIED_VALIDATION_FAILED";
+
+  if (cooldownActive && evidenceUnchanged && (priorValidationFailed || priorPatchValidationFailed)) {
+    return {
+      blocked: true,
+      reason: "recent_patch_validation_failed_for_same_root_cause",
+      cooldownActive: true,
+      cooldownUntil: prior.cooldownUntil,
+    };
+  }
+
+  if (cooldownActive && evidenceUnchanged) {
+    return {
+      blocked: true,
+      reason: "duplicate_no_new_evidence",
+      cooldownActive: true,
+      cooldownUntil: prior.cooldownUntil,
+    };
+  }
+
+  return {
+    blocked: false,
+    reason: null,
+    cooldownActive,
+    cooldownUntil: prior.cooldownUntil,
+  };
+}
+
+export async function recordRootCauseExecutionOutcome(input: {
+  rootCauseKey: string;
+  evidenceHash: string;
+  status: string;
+  validationStatus?: string | null;
+  patchApplied?: boolean;
+  commitSha?: string | null;
+}): Promise<RootCauseExecutionState> {
+  const failedValidation = validationFailed(input.validationStatus) || input.status === "PATCH_APPLIED_VALIDATION_FAILED";
+  const duplicateAttempt = input.status === "BLOCKED_DUPLICATE_OR_COOLDOWN" || input.status === "SKIPPED";
+
+  const cooldownMinutes = failedValidation && input.patchApplied
+    ? configuredCooldownMinutes(FAILED_VALIDATION_COOLDOWN_MINUTES)
+    : duplicateAttempt
+      ? configuredCooldownMinutes(DUPLICATE_ATTEMPT_COOLDOWN_MINUTES)
+      : 0;
+
+  const nextState: RootCauseExecutionState = {
+    rootCauseKey: input.rootCauseKey,
+    lastEvidenceHash: input.evidenceHash,
+    lastAttemptAt: new Date().toISOString(),
+    lastCommitSha: input.commitSha ?? null,
+    lastStatus: input.status,
+    lastValidationStatus: input.validationStatus ?? null,
+    cooldownUntil: cooldownMinutes > 0 ? toIsoFromNow(cooldownMinutes) : null,
+  };
+
+  await writeRootCauseExecutionState(nextState);
+  return nextState;
 }
 
 /**

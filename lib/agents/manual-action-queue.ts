@@ -1,6 +1,7 @@
 import { redis } from "@/lib/redis";
 import { AGENT_MANUAL_QUEUE_KEY } from "@/lib/agents/keys";
 import { randomUUID } from "crypto";
+import { normalizeAgentIssueKey } from "@/lib/agents/root-cause";
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -59,6 +60,10 @@ export interface ManualActionTask {
   failedAt?: string | null;
   blockedReason?: string | null;
   latestExecutionResult?: ManualActionExecutionResult | null;
+  rootCauseKey?: string;
+  dedupeKey?: string;
+  evidenceHash?: string;
+  cooldownUntil?: string | null;
 }
 
 export type ManualActionTaskInput = Pick<
@@ -75,6 +80,10 @@ export type ManualActionTaskInput = Pick<
       | "routeHints"
       | "createdBy"
       | "source"
+      | "rootCauseKey"
+      | "dedupeKey"
+      | "evidenceHash"
+      | "cooldownUntil"
     >
   >;
 
@@ -89,6 +98,10 @@ export type ManualActionTaskPatch = Partial<
     | "fileHints"
     | "routeHints"
     | "latestExecutionResult"
+    | "rootCauseKey"
+    | "dedupeKey"
+    | "evidenceHash"
+    | "cooldownUntil"
   >
 >;
 
@@ -158,6 +171,10 @@ export async function createManualActionTask(
     failedAt: null,
     blockedReason: null,
     latestExecutionResult: null,
+    rootCauseKey: input.rootCauseKey,
+    dedupeKey: input.dedupeKey,
+    evidenceHash: input.evidenceHash,
+    cooldownUntil: input.cooldownUntil ?? null,
   };
   await saveTask(task);
   return task;
@@ -1091,4 +1108,35 @@ export async function getManualQueueDiagnostics(): Promise<{
     healthStatus,
     healthReason,
   };
+}
+
+export async function suppressDuplicateManualTasksByRootCause(): Promise<{ suppressedCount: number; keptTaskIds: string[] }> {
+  const tasks = await getAllTasks();
+  const active = tasks.filter((t) => ["OPEN", "SELECTED", "IN_PROGRESS", "BLOCKED"].includes(t.status));
+  const grouped = new Map<string, ManualActionTask[]>();
+
+  for (const task of active) {
+    const key = task.rootCauseKey || normalizeAgentIssueKey(task.title);
+    const list = grouped.get(key) ?? [];
+    list.push(task);
+    grouped.set(key, list);
+  }
+
+  let suppressedCount = 0;
+  const keptTaskIds: string[] = [];
+  for (const [rootKey, group] of grouped.entries()) {
+    if (group.length === 0) continue;
+    const canonical = group.slice().sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+    keptTaskIds.push(canonical.id);
+    for (const task of group) {
+      if (task.id === canonical.id) continue;
+      suppressedCount += 1;
+      await updateManualActionTask(task.id, {
+        status: "CANCELED",
+        blockedReason: `superseded_by_root_cause_dedupe:${rootKey}`,
+      });
+    }
+  }
+
+  return { suppressedCount, keptTaskIds };
 }

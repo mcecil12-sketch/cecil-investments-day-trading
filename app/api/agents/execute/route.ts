@@ -38,6 +38,7 @@ import {
   recoverBlockedTasksWithFallbackHints,
   getActiveManualTask,
   cleanupFailedTasks,
+  suppressDuplicateManualTasksByRootCause,
   listManualActionTasks,
   computeTaskSelectability,
   type ManualActionTask,
@@ -48,6 +49,7 @@ import {
 import { executeManualTask } from "@/lib/agents/manual-task-executor";
 import { mapIncidentsToTasks } from "@/lib/agents/critical-incident-mapper";
 import { createTasksFromIncidents, type FunnelIncident } from "@/lib/agents/incident-task-bridge";
+import { getSharedTradingKpis } from "@/lib/agents/trading-kpis";
 import { auditProtectionIntegrity } from "@/lib/risk/protection-integrity";
 import { fetchBrokerTruth } from "@/lib/broker/truth";
 import { readTrades } from "@/lib/tradesStore";
@@ -74,7 +76,10 @@ import {
   acquireExecutionLock,
   releaseExecutionLock,
   REOPT_MIN_NEW_TRADES,
+  evaluateRootCauseLockout,
+  recordRootCauseExecutionOutcome,
 } from "@/lib/agents/task-dedup";
+import { buildAgentOpportunityDedupeKey, buildStableEvidenceHash, normalizeAgentIssueKey, rootCausePriorityLane } from "@/lib/agents/root-cause";
 import type {
   EngineeringTask,
   ExecutionPhase,
@@ -166,6 +171,50 @@ async function readProtectionAuditCriticalCount(): Promise<number | null> {
 
 function appendNotes(current: string[] | undefined, additions: string[]): string[] {
   return [...(current ?? []), ...additions].filter(Boolean).slice(-20);
+}
+
+function resolveRootCauseKey(task: { title: string; rootCauseKey?: string | null }): string {
+  return task.rootCauseKey || normalizeAgentIssueKey(task.title);
+}
+
+function resolveOpportunityDedupeKey(task: { title: string; dedupeKey?: string | null; rootCauseKey?: string | null }): string {
+  const rootCauseKey = resolveRootCauseKey(task);
+  return task.dedupeKey || buildAgentOpportunityDedupeKey(rootCauseKey);
+}
+
+async function buildRootEvidenceHash(task: {
+  title: string;
+  summary?: string;
+  taskType?: string;
+  priority?: string;
+  rootCauseKey?: string | null;
+  status?: string;
+  likelyFiles?: string[];
+  fileHints?: string[];
+  routeHints?: string[];
+  beforeMetrics?: Record<string, number>;
+}): Promise<string> {
+  const sharedKpis = await getSharedTradingKpis().catch(() => null);
+  const payload: Record<string, unknown> = {
+    rootCauseKey: resolveRootCauseKey(task),
+    title: task.title,
+    summary: task.summary ?? null,
+    taskType: task.taskType ?? null,
+    priority: task.priority ?? null,
+    status: task.status ?? null,
+    likelyFiles: task.likelyFiles ?? task.fileHints ?? [],
+    routeHints: task.routeHints ?? [],
+    beforeMetrics: task.beforeMetrics ?? null,
+    kpiSnapshot: {
+      avgRealizedR: Number(sharedKpis?.avgRealizedR ?? 0),
+      actualRImpactRecent: Number(sharedKpis?.actualRImpactRecent ?? 0),
+      seededToExecutedPct: Number(sharedKpis?.seededToExecutedPct ?? 0),
+      freshSignalPct: Number(sharedKpis?.freshSignalPct ?? 0),
+      staleSignalPct: Number(sharedKpis?.staleSignalPct ?? 0),
+      executionLatencySec: Number(sharedKpis?.executionLatencySec ?? 0),
+    },
+  };
+  return buildStableEvidenceHash(payload);
 }
 
 async function markExecutionFailure(task: EngineeringTask | null, message: string) {
@@ -711,10 +760,11 @@ function batchEngineeringTaskRank(task: EngineeringTask): number {
     : task.incidentId ? 2
     : 3;
   const priorityRank = PRIORITY_BUCKET_RANK[engineeringPriorityBucket(task)] * 100;
+  const laneRank = rootCausePriorityLane(resolveRootCauseKey(task), task.title) * 50;
   const statusRank = task.status === "READY_FOR_EXECUTION" ? 0 : task.status === "OPEN" ? 20 : 100;
   const kw = titleKeywordBoost(task.title);
   const age = Date.parse(task.createdAt) || 0; // older = lower number = better
-  return sourcePriority * 1000 + priorityRank + statusRank + kw + age / 1e12;
+  return sourcePriority * 1000 + laneRank + priorityRank + statusRank + kw + age / 1e12;
 }
 
 /**
@@ -910,7 +960,7 @@ async function collectDryRunCandidates(
       if (priorityOnly && t.priority !== "CRITICAL" && t.priority !== "HIGH") continue;
       const sel = computeTaskSelectability(t);
       const rImpact = scoreManualTask(t);
-      const dedupeKey = buildDedupeKey(t.title, undefined, t.taskType ?? undefined, t.fileHints ?? []);
+      const dedupeKey = resolveOpportunityDedupeKey(t);
       candidates.push({
         taskId: t.id,
         title: t.title,
@@ -952,12 +1002,7 @@ async function collectDryRunCandidates(
       for (const t of eligible.slice(0, remaining)) {
         const readiness = computeEngineeringTaskReadiness(t);
         const rImpact = scoreEngineeringTask(t);
-        const dedupeKey = buildDedupeKey(
-          t.title,
-          undefined,
-          t.patchPlan?.mode ?? undefined,
-          t.patchPlan?.targetFiles ?? [],
-        );
+        const dedupeKey = resolveOpportunityDedupeKey(t);
         const tAsTask = t as unknown as { taskType?: string | null; title: string; priority?: string | null };
 
         // Stale adaptive/profit guard: override readiness when evidence is stale
@@ -1010,6 +1055,7 @@ interface RunOneCycleOptions {
   excludedTaskIds: string[];
   priorityOnly: boolean;
   funnelRecoveryMode: boolean;
+  force: boolean;
 }
 
 /**
@@ -1017,7 +1063,7 @@ interface RunOneCycleOptions {
  * returning a NextResponse — the caller accumulates results for the batch.
  */
 async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
-  const { adaptiveResult: _adaptiveResult, excludedTaskIds, priorityOnly, funnelRecoveryMode } = opts;
+  const { adaptiveResult: _adaptiveResult, excludedTaskIds, priorityOnly, funnelRecoveryMode, force } = opts;
 
   // ── Step A: Manual queue (priority) ───────────────────────────────
   const manualCounts = await countOpenExecutionReadyManualTasks().catch(() => ({
@@ -1051,6 +1097,52 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
 
       manualPhases.push(phaseResult("SELECT_TASK", "passed", "manual_queue"));
       manualPhases.push(phaseResult("CLAIM_TASK", "passed", `claimed: ${manualTask.id}`));
+
+      const manualRootCauseKey = resolveRootCauseKey(manualTask);
+      const manualDedupeKey = resolveOpportunityDedupeKey(manualTask);
+      const manualEvidenceHash = await buildRootEvidenceHash({
+        title: manualTask.title,
+        taskType: manualTask.taskType,
+        priority: manualTask.priority,
+        status: manualTask.status,
+        fileHints: manualTask.fileHints,
+        routeHints: manualTask.routeHints,
+      });
+      const activeSameRootManual = (await listManualActionTasks({ status: "IN_PROGRESS", limit: 50 }).catch(() => []))
+        .some((t) => t.id !== manualTask.id && resolveRootCauseKey(t) === manualRootCauseKey);
+      const manualLockout = await evaluateRootCauseLockout({
+        rootCauseKey: manualRootCauseKey,
+        evidenceHash: manualEvidenceHash,
+        hasActiveTaskWithSameRootCause: activeSameRootManual,
+        force,
+      });
+      if (manualLockout.blocked) {
+        await blockManualActionTask(manualTask.id, "recent_patch_validation_failed_for_same_root_cause", {
+          ok: false,
+          summary: "Execution blocked by root-cause cooldown/dedupe lockout",
+          error: "recent_patch_validation_failed_for_same_root_cause",
+        });
+        await recordRootCauseExecutionOutcome({
+          rootCauseKey: manualRootCauseKey,
+          evidenceHash: manualEvidenceHash,
+          status: "BLOCKED_DUPLICATE_OR_COOLDOWN",
+          validationStatus: "FAILED",
+          patchApplied: false,
+          commitSha: null,
+        });
+        manualPhases.push(phaseResult("SELECT_TASK", "failed", "recent_patch_validation_failed_for_same_root_cause"));
+        return {
+          taskId: manualTask.id,
+          title: manualTask.title,
+          status: "SKIPPED",
+          source: "manual-action-queue",
+          patchApplied: false,
+          verification: { buildOk: true, smokeOk: true, details: {} },
+          resolution: { resolved: false, reason: "recent_patch_validation_failed_for_same_root_cause" },
+          executionPhases: manualPhases,
+          noTaskReason: "cooldown_or_duplicate_lockout",
+        };
+      }
 
       const startedTask = await startManualActionTask(manualTask.id);
       if (!startedTask) {
@@ -1128,6 +1220,14 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
         });
         manualPhases.push(phaseResult("RESOLVE_OR_FAIL", "passed", "completed"));
         const verif = (execResult.verification ?? { buildOk: true, smokeOk: true, details: {} }) as { buildOk: boolean; smokeOk: boolean; details: Record<string, unknown> };
+        await recordRootCauseExecutionOutcome({
+          rootCauseKey: manualRootCauseKey,
+          evidenceHash: manualEvidenceHash,
+          status: verif.buildOk && verif.smokeOk ? "COMPLETED" : "PATCH_APPLIED_VALIDATION_FAILED",
+          validationStatus: verif.buildOk && verif.smokeOk ? "PASSED" : "VALIDATION_FAILED",
+          patchApplied: true,
+          commitSha: execResult.commitSha ?? null,
+        });
         if (!verif.buildOk || !verif.smokeOk) {
           return {
             taskId: manualTask.id, title: manualTask.title, status: "COMPLETED",
@@ -1148,6 +1248,14 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
           ok: false, summary: execResult.summary, error: execResult.blockedReason,
         });
         manualPhases.push(phaseResult("RESOLVE_OR_FAIL", "failed", execResult.blockedReason ?? "blocked"));
+        await recordRootCauseExecutionOutcome({
+          rootCauseKey: manualRootCauseKey,
+          evidenceHash: manualEvidenceHash,
+          status: "BLOCKED",
+          validationStatus: "FAILED",
+          patchApplied: false,
+          commitSha: null,
+        });
         return {
           taskId: manualTask.id, title: manualTask.title, status: "BLOCKED",
           source: "manual-action-queue", patchApplied: false,
@@ -1162,6 +1270,14 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
           verification: execResult.verification as Record<string, unknown>, error: execResult.failureReason,
         });
         manualPhases.push(phaseResult("RESOLVE_OR_FAIL", "failed", execResult.failureReason ?? "execution_failed"));
+        await recordRootCauseExecutionOutcome({
+          rootCauseKey: manualRootCauseKey,
+          evidenceHash: manualEvidenceHash,
+          status: execResult.patchApplied ? "PATCH_APPLIED_VALIDATION_FAILED" : "FAILED",
+          validationStatus: "FAILED",
+          patchApplied: execResult.patchApplied,
+          commitSha: execResult.commitSha ?? null,
+        });
         return {
           taskId: manualTask.id, title: manualTask.title, status: "FAILED",
           source: "manual-action-queue", patchApplied: execResult.patchApplied,
@@ -1268,6 +1384,61 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
         safetyStopReason: "stale_evidence_insufficient_new_trade_data",
       };
     }
+  }
+
+  const engRootCauseKey = resolveRootCauseKey(engTask);
+  const engDedupeKey = resolveOpportunityDedupeKey(engTask);
+  const engEvidenceHash = await buildRootEvidenceHash({
+    title: engTask.title,
+    summary: engTask.summary,
+    status: engTask.status,
+    likelyFiles: engTask.likelyFiles,
+    beforeMetrics: engTask.beforeMetrics,
+  });
+  const activeSameRootEngineering = eligibleEngTasks.some((t) => (
+    t.id !== engTask.id &&
+    (t.status === "IN_PROGRESS" || t.status === "READY_FOR_EXECUTION" || t.status === "OPEN") &&
+    resolveRootCauseKey(t) === engRootCauseKey
+  ));
+  const engLockout = await evaluateRootCauseLockout({
+    rootCauseKey: engRootCauseKey,
+    evidenceHash: engEvidenceHash,
+    hasActiveTaskWithSameRootCause: activeSameRootEngineering,
+    force,
+  });
+  if (engLockout.blocked) {
+    await updateEngineeringTaskById(engTask.id, {
+      status: "BLOCKED",
+      executionStatus: "BLOCKED",
+      executionError: "recent_patch_validation_failed_for_same_root_cause",
+      rootCauseKey: engRootCauseKey,
+      dedupeKey: engDedupeKey,
+      evidenceHash: engEvidenceHash,
+      cooldownUntil: engLockout.cooldownUntil,
+      notes: appendNotes(engTask.notes, [
+        "Execution blocked by root-cause cooldown/dedupe lockout",
+        "recent_patch_validation_failed_for_same_root_cause",
+      ]),
+    }).catch(() => null);
+    await recordRootCauseExecutionOutcome({
+      rootCauseKey: engRootCauseKey,
+      evidenceHash: engEvidenceHash,
+      status: "BLOCKED_DUPLICATE_OR_COOLDOWN",
+      validationStatus: "FAILED",
+      patchApplied: false,
+      commitSha: null,
+    });
+    return {
+      taskId: engTask.id,
+      title: engTask.title,
+      status: "SKIPPED",
+      source: "engineering-backlog",
+      patchApplied: false,
+      verification: { buildOk: true, smokeOk: true, details: {} },
+      resolution: { resolved: false, reason: "recent_patch_validation_failed_for_same_root_cause" },
+      executionPhases: [phaseResult("SELECT_TASK", "failed", "recent_patch_validation_failed_for_same_root_cause")],
+      noTaskReason: "cooldown_or_duplicate_lockout",
+    };
   }
 
 
@@ -1485,6 +1656,17 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
       await acquireExecutionLock(adaptiveLockKey).catch(() => null);
     }
 
+    await recordRootCauseExecutionOutcome({
+      rootCauseKey: engRootCauseKey,
+      evidenceHash: engEvidenceHash,
+      status: taskStatus === "COMPLETED" && (!verif.buildOk || !verif.smokeOk)
+        ? "PATCH_APPLIED_VALIDATION_FAILED"
+        : taskStatus,
+      validationStatus: verif.buildOk && verif.smokeOk ? "PASSED" : "VALIDATION_FAILED",
+      patchApplied: Boolean(responseBody.patchApplied),
+      commitSha: (responseBody.commitSha as string | null | undefined) ?? null,
+    });
+
     return {
       taskId: taskToExecute.id, title: taskToExecute.title, status: taskStatus,
       source: "engineering-backlog", patchApplied: responseBody.patchApplied as boolean ?? false,
@@ -1497,6 +1679,14 @@ async function runOneCycle(opts: RunOneCycleOptions): Promise<BatchTaskResult> {
     const message = error instanceof Error ? error.message : String(error);
     engPhases.push(phaseResult("APPLY_PATCH", "failed", message));
     await blockExecution(taskToExecute, message);
+    await recordRootCauseExecutionOutcome({
+      rootCauseKey: engRootCauseKey,
+      evidenceHash: engEvidenceHash,
+      status: "FAILED",
+      validationStatus: "FAILED",
+      patchApplied: false,
+      commitSha: null,
+    });
     return {
       taskId: taskToExecute.id, title: taskToExecute.title, status: "FAILED",
       source: "engineering-backlog", patchApplied: false,
@@ -1525,6 +1715,7 @@ export async function POST(req: NextRequest) {
   const envMaxTasks = Math.max(1, Math.min(5, Number(process.env.AGENT_MAX_TASKS_PER_RUN ?? "3") || 3));
   const effectiveRequestedMax = Math.min(requestedMax, envMaxTasks);
   const priorityOnly = url.searchParams.get("priorityOnly") === "1";
+  const force = url.searchParams.get("force") === "1";
   const autonomyEnabled = process.env.AGENT_AUTONOMY_ENABLED === "1";
   const requireVerification = process.env.AGENT_REQUIRE_VERIFICATION !== "0";
   const TIME_BUDGET_MS = 90_000;
@@ -2202,6 +2393,11 @@ export async function POST(req: NextRequest) {
       staleRecovery = { attempted: true, recoveredCount: 0, recovered: [], recoveredTaskIds: [], failedTaskIds: [], releasedTaskIds: [], reasonCodes: [] };
     }
 
+    const duplicateSuppression = await suppressDuplicateManualTasksByRootCause().catch(() => ({ suppressedCount: 0, keptTaskIds: [] as string[] }));
+    if (duplicateSuppression.suppressedCount > 0) {
+      console.log(`[AGENT-EXECUTE] Root-cause dedupe suppressed ${duplicateSuppression.suppressedCount} duplicate manual task(s)`);
+    }
+
     let failedTaskCleanup: FailedTaskCleanupResult | null = null;
     try {
       failedTaskCleanup = await cleanupFailedTasks(false);
@@ -2281,6 +2477,7 @@ export async function POST(req: NextRequest) {
         excludedTaskIds: executedTaskIds,
         priorityOnly,
         funnelRecoveryMode: funnelRecoveryState?.funnelRecoveryMode ?? false,
+        force,
       });
 
       if (cycle.status === "NO_TASK") {

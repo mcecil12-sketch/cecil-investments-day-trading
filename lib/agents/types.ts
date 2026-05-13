@@ -35,7 +35,9 @@ export type EngineeringTaskStatus =
   | "READY_FOR_REVIEW"
   | "DONE"
   | "BLOCKED"
-  | "FAILED";
+  | "FAILED"
+  | "CANCELED"
+  | "SUPERSEDED";
 
 export type EngineeringExecutionStatus = "PENDING" | "READY" | "BLOCKED" | "EXECUTED" | "FAILED";
 
@@ -179,6 +181,13 @@ export interface EngineeringTask {
   commitSha?: string | null;
   commitUrl?: string | null;
   notes?: string[];
+
+  // Root-cause orchestration metadata
+  rootCauseKey?: string;
+  dedupeKey?: string;
+  evidenceHash?: string;
+  cooldownUntil?: string | null;
+  completionRequirements?: string[];
 
   // ─── Agent Performance Operating Model v2: R Impact ──────────────
   /** Expected R impact from task completion: positive, neutral, negative, unknown */

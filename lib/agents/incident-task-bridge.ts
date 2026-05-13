@@ -21,6 +21,7 @@ import {
   type ManualActionTaskType,
 } from "@/lib/agents/manual-action-queue";
 import { checkIssue, claimIssue } from "@/lib/agents/issue-registry";
+import { buildAgentOpportunityDedupeKey, normalizeAgentIssueKey } from "@/lib/agents/root-cause";
 
 // ─── Issue key builder ────────────────────────────────────────
 
@@ -38,14 +39,15 @@ const PER_SYMBOL_CODES = new Set([
 ]);
 
 function buildIncidentIssueKey(incident: FunnelIncident): string {
+  const defaultRoot = normalizeAgentIssueKey(incident.message || incident.code);
   const code = incident.code.toLowerCase().replace(/[^a-z0-9]+/g, "_");
   if (PER_SYMBOL_CODES.has(incident.code)) {
     const ticker = String(
       incident.context?.ticker ?? incident.context?.symbol ?? "",
     ).toUpperCase().trim();
-    if (ticker) return `incident_${code}_${ticker.toLowerCase()}`;
+    if (ticker) return `${defaultRoot}:${ticker.toLowerCase()}`;
   }
-  return `incident_${code}`;
+  return defaultRoot || `incident_${code}`;
 }
 
 const BRIDGE_OWNER = "incident_bridge";
@@ -379,6 +381,8 @@ export async function createTaskFromIncident(
   const title = defaults.titleTemplate
     .replace("{code}", incident.code)
     .replace("{context}", contextStr);
+  const rootCauseKey = normalizeAgentIssueKey(title);
+  const dedupeKey = buildAgentOpportunityDedupeKey(rootCauseKey);
   const description = defaults.descriptionTemplate
     .replace("{code}", incident.code)
     .replace("{context}", incident.message);
@@ -422,6 +426,8 @@ export async function createTaskFromIncident(
     routeHints: defaults.routeHints,
     source: "incident_bridge",
     objective: `Resolve ${incident.code} incident: ${incident.message}`,
+    rootCauseKey,
+    dedupeKey,
   };
 
   const task = await createManualActionTask(input);

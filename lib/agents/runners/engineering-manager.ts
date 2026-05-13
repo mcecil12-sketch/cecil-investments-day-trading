@@ -15,14 +15,16 @@ import { approveExecution } from "@/lib/agents/governance/manager";
 import { buildPriorityFeed, type PerformanceOpportunity } from "@/lib/agents/opportunity-engine";
 import { getSharedTradingKpis } from "@/lib/agents/trading-kpis";
 import { nowIso } from "@/lib/agents/time";
+import { buildAgentOpportunityDedupeKey, normalizeAgentIssueKey } from "@/lib/agents/root-cause";
+import { readRootCauseExecutionState } from "@/lib/agents/task-dedup";
 import type { AgentBrief, AgentRunnerResult, BacklogItem, EngineeringTask } from "@/lib/agents/types";
 
 function normalizeTitle(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-function opportunityDedupeKey(title: string, owner: string): string {
-  return `agent-opportunity:${normalizeTitle(title)}:${String(owner || "engineering").toLowerCase()}`;
+function opportunityDedupeKey(title: string): string {
+  return buildAgentOpportunityDedupeKey(normalizeAgentIssueKey(title));
 }
 
 function ownerLikelyFiles(owner: string): string[] {
@@ -43,7 +45,8 @@ function metricOrNull(kpis: any, key: string): number | null {
 
 function buildOpportunityTask(now: string, opportunity: PerformanceOpportunity, kpis: any): EngineeringTask {
   const owner = String(opportunity.owner || "engineering").toLowerCase();
-  const dedupeKey = opportunityDedupeKey(opportunity.title, owner);
+  const rootCauseKey = opportunity.rootCauseKey ?? normalizeAgentIssueKey(opportunity.title);
+  const dedupeKey = opportunity.dedupeKey ?? opportunityDedupeKey(opportunity.title);
   const likelyFiles = ownerLikelyFiles(owner);
 
   const beforeMetrics = {
@@ -57,17 +60,17 @@ function buildOpportunityTask(now: string, opportunity: PerformanceOpportunity, 
   };
 
   const completionRequirements = [
-    "Require afterMetrics snapshot for comparison against beforeMetrics.",
-    "Target improvement in seededToExecutedPct and reduction in staleSignalPct.",
-    "No regression in avgR, realizedR, or execution latency.",
-    "Completion quality must be SUCCESS, PARTIAL_SUCCESS, NO_IMPACT, or REGRESSION.",
-  ].join(" ");
+    "latency improves",
+    "freshSignalPct improves",
+    "seededToExecutedPct improves",
+    "no execution regression",
+  ];
 
   return {
     id: crypto.randomUUID(),
     createdAt: now,
     updatedAt: now,
-    status: "READY_FOR_EXECUTION",
+    status: opportunity.priority === "CRITICAL" || opportunity.priority === "HIGH" ? "READY_FOR_EXECUTION" : "OPEN",
     title: opportunity.title,
     summary: `${opportunity.estimatedImpactText}. ${opportunity.rationale}`,
     likelyFiles,
@@ -83,7 +86,7 @@ function buildOpportunityTask(now: string, opportunity: PerformanceOpportunity, 
     gitBlock: `git add -A && git commit -m "agent: ${opportunity.title}" && git push`,
     remediationAttempted: false,
     remediationStatus: "none",
-    successCriteria: completionRequirements,
+    successCriteria: completionRequirements.join("; "),
     patchPlan: {
       mode: "GITHUB_COMMIT",
       targetFiles: likelyFiles,
@@ -107,7 +110,10 @@ function buildOpportunityTask(now: string, opportunity: PerformanceOpportunity, 
     executionError: null,
     expectedRImpact: opportunity.expectedRImpact,
     estimatedImpactDescription: opportunity.estimatedImpactText,
+    rootCauseKey,
+    dedupeKey,
     beforeMetrics,
+    completionRequirements,
     completionQuality: undefined,
     notes: [
       `owner_assigned:${owner}`,
@@ -190,31 +196,53 @@ export async function runEngineeringManagerAgent(_context?: unknown): Promise<Ag
   const topOpportunity = openOpportunities[0] ?? null;
   let opportunityTasksCreated = 0;
   let opportunityTasksUpdated = 0;
+  let suppressedDuplicateCount = 0;
+  const touchedTaskIds: string[] = [];
+  let selectedTopRootCauseKey: string | null = null;
+  let selectedTopDedupeKey: string | null = null;
+  let selectedTopCooldownActive = false;
+  let selectedTopCooldownUntil: string | null = null;
 
   for (const opp of openOpportunities) {
-    const dedupeKey = opportunityDedupeKey(opp.title, opp.owner);
+    const rootCauseKey = opp.rootCauseKey ?? normalizeAgentIssueKey(opp.title);
+    const dedupeKey = opp.dedupeKey ?? opportunityDedupeKey(opp.title);
+    const rootState = await readRootCauseExecutionState(rootCauseKey);
+    const cooldownUntil = rootState?.cooldownUntil ?? null;
+    const cooldownActive = !!cooldownUntil && Date.parse(cooldownUntil) > Date.now();
+    if (topOpportunity && opp.title === topOpportunity.title) {
+      selectedTopRootCauseKey = rootCauseKey;
+      selectedTopDedupeKey = dedupeKey;
+      selectedTopCooldownActive = cooldownActive;
+      selectedTopCooldownUntil = cooldownUntil;
+    }
+
     const existing = existingEngineeringTasks.find((task) => {
       const notes = Array.isArray(task.notes) ? task.notes : [];
+      const taskRootCause = task.rootCauseKey ?? normalizeAgentIssueKey(task.title);
       return (
         task.status !== "DONE" &&
         task.status !== "FAILED" &&
-        (notes.some((n) => String(n).includes(`opportunity_dedupe_key:${dedupeKey}`)) || normalizeTitle(task.title) === normalizeTitle(opp.title))
+        task.status !== "CANCELED" &&
+        task.status !== "SUPERSEDED" &&
+        (taskRootCause === rootCauseKey || notes.some((n) => String(n).includes(`opportunity_dedupe_key:${dedupeKey}`)) || normalizeTitle(task.title) === normalizeTitle(opp.title))
       );
     });
 
     const taskDraft = buildOpportunityTask(now, opp, sharedKpis);
-    const upserted = await upsertEngineeringTask(taskDraft);
-    if (upserted.created) {
-      opportunityTasksCreated += 1;
-      existingEngineeringTasks.unshift(upserted.task);
+    if (!existing) {
+      const upserted = await upsertEngineeringTask(taskDraft);
+      if (upserted.created) {
+        opportunityTasksCreated += 1;
+        touchedTaskIds.push(upserted.task.id);
+        existingEngineeringTasks.unshift(upserted.task);
+      }
       continue;
     }
 
-    opportunityTasksUpdated += 1;
-    await updateEngineeringTaskById(upserted.task.id, {
-      status: "READY_FOR_EXECUTION",
-      executionStatus: "READY",
-      executionError: null,
+    const updated = await updateEngineeringTaskById(existing.id, {
+      status: taskDraft.status,
+      executionStatus: taskDraft.status === "READY_FOR_EXECUTION" ? "READY" : existing.executionStatus,
+      executionError: cooldownActive ? "cooldown_active_for_root_cause" : null,
       likelyFiles: taskDraft.likelyFiles,
       patchPlan: taskDraft.patchPlan,
       validationPlan: taskDraft.validationPlan,
@@ -223,8 +251,42 @@ export async function runEngineeringManagerAgent(_context?: unknown): Promise<Ag
       estimatedImpactDescription: taskDraft.estimatedImpactDescription,
       beforeMetrics: taskDraft.beforeMetrics,
       successCriteria: taskDraft.successCriteria,
-      notes: [...(upserted.task.notes ?? []), `Updated existing opportunity task (${dedupeKey})`, `expected_r_impact:${opp.expectedRImpact}`].slice(-20),
+      rootCauseKey,
+      dedupeKey,
+      cooldownUntil,
+      completionRequirements: taskDraft.completionRequirements,
+      notes: [...(existing.notes ?? []), `Updated existing opportunity task (${dedupeKey})`, `expected_r_impact:${opp.expectedRImpact}`].slice(-20),
     });
+    if (updated) {
+      opportunityTasksUpdated += 1;
+      touchedTaskIds.push(updated.id);
+    }
+  }
+
+  const refreshedForDedup = await listEngineeringTasks(200);
+  const byRoot = new Map<string, EngineeringTask[]>();
+  for (const task of refreshedForDedup) {
+    if (!["OPEN", "IN_PROGRESS", "READY_FOR_EXECUTION", "READY_FOR_PUSH", "BLOCKED"].includes(task.status)) continue;
+    const key = task.rootCauseKey ?? normalizeAgentIssueKey(task.title);
+    const arr = byRoot.get(key) ?? [];
+    arr.push(task);
+    byRoot.set(key, arr);
+  }
+
+  for (const [rootCauseKey, group] of byRoot.entries()) {
+    if (group.length <= 1) continue;
+    const canonical = group.slice().sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+    for (const dup of group) {
+      if (dup.id === canonical.id) continue;
+      suppressedDuplicateCount += 1;
+      await updateEngineeringTaskById(dup.id, {
+        status: "SUPERSEDED",
+        executionStatus: "FAILED",
+        executionError: "superseded_by_root_cause_dedupe",
+        rootCauseKey,
+        notes: [...(dup.notes ?? []), `superseded_by_root_cause_dedupe:${canonical.id}`].slice(-20),
+      });
+    }
   }
 
   const engineeringTasks = await listEngineeringTasks(200);
@@ -302,7 +364,7 @@ export async function runEngineeringManagerAgent(_context?: unknown): Promise<Ag
           : "Engineering manager backlog unchanged",
     summary:
       opportunityTasksCreated + opportunityTasksUpdated > 0
-        ? `Created ${opportunityTasksCreated} and updated ${opportunityTasksUpdated} opportunity task(s). Top opportunity: ${topOpportunity?.title ?? "n/a"} owner=${topOpportunity?.owner ?? "n/a"} expectedRImpact=${topOpportunity?.expectedRImpact ?? "unknown"}.`
+        ? `Created ${opportunityTasksCreated} and updated ${opportunityTasksUpdated} opportunity task(s). Suppressed ${suppressedDuplicateCount} duplicate root-cause task(s). Top opportunity: ${topOpportunity?.title ?? "n/a"} owner=${topOpportunity?.owner ?? "n/a"} expectedRImpact=${topOpportunity?.expectedRImpact ?? "unknown"}.`
         : newItems.length > 0
           ? `Ensured ${tasksToEnsure.length} strategic backlog items and created ${newItems.length} missing item${newItems.length === 1 ? "" : "s"}.`
           : `Strategic backlog already satisfied across ${tasksToEnsure.length} managed items.`,
@@ -314,6 +376,12 @@ export async function runEngineeringManagerAgent(_context?: unknown): Promise<Ag
       topOpportunityTitle: topOpportunity?.title ?? null,
       topOpportunityOwner: topOpportunity?.owner ?? null,
       topOpportunityExpectedRImpact: topOpportunity?.expectedRImpact ?? null,
+      rootCauseKey: selectedTopRootCauseKey,
+      dedupeKey: selectedTopDedupeKey,
+      cooldownActive: selectedTopCooldownActive,
+      cooldownUntil: selectedTopCooldownUntil,
+      suppressedDuplicateCount,
+      updatedTaskIds: touchedTaskIds,
       openExecutionReadyCount: newlyReadyCount,
       blockedTaskCount: newlyBlockedCount,
       latestExecutionTaskTitle: latestExecutionReadyTitle,
@@ -348,7 +416,7 @@ export async function runEngineeringManagerAgent(_context?: unknown): Promise<Ag
     status: "APPLIED",
     summary:
       opportunityTasksCreated + opportunityTasksUpdated > 0
-        ? `Opportunity loop: created ${opportunityTasksCreated}, updated ${opportunityTasksUpdated}; selected "${topOpportunity?.title ?? "n/a"}" owner=${topOpportunity?.owner ?? "n/a"} expectedR=${topOpportunity?.expectedRImpact ?? "unknown"}.`
+        ? `Opportunity loop: created ${opportunityTasksCreated}, updated ${opportunityTasksUpdated}, suppressedDuplicates=${suppressedDuplicateCount}; selected "${topOpportunity?.title ?? "n/a"}" owner=${topOpportunity?.owner ?? "n/a"} expectedR=${topOpportunity?.expectedRImpact ?? "unknown"}.`
         : newItems.length > 0
           ? `Created ${newItems.length} missing strategic backlog item${newItems.length === 1 ? "" : "s"}.`
           : "Existing task already covers top opportunity.",
@@ -360,6 +428,12 @@ export async function runEngineeringManagerAgent(_context?: unknown): Promise<Ag
       topOpportunityTitle: topOpportunity?.title ?? null,
       topOpportunityOwner: topOpportunity?.owner ?? null,
       topOpportunityExpectedRImpact: topOpportunity?.expectedRImpact ?? null,
+      rootCauseKey: selectedTopRootCauseKey,
+      dedupeKey: selectedTopDedupeKey,
+      cooldownActive: selectedTopCooldownActive,
+      cooldownUntil: selectedTopCooldownUntil,
+      suppressedDuplicateCount,
+      updatedTaskIds: touchedTaskIds,
       executionReadyCount: newlyReadyCount,
       blockedTaskCount: newlyBlockedCount,
       latestExecutionTaskTitle: latestExecutionReadyTitle,

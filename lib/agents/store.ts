@@ -62,6 +62,8 @@ const VALID_ENGINEERING_STATUS = new Set<EngineeringTaskStatus>([
   "DONE",
   "BLOCKED",
   "FAILED",
+  "CANCELED",
+  "SUPERSEDED",
 ]);
 const VALID_EXECUTION_STATUS = new Set<EngineeringExecutionStatus>([
   "PENDING",
@@ -851,6 +853,11 @@ export async function upsertEngineeringTask(
       patchPlan: task.patchPlan ?? current.patchPlan,
       validationPlan: task.validationPlan ?? current.validationPlan,
       commitPlan: task.commitPlan ?? current.commitPlan,
+      rootCauseKey: task.rootCauseKey ?? current.rootCauseKey,
+      dedupeKey: task.dedupeKey ?? current.dedupeKey,
+      evidenceHash: task.evidenceHash ?? current.evidenceHash,
+      cooldownUntil: task.cooldownUntil ?? current.cooldownUntil,
+      completionRequirements: task.completionRequirements ?? current.completionRequirements,
       notes: mergeNotes(current.notes, task.notes),
     });
 
@@ -866,7 +873,7 @@ export async function upsertEngineeringTask(
 
 export async function updateEngineeringTaskById(
   id: string,
-  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot" | "notes" | "backlogItemId" | "likelyFiles" | "patchPlan" | "validationPlan" | "commitPlan" | "executionStatus" | "executionError" | "commitSha" | "commitUrl" | "successCriteria" | "expectedRImpact" | "estimatedImpactDescription" | "beforeMetrics" | "afterMetrics" | "completionQuality">>,
+  updates: Partial<Pick<EngineeringTask, "status" | "remediationAttempted" | "remediationStatus" | "remediationResultSummary" | "linkedTelemetrySnapshot" | "notes" | "backlogItemId" | "likelyFiles" | "patchPlan" | "validationPlan" | "commitPlan" | "executionStatus" | "executionError" | "commitSha" | "commitUrl" | "successCriteria" | "expectedRImpact" | "estimatedImpactDescription" | "beforeMetrics" | "afterMetrics" | "completionQuality" | "rootCauseKey" | "dedupeKey" | "evidenceHash" | "cooldownUntil" | "completionRequirements">>,
 ): Promise<EngineeringTask | null> {
   const now = nowIso();
   const history = await listEngineeringTasks(HISTORY_LIMIT);

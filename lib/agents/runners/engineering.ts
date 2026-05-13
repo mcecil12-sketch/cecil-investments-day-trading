@@ -17,6 +17,8 @@ import { classifyIncident } from "@/lib/agents/incidents";
 import { buildPriorityFeed } from "@/lib/agents/opportunity-engine";
 import { getSharedTradingKpis } from "@/lib/agents/trading-kpis";
 import { nowIso } from "@/lib/agents/time";
+import { buildAgentOpportunityDedupeKey, normalizeAgentIssueKey } from "@/lib/agents/root-cause";
+import { readRootCauseExecutionState } from "@/lib/agents/task-dedup";
 import type {
   AgentBrief,
   AgentIncident,
@@ -728,6 +730,11 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
   ]);
   const criticalOpenOpportunity = (priorityFeed.priorities || []).find((p: any) => p.status === "OPEN" && p.priority === "CRITICAL") ?? null;
   const opportunityCovered = criticalOpenOpportunity ? hasCoverageForOpportunity(refreshedTasks, criticalOpenOpportunity.title) : true;
+  const selectedRootCauseKey = criticalOpenOpportunity ? normalizeAgentIssueKey(criticalOpenOpportunity.title) : null;
+  const selectedDedupeKey = selectedRootCauseKey ? buildAgentOpportunityDedupeKey(selectedRootCauseKey) : null;
+  const selectedRootState = selectedRootCauseKey ? await readRootCauseExecutionState(selectedRootCauseKey) : null;
+  const cooldownUntil = selectedRootState?.cooldownUntil ?? null;
+  const cooldownActive = !!cooldownUntil && Date.parse(cooldownUntil) > Date.now();
 
   const taskSummary = upsertCreated
     ? `Created engineering task "${buildTaskTitle(candidate!)}" for incident ${candidate!.id}.`
@@ -793,8 +800,13 @@ export async function runEngineeringAgent(): Promise<AgentRunnerResult> {
     metadata: {
       createdTaskId,
       updatedTaskId,
+      selectedTaskId: selectedTaskId,
       incidentId: candidate?.id ?? null,
       backlogTaskIds: createdBacklogTaskIds,
+      rootCauseKey: selectedRootCauseKey,
+      dedupeKey: selectedDedupeKey,
+      cooldownActive,
+      cooldownUntil,
       openExecutionReadyCount,
       blockedTaskCount,
       openBacklogCount,
