@@ -82,6 +82,9 @@ export type StoredSignal = {
   seedOutcome?: "created" | "skipped";
   seedReason?: string;
   linkedTradeId?: string | null;
+  staleDropped?: boolean;
+  staleDroppedAt?: string;
+  staleDropReason?: string;
 };
 
 const LOCAL_DATA_DIR = path.join(process.cwd(), "data");

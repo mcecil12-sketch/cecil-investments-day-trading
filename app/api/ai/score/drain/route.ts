@@ -14,6 +14,8 @@ import {
 import { evaluateSignalEligibility, getEligibilityThresholds, computePreScore } from "@/lib/ai/eligibilityGates";
 import { buildSignalContext } from "@/lib/signalContext";
 import { fetchAlpacaClock } from "@/lib/alpacaClock";
+import { getEtDateString } from "@/lib/time/etDate";
+import { enqueueHighPrioritySeedQueue } from "@/lib/autoEntry/highPrioritySeedQueue";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -1459,6 +1461,49 @@ export async function POST(req: Request) {
 
     // Write updates (atomic for all signals processed so far)
     await writeSignals(signals);
+
+    // Real-time funnel: push newly-qualified signals to high-priority seed queue.
+    // This avoids waiting for broad seed cadence when scoring finds fresh qualified setups.
+    if (isMarketOpen && qualifiedPersistedCount > 0) {
+      const etDate = getEtDateString();
+      let highPriorityQueueEnqueued = 0;
+      for (const sig of finalizedPersistedSignals) {
+        const signal = sig as any;
+        const direction =
+          String(signal?.bestDirection || signal?.direction || signal?.aiDirection || "")
+            .trim()
+            .toUpperCase();
+        const entry = Number(signal?.entryPrice);
+        const stop = Number(signal?.stopPrice);
+        const target = Number(signal?.targetPrice ?? signal?.takeProfitPrice);
+        if (signal?.status !== "SCORED" || signal?.qualified !== true) continue;
+        if (direction !== "LONG" && direction !== "SHORT") continue;
+        if (!(Number.isFinite(entry) && entry > 0 && Number.isFinite(stop) && stop > 0 && Number.isFinite(target) && target > 0)) {
+          continue;
+        }
+        const enqueue = await enqueueHighPrioritySeedQueue({
+          signalId: String(signal.id || "").trim(),
+          symbol: String(signal.ticker || "").trim().toUpperCase(),
+          scoredAt: String(signal.scoredAt || new Date().toISOString()),
+          qualifiedAt: String(signal.scoredAt || new Date().toISOString()),
+          aiScore: Number(signal.aiScore),
+          aiGrade: signal.aiGrade ? String(signal.aiGrade) : null,
+          direction,
+          entry,
+          stop,
+          target,
+          etDate,
+        });
+        if (enqueue.enqueued) highPriorityQueueEnqueued += 1;
+      }
+
+      (result.pipeline as any).highPriorityQueueEnqueued = highPriorityQueueEnqueued;
+      try {
+        await bumpTodayFunnel({ seedHighPriorityEnqueued: highPriorityQueueEnqueued });
+      } catch {
+        // Non-fatal telemetry path.
+      }
+    }
 
     // Update funnel counters if any were scored
     if (result.scored > 0) {

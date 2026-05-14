@@ -40,6 +40,12 @@ export async function GET() {
       // Phase 3c: Deduplication visibility
       uniqueCandidates: num(today.seedUniqueCandidates),
       duplicatesCollapsed: num(today.seedDuplicatesCollapsed),
+      highPriorityEnqueued: num(today.seedHighPriorityEnqueued),
+      highPriorityDequeued: num(today.seedHighPriorityDequeued),
+      staleDropped: num(today.seedStaleDropped),
+      recoverySeeded: num(today.seedRecoverySeeded),
+      realTimeSeeded: num(today.seedRealTimeSeeded),
+      immediateExecuteTriggered: num(today.seedImmediateExecuteTriggered),
       // Skip reasons
       skippedNotQualified: num(today.seedSkippedNotQualified),
       skippedOverlayGrade: num(today.seedSkippedOverlayGrade),
@@ -51,6 +57,7 @@ export async function GET() {
       skippedMissingDirection: num(today.seedSkippedMissingDirection),
       skippedMissingPrices: num(today.seedSkippedMissingPrices),
       skippedTierDisabled: num(today.seedSkippedTierDisabled),
+      skippedCapacity: num(today.seedSkippedCapacity),
       skippedOther: num(today.seedSkippedOther),
       // Derived
       totalSeeded: num(today.seedFromQualifiedLong) + num(today.seedFromQualifiedShort),

@@ -22,6 +22,10 @@ import {
   getFreshnessThresholdSource,
   type FreshnessDecision,
 } from "./freshness";
+import {
+  drainHighPrioritySeedQueue,
+  type HighPrioritySeedQueueItem,
+} from "@/lib/autoEntry/highPrioritySeedQueue";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -128,7 +132,12 @@ function mapSkipReason(raw: string): SeedSkipReason | null {
     case "poor_rr_block":
     // Real-time seeding guardrails
     case "price_drift":
-      return raw;
+    case "capacity_blocked":
+    case "near_capacity_freshness_block":
+    case "near_capacity_ctier_block":
+    case "near_capacity_recovery_block":
+    case "missing_trade_plan":
+      return raw as SeedSkipReason;
     default:
       return null;
   }
@@ -165,6 +174,25 @@ function bumpSkipReason(
   reason: SeedSkipReason
 ) {
   counts[reason] = (counts[reason] ?? 0) + 1;
+}
+
+function getFreshnessBucketMaxMs(bucket: FreshnessDecision["freshnessBucket"]): number {
+  switch (bucket) {
+    case "under10min":
+      return 10 * 60_000;
+    case "under20min":
+      return 20 * 60_000;
+    case "under45min":
+      return 45 * 60_000;
+    case "over45min":
+      return 90 * 60_000;
+    case "over90min":
+      return 180 * 60_000;
+    case "over180min":
+      return Number.POSITIVE_INFINITY;
+    default:
+      return Number.POSITIVE_INFINITY;
+  }
 }
 
 // -------------------------------------------------------------------------
@@ -377,7 +405,41 @@ type QualifiedCandidate = {
   effectiveScore: number;
   actionabilityRank: number; // 1-10 from aiScoring, higher = more actionable
   ageMs: number;
+  fromHighPriorityQueue: boolean;
+  freshnessBucket: FreshnessDecision["freshnessBucket"];
+  priorityGroup: number;
 };
+
+const SOFT_FRESH_MAX_MS = 45 * 60_000;
+const RECOVERY_MAX_SEED_AGE_MS = 90 * 60_000;
+const HARD_DROP_AGE_MS = 180 * 60_000;
+
+function freshnessBucketRank(bucket: FreshnessDecision["freshnessBucket"]): number {
+  switch (bucket) {
+    case "under10min":
+      return 0;
+    case "under20min":
+      return 1;
+    case "under45min":
+      return 2;
+    case "over45min":
+      return 3;
+    case "over90min":
+      return 4;
+    case "over180min":
+      return 5;
+    default:
+      return 9;
+  }
+}
+
+function candidatePriorityGroup(candidate: {
+  fromHighPriorityQueue: boolean;
+  freshnessBucket: FreshnessDecision["freshnessBucket"];
+}): number {
+  const base = candidate.fromHighPriorityQueue ? 0 : 10;
+  return base + freshnessBucketRank(candidate.freshnessBucket);
+}
 
 /**
  * Deduplicate candidates by symbol+side, keeping only the best per group.
@@ -402,6 +464,9 @@ function dedupeCandidates(candidates: QualifiedCandidate[]): {
   for (const [, group] of bySymbolSide) {
     // Sort by effectiveScore DESC, then createdAt DESC (newest first)
     group.sort((a, b) => {
+      if (a.priorityGroup !== b.priorityGroup) {
+        return a.priorityGroup - b.priorityGroup;
+      }
       if (b.effectiveScore !== a.effectiveScore) {
         return b.effectiveScore - a.effectiveScore;
       }
@@ -423,6 +488,7 @@ function dedupeCandidates(candidates: QualifiedCandidate[]): {
   // Final sort: tier-priority first (A > B > C), then effectiveScore, then actionabilityRank, then freshest
   const tierWeight = (tier: string) => tier === "A" ? 3 : tier === "B" ? 2 : 1;
   unique.sort((a, b) => {
+    if (a.priorityGroup !== b.priorityGroup) return a.priorityGroup - b.priorityGroup;
     const scoreDiff = b.aiScore - a.aiScore;
     if (Math.abs(scoreDiff) > 0.01) return scoreDiff;
     const tierDiff = tierWeight(b.tier) - tierWeight(a.tier);
@@ -496,7 +562,7 @@ export async function POST(req: NextRequest) {
   const today = getEtDateString();
   const { startMs: dayStartMs, endMs: dayEndMs } = getEtDayBoundsMs(today);
   const guardConfig = getGuardrailConfig();
-  const [rawSignals, trades, overlay, brokerTruth, guardState, clock, allStoredSignals, openFunnelBlockIncident] = await Promise.all([
+  const [rawSignals, trades, overlay, brokerTruth, guardState, clock, allStoredSignals, openFunnelBlockIncident, highPriorityQueueItems] = await Promise.all([
     fetchScoredSignalsFromInternalApi(),
     readTrades<any>(),
     readExecutionOverlays(),
@@ -505,7 +571,32 @@ export async function POST(req: NextRequest) {
     fetchAlpacaClockSafe(),
     readSignals(),
     findOpenIncident({ category: "FUNNEL_BLOCK", title: "Fresh qualified signals not seeded" }),
+    drainHighPrioritySeedQueue(300),
   ]);
+
+  const highPriorityBySignalId = new Map<string, { rank: number; item: HighPrioritySeedQueueItem }>();
+  for (let i = 0; i < highPriorityQueueItems.length; i++) {
+    const item = highPriorityQueueItems[i];
+    const signalId = String(item?.signalId || "").trim();
+    if (!signalId || highPriorityBySignalId.has(signalId)) continue;
+    highPriorityBySignalId.set(signalId, { rank: i, item });
+  }
+
+  const mergedRawSignalsById = new Map<string, RawSignal>();
+  for (const s of rawSignals || []) {
+    const sid = String((s as any)?.id || "").trim();
+    if (!sid) continue;
+    mergedRawSignalsById.set(sid, s);
+  }
+  if (highPriorityBySignalId.size > 0) {
+    const storedById = new Map((allStoredSignals || []).map((s: any) => [String(s?.id || "").trim(), s]));
+    for (const signalId of highPriorityBySignalId.keys()) {
+      if (mergedRawSignalsById.has(signalId)) continue;
+      const fallbackSignal = storedById.get(signalId);
+      if (fallbackSignal) mergedRawSignalsById.set(signalId, fallbackSignal as unknown as RawSignal);
+    }
+  }
+  const mergedRawSignals = Array.from(mergedRawSignalsById.values());
 
   const marketOpen = clock.ok ? Boolean(clock.is_open) : false;
   const allowAfterHoursCreate = debug;
@@ -571,23 +662,24 @@ export async function POST(req: NextRequest) {
     staleThresholdUsedMs = Math.round(legacyMinEnv * 60_000);
     freshnessMode = "legacy_env_min";
   } else if (marketOpen && isEodWindow) {
-    staleThresholdUsedMs = 75 * 60_000;
-    freshnessMode = "eod_75m";
+    staleThresholdUsedMs = 45 * 60_000;
+    freshnessMode = "eod_45m";
   } else if (marketOpen) {
-    staleThresholdUsedMs = 60 * 60_000;
-    freshnessMode = "market_default_60m";
+    staleThresholdUsedMs = 45 * 60_000;
+    freshnessMode = "market_default_45m";
   } else {
     staleThresholdUsedMs = 10 * 60_000;
     freshnessMode = "closed_default_10m";
   }
+  staleThresholdUsedMs = Math.max(60_000, Math.min(staleThresholdUsedMs, SOFT_FRESH_MAX_MS));
   const nowMs = Date.now();
 
-  const signals = (rawSignals || []).filter((s: RawSignal) => {
+  const signals = (mergedRawSignals || []).filter((s: RawSignal) => {
     const tsMs = getSignalTimestampMs(s);
     if (tsMs == null || !Number.isFinite(tsMs)) return false;
     return tsMs >= dayStartMs && tsMs < dayEndMs;
   });
-  const signalsFilteredOut = (rawSignals || []).length - signals.length;
+  const signalsFilteredOut = (mergedRawSignals || []).length - signals.length;
 
   const currentOpenPositions = brokerTruth.positionsCount ?? 0;
   const maxOpenPositions = guardConfig.maxOpenPositions;
@@ -611,6 +703,8 @@ export async function POST(req: NextRequest) {
     limitReason = remainingEntriesToday === 0 ? "entries_per_day_exhausted" : "entries_per_day";
   }
   effectiveLimit = Math.max(0, effectiveLimit);
+  const hardCapacityBlocked = remainingEntriesToday <= 0;
+  const nearCapacityMode = remainingEntriesToday <= 1;
 
   // ── Pre-seed stale trade cleanup ─────────────────────────────────────────
   // Archive stale AUTO_PENDING and error-blocked trades from previous runs that
@@ -619,7 +713,7 @@ export async function POST(req: NextRequest) {
   {
     const _maxAgeMs = Math.max(1, Number.isFinite(Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
       ? Number(process.env.AUTO_ENTRY_MAX_AGE_MIN)
-      : 30) * 60_000;
+      : 20) * 60_000;
     const _blockingReasons = new Set(["rescore_required", "invalid_trade", "rescore_failed"]);
     let _cleanedCount = 0;
     const _tradesArr = trades as any[];
@@ -707,7 +801,21 @@ export async function POST(req: NextRequest) {
   // Diagnostic counters
   let staleAllowedCount = 0;
   let staleHardBlockedCount = 0;
+  let staleDroppedCount = 0;
   let terminalBypassedCount = 0;
+  let capacityBlockedCount = 0;
+  let nearCapacityBlockedCount = 0;
+  let nearCapacityCTierBlockedCount = 0;
+  let nearCapacityRecoveryBlockedCount = 0;
+  let nearCapacityFreshnessBlockedCount = 0;
+  let staleSeedBlockedCount = 0;
+  let freshSeededCount = 0;
+  let staleSeededCount = 0;
+  const seedBlockReasonCounts: Record<string, number> = {};
+
+  const bumpSeedBlockReason = (reason: string) => {
+    seedBlockReasonCounts[reason] = (seedBlockReasonCounts[reason] ?? 0) + 1;
+  };
 
   const created: any[] = [];
   const skipped: Array<{
@@ -753,21 +861,25 @@ export async function POST(req: NextRequest) {
   });
 
   const preRecoveryFreshCount = qualifiedSignals.filter((s) => {
-    const d = evaluateSignalFreshnessDecision(s, nowMs, staleThresholdUsedMs);
+    const d = evaluateSignalFreshnessDecision(s, nowMs, staleThresholdUsedMs, {
+      maxSeedAgeMs: RECOVERY_MAX_SEED_AGE_MS,
+      hardDropAgeMs: HARD_DROP_AGE_MS,
+      recoveryMode: false,
+    });
     return d.isFresh;
   }).length;
   const preRecoveryStaleCount = Math.max(0, qualifiedSignals.length - preRecoveryFreshCount);
 
-  // ── Recovery mode: expand freshness window when no fresh qualified signals ──
-  // When capacity is available but no fresh signals exist, widen freshness threshold.
+  // Recovery mode is explicit and only enables 45-90m carryover seeding.
+  // It never permits >90m seeding.
   let recoveryModeActive = false;
-  let effectiveFreshnessMs = staleThresholdUsedMs;
-  if (preRecoveryFreshCount === 0 && preRecoveryStaleCount > 0 && effectiveLimit > 0) {
+  const recoveryModeEnabled = funnelRecoveryModeParam;
+  const effectiveFreshnessMs = staleThresholdUsedMs;
+  if (recoveryModeEnabled && preRecoveryFreshCount === 0 && preRecoveryStaleCount > 0 && effectiveLimit > 0) {
     recoveryModeActive = true;
-    effectiveFreshnessMs = staleThresholdUsedMs * 3; // expand window 3x
     console.log("[seed-from-signals] recovery_mode_activated", {
       reason: "no_fresh_qualified_signals",
-      expandedFreshnessMsTo: effectiveFreshnessMs,
+      recoveryMaxSeedAgeMs: RECOVERY_MAX_SEED_AGE_MS,
       preRecoveryStaleCount,
       effectiveLimit,
       remainingPositionSlots,
@@ -776,7 +888,11 @@ export async function POST(req: NextRequest) {
 
   const freshnessThresholdSource = getFreshnessThresholdSource(freshnessMode);
   const freshnessDecisionBySignal: FreshnessDecision[] = qualifiedSignals.map((s) =>
-    evaluateSignalFreshnessDecision(s, nowMs, effectiveFreshnessMs)
+    evaluateSignalFreshnessDecision(s, nowMs, effectiveFreshnessMs, {
+      maxSeedAgeMs: RECOVERY_MAX_SEED_AGE_MS,
+      hardDropAgeMs: HARD_DROP_AGE_MS,
+      recoveryMode: recoveryModeActive,
+    })
   );
   const freshnessDecisionMap = new Map(
     freshnessDecisionBySignal
@@ -829,7 +945,11 @@ export async function POST(req: NextRequest) {
     const createdAt = String(s?.createdAt || s?.updatedAt || nowIso);
     const freshnessDecision =
       freshnessDecisionMap.get(signalId) ??
-      evaluateSignalFreshnessDecision(s, nowMs, effectiveFreshnessMs);
+      evaluateSignalFreshnessDecision(s, nowMs, effectiveFreshnessMs, {
+        maxSeedAgeMs: RECOVERY_MAX_SEED_AGE_MS,
+        hardDropAgeMs: HARD_DROP_AGE_MS,
+        recoveryMode: recoveryModeActive,
+      });
     const ageMs = freshnessDecision.ageMs;
 
     const markSkip = (
@@ -861,16 +981,19 @@ export async function POST(req: NextRequest) {
 
     if (!signalId) {
       markSkip("missing_signal_id");
+      bumpSeedBlockReason("missing_signal_id");
       continue;
     }
 
     if (!side) {
       markSkip("missing_direction");
+      bumpSeedBlockReason("missing_direction");
       continue;
     }
 
     if (!(entryPrice != null && entryPrice > 0 && stopPrice != null && stopPrice > 0 && targetPrice != null && targetPrice > 0)) {
-      markSkip("missing_prices");
+      markSkip("missing_trade_plan");
+      bumpSeedBlockReason("missing_trade_plan");
       continue;
     }
 
@@ -893,24 +1016,82 @@ export async function POST(req: NextRequest) {
         normalizedForSide: normalizedPlan.normalizedForSide,
         invalidReason: normalizedPlan.invalidReason,
       });
+      bumpSeedBlockReason("missing_trade_plan");
+      continue;
+    }
+
+    if (hardCapacityBlocked) {
+      capacityBlockedCount++;
+      markSkip("capacity_blocked");
+      bumpSeedBlockReason("max_entries_per_day");
       continue;
     }
 
     if (effectiveMinScore > 0 && (!Number.isFinite(aiScore as number) || (aiScore as number) < effectiveMinScore)) {
       markSkip("below_threshold");
+      bumpSeedBlockReason("below_threshold");
       continue;
     }
 
-    // Single stale decision: reuse computed freshness decision for all stale handling.
-    if (!freshnessDecision.isFresh) {
+    // Stale handling policy:
+    // - <=45m: fresh
+    // - 45-90m: only if recovery mode is active
+    // - >90m: hard drop (never seed)
+    if (!freshnessDecision.isSeedEligible) {
       staleHardBlockedCount++;
+      staleDroppedCount++;
+      staleSeedBlockedCount++;
       markSkip("stale_signal");
+      bumpSeedBlockReason("stale_signal_blocked");
       continue;
+    }
+    if (!freshnessDecision.isFresh) {
+      staleAllowedCount++;
     }
 
     if (!tier) {
       markSkip("below_threshold");
+      bumpSeedBlockReason("below_threshold");
       continue;
+    }
+
+    if (nearCapacityMode) {
+      const relVol = getNum(s, ["relVol", "relativeVolume", "context.relVol", "signalContext.relVolume"]);
+      const isHighRelVol = relVol != null && relVol >= 1.5;
+      const ageMsBound = getFreshnessBucketMaxMs(freshnessDecision.freshnessBucket);
+      const isOlderThan20m = ageMsBound > 20 * 60_000;
+
+      if (recoveryModeActive && !freshnessDecision.isFresh) {
+        nearCapacityBlockedCount++;
+        nearCapacityRecoveryBlockedCount++;
+        markSkip("near_capacity_recovery_block");
+        bumpSeedBlockReason("near_capacity_recovery_block");
+        continue;
+      }
+
+      if (tier === "C") {
+        nearCapacityBlockedCount++;
+        nearCapacityCTierBlockedCount++;
+        markSkip("near_capacity_ctier_block");
+        bumpSeedBlockReason("near_capacity_ctier_block");
+        continue;
+      }
+
+      if (isOlderThan20m) {
+        nearCapacityBlockedCount++;
+        nearCapacityFreshnessBlockedCount++;
+        markSkip("near_capacity_freshness_block");
+        bumpSeedBlockReason("near_capacity_freshness_block");
+        continue;
+      }
+
+      if (freshnessDecision.freshnessBucket === "under20min" && !(tier === "A" || tier === "B" || isHighRelVol)) {
+        nearCapacityBlockedCount++;
+        nearCapacityFreshnessBlockedCount++;
+        markSkip("near_capacity_freshness_block");
+        bumpSeedBlockReason("near_capacity_freshness_block");
+        continue;
+      }
     }
 
     {
@@ -918,6 +1099,7 @@ export async function POST(req: NextRequest) {
       const _isBlockedByEffectiveOverlay = !effectiveOverlay.allowedGrades.includes(tier as "A" | "B" | "C");
       if (_isBlockedByCfgCTier || _isBlockedByEffectiveOverlay) {
         markSkip("overlay_block");
+        bumpSeedBlockReason("overlay_block");
         continue;
       }
       // Count signals rescued by the override (would have been blocked without it)
@@ -928,6 +1110,7 @@ export async function POST(req: NextRequest) {
 
     if (activeSignalIds.has(signalId)) {
       markSkip("already_active_trade");
+      bumpSeedBlockReason("already_active_trade");
       continue;
     }
     // already_terminal_trade: replaced with ticker-level cooldown.
@@ -938,6 +1121,7 @@ export async function POST(req: NextRequest) {
       const lastTermMs = terminalSymbolSideLatestMs.get(symSideKey) ?? 0;
       if (lastTermMs > 0 && nowMs - lastTermMs < TICKER_COOLDOWN_MS) {
         markSkip("already_active_trade");
+        bumpSeedBlockReason("already_active_trade");
         continue;
       }
       // Count bypassed terminal-signal blocks for diagnostics
@@ -947,11 +1131,13 @@ export async function POST(req: NextRequest) {
     }
     if (activeSymbolSide.has(`${symbol}:${side}`)) {
       markSkip("already_active_trade");
+      bumpSeedBlockReason("already_active_trade");
       continue;
     }
 
     if (!marketOpen && !allowAfterHoursCreate) {
       markSkip("market_closed");
+      bumpSeedBlockReason("market_closed");
       continue;
     }
 
@@ -961,6 +1147,7 @@ export async function POST(req: NextRequest) {
       if (!shortQuality.pass) {
         shortSkippedWeakStructure += 1;
         markSkip(shortQuality.blockReason ?? "below_threshold");
+        bumpSeedBlockReason(shortQuality.blockReason ?? "below_threshold");
         console.log("[seed-from-signals] short_rejected", {
           signalId,
           symbol,
@@ -987,6 +1174,7 @@ export async function POST(req: NextRequest) {
       if (!cGate.pass) {
         const blockReason = cGate.blockReason ?? "c_tier_quality_block";
         markSkip(blockReason);
+        bumpSeedBlockReason(blockReason);
         console.log("[seed-from-signals] c_tier_rejected", {
           signalId,
           symbol,
@@ -1015,6 +1203,7 @@ export async function POST(req: NextRequest) {
           const driftR = Math.abs(currentPrice - ep) / risk;
           if (driftR > 0.5) {
             markSkip("price_drift");
+            bumpSeedBlockReason("price_drift");
             console.log("[seed-from-signals] price_drift_rejected", {
               signalId,
               symbol,
@@ -1048,6 +1237,12 @@ export async function POST(req: NextRequest) {
       effectiveScore: (aiScore as number) - shortPenalty,
       actionabilityRank,
       ageMs,
+      fromHighPriorityQueue: highPriorityBySignalId.has(signalId),
+      freshnessBucket: freshnessDecision.freshnessBucket,
+      priorityGroup: candidatePriorityGroup({
+        fromHighPriorityQueue: highPriorityBySignalId.has(signalId),
+        freshnessBucket: freshnessDecision.freshnessBucket,
+      }),
     });
   }
 
@@ -1093,10 +1288,12 @@ export async function POST(req: NextRequest) {
   const abCandidates = uniqueCandidates.filter((c) => c.tier === "A" || c.tier === "B");
   const cCandidates = uniqueCandidates.filter((c) => c.tier === "C");
   const sortedAbCandidates = [...abCandidates].sort((a, b) => {
+    if (a.priorityGroup !== b.priorityGroup) return a.priorityGroup - b.priorityGroup;
     if (b.aiScore !== a.aiScore) return b.aiScore - a.aiScore;
     return (a.ageMs ?? Infinity) - (b.ageMs ?? Infinity); // fresher first
   });
   const sortedCCandidates = [...cCandidates].sort((a, b) => {
+    if (a.priorityGroup !== b.priorityGroup) return a.priorityGroup - b.priorityGroup;
     if (b.aiScore !== a.aiScore) return b.aiScore - a.aiScore;
     return (a.ageMs ?? Infinity) - (b.ageMs ?? Infinity);
   });
@@ -1108,6 +1305,17 @@ export async function POST(req: NextRequest) {
     ...sortedAbCandidates,
     ...sortedCCandidates,
   ].slice(0, safeLimit);
+
+  const recoverySeededCount = candidatesToSeed.filter(
+    (c) => Number.isFinite(c.ageMs) && (c.ageMs as number) > SOFT_FRESH_MAX_MS
+  ).length;
+  const realTimeSeededCount = candidatesToSeed.filter(
+    (c) => Number.isFinite(c.ageMs) && (c.ageMs as number) <= 10 * 60_000
+  ).length;
+  freshSeededCount = candidatesToSeed.filter(
+    (c) => Number.isFinite(c.ageMs) && (c.ageMs as number) <= SOFT_FRESH_MAX_MS
+  ).length;
+  staleSeededCount = Math.max(0, candidatesToSeed.length - freshSeededCount);
 
   // Track whether seeding stale signals was needed to hit our count
   const forcedSeedApplied = candidatesToSeed.some((c) =>
@@ -1222,18 +1430,56 @@ export async function POST(req: NextRequest) {
   }
 
   const seedEvaluatedAt = new Date().toISOString();
+  const staleSkippedMap = new Map<string, { ageMs: number | null }>();
+  for (const [sid, a] of attributionBySignalId.entries()) {
+    if (a.seedOutcome === "skipped" && a.seedReason === "stale_signal") {
+      staleSkippedMap.set(sid, {
+        ageMs: typeof a.ageMs === "number" && Number.isFinite(a.ageMs) ? a.ageMs : null,
+      });
+    }
+  }
   let updatedSignalsCount = 0;
   const updatedSignals: StoredSignal[] = (allStoredSignals || []).map((sig) => {
     const sid = String((sig as any)?.id || "");
     const a = attributionBySignalId.get(sid);
-    if (!a) return sig;
+    const staleSkip = staleSkippedMap.get(sid);
+    if (!a && !staleSkip) return sig;
     updatedSignalsCount += 1;
+
+    const staleDroppedPatch = staleSkip
+      ? {
+          staleDropped: true,
+          staleDroppedAt: seedEvaluatedAt,
+          staleDropReason: "over_90m",
+        }
+      : {};
+
+    const staleHardDropPatch = staleSkip && typeof staleSkip.ageMs === "number" && staleSkip.ageMs > HARD_DROP_AGE_MS
+      ? {
+          status: "ARCHIVED" as const,
+          qualified: false,
+          shownInApp: false,
+          skipReason: "stale_signal_hard_drop",
+        }
+      : {};
+
+    if (!a) {
+      return {
+        ...sig,
+        ...staleDroppedPatch,
+        ...staleHardDropPatch,
+        updatedAt: seedEvaluatedAt,
+      };
+    }
+
     return {
       ...sig,
       seedEvaluatedAt,
       seedOutcome: a.seedOutcome,
       seedReason: a.seedReason,
       linkedTradeId: a.linkedTradeId,
+      ...staleDroppedPatch,
+      ...staleHardDropPatch,
       updatedAt: seedEvaluatedAt,
     };
   });
@@ -1243,10 +1489,10 @@ export async function POST(req: NextRequest) {
 
   const duplicateSkippedCount = skippedByReason.duplicate_symbol ?? 0;
   const alreadyHasTradeSkippedCount = (skippedByReason.already_active_trade ?? 0) + (skippedByReason.already_terminal_trade ?? 0);
-  const limitReachedSkippedCount = skippedByReason.capacity_full ?? 0;
+  const limitReachedSkippedCount = (skippedByReason.capacity_full ?? 0) + (skippedByReason.capacity_blocked ?? 0);
   const belowMinScoreSkippedCount = skippedByReason.below_threshold ?? 0;
   const missingDirectionSkippedCount = skippedByReason.missing_direction ?? 0;
-  const missingPricesSkippedCount = skippedByReason.missing_prices ?? 0;
+  const missingPricesSkippedCount = (skippedByReason.missing_prices ?? 0) + (skippedByReason.missing_trade_plan ?? 0);
   const overlayGradeSkippedCount = skippedByReason.overlay_block ?? 0;
   const cTierQualityBlockCount =
     (skippedByReason.c_tier_quality_block ?? 0) +
@@ -1277,6 +1523,11 @@ export async function POST(req: NextRequest) {
     seedSkippedTierDisabled: 0,
     seedSkippedCTierQualityBlock: cTierQualityBlockCount,
     seedSkippedOther: (skippedByReason.market_closed ?? 0) + (skippedByReason.stale_signal ?? 0),
+    seedHighPriorityDequeued: highPriorityQueueItems.length,
+    seedStaleDropped: staleDroppedCount,
+    seedRecoverySeeded: recoverySeededCount,
+    seedRealTimeSeeded: realTimeSeededCount,
+    seedSkippedCapacity: capacityBlockedCount + nearCapacityBlockedCount,
   });
 
   const skippedQualifiedSignals = Array.from(attributionBySignalId.entries())
@@ -1305,6 +1556,22 @@ export async function POST(req: NextRequest) {
 
   let funnelBlockIncident: { created: boolean; incidentId: string } | null = null;
   const createdCount = dryRun ? 0 : created.length;
+  let immediateExecuteTriggeredCount = 0;
+  let immediateExecuteResult: {
+    attempted: boolean;
+    ok: boolean;
+    status: number | null;
+    executedCount: number | null;
+    executeBlockReason: string | null;
+    error: string | null;
+  } = {
+    attempted: false,
+    ok: false,
+    status: null,
+    executedCount: null,
+    executeBlockReason: null,
+    error: null,
+  };
 
   // Distinguish QUALITY_FILTERING (intentional gates) from TRUE_EXECUTION_BLOCK (system broken)
   // Only raise CRITICAL incident when ALL skips are NOT quality gates — meaning a real system issue.
@@ -1348,6 +1615,59 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  if (!dryRun && marketOpen && createdCount > 0) {
+    immediateExecuteTriggeredCount = createdCount;
+    immediateExecuteResult.attempted = true;
+    try {
+      const executeOrigin = (() => {
+        const envBase = String(process.env.NEXT_PUBLIC_BASE_URL || "").trim();
+        if (envBase) return envBase.replace(/\/$/, "");
+        try {
+          return new URL(req.url).origin;
+        } catch {
+          return "http://127.0.0.1:3000";
+        }
+      })();
+      const executeUrl = `${executeOrigin}/api/auto-entry/execute?source=seed_immediate&runId=${encodeURIComponent(runId)}`;
+      const executeHeaders: Record<string, string> = {
+        "content-type": "application/json",
+        "x-run-source": "seed_immediate_execute",
+        "x-run-id": runId,
+      };
+      if (process.env.CRON_TOKEN) executeHeaders["x-cron-token"] = String(process.env.CRON_TOKEN);
+      if (process.env.AUTO_ENTRY_TOKEN) executeHeaders["x-auto-entry-token"] = String(process.env.AUTO_ENTRY_TOKEN);
+
+      const executeResp = await fetch(executeUrl, {
+        method: "POST",
+        headers: executeHeaders,
+        body: JSON.stringify({ source: "seed_immediate", runId }),
+        cache: "no-store",
+      });
+      immediateExecuteResult.status = executeResp.status;
+      immediateExecuteResult.ok = executeResp.ok;
+      if (executeResp.ok) {
+        const payload = await executeResp.json().catch(() => ({}));
+        const executedCount = Number((payload as any)?.executedCount);
+        immediateExecuteResult.executedCount = Number.isFinite(executedCount) ? executedCount : null;
+        if ((immediateExecuteResult.executedCount ?? 0) <= 0) {
+          immediateExecuteResult.executeBlockReason =
+            String((payload as any)?.reason || "execute_blocked_or_no_auto_pending").slice(0, 200);
+        }
+      } else {
+        const errText = await executeResp.text().catch(() => "execute_call_failed");
+        immediateExecuteResult.error = errText.slice(0, 300);
+        immediateExecuteResult.executeBlockReason = "execute_http_error";
+      }
+    } catch (err) {
+      immediateExecuteResult.error = String(err || "immediate_execute_error").slice(0, 300);
+      immediateExecuteResult.executeBlockReason = "execute_exception";
+    }
+  }
+
+  if (immediateExecuteTriggeredCount > 0) {
+    await bumpTodayFunnel({ seedImmediateExecuteTriggered: immediateExecuteTriggeredCount }).catch(() => null);
+  }
+
   const telemetryPayload: SeedRunTelemetry = {
     runAt: seedEvaluatedAt,
     source: runSource,
@@ -1360,11 +1680,19 @@ export async function POST(req: NextRequest) {
     staleThresholdUsedMs,
     skippedByReason,
     skippedQualifiedSignals,
+    staleDroppedCount,
+    recoverySeededCount,
+    realTimeSeededCount,
+    immediateExecuteTriggeredCount,
+    highPriorityDequeuedCount: highPriorityQueueItems.length,
     dryRun,
     debug,
     runId,
   };
   await recordSeedRunTelemetry(today, telemetryPayload);
+
+  const topSeedBlockReason = Object.entries(seedBlockReasonCounts)
+    .sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
 
   console.log("[seed-from-signals] complete", {
     runId,
@@ -1378,7 +1706,21 @@ export async function POST(req: NextRequest) {
     staleQualifiedSignals,
     staleAllowedCount,
     staleHardBlockedCount,
+    staleDroppedCount,
+    staleSeedBlockedCount,
+    capacityBlockedCount,
+    nearCapacityBlockedCount,
+    nearCapacityCTierBlockedCount,
+    nearCapacityRecoveryBlockedCount,
+    nearCapacityFreshnessBlockedCount,
+    freshSeededCount,
+    staleSeededCount,
+    topSeedBlockReason,
     terminalBypassedCount,
+    highPriorityDequeuedCount: highPriorityQueueItems.length,
+    recoverySeededCount,
+    realTimeSeededCount,
+    immediateExecuteTriggeredCount,
     candidates: totalCandidates,
     skipReasonCounts: skippedByReason,
     effectiveLimit,
@@ -1440,15 +1782,32 @@ export async function POST(req: NextRequest) {
     blockedByTerminalTrade: false, // terminal_signal no longer hard-blocks; cooldown applies instead
     staleAllowedCount,
     staleHardBlockedCount,
+    staleDroppedCount,
+    staleSeedBlockedCount,
+    capacityBlockedCount,
+    nearCapacityBlockedCount,
+    nearCapacityCTierBlockedCount,
+    nearCapacityRecoveryBlockedCount,
+    nearCapacityFreshnessBlockedCount,
+    freshSeededCount,
+    staleSeededCount,
+    topSeedBlockReason,
     terminalBypassedCount,
+    highPriorityDequeuedCount: highPriorityQueueItems.length,
+    recoverySeededCount,
+    realTimeSeededCount,
+    immediateExecuteTriggeredCount,
+    immediateExecuteResult,
     newestQualifiedAgeMs,
     oldestQualifiedAgeMs,
     totalSignals: (signals || []).length,
     totalQualifiedSignals: qualifiedSignals.length,
     freshQualifiedSignals,
     staleQualifiedSignals,
+    seedBlockReasonCounts,
     signalsFilteredOutByEtDay: signalsFilteredOut,
     rawSignalsFromApi: (rawSignals || []).length,
+    rawSignalsAfterQueueMerge: mergedRawSignals.length,
     etDayBounds: { startMs: dayStartMs, endMs: dayEndMs },
     totalCandidates,
     uniqueCandidatesCount,

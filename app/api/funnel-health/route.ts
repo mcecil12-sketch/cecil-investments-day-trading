@@ -69,9 +69,12 @@ type FunnelHealthResponse = {
   qualifiedButNotSeeded?: number;
   freshQualifiedSignals?: number;
   staleQualifiedSignals?: number;
+  freshSignalPct?: number | null;
+  staleSignalPct?: number | null;
   qualifiedToSeedLatencyMaxMs?: number | null;
   qualifiedToSeedLatencyAvgMs?: number | null;
   medianQualifiedToSeedLatencyMs?: number | null;
+  p95QualifiedToSeedLatencyMs?: number | null;
   seedFreshnessBuckets?: {
     under10min: number;
     under20min: number;
@@ -81,6 +84,15 @@ type FunnelHealthResponse = {
     over180min: number;
   };
   staleDropCount?: number;
+  capacityBlockedCount?: number;
+  staleSeedBlockedCount?: number;
+  freshSeededCount?: number;
+  staleSeededCount?: number;
+  pendingStaleArchivedCount?: number;
+  topSeedBlockReason?: string | null;
+  recoverySeededCount?: number;
+  realTimeSeededCount?: number;
+  immediateExecuteTriggeredCount?: number;
   executionRejectReasons?: Record<string, number>;
   seedSlaBreached?: boolean;
   seedSlaBreachSignals?: Array<{
@@ -92,6 +104,7 @@ type FunnelHealthResponse = {
     staleThresholdUsedMs: number;
   }>;
   seedSkipReasonBreakdown?: Record<string, number>;
+  noFreshSeedExplanation?: string | null;
   lastSeedRunAt?: string | null;
   lastSeedRunSource?: string | null;
   lastSeedRunId?: string | null;
@@ -582,6 +595,12 @@ export async function GET() {
         ? Math.round((sorted[mid - 1] + sorted[mid]) / 2)
         : sorted[mid];
     })();
+    const p95QualifiedToSeedLatencyMs = (() => {
+      if (qualifiedToSeedLatencyValuesMs.length === 0) return null;
+      const sorted = [...qualifiedToSeedLatencyValuesMs].sort((a, b) => a - b);
+      const idx = Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1);
+      return sorted[idx];
+    })();
     const seedFreshnessBuckets = (() => {
       const buckets = { under10min: 0, under20min: 0, under45min: 0, over45min: 0, over90min: 0, over180min: 0 };
       for (const ms of qualifiedToSeedLatencyValuesMs) {
@@ -748,6 +767,8 @@ export async function GET() {
     const signalToQualified = safePercent(qualified, signalsReceived);
     const qualifiedToSeeded = safePercent(seeded, qualified);
     const seededToExecuted = safePercent(executed, seeded);
+    const freshSignalPct = safePercent(freshQualifiedSignals, qualified);
+    const staleSignalPct = safePercent(staleQualifiedSignals, qualified);
     const qualifiedButNotSeeded = qualifiedSignalsToday.filter((s: any) => s?.seedOutcome !== "created").length;
 
     const seedSkipReasonBreakdown: Record<string, number> = {};
@@ -757,6 +778,20 @@ export async function GET() {
         seedSkipReasonBreakdown[reason] = count;
       }
     }
+    const capacityBlockedCount =
+      (seedSkipReasonBreakdown["capacity_blocked"] ?? 0) +
+      (seedSkipReasonBreakdown["capacity_full"] ?? 0) +
+      (seedSkipReasonBreakdown["near_capacity_freshness_block"] ?? 0) +
+      (seedSkipReasonBreakdown["near_capacity_ctier_block"] ?? 0) +
+      (seedSkipReasonBreakdown["near_capacity_recovery_block"] ?? 0);
+    const staleSeedBlockedCount =
+      (seedSkipReasonBreakdown["stale_signal"] ?? 0) +
+      Number(lastSeedRun?.staleDroppedCount ?? 0);
+    const freshSeededCount = Number(lastSeedRun?.realTimeSeededCount ?? 0);
+    const staleSeededCount = Number(lastSeedRun?.recoverySeededCount ?? 0);
+    const pendingStaleArchivedCount = num(funnelData.executeStaleArchived);
+    const topSeedBlockReason = Object.entries(seedSkipReasonBreakdown)
+      .sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
 
     // -------------------------------------------------------------------------
     // Protection Integrity Audit
@@ -1024,15 +1059,44 @@ export async function GET() {
       qualifiedButNotSeeded,
       freshQualifiedSignals,
       staleQualifiedSignals,
+      freshSignalPct,
+      staleSignalPct,
       qualifiedToSeedLatencyMaxMs,
       qualifiedToSeedLatencyAvgMs,
       medianQualifiedToSeedLatencyMs,
+      p95QualifiedToSeedLatencyMs,
       seedFreshnessBuckets,
-      staleDropCount: staleExpiredCount + (executeSkipReasonBreakdown["SKIPPED_STALE"] ?? 0),
+      staleDropCount:
+        Number(lastSeedRun?.staleDroppedCount ?? 0) +
+        staleExpiredCount +
+        (executeSkipReasonBreakdown["SKIPPED_STALE"] ?? 0),
+      capacityBlockedCount,
+      staleSeedBlockedCount,
+      freshSeededCount,
+      staleSeededCount,
+      pendingStaleArchivedCount,
+      topSeedBlockReason,
+      recoverySeededCount: Number(lastSeedRun?.recoverySeededCount ?? 0),
+      realTimeSeededCount: Number(lastSeedRun?.realTimeSeededCount ?? 0),
+      immediateExecuteTriggeredCount: Number(lastSeedRun?.immediateExecuteTriggeredCount ?? 0),
       ...(Object.keys(executeSkipReasonBreakdown).length > 0 ? { executionRejectReasons: executeSkipReasonBreakdown } : {}),
       seedSlaBreached,
       seedSlaBreachSignals: seedSlaBreachSignals.slice(0, 50),
       ...(Object.keys(seedSkipReasonBreakdown).length > 0 ? { seedSkipReasonBreakdown } : {}),
+      noFreshSeedExplanation:
+        freshSeededCount > 0
+          ? null
+          : freshQualifiedSignals === 0
+            ? "no_fresh_qualified"
+            : remainingEntriesToday <= 0
+              ? "max_entries_per_day"
+              : (seedSkipReasonBreakdown["near_capacity_ctier_block"] ?? 0) > 0
+                ? "near_capacity_c_tier_blocked"
+                : (seedSkipReasonBreakdown["stale_signal"] ?? 0) > 0
+                  ? "stale_signal_blocked"
+                  : (seedSkipReasonBreakdown["missing_trade_plan"] ?? 0) > 0
+                    ? "missing_trade_plan"
+                    : topSeedBlockReason,
       lastSeedRunAt: lastSeedRun?.runAt ?? null,
       lastSeedRunSource: lastSeedRun?.source ?? null,
       lastSeedRunId: lastSeedRun?.runId ?? null,

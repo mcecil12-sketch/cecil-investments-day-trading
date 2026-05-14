@@ -1052,7 +1052,7 @@ export async function POST(req: Request) {
   const nowForPending = nowIso();
   const maxAgeMin = Number.isFinite(Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
     ? Math.max(1, Number(process.env.AUTO_ENTRY_MAX_AGE_MIN))
-    : 30;
+    : 20;
   // AUTO_ENTRY_MAX_PENDING_AGE_MS: shorter market-hours stale threshold (default 3 min).
   // When market is open, the effective age cap is the minimum of both thresholds.
   const maxPendingAgeMs = Number.isFinite(Number(process.env.AUTO_ENTRY_MAX_PENDING_AGE_MS))

@@ -23,7 +23,12 @@ export type SeedSkipReason =
   | "vwap_alignment_block"
   | "poor_rr_block"
   // Real-time seeding guardrails
-  | "price_drift";
+  | "price_drift"
+  | "capacity_blocked"
+  | "near_capacity_freshness_block"
+  | "near_capacity_ctier_block"
+  | "near_capacity_recovery_block"
+  | "missing_trade_plan";
 
 export type SeedSignalSkip = {
   signalId: string;
@@ -44,6 +49,11 @@ export type SeedRunTelemetry = {
   staleThresholdUsedMs?: number;
   skippedByReason: Partial<Record<SeedSkipReason, number>>;
   skippedQualifiedSignals: SeedSignalSkip[];
+  staleDroppedCount?: number;
+  recoverySeededCount?: number;
+  realTimeSeededCount?: number;
+  immediateExecuteTriggeredCount?: number;
+  highPriorityDequeuedCount?: number;
   dryRun?: boolean;
   debug?: boolean;
   runId?: string;
@@ -126,6 +136,11 @@ export async function recordSeedRunTelemetry(etDate: string, run: SeedRunTelemet
       totalCandidates: run.totalCandidates,
       createdCount: run.createdCount,
       staleThresholdUsedMs: run.staleThresholdUsedMs ?? 0,
+      staleDroppedCount: run.staleDroppedCount ?? 0,
+      recoverySeededCount: run.recoverySeededCount ?? 0,
+      realTimeSeededCount: run.realTimeSeededCount ?? 0,
+      immediateExecuteTriggeredCount: run.immediateExecuteTriggeredCount ?? 0,
+      highPriorityDequeuedCount: run.highPriorityDequeuedCount ?? 0,
       updatedAt: now,
       skippedByReason: JSON.stringify(run.skippedByReason || {}),
       skippedQualifiedSignalsCount: Array.isArray(run.skippedQualifiedSignals) ? run.skippedQualifiedSignals.length : 0,
