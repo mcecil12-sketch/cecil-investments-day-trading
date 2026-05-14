@@ -104,7 +104,13 @@ type FunnelHealthResponse = {
     staleThresholdUsedMs: number;
   }>;
   seedSkipReasonBreakdown?: Record<string, number>;
+  /** Alias for seedSkipReasonBreakdown — same data, agent-facing name */
+  seedBlockReasons?: Record<string, number>;
   noFreshSeedExplanation?: string | null;
+  /** When seeded >> qualified, explains attribution: recovery seeds, carryover, legacy */
+  seededInflationExplanation?: string | null;
+  carryoverSeededCount?: number;
+  immediateExecuteSucceededCount?: number;
   lastSeedRunAt?: string | null;
   lastSeedRunSource?: string | null;
   lastSeedRunId?: string | null;
@@ -793,6 +799,18 @@ export async function GET() {
     const topSeedBlockReason = Object.entries(seedSkipReasonBreakdown)
       .sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
 
+    // Carryover: seeds that came from previous sessions / recovery passes not captured in last run
+    const carryoverSeededCount = Math.max(0, seeded - freshSeededCount - staleSeededCount);
+    // Immediate execute succeeded: executedCount > 0 from last seed run's immediate execute
+    const immediateExecuteSucceededCount = Number(
+      (lastSeedRun as any)?.immediateExecuteSucceededCount ?? 0
+    );
+    // When seeded is heavily inflated vs qualified (>2x), surface an explanation
+    const seededInflationExplanation: string | null =
+      seeded > 0 && qualified > 0 && seeded > qualified * 2
+        ? `seeded(${seeded}) > qualified(${qualified}): realTimeSeed=${freshSeededCount} recoverySeed=${staleSeededCount} carryover/legacy=${carryoverSeededCount}. This is expected if seeds span multiple scoring sessions.`
+        : null;
+
     // -------------------------------------------------------------------------
     // Protection Integrity Audit
     // -------------------------------------------------------------------------
@@ -1079,10 +1097,13 @@ export async function GET() {
       recoverySeededCount: Number(lastSeedRun?.recoverySeededCount ?? 0),
       realTimeSeededCount: Number(lastSeedRun?.realTimeSeededCount ?? 0),
       immediateExecuteTriggeredCount: Number(lastSeedRun?.immediateExecuteTriggeredCount ?? 0),
+      immediateExecuteSucceededCount,
+      carryoverSeededCount,
+      ...(seededInflationExplanation ? { seededInflationExplanation } : {}),
       ...(Object.keys(executeSkipReasonBreakdown).length > 0 ? { executionRejectReasons: executeSkipReasonBreakdown } : {}),
       seedSlaBreached,
       seedSlaBreachSignals: seedSlaBreachSignals.slice(0, 50),
-      ...(Object.keys(seedSkipReasonBreakdown).length > 0 ? { seedSkipReasonBreakdown } : {}),
+      ...(Object.keys(seedSkipReasonBreakdown).length > 0 ? { seedSkipReasonBreakdown, seedBlockReasons: seedSkipReasonBreakdown } : {}),
       noFreshSeedExplanation:
         freshSeededCount > 0
           ? null

@@ -18,9 +18,12 @@ function parseTimestampMs(raw: unknown): number | null {
 }
 
 function getSignalTimestampMs(signal: RawSignal): number | null {
+  // Prefer scoredAt: a signal may have been created much earlier but only
+  // recently became actionable when scoring qualified it.  Using scoredAt
+  // prevents fresh setups from appearing stale in the freshness gate.
   return (
-    parseTimestampMs(signal?.createdAt) ??
     parseTimestampMs(signal?.scoredAt) ??
+    parseTimestampMs(signal?.createdAt) ??
     parseTimestampMs(signal?.updatedAt)
   );
 }

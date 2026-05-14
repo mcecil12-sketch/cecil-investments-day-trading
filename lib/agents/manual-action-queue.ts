@@ -64,6 +64,19 @@ export interface ManualActionTask {
   dedupeKey?: string;
   evidenceHash?: string;
   cooldownUntil?: string | null;
+  // ─── Agent Performance Ownership ──────────────────────────────────────
+  /** The specific KPI metric this task is responsible for improving */
+  ownedMetric?: string;
+  /** Value of ownedMetric at task creation (null if unknown) */
+  beforeValue?: number | null;
+  /** Most recent measured value of ownedMetric */
+  currentValue?: number | null;
+  /** Target value for ownedMetric that defines task success */
+  targetValue?: number;
+  /** currentValue - beforeValue; positive = improvement toward goal */
+  performanceDelta?: number | null;
+  /** Concrete next step if this task completes without metric improvement */
+  nextAction?: string;
 }
 
 export type ManualActionTaskInput = Pick<
@@ -84,6 +97,12 @@ export type ManualActionTaskInput = Pick<
       | "dedupeKey"
       | "evidenceHash"
       | "cooldownUntil"
+      | "ownedMetric"
+      | "beforeValue"
+      | "currentValue"
+      | "targetValue"
+      | "performanceDelta"
+      | "nextAction"
     >
   >;
 

@@ -149,6 +149,18 @@ export interface AgentAction {
   status: AgentActionStatus;
   summary: string;
   metadata?: Record<string, unknown>;
+  /** The specific KPI metric this action is responsible for improving */
+  ownedMetric?: string;
+  /** Value of ownedMetric before this action was applied (null if unknown) */
+  beforeValue?: number | null;
+  /** Most recent measured value of ownedMetric */
+  currentValue?: number | null;
+  /** Target value for ownedMetric that defines success */
+  targetValue?: number;
+  /** currentValue - beforeValue; positive = improvement */
+  performanceDelta?: number | null;
+  /** Concrete next step the agent or operator should take */
+  nextAction?: string;
 }
 
 export interface EngineeringTask {

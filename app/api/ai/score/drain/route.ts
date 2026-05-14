@@ -1503,6 +1503,53 @@ export async function POST(req: Request) {
       } catch {
         // Non-fatal telemetry path.
       }
+
+      // Part 1 — Real-time seed trigger: immediately invoke seed-from-signals so fresh
+      // qualified signals are seeded and executed without waiting for the next cron cycle.
+      // We fire this synchronously but cap it at 8 s so drain response is never held long.
+      if (highPriorityQueueEnqueued > 0) {
+        try {
+          const seedOrigin = (() => {
+            const envBase = String(process.env.NEXT_PUBLIC_BASE_URL || "").trim();
+            if (envBase) return envBase.replace(/\/$/, "");
+            try { return new URL(req.url).origin; } catch { return "http://127.0.0.1:3000"; }
+          })();
+          const drainRunId = `drain_rt_${Date.now()}`;
+          const seedUrl = `${seedOrigin}/api/auto-entry/seed-from-signals?source=drain_immediate_rt&runId=${encodeURIComponent(drainRunId)}`;
+          const seedHeaders: Record<string, string> = {
+            "content-type": "application/json",
+            "x-run-source": "drain_immediate_rt",
+            "x-run-id": drainRunId,
+          };
+          if (process.env.CRON_TOKEN) seedHeaders["x-cron-token"] = String(process.env.CRON_TOKEN);
+          if (process.env.AUTO_ENTRY_TOKEN) seedHeaders["x-auto-entry-token"] = String(process.env.AUTO_ENTRY_TOKEN);
+          const abortCtrl = new AbortController();
+          const abortTimer = setTimeout(() => abortCtrl.abort(), 8_000);
+          try {
+            const seedResp = await fetch(seedUrl, {
+              method: "POST",
+              headers: seedHeaders,
+              body: JSON.stringify({ source: "drain_immediate_rt", highPriorityEnqueued: highPriorityQueueEnqueued }),
+              cache: "no-store",
+              signal: abortCtrl.signal,
+            });
+            clearTimeout(abortTimer);
+            const seedPayload: any = await seedResp.json().catch(() => ({}));
+            (result.pipeline as any).drainImmediateSeedTriggered = true;
+            (result.pipeline as any).drainImmediateSeedCreated = seedPayload?.createdCount ?? 0;
+            (result.pipeline as any).drainImmediateSeedExecuted =
+              seedPayload?.immediateExecuteResult?.executedCount ?? 0;
+            (result.pipeline as any).drainImmediateSeedStatus = seedResp.status;
+          } catch (seedErr: any) {
+            clearTimeout(abortTimer);
+            (result.pipeline as any).drainImmediateSeedTriggered = false;
+            (result.pipeline as any).drainImmediateSeedError =
+              seedErr?.name === "AbortError" ? "timeout_8s" : String(seedErr || "error").slice(0, 100);
+          }
+        } catch {
+          (result.pipeline as any).drainImmediateSeedTriggered = false;
+        }
+      }
     }
 
     // Update funnel counters if any were scored

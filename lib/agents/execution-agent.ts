@@ -266,6 +266,13 @@ export async function createIncidentTasks(
         source: "execution_agent",
         objective: "Investigate and remediate execution funnel degradation",
         executionReady: true,
+        // ─── Performance ownership ────────────────────────────────────
+        ownedMetric: incident.metric,
+        beforeValue: null,
+        currentValue: incident.currentValue,
+        targetValue: incident.threshold,
+        performanceDelta: null,
+        nextAction: `Review ${incident.category} in funnel-health and seed-from-signals logs. Fix root cause and verify ${incident.metric} improves toward ${incident.threshold}.`,
       });
 
       if (task?.id) {
