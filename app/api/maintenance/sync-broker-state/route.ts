@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { alpacaRequest } from "@/lib/alpaca";
+import { alpacaRequest, getOrder, extractBracketLegs } from "@/lib/alpaca";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
 import { redis } from "@/lib/redis";
 import { nowETDate } from "@/lib/performance/time";
@@ -176,9 +176,35 @@ export async function POST(req: NextRequest) {
         t.protectionIssue = null;
         t.protectionVerifiedAt = nowIso;
       } else {
-        t.stopOrderId = null;
-        t.protectionStatus = "MISSING_STOP";
-        t.protectionIssue = "missing_active_broker_stop";
+        // Flat open-orders list didn't find a stop — re-fetch the parent bracket order
+        // with nested=true to check for bracket child legs in "held" state.
+        const parentOrderId: string | null = t?.alpacaOrderId ?? t?.brokerOrderId ?? null;
+        let bracketStopFound = false;
+        if (parentOrderId) {
+          try {
+            const parentOrder = await getOrder(parentOrderId);
+            const bracketExtraction = extractBracketLegs(parentOrder);
+            if (bracketExtraction.stopOrderId) {
+              bracketStopFound = true;
+              t.stopOrderId = bracketExtraction.stopOrderId;
+              t.takeProfitOrderId = bracketExtraction.takeProfitOrderId ?? t.takeProfitOrderId ?? null;
+              t.protectionStatus = "PROTECTION_PENDING_VERIFICATION";
+              t.protectionIssue = null;
+              t.bracketLegsDetected = true;
+              t.bracketStopOrderId = bracketExtraction.stopOrderId;
+              t.bracketTakeProfitOrderId = bracketExtraction.takeProfitOrderId ?? null;
+              t.bracketStopStatus = bracketExtraction.stopStatus ?? null;
+              t.bracketTakeProfitStatus = bracketExtraction.takeProfitStatus ?? null;
+            }
+          } catch {
+            // non-fatal — fall through to MISSING_STOP
+          }
+        }
+        if (!bracketStopFound) {
+          t.stopOrderId = null;
+          t.protectionStatus = "MISSING_STOP";
+          t.protectionIssue = "missing_active_broker_stop";
+        }
       }
       t.alpacaStatus = "filled";
       t.updatedAt = nowIso;
@@ -311,10 +337,35 @@ export async function POST(req: NextRequest) {
             changed = true;
           }
         } else if (t.stopOrderId) {
-          t.stopOrderId = null;
-          t.protectionStatus = "MISSING_STOP";
-          t.protectionIssue = "tracked_stop_not_active_at_broker";
-          changed = true;
+          // Flat orders list didn't find the stop — re-check bracket via nested fetch
+          const parentOrderId2: string | null = t?.alpacaOrderId ?? t?.brokerOrderId ?? null;
+          let bracketStopFound2 = false;
+          if (parentOrderId2) {
+            try {
+              const parentOrder2 = await getOrder(parentOrderId2);
+              const bracketExtraction2 = extractBracketLegs(parentOrder2);
+              if (bracketExtraction2.stopOrderId) {
+                bracketStopFound2 = true;
+                if (String(t.stopOrderId || "") !== bracketExtraction2.stopOrderId) {
+                  t.stopOrderId = bracketExtraction2.stopOrderId;
+                  changed = true;
+                }
+                if (t.protectionStatus !== "VERIFIED" && t.protectionStatus !== "PROTECTION_PENDING_VERIFICATION") {
+                  t.protectionStatus = "PROTECTION_PENDING_VERIFICATION";
+                  t.protectionIssue = null;
+                  changed = true;
+                }
+              }
+            } catch {
+              // non-fatal
+            }
+          }
+          if (!bracketStopFound2) {
+            t.stopOrderId = null;
+            t.protectionStatus = "MISSING_STOP";
+            t.protectionIssue = "tracked_stop_not_active_at_broker";
+            changed = true;
+          }
         }
       }
     }

@@ -413,6 +413,56 @@ export async function getOrder(orderId: string): Promise<AlpacaOrder> {
   return res.json();
 }
 
+export type BracketLegExtraction = {
+  stopLeg: AlpacaOrder | null;
+  takeProfitLeg: AlpacaOrder | null;
+  stopOrderId: string | null;
+  takeProfitOrderId: string | null;
+  stopStatus: string | null;
+  takeProfitStatus: string | null;
+  legsFound: number;
+};
+
+/**
+ * Classify bracket child legs from a nested order response.
+ * Uses order_type + stop_price/limit_price fields, not array position, to identify legs.
+ * Only the first matching leg of each type is returned.
+ */
+export function extractBracketLegs(order: AlpacaOrder): BracketLegExtraction {
+  const legs: any[] = Array.isArray((order as any)?.legs) ? (order as any).legs : [];
+  const entrySide = String((order as any)?.side || "").toLowerCase();
+  const exitSide = entrySide === "buy" ? "sell" : entrySide === "sell" ? "buy" : "";
+  let stopLeg: any = null;
+  let takeProfitLeg: any = null;
+
+  for (const leg of legs) {
+    if (!leg || !leg.id) continue;
+    const legType = String(leg?.order_type ?? leg?.type ?? "").toLowerCase();
+    const legSide = String(leg?.side ?? "").toLowerCase();
+    // For bracket orders, exit legs are opposite side to entry
+    const sideMatch = !exitSide || legSide === exitSide;
+    if (!sideMatch) continue;
+
+    if ((legType === "stop" || legType === "stop_limit") && leg.stop_price != null) {
+      if (!stopLeg) stopLeg = leg;
+      continue;
+    }
+    if ((legType === "limit" || legType === "take_profit") && leg.limit_price != null) {
+      if (!takeProfitLeg) takeProfitLeg = leg;
+    }
+  }
+
+  return {
+    stopLeg: stopLeg ?? null,
+    takeProfitLeg: takeProfitLeg ?? null,
+    stopOrderId: stopLeg?.id ?? null,
+    takeProfitOrderId: takeProfitLeg?.id ?? null,
+    stopStatus: stopLeg ? (String(stopLeg?.status ?? "") || null) : null,
+    takeProfitStatus: takeProfitLeg ? (String(takeProfitLeg?.status ?? "") || null) : null,
+    legsFound: legs.length,
+  };
+}
+
 export async function replaceOrder(
   orderId: string,
   body: Record<string, any>

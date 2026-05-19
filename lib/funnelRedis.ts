@@ -127,6 +127,17 @@ const NUMERIC_COUNTERS = [
   // Context completeness tracking (Signal Context Completeness Enhancement)
   "scoredWithCompleteContext",
   "scoredWithIncompleteContext",
+  // Bracket order stop-leg telemetry (P0 execution-integrity fix)
+  "bracketSubmittedCount",
+  "bracketLegsDetectedCount",
+  "bracketStopLegDetectedCount",
+  "bracketStopLegMissingCount",
+  "bracketTakeProfitLegDetectedCount",
+  "bracketLegsCanceledCount",
+  "protectionGraceActiveCount",
+  "falseProtectionFlattenPreventedCount",
+  "standaloneStopRepairSucceededCount",
+  "flattenAfterRepairFailedCount",
 ] as const;
 
 type NumericCounterKey = (typeof NUMERIC_COUNTERS)[number];

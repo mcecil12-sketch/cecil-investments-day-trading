@@ -1,5 +1,7 @@
 export type ProtectionStatus =
   | "VERIFIED"
+  /** Bracket stop leg detected and registered; awaiting parent order fill to activate. */
+  | "PROTECTION_PENDING_VERIFICATION"
   | "MISSING_STOP"
   | "STOP_EXPIRED"
   | "STOP_CANCELED"

@@ -80,7 +80,7 @@ function rankWeakestTrade(trades: any[]) {
     return (a.openedAt || 0) - (b.openedAt || 0);
   })[0];
 }
-import { alpacaRequest, createOrder } from "@/lib/alpaca";
+import { alpacaRequest, createOrder, getOrder, extractBracketLegs } from "@/lib/alpaca";
 import { redis, saveCriticalTask } from "@/lib/redis";
 import { recordAutoEntryTelemetry } from "@/lib/autoEntry/telemetry";
 import { requireAuth } from "@/lib/auth";
@@ -3206,18 +3206,69 @@ export async function POST(req: Request) {
       continue;
     }
 
-    const legs = Array.isArray((order as any)?.legs) ? (order as any).legs : [];
-    const stopChild = (order as any)?.stop_loss ?? legs.find((l: any) => String(l?.type || "").toLowerCase().includes("stop"));
-    const takeProfitChild = (order as any)?.take_profit ?? legs.find((l: any) => String(l?.type || "").toLowerCase().includes("limit"));
-    const stopOrderId = stopChild?.id ?? null;
-    const takeProfitOrderId = takeProfitChild?.id ?? null;
+    // ─── RE-FETCH BRACKET ORDER (nested=true) ──────────────────────────────────
+    // The initial createOrder response's stop_loss/take_profit fields are REQUEST
+    // parameters with no `id`. Actual child leg order IDs live in order.legs[],
+    // which only populates on a nested=true re-fetch.
+    let nestedOrder: any = order;
+    try {
+      const nestedFetch = await getOrder(order.id);
+      if (nestedFetch?.id) nestedOrder = nestedFetch;
+    } catch (nestedErr: any) {
+      console.warn("[auto-entry] nested order re-fetch failed (non-fatal)", {
+        ticker, tradeId, error: String(nestedErr?.message ?? nestedErr),
+      });
+    }
+    const bracketExtraction = extractBracketLegs(nestedOrder);
+    const bracketLegsDetected = bracketExtraction.legsFound > 0;
+    const bracketStopOrderId = bracketExtraction.stopOrderId;
+    const bracketTakeProfitOrderId = bracketExtraction.takeProfitOrderId;
+    const stopOrderId = bracketStopOrderId;
+    const takeProfitOrderId = bracketTakeProfitOrderId;
+    const bracketLegDiagnostics = {
+      legsFound: bracketExtraction.legsFound,
+      stopLegFound: bracketExtraction.stopLeg != null,
+      takeProfitLegFound: bracketExtraction.takeProfitLeg != null,
+      stopLegId: bracketStopOrderId,
+      takeProfitLegId: bracketTakeProfitOrderId,
+      stopLegStatus: bracketExtraction.stopStatus,
+      takeProfitLegStatus: bracketExtraction.takeProfitStatus,
+      rawLegs: ((nestedOrder as any)?.legs ?? []).map((l: any) => ({
+        id: l?.id, type: l?.order_type ?? l?.type,
+        side: l?.side, status: l?.status,
+        stop_price: l?.stop_price, limit_price: l?.limit_price,
+      })),
+    };
+    await bumpAutoEntryFunnelSafe({ bracketSubmittedCount: 1 } as any);
+    if (bracketLegsDetected) await bumpAutoEntryFunnelSafe({ bracketLegsDetectedCount: 1 } as any);
+    if (bracketStopOrderId) await bumpAutoEntryFunnelSafe({ bracketStopLegDetectedCount: 1 } as any);
+    else await bumpAutoEntryFunnelSafe({ bracketStopLegMissingCount: 1 } as any);
+    if (bracketTakeProfitOrderId) await bumpAutoEntryFunnelSafe({ bracketTakeProfitLegDetectedCount: 1 } as any);
+
+    // ─── BRACKET STOP ASSESSMENT ──────────────────────────────────────────────
+    // "held" = bracket child leg waiting for parent order to fill (stop IS registered).
+    // Do NOT trigger emergency recovery for legs in held/new/accepted state.
+    const BRACKET_PENDING_STATUSES = new Set(["new", "accepted", "held", "pending_new", "accepted_for_bidding"]);
+    const stopLegIsActiveOrPending = bracketStopOrderId != null &&
+      (bracketExtraction.stopStatus == null ||
+       bracketExtraction.stopStatus === "" ||
+       BRACKET_PENDING_STATUSES.has(bracketExtraction.stopStatus));
 
     // ─── STRICT STOP VERIFICATION ─────────────────────────────────────
     // Do NOT mark trade OPEN unless stop is verified active at broker
     let stopVerified = false;
     let verifiedStopOrderId = stopOrderId;
-    
-    if (stopOrderId) {
+    let stopPendingVerification = false;
+
+    if (stopLegIsActiveOrPending) {
+      // ── BRACKET STOP LEG FOUND: protected, pending activation on parent fill ──
+      stopVerified = true;
+      stopPendingVerification = true;
+      verifiedStopOrderId = bracketStopOrderId;
+      console.log("[auto-entry] bracket stop leg detected — protection pending verification", {
+        ticker, tradeId, bracketStopOrderId, stopStatus: bracketExtraction.stopStatus,
+      });
+    } else if (stopOrderId) {
       // Verify the stop leg is active (not just submitted)
       const stopVerify = await verifyStopOrderDirect(stopOrderId);
       stopVerified = stopVerify.active;
@@ -3294,12 +3345,13 @@ export async function POST(req: Request) {
         }
       }
     } else {
-      // No stop order ID in bracket response - attempt recovery
-      console.error("[auto-entry] NO STOP ORDER ID in bracket response - attempting recovery", {
+      // No stop leg found in bracket response - attempt recovery
+      console.error("[auto-entry] NO STOP LEG in bracket response - attempting recovery", {
         ticker,
         tradeId,
         orderId: order.id,
         orderClass: (order as any).order_class,
+        bracketLegDiagnostics,
       });
       
       const recoveryResult = await recoverUnprotectedTrade({
@@ -3403,9 +3455,15 @@ export async function POST(req: Request) {
       alpacaStatus: (order as any).status,
       stopOrderId: verifiedStopOrderId,
       takeProfitOrderId,
-      protectionStatus: "VERIFIED",
-      protectionVerifiedAt: startedAt,
+      protectionStatus: stopPendingVerification ? "PROTECTION_PENDING_VERIFICATION" : "VERIFIED",
+      protectionVerifiedAt: stopPendingVerification ? undefined : startedAt,
       lastStopAppliedAt: startedAt,
+      bracketLegsDetected,
+      bracketStopOrderId: bracketStopOrderId ?? null,
+      bracketTakeProfitOrderId: bracketTakeProfitOrderId ?? null,
+      bracketStopStatus: bracketExtraction.stopStatus ?? null,
+      bracketTakeProfitStatus: bracketExtraction.takeProfitStatus ?? null,
+      bracketLegDiagnostics,
       error: undefined,
       updatedAt: startedAt,
       executedAt: startedAt,

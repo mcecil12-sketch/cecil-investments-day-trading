@@ -234,15 +234,25 @@ export function auditProtectionIntegrity(opts: {
 
     if (!protNow.isCurrentlyProtected && brokerQty > 0) {
       const trackedId = trade.stopOrderId;
-      tradeIncidents.push({
-        code: "MISSING_STOP",
-        severity: "CRITICAL",
-        tradeId: trade.id,
-        symbol,
-        detail: trackedId
-          ? `No active protective stop; tracked stopOrderId=${trackedId} not in open orders`
-          : "No active protective stop and no tracked stop order ID",
-      });
+
+      // Grace window: if trade has bracket pending verification and was opened within 90s,
+      // do not raise MISSING_STOP — the stop is registered but not yet activated.
+      const isPendingVerification = trade.protectionStatus === "PROTECTION_PENDING_VERIFICATION";
+      const tradeOpenedAt = trade.executedAt ?? trade.openedAt ?? trade.createdAt ?? null;
+      const tradeAgeMs = tradeOpenedAt ? (Date.now() - Date.parse(String(tradeOpenedAt))) : Infinity;
+      const inBracketGrace = isPendingVerification && tradeAgeMs < 90_000;
+
+      if (!inBracketGrace) {
+        tradeIncidents.push({
+          code: "MISSING_STOP",
+          severity: "CRITICAL",
+          tradeId: trade.id,
+          symbol,
+          detail: trackedId
+            ? `No active protective stop; tracked stopOrderId=${trackedId} not in open orders`
+            : "No active protective stop and no tracked stop order ID",
+        });
+      }
     }
 
     // 3) DAY TIF check

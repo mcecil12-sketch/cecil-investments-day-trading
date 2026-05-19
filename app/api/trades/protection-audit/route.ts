@@ -21,7 +21,8 @@ import {
   isOpenTradeStatus,
   normalizeTicker,
 } from "@/lib/trades/protection";
-import { createOrder, alpacaRequest, normalizeAlpacaPrice } from "@/lib/alpaca";
+import { createOrder, alpacaRequest, normalizeAlpacaPrice, getOrder, extractBracketLegs } from "@/lib/alpaca";
+import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { forceFlattenPosition } from "@/lib/broker/forceFlattenPosition";
 import { verifyStopAtBroker } from "@/lib/risk/stop-verification";
 
@@ -101,7 +102,13 @@ async function cancelExitOrdersAndWait(
 ): Promise<{ canceled: number; attempted: number; remainingOpen: number; heldForOrders: number | null; qtyAvailable: number | null; error: string | null }> {
   try {
     const openOrders = await fetchSymbolOpenOrders(symbol);
-    const conflicting = openOrders.filter((o) => String(o?.side || "").toLowerCase() === closeSide);
+    const conflicting = openOrders.filter((o) => {
+      if (String(o?.side || "").toLowerCase() !== closeSide) return false;
+      // Preserve bracket take-profit limit legs — only cancel stop/market orders
+      // that genuinely conflict with stop placement. Never cancel bracket TP legs here.
+      const type = String(o?.type ?? "").toLowerCase();
+      return type === "stop" || type === "stop_limit" || type === "market" || type === "trailing_stop";
+    });
     let canceled = 0;
     for (const order of conflicting) {
       if (!order?.id) continue;
@@ -271,6 +278,83 @@ async function enforceProtection(
       : (posSide === "long"
           ? Math.round(entryPrice * 0.98 * 100) / 100
           : Math.round(entryPrice * 1.02 * 100) / 100);
+
+    // ── 0. 90-second bracket grace window ────────────────────────────────────
+    // Bracket stop legs may be in "held" state for up to ~90s after entry fill
+    // while the parent order transitions. Skip repair to avoid false flattening.
+    const tradeOpenedAt = openTrade?.executedAt ?? openTrade?.openedAt ?? openTrade?.createdAt ?? null;
+    const tradeAgeMs = tradeOpenedAt ? (Date.now() - Date.parse(tradeOpenedAt)) : Infinity;
+    const BRACKET_GRACE_MS = 90_000;
+    if (tradeAgeMs < BRACKET_GRACE_MS) {
+      diag.stopRepairError = "bracket_grace_period_active";
+      await bumpTodayFunnel({ protectionGraceActiveCount: 1 } as any).catch(() => {});
+      if (openTrade?.id) {
+        tradeUpdates.push({
+          tradeId: openTrade.id,
+          patch: {
+            protectionStatus: "PROTECTION_PENDING_VERIFICATION",
+            protectionIssue: "bracket_grace_window",
+            updatedAt: new Date().toISOString(),
+          },
+        });
+      }
+      console.log("[protection-audit] bracket grace window active — skipping repair", {
+        symbol: detail.symbol, tradeAgeMs, tradeId: openTrade?.id,
+      });
+      diagnostics.push(diag);
+      continue;
+    }
+
+    // ── 0b. Nested bracket stop re-check ─────────────────────────────────────
+    // Before canceling any orders, re-fetch the parent bracket order with nested=true
+    // to check for stop legs in "held" state that the flat open-orders list may miss.
+    const parentBrokerOrderId = openTrade?.alpacaOrderId ?? openTrade?.brokerOrderId ?? null;
+    if (parentBrokerOrderId) {
+      try {
+        const parentOrder = await getOrder(parentBrokerOrderId);
+        const bracketExtract = extractBracketLegs(parentOrder);
+        if (bracketExtract.stopOrderId) {
+          const bracketActiveStatuses = new Set(["new", "accepted", "held", "pending_new", "accepted_for_bidding"]);
+          const stopIsActive = bracketExtract.stopStatus == null ||
+            bracketExtract.stopStatus === "" ||
+            bracketActiveStatuses.has(bracketExtract.stopStatus);
+          if (stopIsActive) {
+            console.log("[protection-audit] bracket stop leg found via nested re-fetch — no repair needed", {
+              symbol: detail.symbol, stopLegId: bracketExtract.stopOrderId,
+              stopStatus: bracketExtract.stopStatus, parentOrderId: parentBrokerOrderId,
+            });
+            await bumpTodayFunnel({ falseProtectionFlattenPreventedCount: 1 } as any).catch(() => {});
+            if (openTrade?.id) {
+              tradeUpdates.push({
+                tradeId: openTrade.id,
+                patch: {
+                  stopOrderId: bracketExtract.stopOrderId,
+                  takeProfitOrderId: bracketExtract.takeProfitOrderId ?? openTrade.takeProfitOrderId ?? null,
+                  protectionStatus: "PROTECTION_PENDING_VERIFICATION",
+                  protectionIssue: null,
+                  bracketStopOrderId: bracketExtract.stopOrderId,
+                  bracketTakeProfitOrderId: bracketExtract.takeProfitOrderId ?? null,
+                  bracketStopStatus: bracketExtract.stopStatus ?? null,
+                  bracketLegsDetected: true,
+                  brokerSyncedAt: new Date().toISOString(),
+                  updatedAt: new Date().toISOString(),
+                },
+              });
+            }
+            repaired.push(detail.symbol);
+            diag.stopRepairFinalStatus = "protected";
+            diag.finalResolution = "protected";
+            diag.stopVerified = true;
+            diagnostics.push(diag);
+            continue;
+          }
+        }
+      } catch (nestedErr: any) {
+        console.warn("[protection-audit] nested bracket re-fetch failed (non-fatal)", {
+          symbol: detail.symbol, error: String(nestedErr?.message ?? nestedErr),
+        });
+      }
+    }
 
     // ── Pre-repair: cancel conflicting same-side orders to free qty ──
     // Stale sell limit orders hold qty and prevent stop placement for longs.
