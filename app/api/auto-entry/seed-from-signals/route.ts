@@ -1666,6 +1666,24 @@ export async function POST(req: NextRequest) {
 
   if (immediateExecuteTriggeredCount > 0) {
     await bumpTodayFunnel({ seedImmediateExecuteTriggered: immediateExecuteTriggeredCount }).catch(() => null);
+
+    // Bump per-outcome counters so funnel-health can distinguish succeeded/skipped/failed
+    const execCount = immediateExecuteResult.executedCount ?? 0;
+    if (!immediateExecuteResult.attempted) {
+      // Triggered count set but execute not actually attempted — should not normally occur
+    } else if (!immediateExecuteResult.ok) {
+      // HTTP error or exception — execute was rejected or failed
+      const failKey = immediateExecuteResult.executeBlockReason === "execute_exception"
+        ? "immediateExecuteFailedCount"
+        : "immediateExecuteRejectedCount";
+      await bumpTodayFunnel({ [failKey]: immediateExecuteTriggeredCount } as any).catch(() => null);
+    } else if (execCount > 0) {
+      // Execute route returned executedCount > 0 — order(s) placed
+      await bumpTodayFunnel({ immediateExecuteSucceededCount: execCount }).catch(() => null);
+    } else {
+      // Execute route returned 200 but executedCount = 0 — skipped (market closed, disabled, etc.)
+      await bumpTodayFunnel({ immediateExecuteSkippedCount: immediateExecuteTriggeredCount }).catch(() => null);
+    }
   }
 
   const telemetryPayload: SeedRunTelemetry = {

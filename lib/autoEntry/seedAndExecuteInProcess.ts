@@ -303,6 +303,16 @@ export async function seedAndMaybeExecuteQualifiedSignal(
     if (opts.cronToken) exeHeaders["x-cron-token"] = opts.cronToken;
     if (opts.autoEntryToken) exeHeaders["x-auto-entry-token"] = opts.autoEntryToken;
 
+    const executeTriggeredAt = new Date().toISOString();
+    console.log("[seedAndExecute] execute triggered", {
+      tradeId,
+      symbol,
+      executeTriggeredAt,
+      exeUrl,
+      hasCronToken: Boolean(opts.cronToken),
+      hasAutoEntryToken: Boolean(opts.autoEntryToken),
+    });
+
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 6_000);
     try {
@@ -322,41 +332,81 @@ export async function seedAndMaybeExecuteQualifiedSignal(
       const payload: any = await resp.json().catch(() => ({}));
       const execCount = Number(payload?.executedCount ?? payload?.executed ?? 0);
       base.executed = Number.isFinite(execCount) && execCount > 0;
+      const executeSkipReason = String(
+        payload?.reason || payload?.skipReason || (resp.ok ? "not_executed" : "http_error"),
+      ).slice(0, 100);
+      const executeRejectReason = !resp.ok
+        ? String(payload?.error || payload?.reason || "execute_http_error").slice(0, 100)
+        : null;
       base.executeResult = {
         ok: resp.ok,
         status: resp.status,
         executedCount: Number.isFinite(execCount) ? execCount : null,
-        error: !resp.ok
-          ? String(payload?.error || payload?.reason || "execute_http_error").slice(0, 100)
-          : null,
+        error: executeRejectReason,
       };
       base.signalPatches.realTimeExecuteTriggered = true;
       if (!base.executed) {
-        base.signalPatches.realTimeExecuteSkippedReason = String(
-          payload?.reason || payload?.skipReason || "not_executed",
-        ).slice(0, 100);
+        base.signalPatches.realTimeExecuteSkippedReason = resp.ok
+          ? executeSkipReason
+          : executeRejectReason ?? "http_error";
       }
+
+      console.log("[seedAndExecute] execute result", {
+        tradeId,
+        symbol,
+        executeTriggeredAt,
+        httpStatus: resp.status,
+        httpOk: resp.ok,
+        executedCount: execCount,
+        executeResult: base.executed ? "SUCCEEDED" : resp.ok ? "SKIPPED" : "REJECTED",
+        executeSkipReason: base.executed ? null : executeSkipReason,
+        executeRejectReason,
+        brokerOrderId: payload?.brokerOrderId ?? payload?.alpacaOrderId ?? null,
+      });
+
+      // Classify outcome for telemetry:
+      // SUCCEEDED: execute route placed an order (executedCount > 0)
+      // SKIPPED:   execute route returned 200 but skipped (market closed, disabled, no pending, etc.)
+      // REJECTED:  execute route returned non-2xx (auth failure, server error)
       await bumpTodayFunnel({
         seedImmediateExecuteTriggered: 1,
         ...(base.executed
           ? { immediateExecuteSucceededCount: 1 }
-          : { immediateExecuteSkippedCount: 1 }),
+          : resp.ok
+          ? { immediateExecuteSkippedCount: 1 }
+          : { immediateExecuteRejectedCount: 1 }),
       }).catch(() => null);
     } catch (exeErr: any) {
       clearTimeout(timer);
       const isTimeout = exeErr?.name === "AbortError";
+      const errorMsg = isTimeout ? "execute_timeout_6s" : String(exeErr || "error").slice(0, 100);
       base.executeResult = {
         ok: false,
-        error: isTimeout ? "execute_timeout_6s" : String(exeErr || "error").slice(0, 100),
+        error: errorMsg,
       };
       base.signalPatches.realTimeExecuteSkippedReason = isTimeout
         ? "execute_timeout"
         : "execute_error";
+
+      console.log("[seedAndExecute] execute FAILED", {
+        tradeId,
+        symbol,
+        executeTriggeredAt,
+        error: errorMsg,
+        isTimeout,
+      });
+
+      // FAILED: network error or timeout — execute was never reached
       await bumpTodayFunnel({
         seedImmediateExecuteTriggered: 1,
-        immediateExecuteSkippedCount: 1,
+        immediateExecuteFailedCount: 1,
       }).catch(() => null);
     }
+  } else if (opts.immediateExecute !== false && !opts.executeBaseUrl) {
+    // Execute was requested but no URL was provided — count as skipped
+    base.signalPatches.realTimeExecuteSkippedReason = "no_execute_url";
+    console.log("[seedAndExecute] execute skipped — no executeBaseUrl", { tradeId, symbol });
+    await bumpTodayFunnel({ immediateExecuteSkippedCount: 1 }).catch(() => null);
   }
 
   return base;

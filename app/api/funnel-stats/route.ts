@@ -45,11 +45,14 @@ export async function GET() {
       staleDropped: num(today.seedStaleDropped),
       recoverySeeded: num(today.seedRecoverySeeded),
       realTimeSeeded: num(today.seedRealTimeSeeded),
+      realTimeSeededCount: num(today.seedRealTimeSeeded),
       immediateExecuteTriggered: num(today.seedImmediateExecuteTriggered),
       // Real-time in-process seed counters (P0 fix)
       realTimeSeedAttempted: num(today.realTimeSeedAttemptedCount),
       immediateExecuteSucceeded: num(today.immediateExecuteSucceededCount),
       immediateExecuteSkipped: num(today.immediateExecuteSkippedCount),
+      immediateExecuteRejected: num(today.immediateExecuteRejectedCount),
+      immediateExecuteFailed: num(today.immediateExecuteFailedCount),
       // Skip reasons
       skippedNotQualified: num(today.seedSkippedNotQualified),
       skippedOverlayGrade: num(today.seedSkippedOverlayGrade),

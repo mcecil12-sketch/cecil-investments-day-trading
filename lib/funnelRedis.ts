@@ -108,6 +108,8 @@ const NUMERIC_COUNTERS = [
   "realTimeSeedAttemptedCount",
   "immediateExecuteSucceededCount",
   "immediateExecuteSkippedCount",
+  "immediateExecuteRejectedCount",
+  "immediateExecuteFailedCount",
   // Phase 3: Execute attribution
   "executeFromSeededLong",
   "executeFromSeededShort",

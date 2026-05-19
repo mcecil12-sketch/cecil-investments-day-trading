@@ -1511,6 +1511,8 @@ export async function POST(req: Request) {
       const executeBaseUrl = (() => {
         const envBase = String(process.env.NEXT_PUBLIC_BASE_URL || "").trim();
         if (envBase) return envBase.replace(/\/$/, "");
+        const vercelUrl = String(process.env.VERCEL_URL || "").trim();
+        if (vercelUrl) return `https://${vercelUrl.replace(/^https?:\/\//, "")}`.replace(/\/$/, "");
         try { return new URL(req.url).origin; } catch { return ""; }
       })();
 

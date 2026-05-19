@@ -1550,8 +1550,20 @@ export async function POST(req: Request) {
   const runSource = runSourceHeader || (auth.hasCookieAuth ? "terminal" : "unknown");
   const runIdHeader = String(req.headers.get("x-run-id") || req.headers.get("x-scan-run-id") || "").trim();
   const runId = runIdHeader || `ae-exec-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const isRealtimeSeed = runSource === "realtime_seed";
 
   await bumpAutoEntryFunnelSafe({ autoEntryExecutes: 1 });
+
+  // Structured diagnostic log for real-time seed calls so every execute attempt is traceable
+  if (isRealtimeSeed) {
+    console.log("[execute] realtime_seed call received", {
+      runId,
+      runSource,
+      pendingCount: counts.pendingCount,
+      authMode: auth.authModeUsed,
+      hasCronToken: auth.hasCronToken,
+    });
+  }
 
   const pushBreakerNote = (outcome: "SUCCESS" | "SKIP" | "FAIL", action: "increment" | "reset" | "none", after: number, reason: string) => {
     if (action === "increment") {
@@ -1667,6 +1679,9 @@ export async function POST(req: Request) {
   }
 
   if (!cfg.enabled) {
+    if (isRealtimeSeed) {
+      console.log("[execute] realtime_seed skipped: AUTO_TRADING_ENABLED=false", { runId, pendingCount: counts.pendingCount });
+    }
     // --- Attach diagnostics to response ---
     const responseObj = {
       ok: true,
@@ -1688,6 +1703,9 @@ export async function POST(req: Request) {
     return NextResponse.json(responseObj, { status: 200 });
   }
   if (!cfg.paperOnly) {
+    if (isRealtimeSeed) {
+      console.log("[execute] realtime_seed skipped: AUTO_TRADING_PAPER_ONLY=false", { runId, pendingCount: counts.pendingCount });
+    }
     return NextResponse.json(
       {
         ok: true,
@@ -1734,6 +1752,9 @@ export async function POST(req: Request) {
 
   if (!marketOpen) {
     counts.skipped += 1;
+    if (isRealtimeSeed) {
+      console.log("[execute] realtime_seed skipped: market_closed", { runId, pendingCount: counts.pendingCount, eligibleCount: counts.eligibleCount });
+    }
     await recordOutcome({ outcome: "SKIP", reason: "market_closed" });
     if (stampEligibleSkip("market_closed")) await writeTrades(trades);
     return NextResponse.json(
@@ -1987,6 +2008,15 @@ export async function POST(req: Request) {
   }
   if (eligibleIndexes.length === 0) {
     counts.skipped += 1;
+    if (isRealtimeSeed) {
+      console.log("[execute] realtime_seed skipped: no_AUTO_PENDING_trades", {
+        runId,
+        pendingCount: counts.pendingCount,
+        staleArchived: counts.staleArchived,
+        duplicatesArchived: counts.duplicatesArchived,
+        invalidMarked: counts.invalidMarked,
+      });
+    }
     await recordOutcome({ outcome: "SKIP", reason: "no_AUTO_PENDING" });
     return NextResponse.json(
       {
@@ -3417,6 +3447,17 @@ export async function POST(req: Request) {
     counts.executed += 1;
     if (carryoverEligibleIndexSet.has(idx)) {
       counts.carryoverExecutedCount += 1;
+    }
+
+    if (isRealtimeSeed) {
+      console.log("[execute] realtime_seed EXECUTED", {
+        runId,
+        tradeId,
+        symbol: ticker,
+        side: sideEnum,
+        brokerOrderId: (updated as any)?.alpacaOrderId ?? (updated as any)?.brokerOrderId ?? null,
+        executeOutcome: (updated as any)?.executeOutcome ?? "EXECUTED",
+      });
     }
 
     await guardrailsStore.bumpEntry(etDate, ticker);

@@ -98,6 +98,10 @@ type FunnelHealthResponse = {
   immediateExecuteSucceededCount?: number;
   /** How many immediate execute triggers were skipped (trade pending but not yet executed) */
   immediateExecuteSkippedCount?: number;
+  /** How many immediate execute triggers were rejected (non-2xx HTTP response from execute route) */
+  immediateExecuteRejectedCount?: number;
+  /** How many immediate execute triggers failed (network error or timeout) */
+  immediateExecuteFailedCount?: number;
   executionRejectReasons?: Record<string, number>;
   seedSlaBreached?: boolean;
   seedSlaBreachSignals?: Array<{
@@ -254,6 +258,8 @@ function detectIncidents(params: {
   cTierQualityBlockCount?: number;
   /** Count of seeds blocked by quality-based thresholds in general (below_threshold). */
   qualityThresholdBlockCount?: number;
+  /** Count of real-time execute triggers today — suppresses NO_EXECUTION_ACTIVITY when > 0. */
+  immediateExecuteTriggeredCount?: number;
 }): Incident[] {
   const incidents: Incident[] = [];
   const { 
@@ -275,6 +281,7 @@ function detectIncidents(params: {
     staleActivePendingCount,
     cTierQualityBlockCount = 0,
     qualityThresholdBlockCount = 0,
+    immediateExecuteTriggeredCount = 0,
   } = params;
 
   const totalQualityBlocks = cTierQualityBlockCount + qualityThresholdBlockCount;
@@ -379,8 +386,10 @@ function detectIncidents(params: {
 
   // 4) NO_EXECUTION_ACTIVITY: market open AND there is work to do (AUTO_PENDING trades or fresh signals)
   //    BUT no recent execute route activity. Only raise if the execute cron should have done something.
+  //    Suppressed when immediateExecuteTriggeredCount > 0 — real-time execute was triggered recently.
   const hasWorkToDo = freshUnresolvedPendingCount > 0 || freshQualifiedSignals > 0;
-  if (marketOpen && hasWorkToDo && minsSinceLastExecute !== null && minsSinceLastExecute > 20) {
+  const hasRecentRealTimeActivity = immediateExecuteTriggeredCount > 0;
+  if (marketOpen && hasWorkToDo && !hasRecentRealTimeActivity && minsSinceLastExecute !== null && minsSinceLastExecute > 20) {
     incidents.push({
       code: "NO_EXECUTION_ACTIVITY",
       severity: "MEDIUM",
@@ -822,6 +831,8 @@ export async function GET() {
       Number((lastSeedRun as any)?.immediateExecuteSucceededCount ?? 0),
     );
     const immediateExecuteSkippedCount = num(funnelData.immediateExecuteSkippedCount);
+    const immediateExecuteRejectedCount = num(funnelData.immediateExecuteRejectedCount);
+    const immediateExecuteFailedCount = num(funnelData.immediateExecuteFailedCount);
     // When seeded is heavily inflated vs qualified (>2x), surface an explanation
     const seededInflationExplanation: string | null =
       seeded > 0 && qualified > 0 && seeded > qualified * 2
@@ -1018,6 +1029,10 @@ export async function GET() {
       staleActivePendingCount,
       cTierQualityBlockCount,
       qualityThresholdBlockCount,
+      immediateExecuteTriggeredCount: Math.max(
+        Number(lastSeedRun?.immediateExecuteTriggeredCount ?? 0),
+        num(funnelData.seedImmediateExecuteTriggered),
+      ),
     });
 
     // Add lower-severity incident for stale broker/DB mismatch (not live risk)
@@ -1120,6 +1135,8 @@ export async function GET() {
       ),
       immediateExecuteSucceededCount,
       immediateExecuteSkippedCount,
+      immediateExecuteRejectedCount,
+      immediateExecuteFailedCount,
       carryoverSeededCount,
       ...(seededInflationExplanation ? { seededInflationExplanation } : {}),
       ...(Object.keys(executeSkipReasonBreakdown).length > 0 ? { executionRejectReasons: executeSkipReasonBreakdown } : {}),
