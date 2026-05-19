@@ -106,6 +106,8 @@ export type ContinueFlattenResult = {
   closeOrderId?: string;
   detail: string;
   error?: string;
+  /** True when flatten was blocked because an active bracket stop leg was detected. */
+  falseFlattenPrevented?: boolean;
 };
 
 // ─── Core Function ────────────────────────────────────────────────────
@@ -198,6 +200,41 @@ export async function continueFlattenLifecycle(opts: {
       residualQty: currentQty,
       closeOrderSubmitted: false,
       detail: `close_order_active: id=${activeCloseOrder.id} status=${status} brokerQty=${currentQty} filled=${filledQty}`,
+    };
+  }
+
+  // ── 3.5 Guard: check for active bracket stop (prevent premature exit) ────
+  // If any open order on the closing side is a stop-like order, it is an active
+  // bracket protective stop leg — not a competing market close. Blocking the
+  // flatten here prevents the app from canceling bracket legs prematurely.
+  const activeBracketStop = symbolOrders.find((o) => {
+    const type = String(o.type ?? "").toLowerCase();
+    const side = String(o.side ?? "").toLowerCase();
+    const status = String(o.status ?? "").toLowerCase();
+    const isStopLike = type === "stop" || type === "stop_limit" || type === "trailing_stop";
+    const isCloseSideOrder = side === closeSide;
+    return isStopLike && isCloseSideOrder && ACTIVE_CLOSE_STATUSES.has(status);
+  });
+
+  if (activeBracketStop) {
+    console.warn("[emergency-flatten] blocked: active bracket stop leg detected — refusing market close to prevent premature exit", {
+      ticker,
+      tradeId: opts.tradeId,
+      stopOrderId: activeBracketStop.id,
+      stopStatus: activeBracketStop.status,
+      stopType: activeBracketStop.type,
+    });
+    return {
+      ok: false,
+      state: "FLATTEN_PENDING",
+      isFlat: false,
+      brokerPositionQty: currentQty,
+      activeCloseOrderDetected: false,
+      filledQty: 0,
+      residualQty: currentQty,
+      closeOrderSubmitted: false,
+      detail: `blocked_active_bracket_stop: id=${activeBracketStop.id} status=${activeBracketStop.status}`,
+      falseFlattenPrevented: true,
     };
   }
 

@@ -2,7 +2,8 @@ import { getAutoManageConfig } from "@/lib/autoManage/config";
 import { getRuleForGrade, shouldMoveToBreakEven, shouldEnableTrailing } from "@/lib/autoManage/gradeRules";
 import { recordAutoManage } from "@/lib/autoManage/telemetry";
 import { readTrades, writeTrades } from "@/lib/tradesStore";
-import { getLatestQuote, alpacaRequest, getPositions, createOrder, getOrder } from "@/lib/alpaca";
+import { getLatestQuote, alpacaRequest, getPositions, createOrder, getOrder, extractBracketLegs } from "@/lib/alpaca";
+import { bumpTodayFunnel } from "@/lib/funnelRedis";
 import { syncStopForTrade, rescueStop } from "@/lib/autoManage/stopSync";
 import { reconcileOpenTrades } from "@/lib/maintenance/reconcileOpenTrades";
 import { sendNotification } from "@/lib/notifications/notify";
@@ -499,7 +500,56 @@ async function flattenForProtectionFailure(args: {
   tradeId: string;
   issue: ProtectionIssueCode;
   issueDetail: string;
+  runId?: string;
 }) {
+  // ── Bracket stop guard ────────────────────────────────────────────────────
+  // Before submitting a market close, re-fetch the parent bracket order and
+  // verify no active stop leg exists. If one does, this is a false-flatten
+  // triggered solely because DB stopOrderId is null — block it.
+  const parentOrderId: string | null =
+    (args.next[args.idx]?.alpacaOrderId ?? args.next[args.idx]?.brokerOrderId) ?? null;
+  if (parentOrderId) {
+    try {
+      const parentOrder = await getOrder(parentOrderId);
+      const bracketLegs = extractBracketLegs(parentOrder as any);
+      const BRACKET_ACTIVE_STATUSES = new Set(["new", "accepted", "held", "pending_new", "accepted_for_bidding"]);
+      const bracketStopActive =
+        bracketLegs.stopOrderId != null &&
+        (bracketLegs.stopStatus == null ||
+          bracketLegs.stopStatus === "" ||
+          BRACKET_ACTIVE_STATUSES.has(bracketLegs.stopStatus));
+      if (bracketStopActive) {
+        console.warn("[protection] flattenForProtectionFailure: active bracket stop leg found — blocking flatten to prevent premature exit", {
+          ticker: args.ticker,
+          tradeId: args.tradeId,
+          stopLegId: bracketLegs.stopOrderId,
+          stopStatus: bracketLegs.stopStatus,
+        });
+        await bumpTodayFunnel({ falseProtectionFlattenPreventedCount: 1 } as any).catch(() => {});
+        if (args.next[args.idx]) {
+          args.next[args.idx] = {
+            ...args.next[args.idx],
+            stopOrderId: bracketLegs.stopOrderId,
+            takeProfitOrderId: bracketLegs.takeProfitOrderId ?? args.next[args.idx].takeProfitOrderId ?? null,
+            protectionStatus: "PROTECTION_PENDING_VERIFICATION",
+            protectionIssue: null,
+            bracketStopOrderId: bracketLegs.stopOrderId,
+            bracketStopStatus: bracketLegs.stopStatus ?? null,
+            falseFlattenPrevented: true,
+            lastProtectionCheckAt: args.now,
+            updatedAt: args.now,
+          };
+        }
+        return { ok: false, falseFlattenPrevented: true };
+      }
+    } catch (bracketErr: any) {
+      console.warn("[protection] flattenForProtectionFailure: bracket re-check failed (non-fatal)", {
+        ticker: args.ticker,
+        error: String(bracketErr?.message ?? bracketErr),
+      });
+    }
+  }
+
   const closeRes = await submitMarketCloseForTrade(args.next[args.idx], args.ticker);
   if (!closeRes.ok) {
     const flattenIssue = `flatten_submit_failed:${closeRes.error}${closeRes.detail ? ":" + closeRes.detail : ""}`;
@@ -536,6 +586,12 @@ async function flattenForProtectionFailure(args: {
     protectionIssue: `${args.issue}:${args.issueDetail}`,
     protectionVerifiedAt: args.now,
     lastProtectionCheckAt: args.now,
+    // ── Exit attribution ──────────────────────────────────────────────
+    exitInitiator: "auto_manage",
+    exitReason: `protection_flatten:${args.issue}:${args.issueDetail}`,
+    exitSourceRoute: "/api/auto-manage/run",
+    linkedTradeId: args.tradeId,
+    autoManageRunId: args.runId ?? null,
     updatedAt: args.now,
   };
   await emitProtectionEvent({
@@ -865,6 +921,12 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
                 lastPrice: r2(stalePx),
                 closeOrderId: forced.orderId,
                 closeOrderStatus: forced.status,
+                // ── Exit attribution ────────────────────────────────────────
+                exitInitiator: "auto_manage",
+                exitReason: circuitBreakerTriggered ? "circuit_breaker_triggered" : "stop_triggered",
+                exitSourceRoute: "/api/auto-manage/run",
+                linkedTradeId: id,
+                autoManageRunId: opts.runId ?? null,
                 autoManage: {
                   ...(next[idx].autoManage || {}),
                   lastRunAt: now,
@@ -1097,6 +1159,12 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
           lastPrice: r2(px),
           closeOrderId: forced.orderId,
           closeOrderStatus: forced.status,
+          // ── Exit attribution ──────────────────────────────────────────────
+          exitInitiator: "auto_manage",
+          exitReason: circuitBreakerTriggered ? "circuit_breaker_triggered" : "stop_triggered",
+          exitSourceRoute: "/api/auto-manage/run",
+          linkedTradeId: id,
+          autoManageRunId: opts.runId ?? null,
           autoManage: {
             ...(next[idx].autoManage || {}),
             lastRunAt: now,
@@ -1168,6 +1236,12 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
           lastPrice: r2(px),
           closeOrderId: closeRes.orderId,
           closeOrderStatus: closeRes.status,
+          // ── Exit attribution ──────────────────────────────────────────────
+          exitInitiator: "auto_manage",
+          exitReason: `cut_loss:${cutLossAction.reason}`,
+          exitSourceRoute: "/api/auto-manage/run",
+          linkedTradeId: id,
+          autoManageRunId: opts.runId ?? null,
           autoManage: {
             ...(current.autoManage || {}),
             lastRunAt: now,
@@ -1369,6 +1443,7 @@ export async function runAutoManage(opts: { source?: string; runId?: string; for
             tradeId: id,
             issue: (protection.issue || "repair_submit_failed") as ProtectionIssueCode,
             issueDetail: `${rescueResult.error}${rescueResult.detail ? `:${rescueResult.detail}` : ""}`,
+            runId: opts.runId,
           });
           if (flattenedProtection.ok) {
             flattened++;

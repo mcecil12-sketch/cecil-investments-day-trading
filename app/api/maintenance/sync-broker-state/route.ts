@@ -201,9 +201,28 @@ export async function POST(req: NextRequest) {
           }
         }
         if (!bracketStopFound) {
-          t.stopOrderId = null;
-          t.protectionStatus = "MISSING_STOP";
-          t.protectionIssue = "missing_active_broker_stop";
+          // One final scan: check flat symbolOrders for a stop-type bracket child leg
+          // (these appear as top-level open orders once the parent bracket fills).
+          const closeS = String(t.side || "LONG").toUpperCase() === "SHORT" ? "buy" : "sell";
+          const flatBracketStop = symbolOrders.find((o: any) => {
+            const type = String(o?.type || "").toLowerCase();
+            const side = String(o?.side || "").toLowerCase();
+            const status = String(o?.status || "").toLowerCase();
+            const openStatuses = new Set(["new", "accepted", "held", "pending_new", "accepted_for_bidding", "partially_filled"]);
+            return (type === "stop" || type === "stop_limit") && side === closeS && openStatuses.has(status);
+          });
+          if (flatBracketStop) {
+            t.stopOrderId = flatBracketStop.id;
+            t.protectionStatus = "PROTECTION_PENDING_VERIFICATION";
+            t.protectionIssue = null;
+            t.bracketLegsDetected = true;
+            t.bracketStopOrderId = flatBracketStop.id;
+            t.bracketStopStatus = String(flatBracketStop.status || "");
+          } else {
+            t.stopOrderId = null;
+            t.protectionStatus = "MISSING_STOP";
+            t.protectionIssue = "missing_active_broker_stop";
+          }
         }
       }
       t.alpacaStatus = "filled";
@@ -361,10 +380,37 @@ export async function POST(req: NextRequest) {
             }
           }
           if (!bracketStopFound2) {
-            t.stopOrderId = null;
-            t.protectionStatus = "MISSING_STOP";
-            t.protectionIssue = "tracked_stop_not_active_at_broker";
-            changed = true;
+            // One final scan: check flat symbolOrders for a stop-type bracket child leg
+            // to prevent a false MISSING_STOP that would trigger a premature flatten.
+            const symbolOrders2 = (openOrders || []).filter(
+              (o: any) => String(o?.symbol || "").toUpperCase() === String(ticker || "").toUpperCase(),
+            );
+            const closeS2 = String(t.side || "LONG").toUpperCase() === "SHORT" ? "buy" : "sell";
+            const flatBracketStop2 = symbolOrders2.find((o: any) => {
+              const type = String(o?.type || "").toLowerCase();
+              const side = String(o?.side || "").toLowerCase();
+              const status = String(o?.status || "").toLowerCase();
+              const openStatuses = new Set(["new", "accepted", "held", "pending_new", "accepted_for_bidding", "partially_filled"]);
+              return (type === "stop" || type === "stop_limit") && side === closeS2 && openStatuses.has(status);
+            });
+            if (flatBracketStop2) {
+              if (String(t.stopOrderId || "") !== flatBracketStop2.id) {
+                t.stopOrderId = flatBracketStop2.id;
+                changed = true;
+              }
+              if (t.protectionStatus !== "VERIFIED" && t.protectionStatus !== "PROTECTION_PENDING_VERIFICATION") {
+                t.protectionStatus = "PROTECTION_PENDING_VERIFICATION";
+                t.protectionIssue = null;
+                t.bracketStopOrderId = flatBracketStop2.id;
+                t.bracketStopStatus = String(flatBracketStop2.status || "");
+                changed = true;
+              }
+            } else {
+              t.stopOrderId = null;
+              t.protectionStatus = "MISSING_STOP";
+              t.protectionIssue = "tracked_stop_not_active_at_broker";
+              changed = true;
+            }
           }
         }
       }

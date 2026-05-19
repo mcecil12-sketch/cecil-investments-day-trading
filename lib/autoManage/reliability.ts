@@ -296,6 +296,14 @@ export type FlattenAttemptResult = {
   closeOrderStatus?: string;
   cancelledOrderIds: string[];
   skippedBecauseCloseAlreadyOpen?: boolean;
+  /** True when flatten was blocked because an active bracket stop leg was detected. */
+  falseFlattenPrevented?: boolean;
+  /** Attribution fields written to the trade record when a close is submitted. */
+  exitInitiator?: string;
+  exitReason?: string;
+  exitSourceRoute?: string;
+  linkedTradeId?: string;
+  autoManageRunId?: string;
 };
 
 async function cancelOrderId(orderId: string) {
@@ -332,6 +340,27 @@ export async function attemptFlattenPosition(args: {
 
   const existingCloseOrder = openOrders.find((order) => isCloseSideForTrade(order, args.trade?.side));
   if (existingCloseOrder) {
+    // If the existing "close-side" order is a stop-like order, it is an active bracket
+    // protective stop — not a competing market close. Block flatten and surface this.
+    if (isStopLikeOrder(existingCloseOrder)) {
+      console.warn("[flatten] blocked: active bracket stop leg detected on close side; refusing market close to prevent premature exit", {
+        ticker,
+        stopOrderId: existingCloseOrder.id,
+        stopType: existingCloseOrder.type,
+        stopStatus: existingCloseOrder.status,
+      });
+      return {
+        attempted: false,
+        succeeded: false,
+        failed: false,
+        reason: `${args.reason}:blocked_active_bracket_stop`,
+        flattenOrderCount: openOrders.length,
+        flattenClosedCount: 0,
+        lastFlattenAt,
+        cancelledOrderIds: [],
+        falseFlattenPrevented: true,
+      };
+    }
     return {
       attempted: true,
       succeeded: true,
