@@ -16,6 +16,7 @@ import { buildSignalContext } from "@/lib/signalContext";
 import { fetchAlpacaClock } from "@/lib/alpacaClock";
 import { getEtDateString } from "@/lib/time/etDate";
 import { enqueueHighPrioritySeedQueue } from "@/lib/autoEntry/highPrioritySeedQueue";
+import { seedAndMaybeExecuteQualifiedSignal } from "@/lib/autoEntry/seedAndExecuteInProcess";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -1504,52 +1505,61 @@ export async function POST(req: Request) {
         // Non-fatal telemetry path.
       }
 
-      // Part 1 — Real-time seed trigger: immediately invoke seed-from-signals so fresh
-      // qualified signals are seeded and executed without waiting for the next cron cycle.
-      // We fire this synchronously but cap it at 8 s so drain response is never held long.
-      if (highPriorityQueueEnqueued > 0) {
+      // Part 1 — Real-time in-process seed: directly seed and trigger execute for each
+      // freshly-qualified signal without an HTTP round-trip to seed-from-signals.
+      // The HP queue above remains as a backup for any signal the in-process path skips.
+      const executeBaseUrl = (() => {
+        const envBase = String(process.env.NEXT_PUBLIC_BASE_URL || "").trim();
+        if (envBase) return envBase.replace(/\/$/, "");
+        try { return new URL(req.url).origin; } catch { return ""; }
+      })();
+
+      let rtSeedAttempted = 0;
+      let rtSeeded = 0;
+      let rtExecuted = 0;
+      const rtSeedResults: Array<{ signalId: string; seeded: boolean; skippedReason: string | null; executed: boolean }> = [];
+
+      for (const sig of finalizedPersistedSignals) {
+        const signal = sig as any;
+        if (signal?.status !== "SCORED" || signal?.qualified !== true) continue;
+        rtSeedAttempted++;
         try {
-          const seedOrigin = (() => {
-            const envBase = String(process.env.NEXT_PUBLIC_BASE_URL || "").trim();
-            if (envBase) return envBase.replace(/\/$/, "");
-            try { return new URL(req.url).origin; } catch { return "http://127.0.0.1:3000"; }
-          })();
-          const drainRunId = `drain_rt_${Date.now()}`;
-          const seedUrl = `${seedOrigin}/api/auto-entry/seed-from-signals?source=drain_immediate_rt&runId=${encodeURIComponent(drainRunId)}`;
-          const seedHeaders: Record<string, string> = {
-            "content-type": "application/json",
-            "x-run-source": "drain_immediate_rt",
-            "x-run-id": drainRunId,
-          };
-          if (process.env.CRON_TOKEN) seedHeaders["x-cron-token"] = String(process.env.CRON_TOKEN);
-          if (process.env.AUTO_ENTRY_TOKEN) seedHeaders["x-auto-entry-token"] = String(process.env.AUTO_ENTRY_TOKEN);
-          const abortCtrl = new AbortController();
-          const abortTimer = setTimeout(() => abortCtrl.abort(), 8_000);
-          try {
-            const seedResp = await fetch(seedUrl, {
-              method: "POST",
-              headers: seedHeaders,
-              body: JSON.stringify({ source: "drain_immediate_rt", highPriorityEnqueued: highPriorityQueueEnqueued }),
-              cache: "no-store",
-              signal: abortCtrl.signal,
-            });
-            clearTimeout(abortTimer);
-            const seedPayload: any = await seedResp.json().catch(() => ({}));
-            (result.pipeline as any).drainImmediateSeedTriggered = true;
-            (result.pipeline as any).drainImmediateSeedCreated = seedPayload?.createdCount ?? 0;
-            (result.pipeline as any).drainImmediateSeedExecuted =
-              seedPayload?.immediateExecuteResult?.executedCount ?? 0;
-            (result.pipeline as any).drainImmediateSeedStatus = seedResp.status;
-          } catch (seedErr: any) {
-            clearTimeout(abortTimer);
-            (result.pipeline as any).drainImmediateSeedTriggered = false;
-            (result.pipeline as any).drainImmediateSeedError =
-              seedErr?.name === "AbortError" ? "timeout_8s" : String(seedErr || "error").slice(0, 100);
+          const rtResult = await seedAndMaybeExecuteQualifiedSignal(signal, {
+            source: "score-drain-realtime",
+            runId: `drain_rt_${startedAtMs}`,
+            isMarketOpen,
+            immediateExecute: true,
+            executeBaseUrl,
+            cronToken: process.env.CRON_TOKEN ? String(process.env.CRON_TOKEN) : undefined,
+            autoEntryToken: process.env.AUTO_ENTRY_TOKEN ? String(process.env.AUTO_ENTRY_TOKEN) : undefined,
+          });
+          // Apply signal patches back so they are persisted by the writeSignals call below
+          if (rtResult.signalPatches && Object.keys(rtResult.signalPatches).length > 0) {
+            Object.assign(signal, rtResult.signalPatches);
+            signal.updatedAt = new Date().toISOString();
           }
+          if (rtResult.seeded) rtSeeded++;
+          if (rtResult.executed) rtExecuted++;
+          rtSeedResults.push({
+            signalId: rtResult.signalId,
+            seeded: rtResult.seeded,
+            skippedReason: rtResult.skippedReason,
+            executed: rtResult.executed,
+          });
         } catch {
-          (result.pipeline as any).drainImmediateSeedTriggered = false;
+          // Non-fatal: HP queue provides backup coverage
         }
       }
+
+      // Persist signal patches (realTimeSeedAttemptedAt, realTimeSeedTradeId, etc.)
+      if (rtSeedAttempted > 0) {
+        try { await writeSignals(signals); } catch { /* non-fatal */ }
+      }
+
+      (result.pipeline as any).rtSeedAttempted = rtSeedAttempted;
+      (result.pipeline as any).rtSeeded = rtSeeded;
+      (result.pipeline as any).rtExecuted = rtExecuted;
+      (result.pipeline as any).rtSeedResults = rtSeedResults.slice(0, 20);
     }
 
     // Update funnel counters if any were scored

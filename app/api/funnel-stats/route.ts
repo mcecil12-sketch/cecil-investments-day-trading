@@ -46,6 +46,10 @@ export async function GET() {
       recoverySeeded: num(today.seedRecoverySeeded),
       realTimeSeeded: num(today.seedRealTimeSeeded),
       immediateExecuteTriggered: num(today.seedImmediateExecuteTriggered),
+      // Real-time in-process seed counters (P0 fix)
+      realTimeSeedAttempted: num(today.realTimeSeedAttemptedCount),
+      immediateExecuteSucceeded: num(today.immediateExecuteSucceededCount),
+      immediateExecuteSkipped: num(today.immediateExecuteSkippedCount),
       // Skip reasons
       skippedNotQualified: num(today.seedSkippedNotQualified),
       skippedOverlayGrade: num(today.seedSkippedOverlayGrade),

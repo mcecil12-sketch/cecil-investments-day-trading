@@ -104,6 +104,10 @@ const NUMERIC_COUNTERS = [
   "seedRecoverySeeded",
   "seedRealTimeSeeded",
   "seedImmediateExecuteTriggered",
+  // Real-time in-process seed counters (added for P0 fix — score-drain-realtime path)
+  "realTimeSeedAttemptedCount",
+  "immediateExecuteSucceededCount",
+  "immediateExecuteSkippedCount",
   // Phase 3: Execute attribution
   "executeFromSeededLong",
   "executeFromSeededShort",

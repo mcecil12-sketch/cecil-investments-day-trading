@@ -92,7 +92,12 @@ type FunnelHealthResponse = {
   topSeedBlockReason?: string | null;
   recoverySeededCount?: number;
   realTimeSeededCount?: number;
+  /** How many times the in-process real-time seed path was attempted this session */
+  realTimeSeedAttemptedCount?: number;
   immediateExecuteTriggeredCount?: number;
+  immediateExecuteSucceededCount?: number;
+  /** How many immediate execute triggers were skipped (trade pending but not yet executed) */
+  immediateExecuteSkippedCount?: number;
   executionRejectReasons?: Record<string, number>;
   seedSlaBreached?: boolean;
   seedSlaBreachSignals?: Array<{
@@ -110,7 +115,6 @@ type FunnelHealthResponse = {
   /** When seeded >> qualified, explains attribution: recovery seeds, carryover, legacy */
   seededInflationExplanation?: string | null;
   carryoverSeededCount?: number;
-  immediateExecuteSucceededCount?: number;
   lastSeedRunAt?: string | null;
   lastSeedRunSource?: string | null;
   lastSeedRunId?: string | null;
@@ -560,7 +564,12 @@ export async function GET() {
       const seedEvaluatedMs = seedEvaluatedAt ? Date.parse(seedEvaluatedAt) : Number.NaN;
 
       const ageMs = Number.isFinite(createdMs) ? Math.max(0, Date.now() - (createdMs as number)) : null;
-      if (typeof ageMs === "number" && ageMs <= staleThresholdUsedMs) freshQualifiedSignals += 1;
+      // Use scoredAt for freshness (signals are scored much later than created)
+      const scoredMs = getSignalTimestampMs(s, "scoredAt") ?? createdMs;
+      const ageMsForFreshness = Number.isFinite(scoredMs)
+        ? Math.max(0, Date.now() - (scoredMs as number))
+        : ageMs;
+      if (typeof ageMsForFreshness === "number" && ageMsForFreshness <= staleThresholdUsedMs) freshQualifiedSignals += 1;
       else staleQualifiedSignals += 1;
 
       if (Number.isFinite(createdMs) && Number.isFinite(seedEvaluatedMs)) {
@@ -793,7 +802,12 @@ export async function GET() {
     const staleSeedBlockedCount =
       (seedSkipReasonBreakdown["stale_signal"] ?? 0) +
       Number(lastSeedRun?.staleDroppedCount ?? 0);
-    const freshSeededCount = Number(lastSeedRun?.realTimeSeededCount ?? 0);
+    // freshSeededCount: prefer the Redis counter (seedRealTimeSeeded) which is bumped by both
+    // the seed-from-signals route and the new in-process path. Fall back to seed run telemetry.
+    const freshSeededCount = Math.max(
+      num(funnelData.seedRealTimeSeeded),
+      Number(lastSeedRun?.realTimeSeededCount ?? 0),
+    );
     const staleSeededCount = Number(lastSeedRun?.recoverySeededCount ?? 0);
     const pendingStaleArchivedCount = num(funnelData.executeStaleArchived);
     const topSeedBlockReason = Object.entries(seedSkipReasonBreakdown)
@@ -801,10 +815,13 @@ export async function GET() {
 
     // Carryover: seeds that came from previous sessions / recovery passes not captured in last run
     const carryoverSeededCount = Math.max(0, seeded - freshSeededCount - staleSeededCount);
-    // Immediate execute succeeded: executedCount > 0 from last seed run's immediate execute
-    const immediateExecuteSucceededCount = Number(
-      (lastSeedRun as any)?.immediateExecuteSucceededCount ?? 0
+    // In-process real-time seed counters from Redis (new in P0 fix)
+    const realTimeSeedAttemptedCount = num(funnelData.realTimeSeedAttemptedCount);
+    const immediateExecuteSucceededCount = Math.max(
+      num(funnelData.immediateExecuteSucceededCount),
+      Number((lastSeedRun as any)?.immediateExecuteSucceededCount ?? 0),
     );
+    const immediateExecuteSkippedCount = num(funnelData.immediateExecuteSkippedCount);
     // When seeded is heavily inflated vs qualified (>2x), surface an explanation
     const seededInflationExplanation: string | null =
       seeded > 0 && qualified > 0 && seeded > qualified * 2
@@ -1095,9 +1112,14 @@ export async function GET() {
       pendingStaleArchivedCount,
       topSeedBlockReason,
       recoverySeededCount: Number(lastSeedRun?.recoverySeededCount ?? 0),
-      realTimeSeededCount: Number(lastSeedRun?.realTimeSeededCount ?? 0),
-      immediateExecuteTriggeredCount: Number(lastSeedRun?.immediateExecuteTriggeredCount ?? 0),
+      realTimeSeededCount: Math.max(Number(lastSeedRun?.realTimeSeededCount ?? 0), num(funnelData.seedRealTimeSeeded)),
+      realTimeSeedAttemptedCount,
+      immediateExecuteTriggeredCount: Math.max(
+        Number(lastSeedRun?.immediateExecuteTriggeredCount ?? 0),
+        num(funnelData.seedImmediateExecuteTriggered),
+      ),
       immediateExecuteSucceededCount,
+      immediateExecuteSkippedCount,
       carryoverSeededCount,
       ...(seededInflationExplanation ? { seededInflationExplanation } : {}),
       ...(Object.keys(executeSkipReasonBreakdown).length > 0 ? { executionRejectReasons: executeSkipReasonBreakdown } : {}),

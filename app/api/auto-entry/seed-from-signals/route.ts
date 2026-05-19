@@ -163,8 +163,8 @@ function parseTimestampMs(raw: unknown): number | null {
 
 function getSignalTimestampMs(signal: RawSignal): number | null {
   return (
-    parseTimestampMs(signal?.createdAt) ??
     parseTimestampMs(signal?.scoredAt) ??
+    parseTimestampMs(signal?.createdAt) ??
     parseTimestampMs(signal?.updatedAt)
   );
 }

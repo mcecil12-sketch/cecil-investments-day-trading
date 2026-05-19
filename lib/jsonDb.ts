@@ -85,6 +85,13 @@ export type StoredSignal = {
   staleDropped?: boolean;
   staleDroppedAt?: string;
   staleDropReason?: string;
+
+  // Real-time in-process seed attribution (set by score/drain via seedAndExecuteInProcess)
+  realTimeSeedAttemptedAt?: string;
+  realTimeSeedSkippedReason?: string | null;
+  realTimeSeedTradeId?: string | null;
+  realTimeExecuteTriggered?: boolean;
+  realTimeExecuteSkippedReason?: string | null;
 };
 
 const LOCAL_DATA_DIR = path.join(process.cwd(), "data");
