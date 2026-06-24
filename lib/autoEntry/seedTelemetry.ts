@@ -29,7 +29,8 @@ export type SeedSkipReason =
   | "near_capacity_ctier_block"
   | "near_capacity_recovery_block"
   | "missing_trade_plan"
-  | "missing_score";
+  | "missing_score"
+  | "missing_symbol";
 
 export type SeedSignalSkip = {
   signalId: string;

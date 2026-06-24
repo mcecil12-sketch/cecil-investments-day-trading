@@ -3,7 +3,7 @@ export type AllowedTier = "A" | "B" | "C";
 export type ThresholdSource =
   | "seed_decision_honored"
   | "seeded_tier"
-  | "seeded_grade"
+  | "seeded_ai_tier"
   | "score_inferred"
   | "fallback_default";
 
@@ -38,9 +38,9 @@ function finiteOr(value: unknown, fallback: number): number {
 }
 
 function tierBaseThreshold(tier: AllowedTier, config: ThresholdConfig): number {
-  if (tier === "A") return finiteOr(config.tierAmin, 8.5);
-  if (tier === "B") return finiteOr(config.tierBmin, 7.5);
-  return finiteOr(config.tierCmin, 6.5);
+  if (tier === "A") return finiteOr(config.tierAmin, 8.0);
+  if (tier === "B") return finiteOr(config.tierBmin, 7.0);
+  return finiteOr(config.tierCmin, 6.0);
 }
 
 export function resolveThresholdDiagnostics(params: {
@@ -58,7 +58,7 @@ export function resolveThresholdDiagnostics(params: {
       : null;
 
   const seededTier = normalizeTier(params.trade?.tier);
-  const seededGrade = normalizeTier(params.trade?.aiGrade);
+  const seededAiTier = normalizeTier(params.trade?.ai?.tier);
 
   let tier: AllowedTier = "C";
   let thresholdSource: ThresholdSource = "fallback_default";
@@ -66,9 +66,9 @@ export function resolveThresholdDiagnostics(params: {
   if (seededTier) {
     tier = seededTier;
     thresholdSource = "seeded_tier";
-  } else if (seededGrade) {
-    tier = seededGrade;
-    thresholdSource = "seeded_grade";
+  } else if (seededAiTier) {
+    tier = seededAiTier;
+    thresholdSource = "seeded_ai_tier";
   } else if (aiScore != null) {
     tier = params.inferTierForScore(aiScore) ?? "C";
     thresholdSource = "score_inferred";

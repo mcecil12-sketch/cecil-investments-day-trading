@@ -138,6 +138,7 @@ function mapSkipReason(raw: string): SeedSkipReason | null {
     case "near_capacity_recovery_block":
     case "missing_trade_plan":
     case "missing_score":
+    case "missing_symbol":
       return raw as SeedSkipReason;
     default:
       return null;
@@ -925,7 +926,7 @@ export async function POST(req: NextRequest) {
   for (const s of qualifiedSignals || []) {
 
     const signalId = String(s?.id || "").trim();
-    const symbol = getSymbol(s) || "UNKNOWN";
+    const symbol = getSymbol(s);
     const side = getDirection(s);
     const entryPrice = getNum(s, ["entryPrice", "ai.entryPrice"]);
     const stopPrice = getNum(s, ["stopPrice", "ai.stopPrice"]);
@@ -981,6 +982,12 @@ export async function POST(req: NextRequest) {
     if (!signalId) {
       markSkip("missing_signal_id");
       bumpSeedBlockReason("missing_signal_id");
+      continue;
+    }
+
+    if (!symbol) {
+      markSkip("missing_symbol");
+      bumpSeedBlockReason("missing_symbol");
       continue;
     }
 
