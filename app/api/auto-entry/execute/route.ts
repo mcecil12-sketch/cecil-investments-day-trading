@@ -539,18 +539,13 @@ function validateAndRepairBracket(params: {
   const maxStopLong = roundDown(roundedBase - tick);
   const minStopShort = roundUp(roundedBase + tick);
 
+  // Reject if stop is on the wrong side of base price.  Silently clamping to
+  // base±tick would leave position sizing (already computed from the original
+  // stop distance) stale and inconsistent with the submitted bracket.
   if (isLong && stop > maxStopLong) {
-    stop = maxStopLong;
-  }
-  if (!isLong && stop < minStopShort) {
-    stop = minStopShort;
-  }
-  
-  // Validate stop price direction after repair.
-  if (isLong && !(stop <= maxStopLong)) {
     return { valid: false, tp, stop, reason: "stop_price_invalid_for_side" };
   }
-  if (!isLong && !(stop >= minStopShort)) {
+  if (!isLong && stop < minStopShort) {
     return { valid: false, tp, stop, reason: "stop_price_invalid_for_side" };
   }
   
@@ -1919,8 +1914,6 @@ export async function POST(req: Request) {
     }
   }
 
-  const maxOpenReached = brokerTruth.positionsCount >= guardConfig.maxOpenPositions;
-
   if (guardState.entriesToday >= guardConfig.maxEntriesPerDay) {
     counts.skipped += 1;
     await recordOutcome({ outcome: "SKIP", reason: "max_entries_per_day" });
@@ -2202,6 +2195,10 @@ export async function POST(req: Request) {
   }));
   const openOrdersBySymbol = buildOpenOrdersBySymbol(openOrdersLite);
   const openTradesForReplacement = (Array.isArray(trades) ? trades : []).filter((t: any) => isOperationallyOpenTrade(t));
+
+  // Re-evaluate per iteration: counts.executed tracks positions opened earlier in
+  // this same run, so the cap is checked against the latest effective count.
+  const maxOpenReached = brokerTruth.positionsCount + counts.executed >= guardConfig.maxOpenPositions;
 
   const replacementPlan = planConservativeReplacement({
     incomingTrade: trade,

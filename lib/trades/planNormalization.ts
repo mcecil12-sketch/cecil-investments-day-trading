@@ -82,37 +82,5 @@ export function normalizeTradePlanForSide(input: NormalizeTradePlanInput): Norma
     };
   }
 
-  // Invert long-style bracket to short, preserving risk distance and R multiple.
-  if (side === "SHORT" && stop < entry && target > entry) {
-    const risk = Math.abs(entry - stop);
-    if (!(risk > 0)) return bad("invalid_risk_distance");
-
-    const reward = Math.abs(target - entry);
-    const inferredR = reward > 0 && Number.isFinite(reward / risk)
-      ? reward / risk
-      : Number.isFinite(input.rewardMultiple as number) && Number(input.rewardMultiple) > 0
-        ? Number(input.rewardMultiple)
-        : DEFAULT_REWARD_MULTIPLE;
-
-    const normalizedStop = Number((entry + risk).toFixed(6));
-    const normalizedTarget = Number((entry - risk * inferredR).toFixed(6));
-
-    if (!isTradePlanSideValid("SHORT", entry, normalizedStop, normalizedTarget)) {
-      return bad("normalization_failed_short_inversion");
-    }
-
-    return {
-      ok: true,
-      originalEntryPrice: entry,
-      originalStopPrice: stop,
-      originalTargetPrice: target,
-      normalizedEntryPrice: entry,
-      normalizedStopPrice: normalizedStop,
-      normalizedTargetPrice: normalizedTarget,
-      normalizedForSide: true,
-      rewardMultipleUsed: inferredR,
-    };
-  }
-
   return bad("invalid_trade_plan_for_side");
 }

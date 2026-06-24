@@ -28,7 +28,10 @@ describe("planNormalization", () => {
     expect(isTradePlanSideValid("SHORT", result.normalizedEntryPrice, result.normalizedStopPrice, result.normalizedTargetPrice)).toBe(true);
   });
 
-  it("inverts long-style plan when side is SHORT", () => {
+  it("rejects long-style plan when side is SHORT (no silent inversion repair)", () => {
+    // A SHORT bracket shaped like a LONG (stop < entry, target > entry) is
+    // structurally invalid and must be rejected outright.  Silent mirroring
+    // would substitute a fabricated stop and mask scorer bugs.
     const result = normalizeTradePlanForSide({
       side: "SHORT",
       entryPrice: 5.9816,
@@ -36,11 +39,8 @@ describe("planNormalization", () => {
       targetPrice: 6.101232,
     });
 
-    expect(result.ok).toBe(true);
-    expect(result.normalizedForSide).toBe(true);
-    expect(result.normalizedStopPrice).toBeGreaterThan(result.normalizedEntryPrice);
-    expect(result.normalizedTargetPrice).toBeLessThan(result.normalizedEntryPrice);
-    expect(result.rewardMultipleUsed).toBeCloseTo(2, 6);
+    expect(result.ok).toBe(false);
+    expect(result.invalidReason).toBe("invalid_trade_plan_for_side");
   });
 
   it("rejects malformed one-sided SHORT plan", () => {

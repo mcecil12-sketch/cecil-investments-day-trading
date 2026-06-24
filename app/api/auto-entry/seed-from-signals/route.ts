@@ -137,6 +137,7 @@ function mapSkipReason(raw: string): SeedSkipReason | null {
     case "near_capacity_ctier_block":
     case "near_capacity_recovery_block":
     case "missing_trade_plan":
+    case "missing_score":
       return raw as SeedSkipReason;
     default:
       return null;
@@ -930,18 +931,16 @@ export async function POST(req: NextRequest) {
     const stopPrice = getNum(s, ["stopPrice", "ai.stopPrice"]);
     const targetPrice = getNum(s, ["targetPrice", "takeProfitPrice", "ai.targetPrice", "ai.takeProfitPrice"]);
     const aiScoreRaw = getNum(s, ["aiScore", "score", "ai.score"]);
-    const scoreTier = Number.isFinite(aiScoreRaw as number) ? tierForScore(aiScoreRaw as number) : null;
-    const gradeTier = normalizeTier(getStr(s, ["aiGrade", "grade", "ai.grade"]));
-    const tier = scoreTier || gradeTier;
-    const aiScore = Number.isFinite(aiScoreRaw as number)
-      ? (aiScoreRaw as number)
-      : tier === "A"
-        ? cfg.tierAmin
-        : tier === "B"
-          ? cfg.tierBmin
-          : tier === "C"
-            ? cfg.tierCmin
-            : null;
+    // Require a real, positive, finite numeric score. A grade letter with no
+    // numeric score is insufficient — never synthesize aiScore from tier/grade
+    // because that masks missing scoring data and inflates the risk multiplier.
+    if (!(Number.isFinite(aiScoreRaw) && (aiScoreRaw as number) > 0)) {
+      markSkip("missing_score");
+      bumpSeedBlockReason("missing_score");
+      continue;
+    }
+    const aiScore = aiScoreRaw as number;
+    const tier = tierForScore(aiScore);
     const createdAt = String(s?.createdAt || s?.updatedAt || nowIso);
     const freshnessDecision =
       freshnessDecisionMap.get(signalId) ??
