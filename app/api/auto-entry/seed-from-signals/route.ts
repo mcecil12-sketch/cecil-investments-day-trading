@@ -932,16 +932,6 @@ export async function POST(req: NextRequest) {
     const stopPrice = getNum(s, ["stopPrice", "ai.stopPrice"]);
     const targetPrice = getNum(s, ["targetPrice", "takeProfitPrice", "ai.targetPrice", "ai.takeProfitPrice"]);
     const aiScoreRaw = getNum(s, ["aiScore", "score", "ai.score"]);
-    // Require a real, positive, finite numeric score. A grade letter with no
-    // numeric score is insufficient — never synthesize aiScore from tier/grade
-    // because that masks missing scoring data and inflates the risk multiplier.
-    if (!(Number.isFinite(aiScoreRaw) && (aiScoreRaw as number) > 0)) {
-      markSkip("missing_score");
-      bumpSeedBlockReason("missing_score");
-      continue;
-    }
-    const aiScore = aiScoreRaw as number;
-    const tier = tierForScore(aiScore);
     const createdAt = String(s?.createdAt || s?.updatedAt || nowIso);
     const freshnessDecision =
       freshnessDecisionMap.get(signalId) ??
@@ -978,6 +968,17 @@ export async function POST(req: NextRequest) {
         side,
       });
     };
+
+    // Require a real, positive, finite numeric score. A grade letter with no
+    // numeric score is insufficient - never synthesize aiScore from tier/grade
+    // because that masks missing scoring data and inflates the risk multiplier.
+    if (!(Number.isFinite(aiScoreRaw) && (aiScoreRaw as number) > 0)) {
+      markSkip("missing_score");
+      bumpSeedBlockReason("missing_score");
+      continue;
+    }
+    const aiScore = aiScoreRaw as number;
+    const tier = tierForScore(aiScore);
 
     if (!signalId) {
       markSkip("missing_signal_id");
