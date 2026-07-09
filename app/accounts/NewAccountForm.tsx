@@ -70,7 +70,7 @@ export function NewAccountForm() {
           required
         />
       </div>
-      {error && <p style={{ color: "#ff4e4e" }}>{error}</p>}
+      {error && <p style={{ color: "var(--negative)" }}>{error}</p>}
       <button className="btn" type="submit" disabled={submitting}>
         {submitting ? "Adding…" : "Add account"}
       </button>

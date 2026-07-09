@@ -35,9 +35,14 @@ main {
   margin: 0 auto;
 }
 
+.table-wrap {
+  overflow-x: auto;
+}
+
 table {
   border-collapse: collapse;
   width: 100%;
+  min-width: 480px;
 }
 
 th,
@@ -280,4 +285,50 @@ select {
 
 .bottom-nav-item.active {
   color: var(--accent);
+}
+
+/* CSV drop zone */
+.dropzone {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  cursor: pointer;
+  color: var(--text-muted);
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.dropzone.dragging {
+  border-color: var(--accent);
+  background: rgba(0, 168, 255, 0.08);
+  color: var(--text);
+}
+
+.dropzone input[type="file"] {
+  display: none;
+}
+
+.dropzone-title {
+  color: var(--text);
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+.dropzone-hint {
+  font-size: 0.8rem;
+}
+
+.link-back {
+  display: inline-block;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.85rem;
+  margin-bottom: 0.75rem;
+}
+
+.link-back:hover {
+  color: var(--text);
 }

@@ -80,46 +80,48 @@ export default async function BenchmarkPage() {
 
       <h2>Portfolio vs. S&amp;P 500</h2>
       <div className="card">
-        <table>
-          <thead>
-            <tr>
-              <th>Scope</th>
-              <th>Period</th>
-              <th>Portfolio Return</th>
-              <th>S&amp;P 500 Return</th>
-              <th>Alpha</th>
-              <th>Value (start → end)</th>
-            </tr>
-          </thead>
-          <tbody>
-            {AGGREGATE_SCOPES.flatMap((scope) => {
-              const results = aggregateByScope.get(scope) ?? [];
-              return BENCHMARK_PERIODS.map(({ key }) => {
-                const result = results.find((r) => r.period === key);
-                return (
-                  <tr key={`${scope}-${key}`}>
-                    <td>{SCOPE_LABELS[scope]}</td>
-                    <td>{PERIOD_LABELS[key]}</td>
-                    <td className="mono">{formatPercent(result?.portfolioReturn ?? null)}</td>
-                    <td className="mono">{formatPercent(result?.sp500Return ?? null)}</td>
-                    <td className="mono" style={{ color: alphaColor(result?.alpha ?? null) }}>
-                      {formatPercent(result?.alpha ?? null)}
-                    </td>
-                    <td className="mono" style={{ color: "var(--text-muted)" }}>
-                      {result
-                        ? `${formatCurrency(result.startValue)} → ${formatCurrency(result.endValue)}`
-                        : "No data"}
-                      {result?.insufficientHistory && " (partial window)"}
-                      {result && result.excludedAccountIds.length > 0
-                        ? ` — excludes ${result.excludedAccountIds.length} account(s) without history`
-                        : ""}
-                    </td>
-                  </tr>
-                );
-              });
-            })}
-          </tbody>
-        </table>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Scope</th>
+                <th>Period</th>
+                <th>Portfolio Return</th>
+                <th>S&amp;P 500 Return</th>
+                <th>Alpha</th>
+                <th>Value (start → end)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {AGGREGATE_SCOPES.flatMap((scope) => {
+                const results = aggregateByScope.get(scope) ?? [];
+                return BENCHMARK_PERIODS.map(({ key }) => {
+                  const result = results.find((r) => r.period === key);
+                  return (
+                    <tr key={`${scope}-${key}`}>
+                      <td>{SCOPE_LABELS[scope]}</td>
+                      <td>{PERIOD_LABELS[key]}</td>
+                      <td className="mono">{formatPercent(result?.portfolioReturn ?? null)}</td>
+                      <td className="mono">{formatPercent(result?.sp500Return ?? null)}</td>
+                      <td className="mono" style={{ color: alphaColor(result?.alpha ?? null) }}>
+                        {formatPercent(result?.alpha ?? null)}
+                      </td>
+                      <td className="mono" style={{ color: "var(--text-muted)" }}>
+                        {result
+                          ? `${formatCurrency(result.startValue)} → ${formatCurrency(result.endValue)}`
+                          : "No data"}
+                        {result?.insufficientHistory && " (partial window)"}
+                        {result && result.excludedAccountIds.length > 0
+                          ? ` — excludes ${result.excludedAccountIds.length} account(s) without history`
+                          : ""}
+                      </td>
+                    </tr>
+                  );
+                });
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <h2>By Account</h2>
@@ -139,38 +141,40 @@ export default async function BenchmarkPage() {
                 No snapshot data yet — import a statement to see benchmark data.
               </p>
             ) : (
-              <table>
-                <thead>
-                  <tr>
-                    <th>Period</th>
-                    <th>Portfolio Return</th>
-                    <th>S&amp;P 500 Return</th>
-                    <th>Alpha</th>
-                    <th>Value (start → end)</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {BENCHMARK_PERIODS.map(({ key }) => {
-                    const result = results.find((r) => r.period === key);
-                    return (
-                      <tr key={key}>
-                        <td>{PERIOD_LABELS[key]}</td>
-                        <td className="mono">{formatPercent(result?.portfolioReturn ?? null)}</td>
-                        <td className="mono">{formatPercent(result?.sp500Return ?? null)}</td>
-                        <td className="mono" style={{ color: alphaColor(result?.alpha ?? null) }}>
-                          {formatPercent(result?.alpha ?? null)}
-                        </td>
-                        <td className="mono" style={{ color: "var(--text-muted)" }}>
-                          {result
-                            ? `${formatCurrency(result.startValue)} → ${formatCurrency(result.endValue)}`
-                            : "—"}
-                          {result?.insufficientHistory && " (partial window)"}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Period</th>
+                      <th>Portfolio Return</th>
+                      <th>S&amp;P 500 Return</th>
+                      <th>Alpha</th>
+                      <th>Value (start → end)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {BENCHMARK_PERIODS.map(({ key }) => {
+                      const result = results.find((r) => r.period === key);
+                      return (
+                        <tr key={key}>
+                          <td>{PERIOD_LABELS[key]}</td>
+                          <td className="mono">{formatPercent(result?.portfolioReturn ?? null)}</td>
+                          <td className="mono">{formatPercent(result?.sp500Return ?? null)}</td>
+                          <td className="mono" style={{ color: alphaColor(result?.alpha ?? null) }}>
+                            {formatPercent(result?.alpha ?? null)}
+                          </td>
+                          <td className="mono" style={{ color: "var(--text-muted)" }}>
+                            {result
+                              ? `${formatCurrency(result.startValue)} → ${formatCurrency(result.endValue)}`
+                              : "—"}
+                            {result?.insufficientHistory && " (partial window)"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
         );

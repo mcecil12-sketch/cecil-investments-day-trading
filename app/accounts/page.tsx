@@ -1,50 +1,86 @@
+import Link from "next/link";
 import { prisma } from "@/lib/prisma";
+import { computeBenchmark } from "@/lib/benchmark/engine";
+import type { BenchmarkComputation } from "@/lib/benchmark/engine";
+import { persistBenchmarkResults } from "@/lib/benchmark/persist";
+import { alphaColor, formatCompactCurrency, formatCurrency, formatPercent } from "@/lib/format";
 import { NewAccountForm } from "./NewAccountForm";
 
 export const dynamic = "force-dynamic";
 
 export default async function AccountsPage() {
-  const accounts = await prisma.account.findMany({
-    orderBy: { createdAt: "asc" },
-    include: { _count: { select: { holdings: true } } },
-  });
+  const accounts = await prisma.account.findMany({ orderBy: { createdAt: "asc" } });
+
+  let computation: BenchmarkComputation | null = null;
+  try {
+    computation = await computeBenchmark();
+    await persistBenchmarkResults(computation);
+  } catch {
+    // Value/alpha columns just fall back to "—" below if this fails.
+  }
+
+  const accountAlphaByAccount = new Map<string, number | null>();
+  const accountValueByAccount = new Map<string, number>();
+  const accountSplitByAccount = new Map<string, { locked: number; actionable: number }>();
+  for (const result of computation?.accounts ?? []) {
+    if (result.period !== "1y") continue;
+    accountAlphaByAccount.set(result.accountId, result.alpha);
+    accountValueByAccount.set(result.accountId, result.endValue);
+    if (result.currentLockedValue > 0) {
+      accountSplitByAccount.set(result.accountId, {
+        locked: result.currentLockedValue,
+        actionable: result.currentActionableValue,
+      });
+    }
+  }
 
   return (
     <div>
       <h1>Accounts</h1>
       <NewAccountForm />
+
       <div className="card">
-        <table>
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Type</th>
-              <th>Institution</th>
-              <th>External ID</th>
-              <th>Locked</th>
-              <th>Holdings</th>
-            </tr>
-          </thead>
-          <tbody>
-            {accounts.map((account) => (
-              <tr key={account.id}>
-                <td>{account.name}</td>
-                <td>{account.type}</td>
-                <td>{account.institution}</td>
-                <td>{account.externalId ?? "—"}</td>
-                <td>{account.isLocked ? "Yes" : "No"}</td>
-                <td>{account._count.holdings}</td>
-              </tr>
-            ))}
-            {accounts.length === 0 && (
-              <tr>
-                <td colSpan={6} style={{ color: "var(--text-muted)" }}>
-                  No accounts yet — add one above or upload a Fidelity CSV.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+        {accounts.map((account) => {
+          const value = accountValueByAccount.get(account.id) ?? null;
+          const alpha = accountAlphaByAccount.get(account.id) ?? null;
+          const split = accountSplitByAccount.get(account.id) ?? null;
+          return (
+            <Link
+              href={`/accounts/${account.id}`}
+              className={`account-row${account.isLocked ? " muted" : ""}`}
+              key={account.id}
+            >
+              <div className="account-main">
+                <div className="account-info">
+                  <div className="account-name">{account.name}</div>
+                  <div className="account-meta">
+                    <span>{account.type}</span>
+                    {account.isLocked && <span className="badge">Monitor Only</span>}
+                  </div>
+                </div>
+                <div className="account-figures">
+                  <div className="account-value">{formatCurrency(value)}</div>
+                  {!account.isLocked && (
+                    <div className="account-alpha" style={{ color: alphaColor(alpha) }}>
+                      {formatPercent(alpha)} 1Y
+                    </div>
+                  )}
+                </div>
+              </div>
+              {split && (
+                <div className="account-split">
+                  ({formatCompactCurrency(split.locked)} locked / {formatCompactCurrency(split.actionable)}{" "}
+                  actionable)
+                </div>
+              )}
+            </Link>
+          );
+        })}
+        {accounts.length === 0 && (
+          <p style={{ color: "var(--text-muted)" }}>
+            No accounts yet — add one above or upload a Fidelity CSV.
+          </p>
+        )}
       </div>
     </div>
   );
