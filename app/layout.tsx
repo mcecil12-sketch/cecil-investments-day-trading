@@ -1,49 +1,24 @@
 import type { Metadata } from "next";
-
 import "./globals.css";
-import { TradingProvider } from "./tradingContext";
-import { AutoManagePoller } from "@/components/AutoManagePoller";
-import { AppShell } from "@/components/AppShell";
-import { HeartbeatPoller } from "@/components/HeartbeatPoller";
-import { AiHeartbeatPing } from "@/components/AiHeartbeatPing";
 
 export const metadata: Metadata = {
-  applicationName: "Cecil Trading",
-  title: "Cecil Trading",
-  description: "AI-powered day trading assistant",
-  manifest: "/manifest.json",
-  appleWebApp: {
-    capable: true,
-    statusBarStyle: "black-translucent",
-    title: "Cecil Trading",
-  },
+  title: "Cecil Investments — Portfolio Benchmark",
+  description: "Portfolio performance vs. S&P 500 across all accounts.",
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <head>
-        <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
-      </head>
       <body>
-        <TradingProvider>
-          <HeartbeatPoller />
-          <AiHeartbeatPing />
-          <AutoManagePoller />
-          <AppShell>{children}</AppShell>
-        </TradingProvider>
+        <nav className="app-nav">
+          <a href="/">Home</a>
+          <a href="/accounts">Accounts</a>
+          <a href="/import">Import</a>
+          <a href="/benchmark">Benchmark</a>
+          <a href="/dashboard">Dashboard</a>
+        </nav>
+        <main>{children}</main>
       </body>
     </html>
   );
 }
-
-export const viewport = {
-  width: "device-width",
-  initialScale: 1,
-  viewportFit: "cover",
-  themeColor: "#000000",
-};

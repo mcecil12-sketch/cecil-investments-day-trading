@@ -1,38 +1,89 @@
 generator client {
   provider = "prisma-client-js"
+  output   = "../lib/generated/prisma"
 }
 
 datasource db {
   provider = "sqlite"
+  url      = env("DATABASE_URL")
 }
 
-model Trade {
-  id                  String   @id
-  ticker              String
-  side                String
-  size                Int
-  entryPrice          Float
-  stopPrice           Float?
-  targetPrice         Float?
-  openedAt            DateTime
-  closedAt            DateTime?
-  status              String
-  notes               String?
-  realizedPnL         Float?
-  initialRiskPerShare Float?
-  initialDollarRisk   Float?
-  maxRReached         Float?
-  management          Json?
+enum AccountType {
+  FIDELITY_TAXABLE
+  VZ_SAVINGS_401K
+  VZ_LEGACY_401K
+  VZ_EDP
 }
 
-model Signal {
-  id         String   @id
-  ticker     String
-  side       String
-  entryPrice Float
-  stopPrice  Float?
-  targetPrice Float?
-  reasoning  String?
-  source     String?
-  createdAt  DateTime
+enum InstrumentType {
+  STOCK
+  FUND
+  CASH
+}
+
+enum ImportBatchStatus {
+  PENDING
+  COMPLETE
+  PARTIAL
+  FAILED
+}
+
+model Account {
+  id            String        @id @default(cuid())
+  name          String
+  type          AccountType
+  institution   String
+  /// External account identifier from the source institution's export (e.g. Fidelity's masked account number), used to match repeat imports to the right account.
+  externalId    String?       @unique
+  isLocked      Boolean       @default(false)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  holdings      Holding[]
+  importBatches ImportBatch[]
+}
+
+model Instrument {
+  id           String         @id @default(cuid())
+  symbol       String         @unique
+  name         String?
+  type         InstrumentType @default(STOCK)
+  expenseRatio Float?
+  category     String?
+  holdings     Holding[]
+}
+
+model ImportBatch {
+  id           String            @id @default(cuid())
+  account      Account           @relation(fields: [accountId], references: [id])
+  accountId    String
+  source       String
+  fileName     String
+  asOfDate     DateTime
+  uploadedAt   DateTime          @default(now())
+  status       ImportBatchStatus @default(PENDING)
+  errorMessage String?
+  rowCount     Int               @default(0)
+  holdings     Holding[]
+
+  @@index([accountId, asOfDate])
+}
+
+model Holding {
+  id               String      @id @default(cuid())
+  account          Account     @relation(fields: [accountId], references: [id])
+  accountId        String
+  instrument       Instrument  @relation(fields: [instrumentId], references: [id])
+  instrumentId     String
+  importBatch      ImportBatch @relation(fields: [importBatchId], references: [id])
+  importBatchId    String
+  asOfDate         DateTime
+  quantity         Float
+  lastPrice        Float?
+  currentValue     Float
+  costBasisTotal   Float?
+  averageCostBasis Float?
+  percentOfAccount Float?
+
+  @@index([accountId, asOfDate])
+  @@index([instrumentId])
 }
