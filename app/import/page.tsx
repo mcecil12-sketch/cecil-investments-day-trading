@@ -2,6 +2,7 @@ import { prisma } from "@/lib/prisma";
 import type { ImportBatchStatus } from "@/lib/generated/prisma";
 import { formatDate } from "@/lib/format";
 import { ImportForm } from "./ImportForm";
+import { ScreenshotImportForm } from "./ScreenshotImportForm";
 
 export const dynamic = "force-dynamic";
 
@@ -13,16 +14,30 @@ const STATUS_COLOR: Record<ImportBatchStatus, string> = {
 };
 
 export default async function ImportPage() {
-  const batches = await prisma.importBatch.findMany({
-    orderBy: { uploadedAt: "desc" },
-    take: 25,
-    include: { account: { select: { name: true } } },
-  });
+  const [batches, accounts] = await Promise.all([
+    prisma.importBatch.findMany({
+      orderBy: { uploadedAt: "desc" },
+      take: 25,
+      include: { account: { select: { name: true } } },
+    }),
+    prisma.account.findMany({ orderBy: { createdAt: "asc" }, select: { id: true, name: true } }),
+  ]);
 
   return (
     <div>
       <h1>Import</h1>
       <ImportForm />
+
+      <h2>Upload Screenshot</h2>
+      {accounts.length === 0 ? (
+        <div className="card">
+          <p style={{ color: "var(--text-muted)" }}>
+            Add an account first — screenshot positions need an account to import into.
+          </p>
+        </div>
+      ) : (
+        <ScreenshotImportForm accounts={accounts} />
+      )}
 
       <h2>Import History</h2>
       <div className="card">
