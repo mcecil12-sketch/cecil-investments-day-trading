@@ -28,18 +28,25 @@ enum ImportBatchStatus {
   FAILED
 }
 
+enum BenchmarkScope {
+  ACCOUNT
+  AGGREGATE_TOTAL
+  AGGREGATE_ACTIONABLE
+}
+
 model Account {
-  id            String        @id @default(cuid())
-  name          String
-  type          AccountType
-  institution   String
+  id               String            @id @default(cuid())
+  name             String
+  type             AccountType
+  institution      String
   /// External account identifier from the source institution's export (e.g. Fidelity's masked account number), used to match repeat imports to the right account.
-  externalId    String?       @unique
-  isLocked      Boolean       @default(false)
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
-  holdings      Holding[]
-  importBatches ImportBatch[]
+  externalId       String?           @unique
+  isLocked         Boolean           @default(false)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  holdings         Holding[]
+  importBatches    ImportBatch[]
+  benchmarkResults BenchmarkResult[]
 }
 
 model Instrument {
@@ -53,17 +60,18 @@ model Instrument {
 }
 
 model ImportBatch {
-  id           String            @id @default(cuid())
-  account      Account           @relation(fields: [accountId], references: [id])
-  accountId    String
-  source       String
-  fileName     String
-  asOfDate     DateTime
-  uploadedAt   DateTime          @default(now())
-  status       ImportBatchStatus @default(PENDING)
-  errorMessage String?
-  rowCount     Int               @default(0)
-  holdings     Holding[]
+  id               String            @id @default(cuid())
+  account          Account           @relation(fields: [accountId], references: [id])
+  accountId        String
+  source           String
+  fileName         String
+  asOfDate         DateTime
+  uploadedAt       DateTime          @default(now())
+  status           ImportBatchStatus @default(PENDING)
+  errorMessage     String?
+  rowCount         Int               @default(0)
+  holdings         Holding[]
+  benchmarkResults BenchmarkResult[]
 
   @@index([accountId, asOfDate])
 }
@@ -86,4 +94,39 @@ model Holding {
 
   @@index([accountId, asOfDate])
   @@index([instrumentId])
+}
+
+/// Cached daily S&P 500 (^GSPC) closing prices, so benchmark math doesn't hit
+/// Yahoo Finance on every request.
+model BenchmarkPrice {
+  id    String   @id @default(cuid())
+  date  DateTime @unique
+  close Float
+}
+
+/// A single computed portfolio-vs-S&P-500 comparison for one account or one
+/// aggregate scope, over one rolling period, tied to the ImportBatch whose
+/// snapshot supplied the "as of" end value.
+model BenchmarkResult {
+  id                  String         @id @default(cuid())
+  importBatch         ImportBatch    @relation(fields: [importBatchId], references: [id])
+  importBatchId       String
+  scope               BenchmarkScope
+  account             Account?       @relation(fields: [accountId], references: [id])
+  accountId           String?
+  /// "1y" | "3y" | "5y"
+  period              String
+  asOfDate            DateTime
+  requestedStartDate  DateTime
+  actualStartDate     DateTime?
+  startValue          Float?
+  endValue            Float?
+  portfolioReturn     Float?
+  sp500Return         Float?
+  alpha               Float?
+  insufficientHistory Boolean        @default(false)
+  createdAt           DateTime       @default(now())
+
+  @@index([scope, period, asOfDate])
+  @@index([accountId, period])
 }
