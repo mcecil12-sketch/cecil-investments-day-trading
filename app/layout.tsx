@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { BottomNav } from "@/components/BottomNav";
 
 export const metadata: Metadata = {
   title: "Cecil Investments — Portfolio Benchmark",
@@ -10,14 +11,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body>
-        <nav className="app-nav">
-          <a href="/">Home</a>
-          <a href="/accounts">Accounts</a>
-          <a href="/import">Import</a>
-          <a href="/benchmark">Benchmark</a>
-          <a href="/dashboard">Dashboard</a>
-        </nav>
         <main>{children}</main>
+        <BottomNav />
       </body>
     </html>
   );

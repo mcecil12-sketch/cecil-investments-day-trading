@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/prisma";
-import { Account, BenchmarkScope } from "@/lib/generated/prisma";
+import { Account } from "@/lib/generated/prisma";
 import { ensureSp500PriceCache, getSp500CloseOnOrBefore } from "@/lib/benchmark/priceCache";
 import {
   getAccountSnapshot,
@@ -26,6 +26,10 @@ export interface AccountBenchmarkResult {
   actualStartDate: Date | null;
   startValue: number | null;
   endValue: number;
+  /** Current value that can't be reallocated (e.g. a locked company stock fund) — included in endValue but not in return/alpha. */
+  currentLockedValue: number;
+  /** endValue minus currentLockedValue. */
+  currentActionableValue: number;
   portfolioReturn: number | null;
   sp500Return: number | null;
   alpha: number | null;
@@ -143,6 +147,8 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
         actualStartDate: startSnap?.asOfDate ?? null,
         startValue: startSnap?.totalValue ?? null,
         endValue: latest.totalValue,
+        currentLockedValue: latest.lockedValue,
+        currentActionableValue: latest.actionableValue,
         portfolioReturn,
         sp500Return,
         alpha: computeAlpha(portfolioReturn, sp500Return),
@@ -153,78 +159,82 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
   }
 
   const aggregateResults: AggregateBenchmarkResult[] = [];
-  const scopes: Array<{ scope: BenchmarkScope; accounts: Account[] }> = [
-    { scope: "AGGREGATE_TOTAL", accounts: accountsWithData },
-    { scope: "AGGREGATE_ACTIONABLE", accounts: accountsWithData.filter((a) => !a.isLocked) },
+  // AGGREGATE_TOTAL and AGGREGATE_ACTIONABLE run over the same set of accounts —
+  // the difference is which slice of each account's value counts. A locked
+  // company stock fund inside an otherwise-actionable account (e.g. Verizon
+  // EDP) contributes to TOTAL but drops out of ACTIONABLE via actionableValue.
+  const scopeValueSelectors: Array<{
+    scope: "AGGREGATE_TOTAL" | "AGGREGATE_ACTIONABLE";
+    valueOf: (snapshot: AccountSnapshotValue) => number;
+  }> = [
+    { scope: "AGGREGATE_TOTAL", valueOf: (s) => s.totalValue },
+    { scope: "AGGREGATE_ACTIONABLE", valueOf: (s) => s.actionableValue },
   ];
 
-  for (const { key, years } of BENCHMARK_PERIODS) {
-    for (const { scope, accounts: scopeAccounts } of scopes) {
-      // Nothing to compute (e.g. no unlocked accounts yet for ACTIONABLE) —
-      // and no ImportBatch to anchor a row to, so skip entirely.
-      if (scopeAccounts.length === 0) continue;
+  if (accountsWithData.length > 0) {
+    const anchorBatchId =
+      (await latestBatchIdAcrossAccounts(accountsWithData.map((a) => a.id))) ?? "";
 
-      const currentValue = scopeAccounts.reduce(
-        (sum, a) => sum + latestByAccount.get(a.id)!.totalValue,
-        0,
-      );
+    for (const { key, years } of BENCHMARK_PERIODS) {
+      for (const { scope, valueOf } of scopeValueSelectors) {
+        const currentValue = accountsWithData.reduce(
+          (sum, a) => sum + valueOf(latestByAccount.get(a.id)!),
+          0,
+        );
 
-      const asOfDate =
-        scopeAccounts.length > 0
-          ? new Date(Math.max(...scopeAccounts.map((a) => latestByAccount.get(a.id)!.asOfDate.getTime())))
-          : new Date();
-      const requestedStartDate = subtractYears(asOfDate, years);
+        const asOfDate = new Date(
+          Math.max(...accountsWithData.map((a) => latestByAccount.get(a.id)!.asOfDate.getTime())),
+        );
+        const requestedStartDate = subtractYears(asOfDate, years);
 
-      const included: Account[] = [];
-      const excluded: Account[] = [];
-      let startValue = 0;
-      let endValue = 0;
-      let actualStartDate: Date | null = null;
-      let anyIncludedAccountHasPartialWindow = false;
+        const included: Account[] = [];
+        const excluded: Account[] = [];
+        let startValue = 0;
+        let endValue = 0;
+        let actualStartDate: Date | null = null;
+        let anyIncludedAccountHasPartialWindow = false;
 
-      for (const account of scopeAccounts) {
-        const start = startByAccountPeriod.get(`${account.id}:${key}`);
-        const latest = latestByAccount.get(account.id)!;
-        if (start?.snapshot) {
-          included.push(account);
-          startValue += start.snapshot.totalValue;
-          endValue += latest.totalValue;
-          if (start.insufficientHistory) anyIncludedAccountHasPartialWindow = true;
-          if (!actualStartDate || start.snapshot.asOfDate.getTime() > actualStartDate.getTime()) {
-            actualStartDate = start.snapshot.asOfDate;
+        for (const account of accountsWithData) {
+          const start = startByAccountPeriod.get(`${account.id}:${key}`);
+          const latest = latestByAccount.get(account.id)!;
+          if (start?.snapshot) {
+            included.push(account);
+            startValue += valueOf(start.snapshot);
+            endValue += valueOf(latest);
+            if (start.insufficientHistory) anyIncludedAccountHasPartialWindow = true;
+            if (!actualStartDate || start.snapshot.asOfDate.getTime() > actualStartDate.getTime()) {
+              actualStartDate = start.snapshot.asOfDate;
+            }
+          } else {
+            excluded.push(account);
           }
-        } else {
-          excluded.push(account);
         }
+
+        const sp500Start = await getSp500CloseOnOrBefore(requestedStartDate);
+        const sp500End = await getSp500CloseOnOrBefore(asOfDate);
+        const sp500Return =
+          sp500Start && sp500End ? computeReturn(sp500Start.close, sp500End.close) : null;
+        const portfolioReturn = included.length > 0 ? computeReturn(startValue, endValue) : null;
+
+        aggregateResults.push({
+          scope,
+          period: key,
+          asOfDate,
+          requestedStartDate,
+          actualStartDate,
+          currentValue,
+          startValue: included.length > 0 ? startValue : null,
+          endValue: included.length > 0 ? endValue : null,
+          portfolioReturn,
+          sp500Return,
+          alpha: computeAlpha(portfolioReturn, sp500Return),
+          insufficientHistory:
+            excluded.length > 0 || anyIncludedAccountHasPartialWindow || portfolioReturn == null,
+          accountIds: included.map((a) => a.id),
+          excludedAccountIds: excluded.map((a) => a.id),
+          importBatchId: anchorBatchId,
+        });
       }
-
-      const sp500Start = await getSp500CloseOnOrBefore(requestedStartDate);
-      const sp500End = await getSp500CloseOnOrBefore(asOfDate);
-      const sp500Return =
-        sp500Start && sp500End ? computeReturn(sp500Start.close, sp500End.close) : null;
-      const portfolioReturn = included.length > 0 ? computeReturn(startValue, endValue) : null;
-
-      const anchorBatchId =
-        (await latestBatchIdAcrossAccounts(scopeAccounts.map((a) => a.id))) ?? "";
-
-      aggregateResults.push({
-        scope: scope as "AGGREGATE_TOTAL" | "AGGREGATE_ACTIONABLE",
-        period: key,
-        asOfDate,
-        requestedStartDate,
-        actualStartDate,
-        currentValue,
-        startValue: included.length > 0 ? startValue : null,
-        endValue: included.length > 0 ? endValue : null,
-        portfolioReturn,
-        sp500Return,
-        alpha: computeAlpha(portfolioReturn, sp500Return),
-        insufficientHistory:
-          excluded.length > 0 || anyIncludedAccountHasPartialWindow || portfolioReturn == null,
-        accountIds: included.map((a) => a.id),
-        excludedAccountIds: excluded.map((a) => a.id),
-        importBatchId: anchorBatchId,
-      });
     }
   }
 
