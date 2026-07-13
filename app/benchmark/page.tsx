@@ -2,6 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { computeBenchmark } from "@/lib/benchmark/engine";
 import type {
   AccountBenchmarkResult,
+  AccountSincePurchaseResult,
   AggregateBenchmarkResult,
   BenchmarkComputation,
 } from "@/lib/benchmark/engine";
@@ -58,6 +59,11 @@ export default async function BenchmarkPage() {
     const list = aggregateByScope.get(result.scope) ?? [];
     list.push(result);
     aggregateByScope.set(result.scope, list);
+  }
+
+  const sincePurchaseByAccount = new Map<string, AccountSincePurchaseResult>();
+  for (const result of computation!.sincePurchase) {
+    sincePurchaseByAccount.set(result.accountId, result);
   }
 
   return (
@@ -127,6 +133,7 @@ export default async function BenchmarkPage() {
       <h2>By Account</h2>
       {accounts.map((account) => {
         const results = accountResultsByAccount.get(account.id) ?? [];
+        const sincePurchase = sincePurchaseByAccount.get(account.id);
         return (
           <div className="card" key={account.id}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "0.5rem" }}>
@@ -172,6 +179,22 @@ export default async function BenchmarkPage() {
                         </tr>
                       );
                     })}
+                    {sincePurchase && (
+                      <tr>
+                        <td>Since Purchase (est.)</td>
+                        <td className="mono">{formatPercent(sincePurchase.portfolioReturn)}</td>
+                        <td className="mono">{formatPercent(sincePurchase.sp500Return)}</td>
+                        <td className="mono" style={{ color: alphaColor(sincePurchase.alpha) }}>
+                          {formatPercent(sincePurchase.alpha)}
+                        </td>
+                        <td className="mono" style={{ color: "var(--text-muted)" }}>
+                          {formatCurrency(sincePurchase.costBasis)} → {formatCurrency(sincePurchase.currentValue)}
+                          {" (cost basis vs. current value — no purchase date on record, S&P 500 side estimated from "}
+                          {formatDate(sincePurchase.estimatedHoldingStart)}
+                          {")"}
+                        </td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>

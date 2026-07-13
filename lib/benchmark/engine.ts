@@ -58,11 +58,33 @@ export interface AggregateBenchmarkResult {
   importBatchId: string;
 }
 
+/**
+ * Cost-basis-derived return for accounts that don't yet have enough
+ * snapshots for a real rolling-window comparison. There's no known purchase
+ * date, so the account's createdAt (when we first started tracking it) is
+ * used as the best available estimate of the holding period's start, purely
+ * to give the paired S&P 500 figure a comparable window — the portfolio side
+ * doesn't depend on it at all.
+ */
+export interface AccountSincePurchaseResult {
+  scope: "ACCOUNT_SINCE_PURCHASE";
+  accountId: string;
+  accountName: string;
+  asOfDate: Date;
+  costBasis: number;
+  currentValue: number;
+  portfolioReturn: number | null;
+  estimatedHoldingStart: Date;
+  sp500Return: number | null;
+  alpha: number | null;
+}
+
 export interface BenchmarkComputation {
   computedAt: Date;
   totalCurrentValue: number;
   accounts: AccountBenchmarkResult[];
   aggregate: AggregateBenchmarkResult[];
+  sincePurchase: AccountSincePurchaseResult[];
 }
 
 async function resolveStartSnapshot(
@@ -158,6 +180,37 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
     }
   }
 
+  // Cost-basis fallback: a real return the moment a single import exists,
+  // for accounts where every rolling period above came back empty.
+  const sincePurchaseResults: AccountSincePurchaseResult[] = [];
+  for (const account of accountsWithData) {
+    const periodsForAccount = accountResults.filter((r) => r.accountId === account.id);
+    const hasRollingReturn = periodsForAccount.some((r) => r.portfolioReturn != null);
+    if (hasRollingReturn) continue;
+
+    const latest = latestByAccount.get(account.id)!;
+    const portfolioReturn = computeReturn(latest.costBasisTotal, latest.totalValue);
+
+    const estimatedHoldingStart =
+      account.createdAt.getTime() < latest.asOfDate.getTime() ? account.createdAt : latest.asOfDate;
+    const sp500Start = await getSp500CloseOnOrBefore(estimatedHoldingStart);
+    const sp500End = await getSp500CloseOnOrBefore(latest.asOfDate);
+    const sp500Return = sp500Start && sp500End ? computeReturn(sp500Start.close, sp500End.close) : null;
+
+    sincePurchaseResults.push({
+      scope: "ACCOUNT_SINCE_PURCHASE",
+      accountId: account.id,
+      accountName: account.name,
+      asOfDate: latest.asOfDate,
+      costBasis: latest.costBasisTotal,
+      currentValue: latest.totalValue,
+      portfolioReturn,
+      estimatedHoldingStart,
+      sp500Return,
+      alpha: computeAlpha(portfolioReturn, sp500Return),
+    });
+  }
+
   const aggregateResults: AggregateBenchmarkResult[] = [];
   // AGGREGATE_TOTAL and AGGREGATE_ACTIONABLE run over the same set of accounts —
   // the difference is which slice of each account's value counts. A locked
@@ -243,5 +296,6 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
     totalCurrentValue,
     accounts: accountResults,
     aggregate: aggregateResults,
+    sincePurchase: sincePurchaseResults,
   };
 }

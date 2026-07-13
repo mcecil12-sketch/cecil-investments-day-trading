@@ -12,6 +12,8 @@ export interface AccountSnapshotValue {
   lockedValue: number;
   /** totalValue minus lockedValue — what actually participates in return/alpha calculations. */
   actionableValue: number;
+  /** Sum of each holding's cost basis; holdings missing a cost basis (e.g. cash sweep) fall back to their current value so they read as flat rather than skewing the total. */
+  costBasisTotal: number;
 }
 
 const USABLE_STATUSES: ImportBatchStatus[] = ["COMPLETE", "PARTIAL"];
@@ -28,9 +30,11 @@ async function toSnapshotValue(
 
   let totalValue = 0;
   let lockedValue = 0;
+  let costBasisTotal = 0;
   for (const holding of holdings) {
     totalValue += holding.currentValue;
     if (isLockedInstrument(holding.instrument)) lockedValue += holding.currentValue;
+    costBasisTotal += holding.costBasisTotal ?? holding.currentValue;
   }
 
   return {
@@ -40,6 +44,7 @@ async function toSnapshotValue(
     totalValue,
     lockedValue,
     actionableValue: totalValue - lockedValue,
+    costBasisTotal,
   };
 }
 
