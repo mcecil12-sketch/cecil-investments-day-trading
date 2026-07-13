@@ -10,6 +10,21 @@ const ALLOWED_MEDIA_TYPES: Record<string, "image/png" | "image/jpeg"> = {
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
+/**
+ * Claude sometimes returns asOfDate as something like "Jul-10-2026 at 5:58
+ * p.m. ET" despite the prompt asking for YYYY-MM-DD — strip the time/timezone
+ * suffix and the dashes so `new Date()` has a shot at parsing it, and fall
+ * back to today rather than failing the whole import over a date string.
+ */
+function normalizeAsOfDate(raw: string): string {
+  const cleaned = raw.split(/\s+at\s+/i)[0].replace(/-/g, " ").trim();
+  const parsed = new Date(cleaned);
+  if (Number.isNaN(parsed.getTime())) {
+    return new Date().toISOString().slice(0, 10);
+  }
+  return parsed.toISOString().slice(0, 10);
+}
+
 export async function POST(request: NextRequest) {
   const formData = await request.formData().catch(() => null);
   const file = formData?.get("file");
@@ -90,7 +105,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const extracted = parseExtractionResponse(responseText);
-    return NextResponse.json(extracted);
+    return NextResponse.json({ ...extracted, asOfDate: normalizeAsOfDate(extracted.asOfDate) });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json(

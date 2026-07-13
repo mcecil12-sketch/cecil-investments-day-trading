@@ -21,7 +21,7 @@ export interface ScreenshotExtractionResult {
 export const EXTRACTION_SYSTEM_PROMPT = `You are a financial data extractor. Extract all portfolio positions from this screenshot of a brokerage account page. Return ONLY valid JSON, no markdown, no explanation:
 {
   accountName: string,
-  asOfDate: string,
+  asOfDate: string (format YYYY-MM-DD only — no time, no timezone),
   positions: [{
     symbol: string,
     name: string,
