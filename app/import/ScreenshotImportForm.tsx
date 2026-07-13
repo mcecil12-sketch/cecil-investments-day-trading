@@ -20,6 +20,18 @@ interface ConfirmResult {
 
 type Stage = "idle" | "extracting" | "preview" | "importing" | "done" | "error";
 
+/** Matches Claude's extracted account name against the known accounts list so the picker can default to it instead of always falling back to the first account. */
+function findMatchingAccountId(accounts: AccountOption[], extractedName: string): string | undefined {
+  const normalize = (value: string) => value.trim().toLowerCase();
+  const target = normalize(extractedName);
+  const exact = accounts.find((account) => normalize(account.name) === target);
+  if (exact) return exact.id;
+  const partial = accounts.find(
+    (account) => normalize(account.name).includes(target) || target.includes(normalize(account.name)),
+  );
+  return partial?.id;
+}
+
 export function ScreenshotImportForm({ accounts }: { accounts: AccountOption[] }) {
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -51,7 +63,9 @@ export function ScreenshotImportForm({ accounts }: { accounts: AccountOption[] }
       const response = await fetch("/api/import/screenshot", { method: "POST", body: formData });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error ?? "Extraction failed");
-      setExtraction(body as ScreenshotExtractionResult);
+      const result = body as ScreenshotExtractionResult;
+      setExtraction(result);
+      setAccountId(findMatchingAccountId(accounts, result.accountName) ?? accounts[0]?.id ?? "");
       setStage("preview");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

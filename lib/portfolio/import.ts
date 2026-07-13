@@ -55,6 +55,19 @@ export async function importHoldingsBatch(input: {
 
   try {
     await prisma.$transaction(async (tx) => {
+      // A re-import for the same account and as-of date supersedes whatever
+      // was there before, rather than piling on top of it — otherwise
+      // importing the same snapshot twice doubles every position's value.
+      const staleHoldings = await tx.holding.findMany({
+        where: { accountId: input.accountId, asOfDate: input.asOfDate, importBatchId: { not: batch.id } },
+        select: { id: true, importBatchId: true },
+      });
+      if (staleHoldings.length > 0) {
+        await tx.holding.deleteMany({ where: { id: { in: staleHoldings.map((h) => h.id) } } });
+        const staleBatchIds = [...new Set(staleHoldings.map((h) => h.importBatchId))];
+        await tx.importBatch.updateMany({ where: { id: { in: staleBatchIds } }, data: { rowCount: 0 } });
+      }
+
       for (const row of input.rows) {
         const instrument = await tx.instrument.upsert({
           where: { symbol: row.symbol },
