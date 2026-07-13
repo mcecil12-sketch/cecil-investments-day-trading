@@ -30,6 +30,17 @@ export function formatDate(date: Date | null): string {
   });
 }
 
+export function formatDateTime(date: Date | null): string {
+  if (!date) return "—";
+  return new Date(date).toLocaleString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 export function alphaColor(alpha: number | null): string | undefined {
   if (alpha == null) return undefined;
   return alpha >= 0 ? "var(--positive)" : "var(--negative)";

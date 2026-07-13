@@ -332,3 +332,123 @@ select {
 .link-back:hover {
   color: var(--text);
 }
+
+/* Agents */
+.card-accent {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(0, 168, 255, 0.15);
+}
+
+.agent-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.85rem;
+}
+
+@media (max-width: 720px) {
+  .agent-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.agent-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.agent-card-name {
+  font-weight: 600;
+}
+
+.status-pill {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-radius: var(--radius);
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.status-pill.status-running {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.status-pill.status-complete {
+  color: var(--positive);
+  border-color: var(--positive);
+}
+
+.status-pill.status-failed {
+  color: var(--negative);
+  border-color: var(--negative);
+}
+
+.agent-last-run {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  margin-bottom: 0.75rem;
+}
+
+.finding-row {
+  font-size: 0.82rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.finding-row:last-child {
+  border-bottom: none;
+}
+
+.finding-symbol {
+  font-weight: 600;
+  display: block;
+}
+
+.finding-detail {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  display: block;
+  margin-top: 0.1rem;
+}
+
+.action-item-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.action-item-row:last-child {
+  border-bottom: none;
+}
+
+.action-item-priority {
+  font-family: var(--font-mono);
+  color: var(--accent);
+  font-weight: 700;
+  flex-shrink: 0;
+  width: 1.5rem;
+}
+
+.action-item-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.action-item-action {
+  font-weight: 600;
+}
+
+.action-item-rationale {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  margin-top: 0.15rem;
+}

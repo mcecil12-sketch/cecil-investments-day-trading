@@ -35,6 +35,18 @@ enum BenchmarkScope {
   AGGREGATE_ACTIONABLE
 }
 
+enum AgentType {
+  RELATIVE_STRENGTH
+  SECTOR_ROTATION
+  RISK_MANAGER
+}
+
+enum AgentRunStatus {
+  RUNNING
+  COMPLETE
+  FAILED
+}
+
 model Account {
   id               String            @id @default(cuid())
   name             String
@@ -48,6 +60,7 @@ model Account {
   holdings         Holding[]
   importBatches    ImportBatch[]
   benchmarkResults BenchmarkResult[]
+  actionItems      ActionItem[]
 }
 
 model Instrument {
@@ -130,4 +143,49 @@ model BenchmarkResult {
 
   @@index([scope, period, asOfDate])
   @@index([accountId, period])
+}
+
+/// One execution of a portfolio-analysis agent (e.g. Relative Strength),
+/// storing its full structured output alongside the run's lifecycle state.
+model AgentRun {
+  id          String         @id @default(cuid())
+  agentType   AgentType
+  status      AgentRunStatus @default(RUNNING)
+  startedAt   DateTime       @default(now())
+  completedAt DateTime?
+  output      Json?
+  errorMessage String?
+  actionItems ActionItem[]
+
+  @@index([agentType, startedAt])
+}
+
+/// A single recommended action surfaced by an agent run, optionally rolled
+/// up into a WeeklyBrief for the CIO summary view.
+model ActionItem {
+  id             String       @id @default(cuid())
+  agentRun       AgentRun     @relation(fields: [agentRunId], references: [id])
+  agentRunId     String
+  priority       Int
+  action         String
+  rationale      String
+  expectedImpact String?
+  account        Account?     @relation(fields: [accountId], references: [id])
+  accountId      String?
+  weeklyBrief    WeeklyBrief? @relation(fields: [weeklyBriefId], references: [id])
+  weeklyBriefId  String?
+  createdAt      DateTime     @default(now())
+
+  @@index([agentRunId])
+  @@index([weeklyBriefId])
+}
+
+/// The CIO's weekly synthesized brief across all agent runs — one row per
+/// week, linking the action items chosen for that week's summary.
+model WeeklyBrief {
+  id          String       @id @default(cuid())
+  weekOf      DateTime     @unique
+  cioSummary  String
+  actionItems ActionItem[]
+  createdAt   DateTime     @default(now())
 }

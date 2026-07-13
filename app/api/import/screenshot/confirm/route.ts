@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { importHoldingsBatch } from "@/lib/portfolio/import";
 import { positionsToHoldingRows, type ExtractedPosition } from "@/lib/portfolio/screenshotImport";
+import { triggerRelativeStrengthRun } from "@/lib/agents/runner";
 
 export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => null);
@@ -32,6 +33,10 @@ export async function POST(request: NextRequest) {
     asOfDate,
     rows,
   });
+
+  if (result.status === "COMPLETE") {
+    triggerRelativeStrengthRun();
+  }
 
   return NextResponse.json({
     accountId: account.id,

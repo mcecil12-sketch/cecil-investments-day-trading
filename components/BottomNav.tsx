@@ -8,6 +8,7 @@ const NAV_ITEMS = [
   { href: "/accounts", label: "Accounts" },
   { href: "/import", label: "Import" },
   { href: "/benchmark", label: "Benchmark" },
+  { href: "/agents", label: "Agents" },
 ];
 
 export function BottomNav() {

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { importFidelityCsv } from "@/lib/portfolio/import";
+import { triggerRelativeStrengthRun } from "@/lib/agents/runner";
 
 export async function POST(request: NextRequest) {
   const formData = await request.formData().catch(() => null);
@@ -15,5 +16,10 @@ export async function POST(request: NextRequest) {
   }
 
   const result = await importFidelityCsv({ csvText, fileName: file.name });
+
+  if (result.batches.some((batch) => batch.status === "COMPLETE")) {
+    triggerRelativeStrengthRun();
+  }
+
   return NextResponse.json(result, { status: 201 });
 }
