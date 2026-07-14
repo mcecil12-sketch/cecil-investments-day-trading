@@ -1,10 +1,7 @@
-import { prisma } from "@/lib/prisma";
-import type { ImportBatchStatus } from "@/lib/generated/prisma";
-import { ensureSp500PriceCache } from "@/lib/benchmark/priceCache";
-import { getPriceHistory, type PricePoint } from "@/lib/agents/marketData";
-import { getFundProxy, ACTIVE_FUND_NOTE } from "@/lib/agents/fundMappings";
-
-const USABLE_STATUSES: ImportBatchStatus[] = ["COMPLETE", "PARTIAL"];
+import { getPriceHistory, getSp500Series, type PricePoint } from "@/lib/agents/marketData";
+import { getFundProxy, getKnownFundReturns, KNOWN_SP500_RETURNS, ACTIVE_FUND_NOTE } from "@/lib/agents/fundMappings";
+import { getCurrentHoldings } from "@/lib/agents/holdings";
+import { momentumOverDays, momentumTo100, sma, trendStrengthScore } from "@/lib/agents/technicals";
 
 export interface RelativeStrengthEntry {
   symbol: string;
@@ -13,29 +10,36 @@ export interface RelativeStrengthEntry {
   currentPrice: number;
   /** 0-100, momentum (60%) + trend strength (40%). */
   score: number;
-  /** score minus the S&P 500's score over the same window. */
+  /** score minus the S&P 500's score over the same window — or, when reported returns are used, the fund's actual return minus the S&P's actual return (percentage points). */
   relativeScore: number;
-  /** 52-week price return, e.g. 0.18 = +18%. */
+  /** 1-year return, e.g. 0.18 = +18%. Sourced from the fund's own reported return when available, otherwise the 52-week price return. */
   momentum: number | null;
   aboveSma50: boolean | null;
   aboveSma200: boolean | null;
   sma50: number | null;
   sma200: number | null;
   accountIds: string[];
-  /** Ticker whose price history was used in place of this holding's own, e.g. "SPY" for a 401k fund with no public price data. Null when the holding's own symbol had usable data. */
+  /** Ticker whose price history was used for trend (50d/200d) in place of this holding's own, e.g. "SPY" for a 401k fund with no public price data. Null when the holding's own symbol had usable data. */
   proxySymbol: string | null;
-  /** Human-readable disclosure of the proxy/active-fund caveats, e.g. "via SPY proxy — Active fund — proxy score is directional only". Null when no proxy was used. */
+  /** Human-readable disclosure of the reported-return/proxy/active-fund caveats. Null when neither applies. */
   note: string | null;
 }
 
-export interface RelativeStrengthOutput {
-  generatedAt: string;
+export interface RelativeStrengthScoringResult {
   sp500: {
     score: number;
     momentum: number | null;
     aboveSma50: boolean | null;
     aboveSma200: boolean | null;
   };
+  /** Every holding that could be scored, unfiltered — the full universe behind topHoldings/underperformers/candidates. */
+  scored: RelativeStrengthEntry[];
+  skipped: Array<{ symbol: string; reason: string }>;
+}
+
+export interface RelativeStrengthOutput {
+  generatedAt: string;
+  sp500: RelativeStrengthScoringResult["sp500"];
   topHoldings: RelativeStrengthEntry[];
   underperformers: RelativeStrengthEntry[];
   candidates: RelativeStrengthEntry[];
@@ -52,47 +56,10 @@ interface ScoredSeries {
   score: number;
 }
 
-function computeReturn(startValue: number, endValue: number): number | null {
-  if (!Number.isFinite(startValue) || startValue === 0) return null;
-  return (endValue - startValue) / startValue;
-}
-
-function sma(points: PricePoint[], window: number): number | null {
-  if (points.length < window) return null;
-  const slice = points.slice(-window);
-  return slice.reduce((sum, p) => sum + p.close, 0) / window;
-}
-
-/** Return over the ~52 weeks ending at the series' last point. */
-function momentum52w(points: PricePoint[]): number | null {
-  if (points.length < 2) return null;
-  const last = points[points.length - 1];
-  const targetTime = last.date.getTime() - 364 * 24 * 60 * 60 * 1000;
-  let start = points[0];
-  for (const p of points) {
-    if (p.date.getTime() <= targetTime) start = p;
-    else break;
-  }
-  return computeReturn(start.close, last.close);
-}
-
-function momentumTo100(momentum: number | null): number {
-  if (momentum == null) return 50;
-  const clamped = Math.max(-0.5, Math.min(0.5, momentum));
-  return (clamped + 0.5) * 100;
-}
-
-/** 0-100: half credit for trading above the 50-day SMA, half for the 200-day. Missing SMAs (short history) score neutral rather than penalized. */
-function trendStrengthScore(currentPrice: number, sma50: number | null, sma200: number | null): number {
-  const part50 = sma50 == null ? 25 : currentPrice > sma50 ? 50 : 0;
-  const part200 = sma200 == null ? 25 : currentPrice > sma200 ? 50 : 0;
-  return part50 + part200;
-}
-
 function scoreSeries(rawPoints: PricePoint[]): ScoredSeries {
   const points = [...rawPoints].sort((a, b) => a.date.getTime() - b.date.getTime());
   const last = points[points.length - 1];
-  const momentum = momentum52w(points);
+  const momentum = momentumOverDays(points, 364);
   const sma50 = sma(points, 50);
   const sma200 = sma(points, 200);
   const trend = trendStrengthScore(last.close, sma50, sma200);
@@ -110,76 +77,16 @@ function scoreSeries(rawPoints: PricePoint[]): ScoredSeries {
   };
 }
 
-interface CurrentHolding {
-  symbol: string;
-  name: string | null;
-  currentValue: number;
-  accountIds: string[];
-}
-
-/**
- * Each account's latest usable snapshot, aggregated by instrument symbol
- * across accounts (a position held in two accounts nets to one entry).
- * Cash/money-market instruments are excluded — momentum and moving averages
- * aren't a meaningful signal for them.
- */
-async function getCurrentHoldings(): Promise<CurrentHolding[]> {
-  const accounts = await prisma.account.findMany();
-  const byInstrument = new Map<
-    string,
-    { symbol: string; name: string | null; currentValue: number; accountIds: Set<string> }
-  >();
-
-  for (const account of accounts) {
-    const batch = await prisma.importBatch.findFirst({
-      where: { accountId: account.id, status: { in: USABLE_STATUSES } },
-      orderBy: [{ asOfDate: "desc" }, { uploadedAt: "desc" }],
-      select: { id: true },
-    });
-    if (!batch) continue;
-
-    const holdings = await prisma.holding.findMany({
-      where: { importBatchId: batch.id },
-      include: { instrument: true },
-    });
-
-    for (const holding of holdings) {
-      if (holding.instrument.type === "CASH") continue;
-      const key = holding.instrument.symbol;
-      const entry = byInstrument.get(key) ?? {
-        symbol: key,
-        name: holding.instrument.name,
-        currentValue: 0,
-        accountIds: new Set<string>(),
-      };
-      entry.currentValue += holding.currentValue;
-      entry.accountIds.add(account.id);
-      byInstrument.set(key, entry);
-    }
-  }
-
-  return Array.from(byInstrument.values()).map((entry) => ({
-    ...entry,
-    accountIds: Array.from(entry.accountIds),
-  }));
-}
-
-async function getSp500Series(): Promise<PricePoint[]> {
-  await ensureSp500PriceCache();
-  const rows = await prisma.benchmarkPrice.findMany({
-    orderBy: { date: "desc" },
-    take: 300,
-  });
-  return rows.map((row) => ({ date: row.date, close: row.close })).reverse();
-}
-
 /**
  * Scores every current holding 0-100 on momentum (60%) + trend strength vs.
  * its 50/200-day moving averages (40%), relative to the S&P 500 over the
- * same window, and buckets the results into top performers, underperformers,
- * and next-tier candidates to watch.
+ * same window. For 401k funds with no public ticker, falls back to a proxy
+ * ETF's price history (see fundMappings.ts) for trend, and to the fund's own
+ * manually reported return for momentum when one is on file — the reported
+ * return is the fund's actual performance, so it takes priority over any
+ * proxy approximation.
  */
-export async function runRelativeStrengthAgent(): Promise<RelativeStrengthOutput> {
+export async function scoreCurrentHoldings(): Promise<RelativeStrengthScoringResult> {
   const [sp500Points, holdings] = await Promise.all([getSp500Series(), getCurrentHoldings()]);
   const sp500 = scoreSeries(sp500Points);
 
@@ -205,24 +112,40 @@ export async function runRelativeStrengthAgent(): Promise<RelativeStrengthOutput
         ({ points } = await getPriceHistory(proxySymbol));
       }
 
-      const s = scoreSeries(points);
+      const priceScored = scoreSeries(points);
+      const knownReturns = getKnownFundReturns(holding.symbol, holding.name);
       const noteParts: string[] = [];
-      if (proxySymbol) noteParts.push(`via ${proxySymbol} proxy`);
+
+      let momentum = priceScored.momentum;
+      let score = priceScored.score;
+      let relativeScore = score - sp500.score;
+
+      if (knownReturns) {
+        momentum = knownReturns.oneYear;
+        const momentumScore = momentumTo100(momentum);
+        const trend = trendStrengthScore(priceScored.currentPrice, priceScored.sma50, priceScored.sma200);
+        score = Math.max(0, Math.min(100, Math.round(momentumScore * 0.6 + trend * 0.4)));
+        relativeScore = Math.round((knownReturns.oneYear - KNOWN_SP500_RETURNS.oneYear) * 100);
+        noteParts.push("via reported returns");
+        if (proxySymbol) noteParts.push(`trend via ${proxySymbol} proxy`);
+      } else if (proxySymbol) {
+        noteParts.push(`via ${proxySymbol} proxy`);
+      }
       if (isActiveFund) noteParts.push(ACTIVE_FUND_NOTE);
 
       scored.push({
         symbol: holding.symbol,
         name: holding.name,
         currentValue: holding.currentValue,
-        currentPrice: s.currentPrice,
-        score: s.score,
-        relativeScore: s.score - sp500.score,
-        momentum: s.momentum,
-        aboveSma50: s.aboveSma50,
-        aboveSma200: s.aboveSma200,
-        sma50: s.sma50,
-        sma200: s.sma200,
-        accountIds: holding.accountIds,
+        currentPrice: priceScored.currentPrice,
+        score,
+        relativeScore,
+        momentum,
+        aboveSma50: priceScored.aboveSma50,
+        aboveSma200: priceScored.aboveSma200,
+        sma50: priceScored.sma50,
+        sma200: priceScored.sma200,
+        accountIds: holding.accounts.map((a) => a.accountId),
         proxySymbol,
         note: noteParts.length > 0 ? noteParts.join(" — ") : null,
       });
@@ -230,6 +153,22 @@ export async function runRelativeStrengthAgent(): Promise<RelativeStrengthOutput
       skipped.push({ symbol: holding.symbol, reason: err instanceof Error ? err.message : String(err) });
     }
   }
+
+  return {
+    sp500: {
+      score: sp500.score,
+      momentum: sp500.momentum,
+      aboveSma50: sp500.aboveSma50,
+      aboveSma200: sp500.aboveSma200,
+    },
+    scored,
+    skipped,
+  };
+}
+
+/** Buckets the full scored universe into top performers, underperformers, and next-tier candidates to watch. */
+export async function runRelativeStrengthAgent(): Promise<RelativeStrengthOutput> {
+  const { sp500, scored, skipped } = await scoreCurrentHoldings();
 
   const sortedDesc = [...scored].sort((a, b) => b.score - a.score);
   const topHoldings = sortedDesc.slice(0, 3);
@@ -240,12 +179,7 @@ export async function runRelativeStrengthAgent(): Promise<RelativeStrengthOutput
 
   return {
     generatedAt: new Date().toISOString(),
-    sp500: {
-      score: sp500.score,
-      momentum: sp500.momentum,
-      aboveSma50: sp500.aboveSma50,
-      aboveSma200: sp500.aboveSma200,
-    },
+    sp500,
     topHoldings,
     underperformers,
     candidates,
