@@ -50,11 +50,22 @@ const SECTOR_CONCENTRATION_THRESHOLD = 0.5;
 const DRAWDOWN_CRITICAL_THRESHOLD = -0.15;
 const OPPORTUNITY_COST_GAP_THRESHOLD = 0.02;
 const OPPORTUNITY_COST_MIN_SHARE = 0.03;
+/** Minimum score gap vs. the S&P 500 before a fund's relative weakness is worth a watch flag — a 2-point gap (e.g. 80 vs 82) is noise. */
+const MOMENTUM_GAP_WATCH_THRESHOLD = 10;
+/** Minimum lag vs. the S&P 500, on both 3Y and 5Y, before persistent underperformance is worth a watch flag. */
+const PERSISTENCE_LAG_THRESHOLD = 0.03;
+/** Positions smaller than this aren't worth watch-level attention — they still surface, but only as informational. */
+const MIN_WATCH_POSITION_VALUE = 5000;
 
 const RETIREMENT_PLAN_ACCOUNT_TYPES: AccountType[] = ["VZ_SAVINGS_401K", "VZ_LEGACY_401K", "VZ_EDP"];
 
 function singleAccountId(holding: Pick<CurrentHolding, "accounts">): string | null {
   return holding.accounts.length === 1 ? holding.accounts[0].accountId : null;
+}
+
+/** Below the minimum position size, a would-be watch flag is downgraded to informational — small positions aren't worth the attention. */
+function sizeAdjustedSeverity(baseSeverity: RiskSeverity, currentValue: number): RiskSeverity {
+  return baseSeverity === "watch" && currentValue < MIN_WATCH_POSITION_VALUE ? "informational" : baseSeverity;
 }
 
 /**
@@ -75,6 +86,12 @@ export async function runRiskManagerAgent(): Promise<RiskManagerOutput> {
   const watch: RiskFlag[] = [];
   const informational: RiskFlag[] = [];
   const opportunityCost: OpportunityCostEntry[] = [];
+
+  function pushFlag(flag: RiskFlag) {
+    if (flag.severity === "critical") critical.push(flag);
+    else if (flag.severity === "watch") watch.push(flag);
+    else informational.push(flag);
+  }
 
   // 1. Concentration risk — any single position over the portfolio threshold.
   for (const holding of holdings) {
@@ -126,39 +143,41 @@ export async function runRiskManagerAgent(): Promise<RiskManagerOutput> {
     }
   }
 
-  // 4 & 6. Momentum deterioration (score fell below S&P) and drawdown (negative 1Y momentum) — over every scored holding, not just the top/bottom tiers.
+  // 4 & 6. Momentum deterioration (score meaningfully below S&P) and drawdown (negative 1Y momentum) — over every scored holding, not just the top/bottom tiers.
   for (const entry of rsScored) {
-    if (entry.score < sp500.score) {
-      watch.push({
-        severity: "watch",
+    const scoreGap = sp500.score - entry.score;
+    if (scoreGap >= MOMENTUM_GAP_WATCH_THRESHOLD) {
+      pushFlag({
+        severity: sizeAdjustedSeverity("watch", entry.currentValue),
         check: "momentum-deterioration",
         symbol: entry.symbol,
         title: `${entry.symbol} score has fallen below the S&P 500`,
-        detail: `Score ${entry.score}/100 vs S&P 500 ${sp500.score}/100.`,
+        detail: `Score ${entry.score}/100 vs S&P 500 ${sp500.score}/100 (${scoreGap}-point gap).`,
         accountId: entry.accountIds.length === 1 ? entry.accountIds[0] : null,
       });
     }
     if (entry.momentum != null && entry.momentum < 0) {
-      const severity: RiskSeverity = entry.momentum < DRAWDOWN_CRITICAL_THRESHOLD ? "critical" : "watch";
-      const flag: RiskFlag = {
-        severity,
+      const baseSeverity: RiskSeverity = entry.momentum < DRAWDOWN_CRITICAL_THRESHOLD ? "critical" : "watch";
+      pushFlag({
+        severity: sizeAdjustedSeverity(baseSeverity, entry.currentValue),
         check: "drawdown",
         symbol: entry.symbol,
         title: `${entry.symbol} has negative 1-year momentum`,
         detail: `1-year return ${formatPercent(entry.momentum)}.`,
         accountId: entry.accountIds.length === 1 ? entry.accountIds[0] : null,
-      };
-      (severity === "critical" ? critical : watch).push(flag);
+      });
     }
   }
 
-  // 5. Underperformer persistence — known returns lagging the S&P over both 3Y and 5Y.
+  // 5. Underperformer persistence — known returns lagging the S&P by a meaningful margin over both 3Y and 5Y.
   for (const holding of holdings) {
     const known = getKnownFundReturns(holding.symbol, holding.name);
     if (!known) continue;
-    if (known.threeYear < KNOWN_SP500_RETURNS.threeYear && known.fiveYear < KNOWN_SP500_RETURNS.fiveYear) {
-      watch.push({
-        severity: "watch",
+    const threeYearLag = KNOWN_SP500_RETURNS.threeYear - known.threeYear;
+    const fiveYearLag = KNOWN_SP500_RETURNS.fiveYear - known.fiveYear;
+    if (threeYearLag >= PERSISTENCE_LAG_THRESHOLD && fiveYearLag >= PERSISTENCE_LAG_THRESHOLD) {
+      pushFlag({
+        severity: sizeAdjustedSeverity("watch", holding.currentValue),
         check: "underperformer-persistence",
         symbol: holding.symbol,
         title: `${holding.symbol} has lagged the S&P 500 over both 3Y and 5Y`,
@@ -198,11 +217,21 @@ export async function runRiskManagerAgent(): Promise<RiskManagerOutput> {
   }
   opportunityCost.sort((a, b) => b.currentValue - a.currentValue);
 
+  // 8. Dedup — a critical flag, or the structurally-locked designation,
+  // already tells the CIO everything they need to know about a position; a
+  // watch flag for that same symbol (e.g. Verizon Stock Fund also flagged as
+  // a lagging performer) is redundant noise on top of a stronger signal.
+  // One entry per position: highest severity wins.
+  const strongerSignalSymbols = new Set<string>();
+  for (const flag of critical) if (flag.symbol) strongerSignalSymbols.add(flag.symbol);
+  for (const flag of informational) if (flag.check === "locked-stock" && flag.symbol) strongerSignalSymbols.add(flag.symbol);
+  const dedupedWatch = watch.filter((flag) => !(flag.symbol && strongerSignalSymbols.has(flag.symbol)));
+
   return {
     generatedAt: new Date().toISOString(),
     totalPortfolioValue: portfolioValue,
     critical,
-    watch,
+    watch: dedupedWatch,
     informational,
     opportunityCost,
   };
