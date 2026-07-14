@@ -46,7 +46,14 @@ function renderTable(title: string, entries: RelativeStrengthEntry[]) {
             <tbody>
               {entries.map((entry) => (
                 <tr key={entry.symbol}>
-                  <td>{entry.symbol}</td>
+                  <td>
+                    {entry.symbol}
+                    {entry.note && (
+                      <div style={{ color: "var(--text-muted)", fontSize: "0.72rem", fontWeight: 400 }}>
+                        {entry.note}
+                      </div>
+                    )}
+                  </td>
                   <td className="mono">{entry.score}</td>
                   <td className="mono" style={{ color: alphaColor(entry.relativeScore) }}>
                     {entry.relativeScore > 0 ? "+" : ""}
@@ -217,9 +224,16 @@ export default async function AgentsPage() {
               {renderTable("Underperformers", output.underperformers)}
               {renderTable("Candidates to Watch", output.candidates)}
               {output.skipped.length > 0 && (
-                <p style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>
-                  Skipped (no price data available): {output.skipped.map((s) => s.symbol).join(", ")}
-                </p>
+                <div style={{ marginTop: "0.5rem" }}>
+                  <div style={{ fontWeight: 600, marginBottom: "0.4rem", fontSize: "0.85rem" }}>Skipped</div>
+                  <ul style={{ margin: 0, paddingLeft: "1.2rem", color: "var(--text-muted)", fontSize: "0.78rem" }}>
+                    {output.skipped.map((s) => (
+                      <li key={s.symbol}>
+                        {s.symbol}: {s.reason}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
             </div>
           </div>

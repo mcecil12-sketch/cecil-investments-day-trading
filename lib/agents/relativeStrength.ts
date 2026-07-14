@@ -2,6 +2,7 @@ import { prisma } from "@/lib/prisma";
 import type { ImportBatchStatus } from "@/lib/generated/prisma";
 import { ensureSp500PriceCache } from "@/lib/benchmark/priceCache";
 import { getPriceHistory, type PricePoint } from "@/lib/agents/marketData";
+import { getFundProxy, ACTIVE_FUND_NOTE } from "@/lib/agents/fundMappings";
 
 const USABLE_STATUSES: ImportBatchStatus[] = ["COMPLETE", "PARTIAL"];
 
@@ -21,6 +22,10 @@ export interface RelativeStrengthEntry {
   sma50: number | null;
   sma200: number | null;
   accountIds: string[];
+  /** Ticker whose price history was used in place of this holding's own, e.g. "SPY" for a 401k fund with no public price data. Null when the holding's own symbol had usable data. */
+  proxySymbol: string | null;
+  /** Human-readable disclosure of the proxy/active-fund caveats, e.g. "via SPY proxy — Active fund — proxy score is directional only". Null when no proxy was used. */
+  note: string | null;
 }
 
 export interface RelativeStrengthOutput {
@@ -183,8 +188,28 @@ export async function runRelativeStrengthAgent(): Promise<RelativeStrengthOutput
 
   for (const holding of holdings) {
     try {
-      const { points } = await getPriceHistory(holding.symbol);
+      let points: PricePoint[];
+      let proxySymbol: string | null = null;
+      let isActiveFund = false;
+
+      try {
+        ({ points } = await getPriceHistory(holding.symbol));
+      } catch {
+        const proxy = getFundProxy(holding.symbol, holding.name);
+        if (!proxy) {
+          skipped.push({ symbol: holding.symbol, reason: "No proxy available" });
+          continue;
+        }
+        proxySymbol = proxy.proxy;
+        isActiveFund = proxy.isActive;
+        ({ points } = await getPriceHistory(proxySymbol));
+      }
+
       const s = scoreSeries(points);
+      const noteParts: string[] = [];
+      if (proxySymbol) noteParts.push(`via ${proxySymbol} proxy`);
+      if (isActiveFund) noteParts.push(ACTIVE_FUND_NOTE);
+
       scored.push({
         symbol: holding.symbol,
         name: holding.name,
@@ -198,6 +223,8 @@ export async function runRelativeStrengthAgent(): Promise<RelativeStrengthOutput
         sma50: s.sma50,
         sma200: s.sma200,
         accountIds: holding.accountIds,
+        proxySymbol,
+        note: noteParts.length > 0 ? noteParts.join(" — ") : null,
       });
     } catch (err) {
       skipped.push({ symbol: holding.symbol, reason: err instanceof Error ? err.message : String(err) });

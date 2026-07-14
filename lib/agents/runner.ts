@@ -14,11 +14,18 @@ interface DraftActionItem {
   accountId: string | null;
 }
 
+function withNote(rationale: string, entry: RelativeStrengthEntry): string {
+  return entry.note ? `${rationale} (${entry.note}.)` : rationale;
+}
+
 function underperformerItem(entry: RelativeStrengthEntry, priority: number): DraftActionItem {
   return {
     priority,
     action: `Review ${entry.symbol} — trailing relative strength`,
-    rationale: `Score ${entry.score}/100 (${formatPercent(entry.relativeScore / 100)} vs S&P 500), 52-week momentum ${formatPercent(entry.momentum)}.`,
+    rationale: withNote(
+      `Score ${entry.score}/100 (${formatPercent(entry.relativeScore / 100)} vs S&P 500), 52-week momentum ${formatPercent(entry.momentum)}.`,
+      entry,
+    ),
     expectedImpact: "Reduces drag from a persistently lagging position.",
     accountId: entry.accountIds.length === 1 ? entry.accountIds[0] : null,
   };
@@ -28,7 +35,10 @@ function candidateItem(entry: RelativeStrengthEntry, priority: number): DraftAct
   return {
     priority,
     action: `Watch ${entry.symbol} — building relative strength`,
-    rationale: `Score ${entry.score}/100, 52-week momentum ${formatPercent(entry.momentum)}, trading ${entry.aboveSma50 ? "above" : "below"} its 50-day average.`,
+    rationale: withNote(
+      `Score ${entry.score}/100, 52-week momentum ${formatPercent(entry.momentum)}, trading ${entry.aboveSma50 ? "above" : "below"} its 50-day average.`,
+      entry,
+    ),
     expectedImpact: "Early signal for a potential add if strength continues.",
     accountId: entry.accountIds.length === 1 ? entry.accountIds[0] : null,
   };
@@ -38,7 +48,10 @@ function topHoldingItem(entry: RelativeStrengthEntry, priority: number): DraftAc
   return {
     priority,
     action: `Hold ${entry.symbol} — leading relative strength`,
-    rationale: `Score ${entry.score}/100 (${formatPercent(entry.relativeScore / 100)} vs S&P 500), 52-week momentum ${formatPercent(entry.momentum)}.`,
+    rationale: withNote(
+      `Score ${entry.score}/100 (${formatPercent(entry.relativeScore / 100)} vs S&P 500), 52-week momentum ${formatPercent(entry.momentum)}.`,
+      entry,
+    ),
     expectedImpact: "Confirms the position is still earning its place in the portfolio.",
     accountId: entry.accountIds.length === 1 ? entry.accountIds[0] : null,
   };
