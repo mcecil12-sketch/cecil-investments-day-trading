@@ -40,6 +40,8 @@ export interface RelativeStrengthScoringResult {
 export interface RelativeStrengthOutput {
   generatedAt: string;
   sp500: RelativeStrengthScoringResult["sp500"];
+  /** Every scored holding, sorted by score descending — the comprehensive universe behind the three curated buckets below. The full report renders this so no position is ever hidden by the top/bottom/candidate selection. */
+  allHoldings: RelativeStrengthEntry[];
   topHoldings: RelativeStrengthEntry[];
   underperformers: RelativeStrengthEntry[];
   candidates: RelativeStrengthEntry[];
@@ -166,7 +168,14 @@ export async function scoreCurrentHoldings(): Promise<RelativeStrengthScoringRes
   };
 }
 
-/** Buckets the full scored universe into top performers, underperformers, and next-tier candidates to watch. */
+/**
+ * Buckets the full scored universe into top performers, underperformers, and
+ * next-tier candidates to watch — a curated top/bottom/middle-3 selection
+ * used to build a manageable set of draft Action Items. This selection is
+ * deliberately small (it feeds the CIO action list), so it's not where a
+ * position "disappears": every scored holding, however it buckets, is also
+ * returned unfiltered in `allHoldings` for the full report.
+ */
 export async function runRelativeStrengthAgent(): Promise<RelativeStrengthOutput> {
   const { sp500, scored, skipped } = await scoreCurrentHoldings();
 
@@ -180,6 +189,7 @@ export async function runRelativeStrengthAgent(): Promise<RelativeStrengthOutput
   return {
     generatedAt: new Date().toISOString(),
     sp500,
+    allHoldings: sortedDesc,
     topHoldings,
     underperformers,
     candidates,

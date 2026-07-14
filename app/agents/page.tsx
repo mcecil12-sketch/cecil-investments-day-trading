@@ -114,6 +114,7 @@ function renderRelativeStrengthReport(output: RelativeStrengthOutput) {
       {renderRelativeStrengthTable("Top Holdings", output.topHoldings)}
       {renderRelativeStrengthTable("Underperformers", output.underperformers)}
       {renderRelativeStrengthTable("Candidates to Watch", output.candidates)}
+      {renderRelativeStrengthTable("All Scored Positions", output.allHoldings ?? [])}
       {renderSkipped(output.skipped)}
     </div>
   );
