@@ -1,5 +1,7 @@
 import { prisma } from "@/lib/prisma";
-import { runRelativeStrengthAgent, type RelativeStrengthEntry } from "@/lib/agents/relativeStrength";
+import { runRelativeStrengthAgent, type RelativeStrengthEntry, type RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
+import { runSectorRotationAgent, type SectorScore, type SectorRotationFlag, type SectorRotationOutput } from "@/lib/agents/sectorRotation";
+import { runRiskManagerAgent, type RiskFlag, type OpportunityCostEntry, type RiskManagerOutput } from "@/lib/agents/riskManager";
 
 function formatPercent(value: number | null): string {
   if (value == null) return "unknown";
@@ -60,7 +62,7 @@ function topHoldingItem(entry: RelativeStrengthEntry, priority: number): DraftAc
 export interface RelativeStrengthRunResult {
   runId: string;
   status: "COMPLETE" | "FAILED";
-  output?: Awaited<ReturnType<typeof runRelativeStrengthAgent>>;
+  output?: RelativeStrengthOutput;
   error?: string;
 }
 
@@ -115,13 +117,271 @@ export async function runAndPersistRelativeStrength(): Promise<RelativeStrengthR
   }
 }
 
+function sectorFlagItem(flag: SectorRotationFlag, priority: number): DraftActionItem {
+  return {
+    priority,
+    action:
+      flag.type === "overweight_weakening"
+        ? `Reduce ${flag.sector} exposure — weakening sector`
+        : `Consider adding ${flag.sector} exposure — leading sector`,
+    rationale: flag.detail,
+    expectedImpact:
+      flag.type === "overweight_weakening"
+        ? "Cuts exposure to a sector losing relative strength."
+        : "Captures a sector gaining relative strength.",
+    accountId: null,
+  };
+}
+
+function sectorRecommendationItem(sector: SectorScore, priority: number): DraftActionItem {
+  return {
+    priority,
+    action: `Watch ${sector.sector} (${sector.symbol}) — leading sector rotation signal`,
+    rationale: `Composite score ${sector.score}/100 (1M ${formatPercent(sector.oneMonth)}, 3M ${formatPercent(sector.threeMonth)}, 12M ${formatPercent(sector.twelveMonth)}).`,
+    expectedImpact: "Early signal for a sector-level tilt.",
+    accountId: null,
+  };
+}
+
+export interface SectorRotationRunResult {
+  runId: string;
+  status: "COMPLETE" | "FAILED";
+  output?: SectorRotationOutput;
+  error?: string;
+}
+
+/** Runs the Sector Rotation agent and persists its AgentRun + derived ActionItems, same pattern as Relative Strength. */
+export async function runAndPersistSectorRotation(): Promise<SectorRotationRunResult> {
+  const run = await prisma.agentRun.create({
+    data: { agentType: "SECTOR_ROTATION", status: "RUNNING" },
+  });
+
+  try {
+    const output = await runSectorRotationAgent();
+
+    const draftItems: DraftActionItem[] = [
+      ...output.flags.map((f, i) => sectorFlagItem(f, i + 1)),
+      ...output.topSectors.map((s, i) => sectorRecommendationItem(s, output.flags.length + i + 1)),
+    ];
+
+    await prisma.$transaction([
+      prisma.agentRun.update({
+        where: { id: run.id },
+        data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },
+      }),
+      ...draftItems.map((item) =>
+        prisma.actionItem.create({
+          data: {
+            agentRunId: run.id,
+            priority: item.priority,
+            action: item.action,
+            rationale: item.rationale,
+            expectedImpact: item.expectedImpact,
+            accountId: item.accountId,
+          },
+        }),
+      ),
+    ]);
+
+    return { runId: run.id, status: "COMPLETE", output };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "FAILED", completedAt: new Date(), errorMessage: message },
+    });
+    return { runId: run.id, status: "FAILED", error: message };
+  }
+}
+
+function riskFlagItem(flag: RiskFlag, priority: number): DraftActionItem {
+  return {
+    priority,
+    action: flag.title,
+    rationale: flag.detail,
+    expectedImpact: flag.severity === "critical" ? "Address to reduce portfolio risk." : "Monitor for further deterioration.",
+    accountId: flag.accountId,
+  };
+}
+
+function opportunityCostItem(entry: OpportunityCostEntry, priority: number): DraftActionItem {
+  return {
+    priority,
+    action: `Reallocate ${entry.symbol} — better option in plan menu`,
+    rationale: entry.detail,
+    expectedImpact: `Closing the gap to ${entry.alternativeName} could improve 5Y return by roughly ${formatPercent(entry.gap)}.`,
+    accountId: null,
+  };
+}
+
+export interface RiskManagerRunResult {
+  runId: string;
+  status: "COMPLETE" | "FAILED";
+  output?: RiskManagerOutput;
+  error?: string;
+}
+
 /**
- * Fire-and-forget trigger for the import pipeline — logs failures instead of
- * throwing, since an agent-scoring failure should never surface as an import
- * error to the user.
+ * Runs the Risk Manager agent and persists its AgentRun + derived
+ * ActionItems. Informational flags aren't surfaced as action items — they're
+ * awareness-only and have nothing to "do."
  */
-export function triggerRelativeStrengthRun(): void {
-  runAndPersistRelativeStrength().catch((err) => {
-    console.error("Relative Strength agent auto-trigger failed:", err);
+export async function runAndPersistRiskManager(): Promise<RiskManagerRunResult> {
+  const run = await prisma.agentRun.create({
+    data: { agentType: "RISK_MANAGER", status: "RUNNING" },
+  });
+
+  try {
+    const output = await runRiskManagerAgent();
+
+    const draftItems: DraftActionItem[] = [
+      ...output.critical.map((f, i) => riskFlagItem(f, i + 1)),
+      ...output.watch.map((f, i) => riskFlagItem(f, output.critical.length + i + 1)),
+      ...output.opportunityCost.map((o, i) => opportunityCostItem(o, output.critical.length + output.watch.length + i + 1)),
+    ];
+
+    await prisma.$transaction([
+      prisma.agentRun.update({
+        where: { id: run.id },
+        data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },
+      }),
+      ...draftItems.map((item) =>
+        prisma.actionItem.create({
+          data: {
+            agentRunId: run.id,
+            priority: item.priority,
+            action: item.action,
+            rationale: item.rationale,
+            expectedImpact: item.expectedImpact,
+            accountId: item.accountId,
+          },
+        }),
+      ),
+    ]);
+
+    return { runId: run.id, status: "COMPLETE", output };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "FAILED", completedAt: new Date(), errorMessage: message },
+    });
+    return { runId: run.id, status: "FAILED", error: message };
+  }
+}
+
+function startOfWeekUTC(date: Date): Date {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const day = d.getUTCDay();
+  const diff = (day === 0 ? -6 : 1) - day;
+  d.setUTCDate(d.getUTCDate() + diff);
+  return d;
+}
+
+interface SynthesizedItem {
+  agentRunId: string;
+  action: string;
+  rationale: string;
+  expectedImpact: string | null;
+  accountId: string | null;
+}
+
+/**
+ * Rebuilds the current week's WeeklyBrief from the latest completed run of
+ * each agent, in priority order: critical Risk Manager flags first, then the
+ * Relative Strength agent's highest-conviction opportunities, then Sector
+ * Rotation signals. Called after the post-import agent sequence so the CIO
+ * Weekly Action List reflects all three agents instead of just whichever ran
+ * most recently.
+ */
+export async function synthesizeWeeklyBrief(): Promise<void> {
+  const [riskRun, relativeRun, sectorRun] = await Promise.all([
+    prisma.agentRun.findFirst({ where: { agentType: "RISK_MANAGER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
+    prisma.agentRun.findFirst({ where: { agentType: "RELATIVE_STRENGTH", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
+    prisma.agentRun.findFirst({ where: { agentType: "SECTOR_ROTATION", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
+  ]);
+
+  const items: SynthesizedItem[] = [];
+
+  if (riskRun?.output) {
+    const output = riskRun.output as unknown as RiskManagerOutput;
+    for (const flag of output.critical.slice(0, 5)) {
+      items.push({
+        agentRunId: riskRun.id,
+        action: flag.title,
+        rationale: flag.detail,
+        expectedImpact: "Critical risk flag — act immediately.",
+        accountId: flag.accountId,
+      });
+    }
+  }
+  if (relativeRun?.output) {
+    const output = relativeRun.output as unknown as RelativeStrengthOutput;
+    for (const entry of [...output.topHoldings, ...output.candidates].slice(0, 3)) {
+      items.push({
+        agentRunId: relativeRun.id,
+        action: `Highest-conviction opportunity: ${entry.symbol}`,
+        rationale: withNote(
+          `Score ${entry.score}/100 (${formatPercent(entry.relativeScore / 100)} vs S&P 500), 52-week momentum ${formatPercent(entry.momentum)}.`,
+          entry,
+        ),
+        expectedImpact: "Reinforces or adds to a position building relative strength.",
+        accountId: entry.accountIds.length === 1 ? entry.accountIds[0] : null,
+      });
+    }
+  }
+  if (sectorRun?.output) {
+    const output = sectorRun.output as unknown as SectorRotationOutput;
+    for (const sector of output.topSectors.slice(0, 3)) {
+      items.push({
+        agentRunId: sectorRun.id,
+        action: `Sector rotation signal: ${sector.sector}`,
+        rationale: `Composite score ${sector.score}/100 (1M ${formatPercent(sector.oneMonth)}, 3M ${formatPercent(sector.threeMonth)}, 12M ${formatPercent(sector.twelveMonth)}).`,
+        expectedImpact: "Early signal for a sector-level tilt.",
+        accountId: null,
+      });
+    }
+  }
+
+  if (items.length === 0) return;
+
+  const weekOf = startOfWeekUTC(new Date());
+  const sourcesUsed = [riskRun && "Risk Manager", relativeRun && "Relative Strength", sectorRun && "Sector Rotation"]
+    .filter(Boolean)
+    .join(", ");
+  const cioSummary = `Synthesized from ${sourcesUsed}, prioritizing critical risk flags, then high-conviction opportunities, then sector rotation signals.`;
+  const actionItemsData = items.map((item, i) => ({ ...item, priority: i + 1 }));
+
+  const existing = await prisma.weeklyBrief.findUnique({ where: { weekOf } });
+  if (existing) {
+    await prisma.$transaction([
+      prisma.actionItem.deleteMany({ where: { weeklyBriefId: existing.id } }),
+      prisma.weeklyBrief.update({
+        where: { id: existing.id },
+        data: { cioSummary, actionItems: { create: actionItemsData } },
+      }),
+    ]);
+  } else {
+    await prisma.weeklyBrief.create({
+      data: { weekOf, cioSummary, actionItems: { create: actionItemsData } },
+    });
+  }
+}
+
+/**
+ * Fire-and-forget trigger for the import pipeline — runs all three agents in
+ * sequence (Relative Strength → Sector Rotation → Risk Manager) and then
+ * resynthesizes the CIO Weekly Action List from their output. Logs failures
+ * instead of throwing, since an agent-scoring failure should never surface as
+ * an import error to the user.
+ */
+export function triggerAllAgentsRun(): void {
+  (async () => {
+    await runAndPersistRelativeStrength();
+    await runAndPersistSectorRotation();
+    await runAndPersistRiskManager();
+    await synthesizeWeeklyBrief();
+  })().catch((err) => {
+    console.error("Post-import agent sequence failed:", err);
   });
 }

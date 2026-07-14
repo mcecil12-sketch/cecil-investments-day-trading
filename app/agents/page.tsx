@@ -1,6 +1,9 @@
+import type { ReactNode } from "react";
 import { prisma } from "@/lib/prisma";
 import type { AgentType } from "@/lib/generated/prisma";
 import type { RelativeStrengthEntry, RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
+import type { SectorRotationOutput } from "@/lib/agents/sectorRotation";
+import type { RiskManagerOutput, RiskFlag } from "@/lib/agents/riskManager";
 import { alphaColor, formatCurrency, formatDate, formatDateTime, formatPercent } from "@/lib/format";
 import { RunAgentButton } from "./RunAgentButton";
 
@@ -20,11 +23,21 @@ const AGENT_DEFINITIONS: AgentDefinition[] = [
     implemented: true,
     endpoint: "/api/agents/relative-strength",
   },
-  { type: "SECTOR_ROTATION", name: "Sector Rotation", implemented: false },
-  { type: "RISK_MANAGER", name: "Risk Manager", implemented: false },
+  {
+    type: "SECTOR_ROTATION",
+    name: "Sector Rotation",
+    implemented: true,
+    endpoint: "/api/agents/sector-rotation",
+  },
+  {
+    type: "RISK_MANAGER",
+    name: "Risk Manager",
+    implemented: true,
+    endpoint: "/api/agents/risk-manager",
+  },
 ];
 
-function renderTable(title: string, entries: RelativeStrengthEntry[]) {
+function renderRelativeStrengthTable(title: string, entries: RelativeStrengthEntry[]) {
   return (
     <div style={{ marginBottom: "1rem" }}>
       <div style={{ fontWeight: 600, marginBottom: "0.4rem" }}>{title}</div>
@@ -72,6 +85,201 @@ function renderTable(title: string, entries: RelativeStrengthEntry[]) {
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+function renderSkipped(skipped: Array<{ symbol: string; reason: string }>) {
+  if (skipped.length === 0) return null;
+  return (
+    <div style={{ marginTop: "0.5rem" }}>
+      <div style={{ fontWeight: 600, marginBottom: "0.4rem", fontSize: "0.85rem" }}>Skipped</div>
+      <ul style={{ margin: 0, paddingLeft: "1.2rem", color: "var(--text-muted)", fontSize: "0.78rem" }}>
+        {skipped.map((s) => (
+          <li key={s.symbol}>
+            {s.symbol}: {s.reason}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function renderRelativeStrengthReport(output: RelativeStrengthOutput) {
+  return (
+    <div className="card">
+      <p style={{ color: "var(--text-muted)" }}>
+        S&amp;P 500 baseline: score {output.sp500.score}/100 · 52-week momentum {formatPercent(output.sp500.momentum)}
+      </p>
+      {renderRelativeStrengthTable("Top Holdings", output.topHoldings)}
+      {renderRelativeStrengthTable("Underperformers", output.underperformers)}
+      {renderRelativeStrengthTable("Candidates to Watch", output.candidates)}
+      {renderSkipped(output.skipped)}
+    </div>
+  );
+}
+
+function renderSectorRotationReport(output: SectorRotationOutput) {
+  return (
+    <div className="card">
+      <p style={{ color: "var(--text-muted)" }}>
+        S&amp;P 500 baseline: score {output.sp500.score}/100 · 1M {formatPercent(output.sp500.oneMonth)} · 3M{" "}
+        {formatPercent(output.sp500.threeMonth)} · 12M {formatPercent(output.sp500.twelveMonth)}
+      </p>
+
+      <div style={{ marginBottom: "1rem" }}>
+        <div style={{ fontWeight: 600, marginBottom: "0.4rem" }}>Ranked Sectors</div>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Rank</th>
+                <th>Sector</th>
+                <th>Symbol</th>
+                <th>1M</th>
+                <th>3M</th>
+                <th>12M</th>
+                <th>Score</th>
+              </tr>
+            </thead>
+            <tbody>
+              {output.rankedSectors.map((s) => (
+                <tr key={s.symbol}>
+                  <td className="mono">{s.rank}</td>
+                  <td>{s.sector}</td>
+                  <td className="mono">{s.symbol}</td>
+                  <td className="mono">{formatPercent(s.oneMonth)}</td>
+                  <td className="mono">{formatPercent(s.threeMonth)}</td>
+                  <td className="mono">{formatPercent(s.twelveMonth)}</td>
+                  <td className="mono">{s.score}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style={{ marginBottom: "1rem" }}>
+        <div style={{ fontWeight: 600, marginBottom: "0.4rem" }}>Portfolio Sector Exposure</div>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Sector</th>
+                <th>Value</th>
+                <th>% of Portfolio</th>
+                <th>Rotation Score</th>
+              </tr>
+            </thead>
+            <tbody>
+              {output.portfolioExposure.map((e) => (
+                <tr key={e.sector}>
+                  <td>{e.sector}</td>
+                  <td className="mono">{formatCurrency(e.value)}</td>
+                  <td className="mono">{formatPercent(e.percentOfPortfolio)}</td>
+                  <td className="mono">{e.rotationScore == null ? "—" : e.rotationScore}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style={{ marginBottom: "1rem" }}>
+        <div style={{ fontWeight: 600, marginBottom: "0.4rem" }}>Top Rotation Recommendations</div>
+        {output.recommendations.length === 0 ? (
+          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>None.</p>
+        ) : (
+          <ul style={{ margin: 0, paddingLeft: "1.2rem", fontSize: "0.85rem" }}>
+            {output.recommendations.map((r) => (
+              <li key={r}>{r}</li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {output.flags.length > 0 && (
+        <div style={{ marginBottom: "1rem" }}>
+          <div style={{ fontWeight: 600, marginBottom: "0.4rem" }}>Flags</div>
+          <ul style={{ margin: 0, paddingLeft: "1.2rem", fontSize: "0.85rem" }}>
+            {output.flags.map((f) => (
+              <li key={`${f.type}-${f.sector}`} style={{ color: "var(--negative)" }}>
+                {f.detail}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {renderSkipped(output.skipped)}
+    </div>
+  );
+}
+
+function renderRiskFlagList(title: string, flags: RiskFlag[], color?: string) {
+  return (
+    <div style={{ marginBottom: "1rem" }}>
+      <div style={{ fontWeight: 600, marginBottom: "0.4rem" }}>{title}</div>
+      {flags.length === 0 ? (
+        <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>None.</p>
+      ) : (
+        <ul style={{ margin: 0, paddingLeft: "1.2rem", fontSize: "0.85rem" }}>
+          {flags.map((f, i) => (
+            <li key={`${f.check}-${f.symbol ?? "portfolio"}-${i}`} style={{ color, marginBottom: "0.3rem" }}>
+              <strong>{f.title}</strong>
+              <div style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>{f.detail}</div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function renderRiskManagerReport(output: RiskManagerOutput) {
+  return (
+    <div className="card">
+      <p style={{ color: "var(--text-muted)" }}>Total portfolio value: {formatCurrency(output.totalPortfolioValue)}</p>
+
+      {renderRiskFlagList("Critical (act immediately)", output.critical, "var(--negative)")}
+      {renderRiskFlagList("Watch (monitor closely)", output.watch)}
+      {renderRiskFlagList("Informational (awareness only)", output.informational, "var(--text-muted)")}
+
+      <div style={{ marginBottom: "1rem" }}>
+        <div style={{ fontWeight: 600, marginBottom: "0.4rem" }}>401k Opportunity Cost</div>
+        {output.opportunityCost.length === 0 ? (
+          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>None.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Fund</th>
+                  <th>Value</th>
+                  <th>Fund 5Y</th>
+                  <th>Alternative</th>
+                  <th>Alt 5Y</th>
+                  <th>Gap</th>
+                </tr>
+              </thead>
+              <tbody>
+                {output.opportunityCost.map((o) => (
+                  <tr key={o.symbol}>
+                    <td>{o.symbol}</td>
+                    <td className="mono">{formatCurrency(o.currentValue)}</td>
+                    <td className="mono">{formatPercent(o.fundFiveYear)}</td>
+                    <td>{o.alternativeName}</td>
+                    <td className="mono">{formatPercent(o.alternativeFiveYear)}</td>
+                    <td className="mono" style={{ color: "var(--negative)" }}>
+                      +{formatPercent(o.gap)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -210,32 +418,20 @@ export default async function AgentsPage() {
       {latestRuns.map((run, i) => {
         const def = AGENT_DEFINITIONS[i];
         if (!run || !def.implemented || run.status !== "COMPLETE" || !run.output) return null;
-        const output = run.output as unknown as RelativeStrengthOutput;
+
+        let report: ReactNode;
+        if (def.type === "RELATIVE_STRENGTH") {
+          report = renderRelativeStrengthReport(run.output as unknown as RelativeStrengthOutput);
+        } else if (def.type === "SECTOR_ROTATION") {
+          report = renderSectorRotationReport(run.output as unknown as SectorRotationOutput);
+        } else {
+          report = renderRiskManagerReport(run.output as unknown as RiskManagerOutput);
+        }
 
         return (
           <div key={def.type} id={`report-${def.type.toLowerCase()}`}>
             <h2>{def.name} — Full Report</h2>
-            <div className="card">
-              <p style={{ color: "var(--text-muted)" }}>
-                S&amp;P 500 baseline: score {output.sp500.score}/100 · 52-week momentum{" "}
-                {formatPercent(output.sp500.momentum)}
-              </p>
-              {renderTable("Top Holdings", output.topHoldings)}
-              {renderTable("Underperformers", output.underperformers)}
-              {renderTable("Candidates to Watch", output.candidates)}
-              {output.skipped.length > 0 && (
-                <div style={{ marginTop: "0.5rem" }}>
-                  <div style={{ fontWeight: 600, marginBottom: "0.4rem", fontSize: "0.85rem" }}>Skipped</div>
-                  <ul style={{ margin: 0, paddingLeft: "1.2rem", color: "var(--text-muted)", fontSize: "0.78rem" }}>
-                    {output.skipped.map((s) => (
-                      <li key={s.symbol}>
-                        {s.symbol}: {s.reason}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
+            {report}
           </div>
         );
       })}
