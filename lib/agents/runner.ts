@@ -2,6 +2,8 @@ import { prisma } from "@/lib/prisma";
 import { runRelativeStrengthAgent, type RelativeStrengthEntry, type RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
 import { runSectorRotationAgent, type SectorScore, type SectorRotationFlag, type SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import { runRiskManagerAgent, type RiskFlag, type OpportunityCostEntry, type RiskManagerOutput } from "@/lib/agents/riskManager";
+import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
+import { sendWeeklyBriefEmail } from "@/lib/email/weeklyBrief";
 
 function formatPercent(value: number | null): string {
   if (value == null) return "unknown";
@@ -259,6 +261,16 @@ export async function runAndPersistRiskManager(): Promise<RiskManagerRunResult> 
       ),
     ]);
 
+    try {
+      await synthesizeWeeklyBrief();
+      const emailResult = await sendWeeklyBriefEmail();
+      if (!emailResult.sent) {
+        console.log("Weekly brief email not sent:", emailResult.reason);
+      }
+    } catch (err) {
+      console.error("CIO synthesis after Risk Manager run failed:", err);
+    }
+
     return { runId: run.id, status: "COMPLETE", output };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -278,47 +290,67 @@ function startOfWeekUTC(date: Date): Date {
   return d;
 }
 
-interface SynthesizedItem {
-  agentRunId: string;
-  action: string;
-  rationale: string;
-  expectedImpact: string | null;
-  accountId: string | null;
-}
-
 /**
- * Rebuilds the current week's WeeklyBrief from the latest completed run of
- * each agent, in priority order: critical Risk Manager flags first, then the
- * Relative Strength agent's highest-conviction opportunities, then Sector
- * Rotation signals. Called after the post-import agent sequence so the CIO
- * Weekly Action List reflects all three agents instead of just whichever ran
- * most recently.
+ * Builds this week's candidate item list from the latest completed run of
+ * each agent, tagged with a stable key + source so the CIO synthesis step can
+ * reference and reorder them without hallucinating new ones.
  */
-export async function synthesizeWeeklyBrief(): Promise<void> {
+async function buildCioCandidates(): Promise<{
+  candidates: CioCandidateItem[];
+  riskRun: { id: string } | null;
+  relativeRun: { id: string } | null;
+  sectorRun: { id: string } | null;
+}> {
   const [riskRun, relativeRun, sectorRun] = await Promise.all([
     prisma.agentRun.findFirst({ where: { agentType: "RISK_MANAGER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
     prisma.agentRun.findFirst({ where: { agentType: "RELATIVE_STRENGTH", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
     prisma.agentRun.findFirst({ where: { agentType: "SECTOR_ROTATION", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
   ]);
 
-  const items: SynthesizedItem[] = [];
+  const candidates: CioCandidateItem[] = [];
 
   if (riskRun?.output) {
     const output = riskRun.output as unknown as RiskManagerOutput;
-    for (const flag of output.critical.slice(0, 5)) {
-      items.push({
+    output.critical.slice(0, 5).forEach((flag, i) => {
+      candidates.push({
+        key: `risk-critical-${i}`,
+        source: "risk_critical",
         agentRunId: riskRun.id,
         action: flag.title,
         rationale: flag.detail,
         expectedImpact: "Critical risk flag — act immediately.",
         accountId: flag.accountId,
       });
-    }
+    });
+    output.watch.slice(0, 5).forEach((flag, i) => {
+      candidates.push({
+        key: `risk-watch-${i}`,
+        source: "risk_watch",
+        agentRunId: riskRun.id,
+        action: flag.title,
+        rationale: flag.detail,
+        expectedImpact: "Monitor for further deterioration.",
+        accountId: flag.accountId,
+      });
+    });
+    output.opportunityCost.slice(0, 3).forEach((entry, i) => {
+      candidates.push({
+        key: `opportunity-cost-${i}`,
+        source: "opportunity_cost",
+        agentRunId: riskRun.id,
+        action: `Reallocate ${entry.symbol} — better option in plan menu`,
+        rationale: entry.detail,
+        expectedImpact: `Closing the gap to ${entry.alternativeName} could improve 5Y return by roughly ${formatPercent(entry.gap)}.`,
+        accountId: null,
+      });
+    });
   }
   if (relativeRun?.output) {
     const output = relativeRun.output as unknown as RelativeStrengthOutput;
-    for (const entry of [...output.topHoldings, ...output.candidates].slice(0, 3)) {
-      items.push({
+    output.topHoldings.slice(0, 3).forEach((entry, i) => {
+      candidates.push({
+        key: `rs-top-${i}`,
+        source: "relative_strength_top",
         agentRunId: relativeRun.id,
         action: `Highest-conviction opportunity: ${entry.symbol}`,
         rationale: withNote(
@@ -328,29 +360,95 @@ export async function synthesizeWeeklyBrief(): Promise<void> {
         expectedImpact: "Reinforces or adds to a position building relative strength.",
         accountId: entry.accountIds.length === 1 ? entry.accountIds[0] : null,
       });
-    }
+    });
+    output.candidates.slice(0, 3).forEach((entry, i) => {
+      candidates.push({
+        key: `rs-candidate-${i}`,
+        source: "relative_strength_candidate",
+        agentRunId: relativeRun.id,
+        action: `Watch ${entry.symbol} — building relative strength`,
+        rationale: withNote(
+          `Score ${entry.score}/100, 52-week momentum ${formatPercent(entry.momentum)}.`,
+          entry,
+        ),
+        expectedImpact: "Early signal for a potential add if strength continues.",
+        accountId: entry.accountIds.length === 1 ? entry.accountIds[0] : null,
+      });
+    });
+    output.underperformers.slice(0, 3).forEach((entry, i) => {
+      candidates.push({
+        key: `rs-underperformer-${i}`,
+        source: "relative_strength_underperformer",
+        agentRunId: relativeRun.id,
+        action: `Review ${entry.symbol} — trailing relative strength`,
+        rationale: withNote(
+          `Score ${entry.score}/100 (${formatPercent(entry.relativeScore / 100)} vs S&P 500), 52-week momentum ${formatPercent(entry.momentum)}.`,
+          entry,
+        ),
+        expectedImpact: "Reduces drag from a persistently lagging position.",
+        accountId: entry.accountIds.length === 1 ? entry.accountIds[0] : null,
+      });
+    });
   }
   if (sectorRun?.output) {
     const output = sectorRun.output as unknown as SectorRotationOutput;
-    for (const sector of output.topSectors.slice(0, 3)) {
-      items.push({
+    output.flags.slice(0, 3).forEach((flag, i) => {
+      candidates.push({
+        key: `sector-flag-${i}`,
+        source: "sector_flag",
+        agentRunId: sectorRun.id,
+        action:
+          flag.type === "overweight_weakening"
+            ? `Reduce ${flag.sector} exposure — weakening sector`
+            : `Consider adding ${flag.sector} exposure — leading sector`,
+        rationale: flag.detail,
+        expectedImpact:
+          flag.type === "overweight_weakening"
+            ? "Cuts exposure to a sector losing relative strength."
+            : "Captures a sector gaining relative strength.",
+        accountId: null,
+      });
+    });
+    output.topSectors.slice(0, 3).forEach((sector, i) => {
+      candidates.push({
+        key: `sector-top-${i}`,
+        source: "sector_top",
         agentRunId: sectorRun.id,
         action: `Sector rotation signal: ${sector.sector}`,
         rationale: `Composite score ${sector.score}/100 (1M ${formatPercent(sector.oneMonth)}, 3M ${formatPercent(sector.threeMonth)}, 12M ${formatPercent(sector.twelveMonth)}).`,
         expectedImpact: "Early signal for a sector-level tilt.",
         accountId: null,
       });
-    }
+    });
   }
 
-  if (items.length === 0) return;
+  return { candidates, riskRun, relativeRun, sectorRun };
+}
+
+/**
+ * Rebuilds the current week's WeeklyBrief by sending the latest completed
+ * run of each agent to Claude for natural-language synthesis and priority
+ * ranking (see lib/agents/cio.ts). Called after the post-import agent
+ * sequence, and after every standalone Risk Manager run, so the CIO Weekly
+ * Action List reflects all three agents instead of just whichever ran most
+ * recently.
+ */
+export async function synthesizeWeeklyBrief(): Promise<void> {
+  const { candidates } = await buildCioCandidates();
+  if (candidates.length === 0) return;
+
+  const brief = await synthesizeCioBrief(candidates);
+  if (brief.orderedItems.length === 0) return;
 
   const weekOf = startOfWeekUTC(new Date());
-  const sourcesUsed = [riskRun && "Risk Manager", relativeRun && "Relative Strength", sectorRun && "Sector Rotation"]
-    .filter(Boolean)
-    .join(", ");
-  const cioSummary = `Synthesized from ${sourcesUsed}, prioritizing critical risk flags, then high-conviction opportunities, then sector rotation signals.`;
-  const actionItemsData = items.map((item, i) => ({ ...item, priority: i + 1 }));
+  const actionItemsData = brief.orderedItems.map((item, i) => ({
+    agentRunId: item.agentRunId,
+    action: item.action,
+    rationale: item.rationale,
+    expectedImpact: item.expectedImpact,
+    accountId: item.accountId,
+    priority: i + 1,
+  }));
 
   const existing = await prisma.weeklyBrief.findUnique({ where: { weekOf } });
   if (existing) {
@@ -358,29 +456,28 @@ export async function synthesizeWeeklyBrief(): Promise<void> {
       prisma.actionItem.deleteMany({ where: { weeklyBriefId: existing.id } }),
       prisma.weeklyBrief.update({
         where: { id: existing.id },
-        data: { cioSummary, actionItems: { create: actionItemsData } },
+        data: { cioSummary: brief.summary, actionItems: { create: actionItemsData } },
       }),
     ]);
   } else {
     await prisma.weeklyBrief.create({
-      data: { weekOf, cioSummary, actionItems: { create: actionItemsData } },
+      data: { weekOf, cioSummary: brief.summary, actionItems: { create: actionItemsData } },
     });
   }
 }
 
 /**
  * Fire-and-forget trigger for the import pipeline — runs all three agents in
- * sequence (Relative Strength → Sector Rotation → Risk Manager) and then
- * resynthesizes the CIO Weekly Action List from their output. Logs failures
- * instead of throwing, since an agent-scoring failure should never surface as
- * an import error to the user.
+ * sequence (Relative Strength → Sector Rotation → Risk Manager). Risk
+ * Manager's own persistence resynthesizes the CIO Weekly Action List once all
+ * three have fresh output. Logs failures instead of throwing, since an
+ * agent-scoring failure should never surface as an import error to the user.
  */
 export function triggerAllAgentsRun(): void {
   (async () => {
     await runAndPersistRelativeStrength();
     await runAndPersistSectorRotation();
     await runAndPersistRiskManager();
-    await synthesizeWeeklyBrief();
   })().catch((err) => {
     console.error("Post-import agent sequence failed:", err);
   });
