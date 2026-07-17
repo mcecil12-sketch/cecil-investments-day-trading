@@ -87,6 +87,7 @@ export async function importHoldingsBatch(input: {
             costBasisTotal: row.costBasisTotal,
             averageCostBasis: row.averageCostBasis,
             percentOfAccount: row.percentOfAccount,
+            ytdReturn: row.ytdReturn ?? null,
           },
         });
       }

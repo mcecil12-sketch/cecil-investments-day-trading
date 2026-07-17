@@ -23,6 +23,10 @@ export interface RelativeStrengthEntry {
   proxySymbol: string | null;
   /** Human-readable disclosure of the reported-return/proxy/active-fund caveats. Null when neither applies. */
   note: string | null;
+  /** Year-to-date return (decimal fraction) from the known-returns table, when on file. Null when unavailable — the composite score then falls back to 1Y momentum only. */
+  ytdReturn: number | null;
+  /** Set when YTD and 1Y returns disagree sharply (opposite sign, >15pp apart) — a signal to double-check before acting on the score. Null otherwise. */
+  divergenceFlag: string | null;
 }
 
 export interface RelativeStrengthScoringResult {
@@ -47,6 +51,15 @@ export interface RelativeStrengthOutput {
   candidates: RelativeStrengthEntry[];
   skipped: Array<{ symbol: string; reason: string }>;
 }
+
+/** Composite-return weights applied when a fund's known returns include a YTD figure — 20% YTD, 30% 1Y, 30% 3Y, 20% 5Y. Without a YTD figure, scoring falls back to 1Y momentum only (the pre-existing behavior). */
+const YTD_WEIGHT = 0.2;
+const ONE_YEAR_WEIGHT = 0.3;
+const THREE_YEAR_WEIGHT = 0.3;
+const FIVE_YEAR_WEIGHT = 0.2;
+
+/** Minimum gap (percentage points, as a fraction) between YTD and 1Y returns, in opposite directions, before it's worth flagging as a divergence to verify. */
+const DIVERGENCE_THRESHOLD = 0.15;
 
 interface ScoredSeries {
   currentPrice: number;
@@ -86,7 +99,8 @@ function scoreSeries(rawPoints: PricePoint[]): ScoredSeries {
  * ETF's price history (see fundMappings.ts) for trend, and to the fund's own
  * manually reported return for momentum when one is on file — the reported
  * return is the fund's actual performance, so it takes priority over any
- * proxy approximation.
+ * proxy approximation. When a YTD figure is also on file, momentum becomes a
+ * 20/30/30/20 YTD/1Y/3Y/5Y composite return instead of 1Y alone.
  */
 export async function scoreCurrentHoldings(): Promise<RelativeStrengthScoringResult> {
   const [sp500Points, holdings] = await Promise.all([getSp500Series(), getCurrentHoldings()]);
@@ -121,15 +135,36 @@ export async function scoreCurrentHoldings(): Promise<RelativeStrengthScoringRes
       let momentum = priceScored.momentum;
       let score = priceScored.score;
       let relativeScore = score - sp500.score;
+      let ytdReturn: number | null = null;
+      let divergenceFlag: string | null = null;
 
       if (knownReturns) {
         momentum = knownReturns.oneYear;
-        const momentumScore = momentumTo100(momentum);
+        ytdReturn = knownReturns.ytdReturn ?? null;
+
+        // Composite return blends YTD/1Y/3Y/5Y when a YTD figure is on file;
+        // otherwise scoring falls back to 1Y momentum only, same as before.
+        const compositeReturn =
+          ytdReturn != null
+            ? ytdReturn * YTD_WEIGHT +
+              knownReturns.oneYear * ONE_YEAR_WEIGHT +
+              knownReturns.threeYear * THREE_YEAR_WEIGHT +
+              knownReturns.fiveYear * FIVE_YEAR_WEIGHT
+            : knownReturns.oneYear;
+
+        const momentumScore = momentumTo100(compositeReturn);
         const trend = trendStrengthScore(priceScored.currentPrice, priceScored.sma50, priceScored.sma200);
         score = Math.max(0, Math.min(100, Math.round(momentumScore * 0.6 + trend * 0.4)));
         relativeScore = Math.round((knownReturns.oneYear - KNOWN_SP500_RETURNS.oneYear) * 100);
-        noteParts.push("via reported returns");
+        noteParts.push(ytdReturn != null ? "via reported returns (YTD/1Y/3Y/5Y composite)" : "via reported returns");
         if (proxySymbol) noteParts.push(`trend via ${proxySymbol} proxy`);
+
+        if (ytdReturn != null) {
+          const oppositeSigns = (ytdReturn > 0 && knownReturns.oneYear < 0) || (ytdReturn < 0 && knownReturns.oneYear > 0);
+          if (oppositeSigns && Math.abs(ytdReturn - knownReturns.oneYear) > DIVERGENCE_THRESHOLD) {
+            divergenceFlag = "YTD/1Y divergence — verify before acting";
+          }
+        }
       } else if (proxySymbol) {
         noteParts.push(`via ${proxySymbol} proxy`);
       }
@@ -150,6 +185,8 @@ export async function scoreCurrentHoldings(): Promise<RelativeStrengthScoringRes
         accountIds: holding.accounts.map((a) => a.accountId),
         proxySymbol,
         note: noteParts.length > 0 ? noteParts.join(" — ") : null,
+        ytdReturn,
+        divergenceFlag,
       });
     } catch (err) {
       skipped.push({ symbol: holding.symbol, reason: err instanceof Error ? err.message : String(err) });

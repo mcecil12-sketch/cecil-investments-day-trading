@@ -12,6 +12,8 @@ export interface FidelityHoldingRow {
   averageCostBasis: number | null;
   percentOfAccount: number | null;
   type: FidelityInstrumentType;
+  /** Year-to-date return as a decimal fraction, when the import source reports one (screenshot extraction only — Fidelity's CSV export doesn't include it). */
+  ytdReturn?: number | null;
 }
 
 export interface FidelityAccountGroup {

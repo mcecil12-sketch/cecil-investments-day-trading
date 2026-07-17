@@ -181,6 +181,7 @@ export function ScreenshotImportForm({ accounts }: { accounts: AccountOption[] }
                   <th>Cost Basis</th>
                   <th>Gain/Loss</th>
                   <th>% of Account</th>
+                  <th>YTD</th>
                 </tr>
               </thead>
               <tbody>
@@ -200,6 +201,7 @@ export function ScreenshotImportForm({ accounts }: { accounts: AccountOption[] }
                       {formatCurrency(position.gainLoss)} ({formatPercent(position.gainLossPercent / 100)})
                     </td>
                     <td className="mono">{position.percentOfAccount.toFixed(1)}%</td>
+                    <td className="mono">{formatPercent(position.ytdReturn ?? null)}</td>
                   </tr>
                 ))}
               </tbody>

@@ -105,6 +105,8 @@ model Holding {
   costBasisTotal   Float?
   averageCostBasis Float?
   percentOfAccount Float?
+  /// Year-to-date return as a decimal fraction (e.g. 0.1046 for +10.46%), captured from a screenshot's balance overview when shown. Null when the source didn't report it.
+  ytdReturn        Float?
 
   @@index([accountId, asOfDate])
   @@index([instrumentId])

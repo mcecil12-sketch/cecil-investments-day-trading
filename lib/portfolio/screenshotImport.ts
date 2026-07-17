@@ -10,6 +10,8 @@ export interface ExtractedPosition {
   gainLoss: number;
   gainLossPercent: number;
   percentOfAccount: number;
+  /** Year-to-date return as a decimal fraction (e.g. 0.1046 for +10.46%), when the screenshot shows one — null/absent otherwise. */
+  ytdReturn?: number | null;
 }
 
 export interface ScreenshotExtractionResult {
@@ -31,7 +33,8 @@ export const EXTRACTION_SYSTEM_PROMPT = `You are a financial data extractor. Ext
     costBasis: number,
     gainLoss: number,
     gainLossPercent: number,
-    percentOfAccount: number
+    percentOfAccount: number,
+    ytdReturn: number | null (year-to-date return as a decimal fraction, e.g. 0.1046 for +10.46%, -0.0186 for -1.86% — only if the screenshot shows a YTD figure for this position, otherwise null)
   }]
 }`;
 
@@ -59,7 +62,8 @@ function isExtractedPosition(value: unknown): value is ExtractedPosition {
     isFiniteNumber(p.costBasis) &&
     isFiniteNumber(p.gainLoss) &&
     isFiniteNumber(p.gainLossPercent) &&
-    isFiniteNumber(p.percentOfAccount)
+    isFiniteNumber(p.percentOfAccount) &&
+    (p.ytdReturn == null || isFiniteNumber(p.ytdReturn))
   );
 }
 
@@ -85,7 +89,7 @@ export function parseExtractionResponse(text: string): ScreenshotExtractionResul
   return {
     accountName: result.accountName,
     asOfDate: result.asOfDate,
-    positions: result.positions,
+    positions: result.positions.map((position) => ({ ...position, ytdReturn: position.ytdReturn ?? null })),
   };
 }
 
@@ -108,5 +112,6 @@ export function positionsToHoldingRows(positions: ExtractedPosition[]): Fidelity
     averageCostBasis: position.quantity !== 0 ? position.costBasis / position.quantity : null,
     percentOfAccount: position.percentOfAccount,
     type: classifyExtractedType(position),
+    ytdReturn: position.ytdReturn ?? null,
   }));
 }

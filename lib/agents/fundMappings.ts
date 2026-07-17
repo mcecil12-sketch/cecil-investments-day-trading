@@ -68,10 +68,12 @@ export function getFundProxy(symbol: string, name?: string | null): FundProxy | 
 
 /**
  * Manually reported fund performance (plan statement data as of Jun 30,
- * 2026), used in place of proxy-ETF price history when available — it's the
- * fund's own actual return rather than an approximation. Grouped into a
- * `category` so callers (e.g. the Risk Manager's 401k opportunity-cost
- * check) can compare a fund against its closest peers in the known set.
+ * 2026, plus YTD figures from the Fidelity balance overview screenshots as
+ * of Jul 13, 2026 where noted), used in place of proxy-ETF price history
+ * when available — it's the fund's own actual return rather than an
+ * approximation. Grouped into a `category` so callers (e.g. the Risk
+ * Manager's 401k opportunity-cost check) can compare a fund against its
+ * closest peers in the known set.
  */
 export type FundCategory =
   | "us-large-cap"
@@ -87,6 +89,8 @@ export interface FundReturns {
   fiveYear: number;
   tenYear: number;
   category: FundCategory;
+  /** Year-to-date return as a decimal fraction (e.g. 0.1046 for +10.46%), as reported on the plan's Fidelity balance overview screenshots. Optional — only populated for funds where a current YTD figure is on file. */
+  ytdReturn?: number;
 }
 
 export interface FundReturnsMatch extends FundReturns {
@@ -98,14 +102,14 @@ export interface FundReturnsMatch extends FundReturns {
 export const KNOWN_SP500_RETURNS = { oneYear: 0.21, threeYear: 0.18, fiveYear: 0.13 };
 
 const KNOWN_FUND_RETURNS: Record<string, FundReturns> = {
-  "US LARGE CO INDEX": { oneYear: 0.2229, threeYear: 0.2059, fiveYear: 0.1338, tenYear: 0.1549, category: "us-large-cap" },
+  "US LARGE CO INDEX": { oneYear: 0.2229, threeYear: 0.2059, fiveYear: 0.1338, tenYear: 0.1549, category: "us-large-cap", ytdReturn: 0.1046 },
   "PASS US EQ INDX MA": { oneYear: 0.2229, threeYear: 0.2057, fiveYear: 0.1337, tenYear: 0.1548, category: "us-large-cap" },
-  "US SMALL COMPANY": { oneYear: 0.3008, threeYear: 0.1796, fiveYear: 0.0493, tenYear: 0.136, category: "us-small-cap" },
-  "SMALL CAP EQTY INDX": { oneYear: 0.4092, threeYear: 0.1872, fiveYear: 0.0712, tenYear: 0.1047, category: "us-small-cap" },
+  "US SMALL COMPANY": { oneYear: 0.3008, threeYear: 0.1796, fiveYear: 0.0493, tenYear: 0.136, category: "us-small-cap", ytdReturn: 0.1653 },
+  "SMALL CAP EQTY INDX": { oneYear: 0.4092, threeYear: 0.1872, fiveYear: 0.0712, tenYear: 0.1047, category: "us-small-cap", ytdReturn: -0.0186 },
   "ACTV US SM CAP MA": { oneYear: 0.3043, threeYear: 0.1805, fiveYear: 0.0527, tenYear: 0.1384, category: "us-small-cap" },
   "AGGRESS GRW MA": { oneYear: 0.215, threeYear: 0.1707, fiveYear: 0.0674, tenYear: 0.1234, category: "active-growth" },
   "MAGELLAN PORTFOLIO": { oneYear: 0.0767, threeYear: 0.1917, fiveYear: 0.1088, tenYear: 0.1787, category: "active-growth" },
-  "EMERGING MARKETS": { oneYear: 0.3728, threeYear: 0.1964, fiveYear: 0.0454, tenYear: 0.0902, category: "emerging-markets" },
+  "EMERGING MARKETS": { oneYear: 0.3728, threeYear: 0.1964, fiveYear: 0.0454, tenYear: 0.0902, category: "emerging-markets", ytdReturn: -0.0285 },
   "VERIZON STOCK FUND": { oneYear: 0.0453, threeYear: 0.1169, fiveYear: 0.0066, tenYear: 0.0257, category: "verizon-stock" },
   "INTL COMPANY INDEX": { oneYear: 0.2048, threeYear: 0.1677, fiveYear: 0.0942, tenYear: 0.0999, category: "intl-developed" },
   "ACTV INTL EQ MA": { oneYear: 0.1411, threeYear: 0.1367, fiveYear: 0.0617, tenYear: 0.0848, category: "intl-developed" },

@@ -51,6 +51,7 @@ function renderRelativeStrengthTable(title: string, entries: RelativeStrengthEnt
                 <th>Symbol</th>
                 <th>Score</th>
                 <th>vs S&amp;P</th>
+                <th>YTD</th>
                 <th>Momentum (1Y)</th>
                 <th>Trend</th>
                 <th>Value</th>
@@ -66,11 +67,19 @@ function renderRelativeStrengthTable(title: string, entries: RelativeStrengthEnt
                         {entry.note}
                       </div>
                     )}
+                    {entry.divergenceFlag && (
+                      <div style={{ color: "var(--negative)", fontSize: "0.72rem", fontWeight: 600 }}>
+                        {entry.divergenceFlag}
+                      </div>
+                    )}
                   </td>
                   <td className="mono">{entry.score}</td>
                   <td className="mono" style={{ color: alphaColor(entry.relativeScore) }}>
                     {entry.relativeScore > 0 ? "+" : ""}
                     {entry.relativeScore}
+                  </td>
+                  <td className="mono" style={{ color: alphaColor(entry.ytdReturn) }}>
+                    {formatPercent(entry.ytdReturn)}
                   </td>
                   <td className="mono">{formatPercent(entry.momentum)}</td>
                   <td className="mono" style={{ color: "var(--text-muted)" }}>
