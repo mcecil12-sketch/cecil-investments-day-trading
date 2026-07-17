@@ -58,9 +58,4 @@ Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/bui
 ### Pushover
 
 - `PUSHOVER_USER_KEY`: recipient key for Pushover messages.
-- `PUSHOVER_API_TOKEN` / `PUSHOVER_APP_TOKEN`: API or app token used to post notifications.
-
-### Weekly CIO Brief Email
-
-- `RESEND_API_KEY`: API key for [Resend](https://resend.com), used to email the weekly CIO brief. Leave unset to skip email delivery — the brief still appears on `/agents`.
-- `TO_EMAIL`: recipient address for the weekly CIO brief email.
+- `PUSHOVER_API_TOKEN` / `PUSHOVER_APP_TOKEN`: API or app token used to post notifications, including the weekly CIO brief push notification. Leave unset to skip weekly-brief notifications — the brief still appears on `/agents`.

@@ -3,7 +3,7 @@ import { runRelativeStrengthAgent, type RelativeStrengthEntry, type RelativeStre
 import { runSectorRotationAgent, type SectorScore, type SectorRotationFlag, type SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import { runRiskManagerAgent, type RiskFlag, type OpportunityCostEntry, type RiskManagerOutput } from "@/lib/agents/riskManager";
 import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
-import { sendWeeklyBriefEmail } from "@/lib/email/weeklyBrief";
+import { sendWeeklyBriefNotification } from "@/lib/notifications/weeklyBrief";
 
 function formatPercent(value: number | null): string {
   if (value == null) return "unknown";
@@ -263,9 +263,9 @@ export async function runAndPersistRiskManager(): Promise<RiskManagerRunResult> 
 
     try {
       await synthesizeWeeklyBrief();
-      const emailResult = await sendWeeklyBriefEmail();
-      if (!emailResult.sent) {
-        console.log("Weekly brief email not sent:", emailResult.reason);
+      const notificationResult = await sendWeeklyBriefNotification();
+      if (!notificationResult.sent) {
+        console.log("Weekly brief notification not sent:", notificationResult.reason);
       }
     } catch (err) {
       console.error("CIO synthesis after Risk Manager run failed:", err);
