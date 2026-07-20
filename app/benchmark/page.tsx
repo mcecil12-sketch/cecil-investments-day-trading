@@ -1,21 +1,20 @@
 import { prisma } from "@/lib/prisma";
-import { computeBenchmark } from "@/lib/benchmark/engine";
+import { computeBenchmark, FIDELITY_PERIODS } from "@/lib/benchmark/engine";
 import type {
   AccountBenchmarkResult,
   AccountSincePurchaseResult,
   AggregateBenchmarkResult,
   BenchmarkComputation,
+  FidelityPeriodKey,
 } from "@/lib/benchmark/engine";
-import { persistBenchmarkResults } from "@/lib/benchmark/persist";
-import { BENCHMARK_PERIODS, type BenchmarkPeriodKey } from "@/lib/benchmark/math";
 import { alphaColor, formatCurrency, formatDate, formatPercent } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 
-const PERIOD_LABELS: Record<BenchmarkPeriodKey, string> = {
+const PERIOD_LABELS: Record<FidelityPeriodKey, string> = {
+  ytd: "YTD",
   "1y": "1 Year",
   "3y": "3 Year",
-  "5y": "5 Year",
 };
 
 const AGGREGATE_SCOPES = ["AGGREGATE_TOTAL", "AGGREGATE_ACTIONABLE"] as const;
@@ -29,14 +28,13 @@ export default async function BenchmarkPage() {
   let computeError: string | null = null;
   try {
     computation = await computeBenchmark();
-    await persistBenchmarkResults(computation);
   } catch (err) {
     computeError = err instanceof Error ? err.message : String(err);
   }
 
   const accounts = await prisma.account.findMany({ orderBy: { createdAt: "asc" } });
 
-  if (computeError) {
+  if (computeError || !computation) {
     return (
       <div>
         <h1>Benchmark</h1>
@@ -48,23 +46,25 @@ export default async function BenchmarkPage() {
   }
 
   const accountResultsByAccount = new Map<string, AccountBenchmarkResult[]>();
-  for (const result of computation!.accounts) {
+  for (const result of computation.accounts) {
     const list = accountResultsByAccount.get(result.accountId) ?? [];
     list.push(result);
     accountResultsByAccount.set(result.accountId, list);
   }
 
   const aggregateByScope = new Map<string, AggregateBenchmarkResult[]>();
-  for (const result of computation!.aggregate) {
+  for (const result of computation.aggregate) {
     const list = aggregateByScope.get(result.scope) ?? [];
     list.push(result);
     aggregateByScope.set(result.scope, list);
   }
 
   const sincePurchaseByAccount = new Map<string, AccountSincePurchaseResult>();
-  for (const result of computation!.sincePurchase) {
+  for (const result of computation.sincePurchase) {
     sincePurchaseByAccount.set(result.accountId, result);
   }
+
+  const aggregateSincePurchase = computation.aggregateSincePurchase;
 
   return (
     <div>
@@ -75,16 +75,20 @@ export default async function BenchmarkPage() {
           <div>
             <div style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>Total current value</div>
             <div className="mono" style={{ fontSize: "1.5rem", fontWeight: 700 }}>
-              {formatCurrency(computation!.totalCurrentValue)}
+              {formatCurrency(computation.totalCurrentValue)}
             </div>
           </div>
           <div style={{ color: "var(--text-muted)", fontSize: "0.85rem", alignSelf: "flex-end" }}>
-            Computed {formatDate(computation!.computedAt)}
+            Computed {formatDate(computation.computedAt)}
           </div>
         </div>
       </div>
 
       <h2>Portfolio vs. S&amp;P 500</h2>
+      <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+        Rolling period returns are shown when available from the Fidelity Performance PDF. Cost basis
+        return is always shown as a permanent baseline.
+      </p>
       <div className="card">
         <div className="table-wrap">
           <table>
@@ -95,36 +99,50 @@ export default async function BenchmarkPage() {
                 <th>Portfolio Return</th>
                 <th>S&amp;P 500 Return</th>
                 <th>Alpha</th>
-                <th>Value (start → end)</th>
+                <th>Detail</th>
               </tr>
             </thead>
             <tbody>
               {AGGREGATE_SCOPES.flatMap((scope) => {
                 const results = aggregateByScope.get(scope) ?? [];
-                return BENCHMARK_PERIODS.map(({ key }) => {
-                  const result = results.find((r) => r.period === key);
+                return FIDELITY_PERIODS.map((period) => {
+                  const result = results.find((r) => r.period === period);
                   return (
-                    <tr key={`${scope}-${key}`}>
+                    <tr key={`${scope}-${period}`}>
                       <td>{SCOPE_LABELS[scope]}</td>
-                      <td>{PERIOD_LABELS[key]}</td>
+                      <td>{PERIOD_LABELS[period]}</td>
                       <td className="mono">{formatPercent(result?.portfolioReturn ?? null)}</td>
                       <td className="mono">{formatPercent(result?.sp500Return ?? null)}</td>
                       <td className="mono" style={{ color: alphaColor(result?.alpha ?? null) }}>
                         {formatPercent(result?.alpha ?? null)}
                       </td>
                       <td className="mono" style={{ color: "var(--text-muted)" }}>
-                        {result
-                          ? `${formatCurrency(result.startValue)} → ${formatCurrency(result.endValue)}`
-                          : "No data"}
-                        {result?.insufficientHistory && " (partial window)"}
+                        {result?.portfolioReturn == null
+                          ? "Not yet reported"
+                          : `As of ${formatDate(result.asOfDate)}`}
                         {result && result.excludedAccountIds.length > 0
-                          ? ` — excludes ${result.excludedAccountIds.length} account(s) without history`
+                          ? ` — ${result.excludedAccountIds.length} account(s) not yet reported`
                           : ""}
                       </td>
                     </tr>
                   );
                 });
               })}
+              {aggregateSincePurchase && (
+                <tr>
+                  <td>All Accounts</td>
+                  <td>Since Purchase (cost basis)</td>
+                  <td className="mono">{formatPercent(aggregateSincePurchase.portfolioReturn)}</td>
+                  <td className="mono">{formatPercent(aggregateSincePurchase.sp500Return)}</td>
+                  <td className="mono" style={{ color: alphaColor(aggregateSincePurchase.alpha) }}>
+                    {formatPercent(aggregateSincePurchase.alpha)}
+                  </td>
+                  <td className="mono" style={{ color: "var(--text-muted)" }}>
+                    {formatCurrency(aggregateSincePurchase.costBasis)} →{" "}
+                    {formatCurrency(aggregateSincePurchase.currentValue)}
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -143,9 +161,9 @@ export default async function BenchmarkPage() {
                 {account.isLocked ? " · Locked" : ""}
               </span>
             </div>
-            {results.length === 0 ? (
+            {results.length === 0 && !sincePurchase ? (
               <p style={{ color: "var(--text-muted)" }}>
-                No snapshot data yet — import a statement to see benchmark data.
+                No position data yet — import a statement to see benchmark data.
               </p>
             ) : (
               <div className="table-wrap">
@@ -156,32 +174,31 @@ export default async function BenchmarkPage() {
                       <th>Portfolio Return</th>
                       <th>S&amp;P 500 Return</th>
                       <th>Alpha</th>
-                      <th>Value (start → end)</th>
+                      <th>Detail</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {BENCHMARK_PERIODS.map(({ key }) => {
-                      const result = results.find((r) => r.period === key);
+                    {FIDELITY_PERIODS.map((period) => {
+                      const result = results.find((r) => r.period === period);
                       return (
-                        <tr key={key}>
-                          <td>{PERIOD_LABELS[key]}</td>
+                        <tr key={period}>
+                          <td>{PERIOD_LABELS[period]}</td>
                           <td className="mono">{formatPercent(result?.portfolioReturn ?? null)}</td>
                           <td className="mono">{formatPercent(result?.sp500Return ?? null)}</td>
                           <td className="mono" style={{ color: alphaColor(result?.alpha ?? null) }}>
                             {formatPercent(result?.alpha ?? null)}
                           </td>
                           <td className="mono" style={{ color: "var(--text-muted)" }}>
-                            {result
-                              ? `${formatCurrency(result.startValue)} → ${formatCurrency(result.endValue)}`
-                              : "—"}
-                            {result?.insufficientHistory && " (partial window)"}
+                            {result?.portfolioReturn == null
+                              ? "Not yet reported"
+                              : `As of ${formatDate(result.asOfDate)}`}
                           </td>
                         </tr>
                       );
                     })}
                     {sincePurchase && (
                       <tr>
-                        <td>Since Purchase (est.)</td>
+                        <td>Since Purchase (cost basis)</td>
                         <td className="mono">{formatPercent(sincePurchase.portfolioReturn)}</td>
                         <td className="mono">{formatPercent(sincePurchase.sp500Return)}</td>
                         <td className="mono" style={{ color: alphaColor(sincePurchase.alpha) }}>
@@ -189,7 +206,7 @@ export default async function BenchmarkPage() {
                         </td>
                         <td className="mono" style={{ color: "var(--text-muted)" }}>
                           {formatCurrency(sincePurchase.costBasis)} → {formatCurrency(sincePurchase.currentValue)}
-                          {" (cost basis vs. current value — no purchase date on record, S&P 500 side estimated from "}
+                          {" (no purchase date on record — S&P 500 side estimated from "}
                           {formatDate(sincePurchase.estimatedHoldingStart)}
                           {")"}
                         </td>

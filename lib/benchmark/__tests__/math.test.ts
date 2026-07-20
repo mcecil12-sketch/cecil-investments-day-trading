@@ -1,19 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeAlpha, computeReturn, subtractYears } from "@/lib/benchmark/math";
-
-describe("subtractYears", () => {
-  it("subtracts calendar years in UTC", () => {
-    const result = subtractYears(new Date("2026-07-09T00:00:00.000Z"), 3);
-    expect(result.toISOString()).toBe("2023-07-09T00:00:00.000Z");
-  });
-
-  it("handles leap-day gracefully", () => {
-    const result = subtractYears(new Date("2024-02-29T00:00:00.000Z"), 1);
-    // JS Date rolls Feb 29 in a non-leap target year to Mar 1 — acceptable,
-    // just document the behavior so a future change doesn't go unnoticed.
-    expect(result.toISOString()).toBe("2023-03-01T00:00:00.000Z");
-  });
-});
+import { computeAlpha, computeReturn } from "@/lib/benchmark/math";
 
 describe("computeReturn", () => {
   it("computes a simple NAV-delta return", () => {

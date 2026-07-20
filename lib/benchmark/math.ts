@@ -1,17 +1,3 @@
-export type BenchmarkPeriodKey = "1y" | "3y" | "5y";
-
-export const BENCHMARK_PERIODS: ReadonlyArray<{ key: BenchmarkPeriodKey; years: number }> = [
-  { key: "1y", years: 1 },
-  { key: "3y", years: 3 },
-  { key: "5y", years: 5 },
-];
-
-export function subtractYears(date: Date, years: number): Date {
-  const result = new Date(date);
-  result.setUTCFullYear(result.getUTCFullYear() - years);
-  return result;
-}
-
 /**
  * Simple NAV-delta return: (end - start) / start. This is not a true
  * time-weighted or money-weighted return — it doesn't account for deposits

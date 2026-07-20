@@ -1,16 +1,15 @@
 import { prisma } from "@/lib/prisma";
-import { computeBenchmark } from "@/lib/benchmark/engine";
-import type { BenchmarkComputation } from "@/lib/benchmark/engine";
-import { persistBenchmarkResults } from "@/lib/benchmark/persist";
-import { BENCHMARK_PERIODS, type BenchmarkPeriodKey } from "@/lib/benchmark/math";
+import { computeBenchmark, FIDELITY_PERIODS } from "@/lib/benchmark/engine";
+import type { AccountBenchmarkResult, BenchmarkComputation, FidelityPeriodKey } from "@/lib/benchmark/engine";
 import { alphaColor, formatCompactCurrency, formatCurrency, formatPercent } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 
-const PERIOD_LABELS: Record<BenchmarkPeriodKey, string> = {
+const DASHBOARD_PERIODS: FidelityPeriodKey[] = ["ytd", "1y"];
+const PERIOD_LABELS: Record<FidelityPeriodKey, string> = {
+  ytd: "YTD",
   "1y": "1Y",
   "3y": "3Y",
-  "5y": "5Y",
 };
 
 export default async function DashboardPage() {
@@ -18,7 +17,6 @@ export default async function DashboardPage() {
   let computeError: string | null = null;
   try {
     computation = await computeBenchmark();
-    await persistBenchmarkResults(computation);
   } catch (err) {
     computeError = err instanceof Error ? err.message : String(err);
   }
@@ -39,14 +37,20 @@ export default async function DashboardPage() {
   }
 
   const actionable = computation.aggregate.filter((r) => r.scope === "AGGREGATE_ACTIONABLE");
-  const headlineAlpha = actionable.find((r) => r.period === "1y") ?? null;
+  const ytdAlpha = actionable.find((r) => r.period === "ytd") ?? null;
+  const oneYearAlpha = actionable.find((r) => r.period === "1y") ?? null;
 
-  const accountAlphaByAccount = new Map<string, number | null>();
+  const accountResultsByAccount = new Map<string, AccountBenchmarkResult[]>();
+  for (const result of computation.accounts) {
+    const list = accountResultsByAccount.get(result.accountId) ?? [];
+    list.push(result);
+    accountResultsByAccount.set(result.accountId, list);
+  }
+
   const accountValueByAccount = new Map<string, number>();
   const accountSplitByAccount = new Map<string, { locked: number; actionable: number }>();
   for (const result of computation.accounts) {
-    if (result.period !== "1y") continue;
-    accountAlphaByAccount.set(result.accountId, result.alpha);
+    if (result.period !== FIDELITY_PERIODS[0]) continue;
     accountValueByAccount.set(result.accountId, result.endValue);
     if (result.currentLockedValue > 0) {
       accountSplitByAccount.set(result.accountId, {
@@ -56,13 +60,21 @@ export default async function DashboardPage() {
     }
   }
 
+  const sincePurchase = computation.aggregateSincePurchase;
+
   return (
     <div>
       <div className="top-bar">
         <div>
+          <div className="top-bar-label">YTD Alpha vs S&amp;P (Actionable)</div>
+          <div className="top-bar-alpha" style={{ color: alphaColor(ytdAlpha?.alpha ?? null) }}>
+            {formatPercent(ytdAlpha?.alpha ?? null)}
+          </div>
+        </div>
+        <div>
           <div className="top-bar-label">1Y Alpha vs S&amp;P (Actionable)</div>
-          <div className="top-bar-alpha" style={{ color: alphaColor(headlineAlpha?.alpha ?? null) }}>
-            {formatPercent(headlineAlpha?.alpha ?? null)}
+          <div className="top-bar-alpha" style={{ color: alphaColor(oneYearAlpha?.alpha ?? null) }}>
+            {formatPercent(oneYearAlpha?.alpha ?? null)}
           </div>
         </div>
       </div>
@@ -73,11 +85,11 @@ export default async function DashboardPage() {
       </div>
 
       <div className="period-cards">
-        {BENCHMARK_PERIODS.map(({ key }) => {
-          const result = actionable.find((r) => r.period === key) ?? null;
+        {DASHBOARD_PERIODS.map((period) => {
+          const result = actionable.find((r) => r.period === period) ?? null;
           return (
-            <div className="card" key={key}>
-              <div className="period-card-label">{PERIOD_LABELS[key]}</div>
+            <div className="card" key={period}>
+              <div className="period-card-label">{PERIOD_LABELS[period]}</div>
               <div className="period-card-row">
                 <span>Portfolio</span>
                 <span className="value">{formatPercent(result?.portfolioReturn ?? null)}</span>
@@ -92,14 +104,28 @@ export default async function DashboardPage() {
             </div>
           );
         })}
+        <div className="card">
+          <div className="period-card-label">Since Purchase</div>
+          <div className="period-card-row">
+            <span>Portfolio</span>
+            <span className="value">{formatPercent(sincePurchase?.portfolioReturn ?? null)}</span>
+          </div>
+          <div className="period-card-row">
+            <span>S&amp;P 500</span>
+            <span className="value">{formatPercent(sincePurchase?.sp500Return ?? null)}</span>
+          </div>
+          <div className="period-card-alpha" style={{ color: alphaColor(sincePurchase?.alpha ?? null) }}>
+            {formatPercent(sincePurchase?.alpha ?? null)}
+          </div>
+        </div>
       </div>
 
       <h2>Accounts</h2>
       <div className="card">
         {accounts.map((account) => {
           const value = accountValueByAccount.get(account.id) ?? null;
-          const alpha = accountAlphaByAccount.get(account.id) ?? null;
           const split = accountSplitByAccount.get(account.id) ?? null;
+          const results = accountResultsByAccount.get(account.id) ?? [];
           return (
             <div className={`account-row${account.isLocked ? " muted" : ""}`} key={account.id}>
               <div className="account-main">
@@ -112,11 +138,15 @@ export default async function DashboardPage() {
                 </div>
                 <div className="account-figures">
                   <div className="account-value">{formatCurrency(value)}</div>
-                  {!account.isLocked && (
-                    <div className="account-alpha" style={{ color: alphaColor(alpha) }}>
-                      {formatPercent(alpha)} 1Y
-                    </div>
-                  )}
+                  {!account.isLocked &&
+                    DASHBOARD_PERIODS.map((period) => {
+                      const result = results.find((r) => r.period === period);
+                      return (
+                        <div key={period} className="account-alpha" style={{ color: alphaColor(result?.alpha ?? null) }}>
+                          {formatPercent(result?.alpha ?? null)} {PERIOD_LABELS[period]}
+                        </div>
+                      );
+                    })}
                 </div>
               </div>
               {split && (

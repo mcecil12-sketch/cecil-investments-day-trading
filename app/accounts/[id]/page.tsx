@@ -2,7 +2,6 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import { computeBenchmark } from "@/lib/benchmark/engine";
-import { persistBenchmarkResults } from "@/lib/benchmark/persist";
 import { isLockedInstrument } from "@/lib/benchmark/lockedHoldings";
 import { alphaColor, formatCompactCurrency, formatCurrency, formatDate, formatPercent } from "@/lib/format";
 
@@ -31,7 +30,6 @@ export default async function AccountDetailPage({ params }: { params: { id: stri
   let split: { locked: number; actionable: number } | null = null;
   try {
     const computation = await computeBenchmark();
-    await persistBenchmarkResults(computation);
     const result = computation.accounts.find((r) => r.accountId === account.id && r.period === "1y");
     if (result) {
       alpha = result.alpha;

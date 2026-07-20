@@ -2,7 +2,6 @@ import Link from "next/link";
 import { prisma } from "@/lib/prisma";
 import { computeBenchmark } from "@/lib/benchmark/engine";
 import type { BenchmarkComputation } from "@/lib/benchmark/engine";
-import { persistBenchmarkResults } from "@/lib/benchmark/persist";
 import { alphaColor, formatCompactCurrency, formatCurrency, formatPercent } from "@/lib/format";
 import { NewAccountForm } from "./NewAccountForm";
 
@@ -14,7 +13,6 @@ export default async function AccountsPage() {
   let computation: BenchmarkComputation | null = null;
   try {
     computation = await computeBenchmark();
-    await persistBenchmarkResults(computation);
   } catch {
     // Value/alpha columns just fall back to "—" below if this fails.
   }
