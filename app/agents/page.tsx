@@ -6,6 +6,8 @@ import type { SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import type { RiskManagerOutput, RiskFlag } from "@/lib/agents/riskManager";
 import { alphaColor, formatCurrency, formatDate, formatDateTime, formatPercent } from "@/lib/format";
 import { RunAgentButton } from "./RunAgentButton";
+import { AgentStatusPoller } from "./AgentStatusPoller";
+import type { AgentStatusResponse } from "@/app/api/agents/status/route";
 
 export const dynamic = "force-dynamic";
 
@@ -329,8 +331,15 @@ export default async function AgentsPage() {
 
   const hasAnyRun = latestRuns.some((run) => run != null);
 
+  const initialStatuses: AgentStatusResponse = {
+    relativeStrength: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "RELATIVE_STRENGTH")]?.status ?? null,
+    sectorRotation: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "SECTOR_ROTATION")]?.status ?? null,
+    riskManager: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "RISK_MANAGER")]?.status ?? null,
+  };
+
   return (
     <div>
+      <AgentStatusPoller initialStatuses={initialStatuses} />
       <h1>Agents</h1>
 
       <div className="card card-accent">
