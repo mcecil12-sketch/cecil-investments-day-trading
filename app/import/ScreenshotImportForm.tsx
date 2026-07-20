@@ -2,95 +2,124 @@
 
 import { useRef, useState, type DragEvent } from "react";
 import { useRouter } from "next/navigation";
-import { formatCurrency, formatPercent } from "@/lib/format";
-import type { ExtractedPosition, ScreenshotExtractionResult } from "@/lib/portfolio/screenshotImport";
+import type { ScreenshotExtractionResult } from "@/lib/portfolio/screenshotImport";
 import { findMatchingAccountId, type AccountOption } from "@/lib/portfolio/accountMatch";
 
-interface ConfirmResult {
-  accountId: string;
-  accountName: string;
-  status: string;
-  rowCount: number;
-  errorMessage: string | null;
+type FileStatus = "pending" | "extracting" | "preview" | "imported" | "error";
+
+interface QueueItem {
+  id: string;
+  file: File;
+  status: FileStatus;
+  accountName?: string;
+  rowCount?: number;
+  errorMessage?: string;
 }
 
-type Stage = "idle" | "extracting" | "preview" | "importing" | "done" | "error";
+const STATUS_LABEL: Record<FileStatus, string> = {
+  pending: "Pending",
+  extracting: "Extracting…",
+  preview: "Reviewing…",
+  imported: "Imported",
+  error: "Error",
+};
+
+const STATUS_COLOR: Record<FileStatus, string> = {
+  pending: "var(--text-muted)",
+  extracting: "var(--accent)",
+  preview: "var(--accent)",
+  imported: "var(--positive)",
+  error: "var(--negative)",
+};
+
+let queueItemCounter = 0;
 
 export function ScreenshotImportForm({ accounts }: { accounts: AccountOption[] }) {
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement>(null);
-  const [stage, setStage] = useState<Stage>("idle");
+  const [queue, setQueue] = useState<QueueItem[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [fileName, setFileName] = useState<string | null>(null);
-  const [extraction, setExtraction] = useState<ScreenshotExtractionResult | null>(null);
-  const [accountId, setAccountId] = useState<string>(accounts[0]?.id ?? "");
-  const [confirmResult, setConfirmResult] = useState<ConfirmResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
-  function reset() {
-    setStage("idle");
-    setFileName(null);
-    setExtraction(null);
-    setConfirmResult(null);
-    setError(null);
-    if (inputRef.current) inputRef.current.value = "";
+  function updateItem(id: string, patch: Partial<QueueItem>) {
+    setQueue((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
   }
 
-  async function handleFile(selected: File) {
-    setFileName(selected.name);
-    setError(null);
-    setConfirmResult(null);
-    setStage("extracting");
+  async function processFile(item: QueueItem) {
+    updateItem(item.id, { status: "extracting" });
     try {
       const formData = new FormData();
-      formData.set("file", selected);
-      const response = await fetch("/api/import/screenshot", { method: "POST", body: formData });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error ?? "Extraction failed");
-      const result = body as ScreenshotExtractionResult;
-      setExtraction(result);
-      setAccountId(findMatchingAccountId(accounts, result.accountName) ?? accounts[0]?.id ?? "");
-      setStage("preview");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setStage("error");
-    }
-  }
+      formData.set("file", item.file);
+      const extractRes = await fetch("/api/import/screenshot", { method: "POST", body: formData });
+      const extractBody = await extractRes.json();
+      if (!extractRes.ok) throw new Error(extractBody.error ?? "Extraction failed");
+      const extraction = extractBody as ScreenshotExtractionResult;
 
-  async function handleConfirm() {
-    if (!extraction || !accountId) return;
-    setStage("importing");
-    setError(null);
-    try {
-      const response = await fetch("/api/import/screenshot/confirm", {
+      updateItem(item.id, { status: "preview", accountName: extraction.accountName });
+
+      const accountId = findMatchingAccountId(accounts, extraction.accountName);
+      if (!accountId) {
+        throw new Error(`No matching account found for "${extraction.accountName}" — import it individually instead`);
+      }
+
+      const confirmRes = await fetch("/api/import/screenshot/confirm", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           accountId,
           asOfDate: extraction.asOfDate,
           positions: extraction.positions,
-          fileName,
+          fileName: item.file.name,
         }),
       });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error ?? "Import failed");
-      setConfirmResult(body as ConfirmResult);
-      setStage("done");
-      router.refresh();
+      const confirmBody = await confirmRes.json();
+      if (!confirmRes.ok) throw new Error(confirmBody.error ?? "Import failed");
+      if (confirmBody.errorMessage) throw new Error(confirmBody.errorMessage);
+
+      updateItem(item.id, {
+        status: "imported",
+        accountName: confirmBody.accountName ?? extraction.accountName,
+        rowCount: confirmBody.rowCount,
+      });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setStage("error");
+      updateItem(item.id, { status: "error", errorMessage: err instanceof Error ? err.message : String(err) });
     }
+  }
+
+  /** Files are processed one at a time — sequentially, not in parallel — so a
+   *  failed extraction doesn't waste a concurrent Claude request, and so the
+   *  queue's per-row status always reflects work actually in flight. */
+  async function processQueue(items: QueueItem[]) {
+    for (const item of items) {
+      await processFile(item);
+    }
+    router.refresh();
+  }
+
+  function enqueueFiles(files: File[]) {
+    if (files.length === 0) return;
+    const newItems: QueueItem[] = files.map((file) => ({
+      id: `${Date.now()}-${queueItemCounter++}`,
+      file,
+      status: "pending",
+    }));
+    setQueue((prev) => [...prev, ...newItems]);
+    processQueue(newItems);
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     setDragging(false);
-    const dropped = event.dataTransfer.files?.[0];
-    if (dropped) handleFile(dropped);
+    enqueueFiles(Array.from(event.dataTransfer.files ?? []));
   }
 
-  const busy = stage === "extracting" || stage === "importing";
+  function reset() {
+    setQueue([]);
+    if (inputRef.current) inputRef.current.value = "";
+  }
+
+  const importedCount = queue.filter((item) => item.status === "imported").length;
+  const doneCount = queue.filter((item) => item.status === "imported" || item.status === "error").length;
+  const allDone = queue.length > 0 && doneCount === queue.length;
 
   return (
     <div>
@@ -104,133 +133,64 @@ export function ScreenshotImportForm({ accounts }: { accounts: AccountOption[] }
         onDragLeave={() => setDragging(false)}
         onDrop={handleDrop}
       >
-        <div className="dropzone-title">{fileName ?? "Upload Screenshot"}</div>
+        <div className="dropzone-title">Upload Screenshots</div>
         <div className="dropzone-hint">
-          PNG or JPG of a brokerage account page — Claude reads the positions for you
+          PNG or JPG of a brokerage account page — select multiple at once, Claude reads the positions for you
         </div>
         <input
           ref={inputRef}
           type="file"
+          multiple
           accept=".png,.jpg,.jpeg,image/png,image/jpeg"
           onChange={(e) => {
-            const selected = e.target.files?.[0];
-            if (selected) handleFile(selected);
+            enqueueFiles(Array.from(e.target.files ?? []));
           }}
         />
       </div>
 
-      {stage === "extracting" && (
+      {queue.length > 0 && (
         <div className="card">
-          <p style={{ color: "var(--text-muted)" }}>Reading screenshot with Claude…</p>
-        </div>
-      )}
-
-      {error && (
-        <div className="card">
-          <p style={{ color: "var(--negative)" }}>{error}</p>
-          <button className="btn" type="button" onClick={reset}>
-            Try again
-          </button>
-        </div>
-      )}
-
-      {extraction && (stage === "preview" || stage === "importing") && (
-        <div className="card">
-          <h2>Extracted Positions</h2>
-          <p style={{ color: "var(--text-muted)" }}>
-            {extraction.accountName} — as of {extraction.asOfDate} —{" "}
-            {extraction.positions.length} position{extraction.positions.length === 1 ? "" : "s"}
-          </p>
-
-          <div style={{ marginBottom: "0.75rem" }}>
-            <label style={{ display: "block", color: "var(--text-muted)", fontSize: "0.85rem", marginBottom: "0.3rem" }}>
-              Import into account
-            </label>
-            <select value={accountId} onChange={(e) => setAccountId(e.target.value)}>
-              {accounts.map((account) => (
-                <option key={account.id} value={account.id}>
-                  {account.name}
-                </option>
-              ))}
-            </select>
-          </div>
-
+          <h2>Screenshot Queue</h2>
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>Symbol</th>
-                  <th>Quantity</th>
-                  <th>Value</th>
-                  <th>Cost Basis</th>
-                  <th>Gain/Loss</th>
-                  <th>% of Account</th>
-                  <th>YTD</th>
+                  <th>File</th>
+                  <th>Account</th>
+                  <th>Status</th>
+                  <th>Rows</th>
                 </tr>
               </thead>
               <tbody>
-                {extraction.positions.map((position: ExtractedPosition, i: number) => (
-                  <tr key={`${position.symbol}-${i}`}>
-                    <td>
-                      <span className="mono">{position.symbol}</span>
-                      <div className="account-meta">{position.name}</div>
+                {queue.map((item) => (
+                  <tr key={item.id}>
+                    <td>{item.file.name}</td>
+                    <td>{item.accountName ?? "—"}</td>
+                    <td style={{ color: STATUS_COLOR[item.status] }}>
+                      {STATUS_LABEL[item.status]}
+                      {item.status === "error" && item.errorMessage && (
+                        <div style={{ color: "var(--negative)", fontSize: "0.75rem", fontWeight: 400 }}>
+                          {item.errorMessage}
+                        </div>
+                      )}
                     </td>
-                    <td className="mono">{position.quantity.toLocaleString()}</td>
-                    <td className="mono">{formatCurrency(position.currentValue)}</td>
-                    <td className="mono">{formatCurrency(position.costBasis)}</td>
-                    <td
-                      className="mono"
-                      style={{ color: position.gainLoss >= 0 ? "var(--positive)" : "var(--negative)" }}
-                    >
-                      {formatCurrency(position.gainLoss)} ({formatPercent(position.gainLossPercent / 100)})
-                    </td>
-                    <td className="mono">{position.percentOfAccount.toFixed(1)}%</td>
-                    <td className="mono">{formatPercent(position.ytdReturn ?? null)}</td>
+                    <td className="mono">{item.rowCount ?? "—"}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
 
-          <div style={{ display: "flex", gap: "0.75rem", marginTop: "1rem" }}>
-            <button className="btn" type="button" disabled={busy || !accountId} onClick={handleConfirm}>
-              {stage === "importing" ? "Importing…" : "Confirm import"}
-            </button>
-            <button
-              type="button"
-              onClick={reset}
-              disabled={busy}
-              style={{
-                background: "transparent",
-                color: "var(--text-muted)",
-                border: "1px solid var(--border)",
-                borderRadius: "var(--radius)",
-                padding: "0.5rem 1rem",
-                cursor: "pointer",
-              }}
-            >
-              Choose a different screenshot
-            </button>
-          </div>
-        </div>
-      )}
-
-      {confirmResult && stage === "done" && (
-        <div className="card">
-          <h2>Import complete</h2>
-          <p>
-            {confirmResult.accountName} —{" "}
-            <span style={{ color: confirmResult.errorMessage ? "var(--negative)" : "var(--positive)" }}>
-              {confirmResult.status}
-            </span>{" "}
-            — {confirmResult.rowCount} position{confirmResult.rowCount === 1 ? "" : "s"}
-          </p>
-          {confirmResult.errorMessage && (
-            <p style={{ color: "var(--negative)" }}>{confirmResult.errorMessage}</p>
+          {allDone && (
+            <div style={{ marginTop: "1rem" }}>
+              <p>
+                {importedCount} of {queue.length} account{queue.length === 1 ? "" : "s"} imported successfully
+              </p>
+              <button className="btn" type="button" onClick={reset}>
+                Upload more screenshots
+              </button>
+            </div>
           )}
-          <button className="btn" type="button" onClick={reset}>
-            Import another screenshot
-          </button>
         </div>
       )}
     </div>
