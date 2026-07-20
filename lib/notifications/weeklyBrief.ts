@@ -35,12 +35,24 @@ function truncate(message: string, maxLength: number): string {
   return `${message.slice(0, maxLength - 1)}…`;
 }
 
+/** Action text for a new-candidate item always starts with "ADD " (see runner.ts's candidateAddItem) — existing-position items use Hold/Review/Watch/Reduce/Reallocate, never this prefix. */
+function isNewCandidateItem(item: ActionItemLike): boolean {
+  return item.action.startsWith("ADD ");
+}
+
 function buildMessage(headline: string, items: ActionItemLike[]): string {
+  const top3 = items.slice(0, 3);
   const lines = [
     headline,
     "",
-    ...items.slice(0, 3).map((item) => `${urgencyLabel(item.priority)} ${item.action} — ${item.rationale}`),
+    ...top3.map((item) => `${urgencyLabel(item.priority)} ${item.action} — ${item.rationale}`),
   ];
+
+  const topCandidate = items.find(isNewCandidateItem);
+  if (topCandidate && !top3.includes(topCandidate)) {
+    lines.push(`[New Candidate] ${topCandidate.action} — ${topCandidate.rationale}`);
+  }
+
   return truncate(lines.join("\n"), MAX_MESSAGE_LENGTH);
 }
 
