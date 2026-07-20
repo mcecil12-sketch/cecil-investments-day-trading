@@ -3,6 +3,15 @@ import { formatDate } from "@/lib/format";
 
 const PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json";
 const MAX_MESSAGE_LENGTH = 1024;
+const WEEKLY_BRIEF_NOTIFICATION_KEY = "weekly_brief_pushover";
+
+function isSameUtcCalendarDay(a: Date, b: Date): boolean {
+  return (
+    a.getUTCFullYear() === b.getUTCFullYear() &&
+    a.getUTCMonth() === b.getUTCMonth() &&
+    a.getUTCDate() === b.getUTCDate()
+  );
+}
 
 export interface WeeklyBriefNotificationResult {
   sent: boolean;
@@ -64,6 +73,11 @@ async function sendPushover(params: { user: string; token: string; title: string
  * configured, since this is a nice-to-have on top of the in-app CIO Weekly
  * Action List, not a hard dependency for the agent pipeline. Falls back to
  * the latest agent run's top action item when no weekly brief exists yet.
+ *
+ * Also skips (and logs) if a notification already went out today — the
+ * agent pipeline can fire multiple times in one day (several imports in a
+ * batch, a manual "Run Now"), and without this guard each firing pages the
+ * phone again with the same brief.
  */
 export async function sendWeeklyBriefNotification(): Promise<WeeklyBriefNotificationResult> {
   const user = process.env.PUSHOVER_USER_KEY;
@@ -72,37 +86,58 @@ export async function sendWeeklyBriefNotification(): Promise<WeeklyBriefNotifica
     return { sent: false, reason: "PUSHOVER_USER_KEY or PUSHOVER_API_TOKEN/PUSHOVER_APP_TOKEN is not configured" };
   }
 
+  const now = new Date();
+  const notificationState = await prisma.notificationState.findUnique({
+    where: { key: WEEKLY_BRIEF_NOTIFICATION_KEY },
+  });
+  if (notificationState && isSameUtcCalendarDay(notificationState.lastSentAt, now)) {
+    const reason = `Pushover notification already sent today (last sent ${notificationState.lastSentAt.toISOString()}) — skipping duplicate`;
+    console.log(`Weekly brief notification skipped: ${reason}`);
+    return { sent: false, reason };
+  }
+
   const weeklyBrief = await prisma.weeklyBrief.findFirst({
     orderBy: { weekOf: "desc" },
     include: { actionItems: { orderBy: { priority: "asc" } } },
   });
 
+  let result: WeeklyBriefNotificationResult;
   if (weeklyBrief && weeklyBrief.actionItems.length > 0) {
-    return sendPushover({
+    result = await sendPushover({
       user,
       token,
       title: `Portfolio Brief — ${formatDate(weeklyBrief.weekOf)}`,
       message: buildMessage(weeklyBrief.cioSummary, weeklyBrief.actionItems),
     });
+  } else {
+    const latestRun = await prisma.agentRun.findFirst({
+      where: { status: "COMPLETE", actionItems: { some: {} } },
+      orderBy: { startedAt: "desc" },
+      include: { actionItems: { orderBy: { priority: "asc" }, take: 1 } },
+    });
+    const topItem = latestRun?.actionItems[0];
+    if (!topItem) {
+      return { sent: false, reason: "No weekly brief or agent run action items available" };
+    }
+
+    result = await sendPushover({
+      user,
+      token,
+      title: `Portfolio Brief — ${formatDate(new Date())}`,
+      message: truncate(
+        `No weekly brief compiled yet. Latest signal: ${urgencyLabel(topItem.priority)} ${topItem.action} — ${topItem.rationale}`,
+        MAX_MESSAGE_LENGTH,
+      ),
+    });
   }
 
-  const latestRun = await prisma.agentRun.findFirst({
-    where: { status: "COMPLETE", actionItems: { some: {} } },
-    orderBy: { startedAt: "desc" },
-    include: { actionItems: { orderBy: { priority: "asc" }, take: 1 } },
-  });
-  const topItem = latestRun?.actionItems[0];
-  if (!topItem) {
-    return { sent: false, reason: "No weekly brief or agent run action items available" };
+  if (result.sent) {
+    await prisma.notificationState.upsert({
+      where: { key: WEEKLY_BRIEF_NOTIFICATION_KEY },
+      create: { key: WEEKLY_BRIEF_NOTIFICATION_KEY, lastSentAt: now },
+      update: { lastSentAt: now },
+    });
   }
 
-  return sendPushover({
-    user,
-    token,
-    title: `Portfolio Brief — ${formatDate(new Date())}`,
-    message: truncate(
-      `No weekly brief compiled yet. Latest signal: ${urgencyLabel(topItem.priority)} ${topItem.action} — ${topItem.rationale}`,
-      MAX_MESSAGE_LENGTH,
-    ),
-  });
+  return result;
 }

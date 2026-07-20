@@ -191,3 +191,13 @@ model WeeklyBrief {
   actionItems ActionItem[]
   createdAt   DateTime     @default(now())
 }
+
+/// A tiny key-value store for cross-cutting notification state that doesn't
+/// belong to any one domain row — e.g. the last time a Pushover push actually
+/// went out, so a same-day re-run of the agent pipeline (multiple imports in
+/// one day, a manual "Run Now") doesn't page the phone again.
+model NotificationState {
+  id         String   @id @default(cuid())
+  key        String   @unique
+  lastSentAt DateTime
+}
