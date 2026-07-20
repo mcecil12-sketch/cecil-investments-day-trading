@@ -22,6 +22,8 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  /* Removes the gray flash iOS Safari shows on tap for anything without its own :active style. */
+  -webkit-tap-highlight-color: transparent;
 }
 
 a {
@@ -37,6 +39,10 @@ main {
 
 .table-wrap {
   overflow-x: auto;
+  /* Momentum scrolling on iOS Safari, and stop the page's vertical scroll from
+     hijacking a horizontal swipe that starts inside the table. */
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
 }
 
 table {
@@ -78,9 +84,27 @@ th {
   padding: 0.5rem 1rem;
   font-weight: 600;
   cursor: pointer;
+  min-height: 44px;
+  touch-action: manipulation;
 }
 
 .btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  min-height: 44px;
+  touch-action: manipulation;
+}
+
+.btn-secondary:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -92,6 +116,10 @@ select {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 0.4rem 0.6rem;
+  /* iOS Safari zooms the page on focus for any control under 16px — this keeps
+     dropdowns and inputs at a fixed zoom level on tap. */
+  font-size: 16px;
+  min-height: 44px;
 }
 
 /* Pinned top bar (dashboard) */
@@ -281,6 +309,7 @@ select {
   color: var(--text-muted);
   font-size: 0.8rem;
   font-weight: 600;
+  touch-action: manipulation;
 }
 
 .bottom-nav-item.active {
@@ -292,9 +321,15 @@ select {
   border: 2px dashed var(--border);
   border-radius: var(--radius);
   padding: 2.5rem 1.5rem;
+  min-height: 96px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   text-align: center;
   cursor: pointer;
   color: var(--text-muted);
+  touch-action: manipulation;
   transition:
     border-color 0.15s ease,
     background 0.15s ease,

@@ -178,19 +178,7 @@ export function ImportForm() {
             <button className="btn" type="button" disabled={busy} onClick={handleConfirm}>
               {stage === "importing" ? "Importing…" : "Confirm import"}
             </button>
-            <button
-              type="button"
-              onClick={reset}
-              disabled={busy}
-              style={{
-                background: "transparent",
-                color: "var(--text-muted)",
-                border: "1px solid var(--border)",
-                borderRadius: "var(--radius)",
-                padding: "0.5rem 1rem",
-                cursor: "pointer",
-              }}
-            >
+            <button className="btn-secondary" type="button" onClick={reset} disabled={busy}>
               Choose a different file
             </button>
           </div>

@@ -252,19 +252,7 @@ export function PdfImportForm({ accounts }: { accounts: AccountOption[] }) {
             >
               {stage === "importing" ? "Importing…" : "Import All Accounts"}
             </button>
-            <button
-              type="button"
-              onClick={reset}
-              disabled={busy}
-              style={{
-                background: "transparent",
-                color: "var(--text-muted)",
-                border: "1px solid var(--border)",
-                borderRadius: "var(--radius)",
-                padding: "0.5rem 1rem",
-                cursor: "pointer",
-              }}
-            >
+            <button className="btn-secondary" type="button" onClick={reset} disabled={busy}>
               Choose a different PDF
             </button>
           </div>
