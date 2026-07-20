@@ -34,13 +34,15 @@ export interface AggregateBenchmarkResult {
   asOfDate: Date;
   /** Current value of every account in this scope, right now — always present. */
   currentValue: number;
-  /** Value-weighted blend of each included account's Fidelity-reported return for this period. */
+  /** The Performance PDF's own Total row when available (AGGREGATE_TOTAL only), otherwise a value-weighted blend of each included account's Fidelity-reported return for this period. */
   portfolioReturn: number | null;
   sp500Return: number | null;
   alpha: number | null;
   accountIds: string[];
-  /** Accounts in this scope with a current value but no Fidelity Performance PDF data yet for this period. */
+  /** Accounts in this scope with a current value but no Fidelity Performance PDF data yet for this period. Always empty when sourcedFromTotalRow is true. */
   excludedAccountIds: string[];
+  /** True when portfolioReturn/sp500Return/alpha came directly from the Performance PDF's Total row rather than being computed from a value-weighted blend of per-account rows. */
+  sourcedFromTotalRow: boolean;
 }
 
 /**
@@ -110,13 +112,27 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
   // Latest reported AccountPerformance row per (accountId, period) — a
   // re-upload for a later as-of date should supersede the prior week's row.
   const performanceRows = await prisma.accountPerformance.findMany({
-    where: { period: { in: [...FIDELITY_PERIODS] } },
+    where: { period: { in: [...FIDELITY_PERIODS] }, isAggregate: false },
     orderBy: { asOfDate: "desc" },
   });
   const latestPerformance = new Map<string, (typeof performanceRows)[number]>();
   for (const row of performanceRows) {
     const key = `${row.accountId}:${row.period}`;
     if (!latestPerformance.has(key)) latestPerformance.set(key, row);
+  }
+
+  // The Performance PDF's own "Total" row, when the household has uploaded
+  // one — preferred over the computed blend below for AGGREGATE_TOTAL, since
+  // it's Fidelity's own blended figure rather than an approximation from
+  // current account values (which drift from the return period's actual
+  // weights over time).
+  const totalRowPerformance = await prisma.accountPerformance.findMany({
+    where: { period: { in: [...FIDELITY_PERIODS] }, isAggregate: true },
+    orderBy: { asOfDate: "desc" },
+  });
+  const latestTotalRow = new Map<string, (typeof totalRowPerformance)[number]>();
+  for (const row of totalRowPerformance) {
+    if (!latestTotalRow.has(row.period)) latestTotalRow.set(row.period, row);
   }
 
   const accountResults: AccountBenchmarkResult[] = [];
@@ -210,6 +226,23 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
           0,
         );
 
+        const totalRow = scope === "AGGREGATE_TOTAL" ? latestTotalRow.get(period) : undefined;
+        if (totalRow) {
+          aggregateResults.push({
+            scope,
+            period,
+            asOfDate: totalRow.asOfDate,
+            currentValue,
+            portfolioReturn: totalRow.returnPct,
+            sp500Return: totalRow.sp500ReturnPct,
+            alpha: totalRow.alpha,
+            accountIds: accountsWithData.map((a) => a.id),
+            excludedAccountIds: [],
+            sourcedFromTotalRow: true,
+          });
+          continue;
+        }
+
         const included: Account[] = [];
         const excluded: Account[] = [];
         let weightedReturn = 0;
@@ -242,6 +275,7 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
           alpha: computeAlpha(portfolioReturn, sp500Return),
           accountIds: included.map((a) => a.id),
           excludedAccountIds: excluded.map((a) => a.id),
+          sourcedFromTotalRow: false,
         });
       }
     }

@@ -29,6 +29,8 @@ export interface ExtractedSp500Returns {
 export interface PerformancePdfExtractionResult {
   asOfDate: string;
   accounts: ExtractedPerformanceAccount[];
+  /** The "Total" row at the bottom of the returns table — the household's blended return across every account in the PDF. Null if the PDF has no Total row. */
+  totalPortfolio: ExtractedAccountReturns | null;
   benchmarks: { sp500: ExtractedSp500Returns };
 }
 
@@ -60,6 +62,16 @@ Return ONLY valid JSON:
       lifeOfDataStartDate: string | null
     }
   }],
+  totalPortfolio: {
+    oneMonth: number | null,
+    threeMonth: number | null,
+    ytd: number | null,
+    oneYear: number | null,
+    threeYear: number | null,
+    fiveYear: number | null,
+    lifeOfData: number | null,
+    lifeOfDataStartDate: string | null
+  } | null,
   benchmarks: {
     sp500: {
       oneMonth: number | null,
@@ -72,6 +84,7 @@ Return ONLY valid JSON:
   }
 }
 Extract time-weighted pre-tax returns table. Include all accounts.
+Also extract the Total row at the bottom of the returns table (the household's blended return across every account shown) as the separate top-level totalPortfolio field — not as another entry in the accounts array. Use null for any period the Total row doesn't show. Set totalPortfolio to null only if the table has no Total row at all.
 Extract S&P 500 Index returns from the Market Indexes section at the bottom.
 Report every return as a decimal fraction, e.g. 0.1046 for +10.46%, -0.0186 for -1.86% — not a percentage number.`;
 
@@ -135,6 +148,9 @@ export function parsePerformancePdfExtractionResponse(text: string): Performance
   if (!Array.isArray(result.accounts) || !result.accounts.every(isExtractedPerformanceAccount)) {
     throw new Error("Extracted data has a malformed accounts list");
   }
+  if (result.totalPortfolio != null && !isExtractedAccountReturns(result.totalPortfolio)) {
+    throw new Error("Extracted data has a malformed totalPortfolio");
+  }
   const benchmarks = result.benchmarks as Record<string, unknown> | undefined;
   if (!benchmarks || !isExtractedSp500Returns(benchmarks.sp500)) {
     throw new Error("Extracted data is missing benchmarks.sp500");
@@ -143,6 +159,7 @@ export function parsePerformancePdfExtractionResponse(text: string): Performance
   return {
     asOfDate: result.asOfDate,
     accounts: result.accounts as ExtractedPerformanceAccount[],
+    totalPortfolio: (result.totalPortfolio as ExtractedAccountReturns | null) ?? null,
     benchmarks: { sp500: benchmarks.sp500 as ExtractedSp500Returns },
   };
 }

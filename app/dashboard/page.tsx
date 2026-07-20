@@ -36,9 +36,9 @@ export default async function DashboardPage() {
     );
   }
 
-  const actionable = computation.aggregate.filter((r) => r.scope === "AGGREGATE_ACTIONABLE");
-  const ytdAlpha = actionable.find((r) => r.period === "ytd") ?? null;
-  const oneYearAlpha = actionable.find((r) => r.period === "1y") ?? null;
+  const totalPortfolio = computation.aggregate.filter((r) => r.scope === "AGGREGATE_TOTAL");
+  const ytdAlpha = totalPortfolio.find((r) => r.period === "ytd") ?? null;
+  const oneYearAlpha = totalPortfolio.find((r) => r.period === "1y") ?? null;
 
   const accountResultsByAccount = new Map<string, AccountBenchmarkResult[]>();
   for (const result of computation.accounts) {
@@ -66,13 +66,13 @@ export default async function DashboardPage() {
     <div>
       <div className="top-bar">
         <div>
-          <div className="top-bar-label">YTD Alpha vs S&amp;P (Actionable)</div>
+          <div className="top-bar-label">YTD Alpha vs S&amp;P (Total Portfolio)</div>
           <div className="top-bar-alpha" style={{ color: alphaColor(ytdAlpha?.alpha ?? null) }}>
             {formatPercent(ytdAlpha?.alpha ?? null)}
           </div>
         </div>
         <div>
-          <div className="top-bar-label">1Y Alpha vs S&amp;P (Actionable)</div>
+          <div className="top-bar-label">1Y Alpha vs S&amp;P (Total Portfolio)</div>
           <div className="top-bar-alpha" style={{ color: alphaColor(oneYearAlpha?.alpha ?? null) }}>
             {formatPercent(oneYearAlpha?.alpha ?? null)}
           </div>
@@ -86,7 +86,7 @@ export default async function DashboardPage() {
 
       <div className="period-cards">
         {DASHBOARD_PERIODS.map((period) => {
-          const result = actionable.find((r) => r.period === period) ?? null;
+          const result = totalPortfolio.find((r) => r.period === period) ?? null;
           return (
             <div className="card" key={period}>
               <div className="period-card-label">{PERIOD_LABELS[period]}</div>

@@ -28,6 +28,7 @@ interface ConfirmBatchResult {
 interface ConfirmResult {
   accountsImported: number;
   batches: ConfirmBatchResult[];
+  totalPortfolioPeriodCount: number;
 }
 
 type Stage = "idle" | "extracting" | "preview" | "importing" | "done" | "error";
@@ -49,6 +50,7 @@ export function PerformancePdfImportForm({ accounts }: { accounts: AccountOption
   const [fileName, setFileName] = useState<string | null>(null);
   const [asOfDate, setAsOfDate] = useState<string | null>(null);
   const [selections, setSelections] = useState<AccountSelection[]>([]);
+  const [totalPortfolio, setTotalPortfolio] = useState<ExtractedAccountReturns | null>(null);
   const [sp500, setSp500] = useState<ExtractedSp500Returns | null>(null);
   const [confirmResult, setConfirmResult] = useState<ConfirmResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -58,6 +60,7 @@ export function PerformancePdfImportForm({ accounts }: { accounts: AccountOption
     setFileName(null);
     setAsOfDate(null);
     setSelections([]);
+    setTotalPortfolio(null);
     setSp500(null);
     setConfirmResult(null);
     setError(null);
@@ -78,6 +81,7 @@ export function PerformancePdfImportForm({ accounts }: { accounts: AccountOption
       const result = body as PerformancePdfExtractionResult;
       setAsOfDate(result.asOfDate);
       setSp500(result.benchmarks.sp500);
+      setTotalPortfolio(result.totalPortfolio);
       setSelections(
         result.accounts.map((account) => ({
           accountName: account.accountName,
@@ -110,6 +114,7 @@ export function PerformancePdfImportForm({ accounts }: { accounts: AccountOption
           asOfDate,
           fileName,
           benchmarks: { sp500 },
+          totalPortfolio,
           accounts: selections.map((s) => ({ accountId: s.selectedAccountId, returns: s.returns })),
         }),
       });
@@ -201,6 +206,18 @@ export function PerformancePdfImportForm({ accounts }: { accounts: AccountOption
                     </td>
                   ))}
                 </tr>
+                {totalPortfolio && (
+                  <tr>
+                    <td style={{ fontWeight: 600 }}>
+                      Total Portfolio <span className="badge">from PDF</span>
+                    </td>
+                    {RETURN_COLUMNS.map((col) => (
+                      <td key={col.key} className="mono">
+                        {formatPercent(totalPortfolio[col.key])}
+                      </td>
+                    ))}
+                  </tr>
+                )}
                 {selections.map((selection, index) => (
                   <tr key={`${selection.accountNumber}-${index}`}>
                     <td>
@@ -246,7 +263,10 @@ export function PerformancePdfImportForm({ accounts }: { accounts: AccountOption
       {confirmResult && stage === "done" && (
         <div className="card">
           <h2>Import complete</h2>
-          <p>Returns updated for {confirmResult.accountsImported} account{confirmResult.accountsImported === 1 ? "" : "s"}</p>
+          <p>
+            Returns updated for {confirmResult.accountsImported} account{confirmResult.accountsImported === 1 ? "" : "s"}
+            {confirmResult.totalPortfolioPeriodCount > 0 && " — Total Portfolio row also updated"}
+          </p>
           <div className="table-wrap">
             <table>
               <thead>

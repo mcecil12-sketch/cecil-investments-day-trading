@@ -98,8 +98,11 @@ model ImportBatch {
 /// a re-upload for the same as-of date replaces the prior row for that period.
 model AccountPerformance {
   id             String   @id @default(cuid())
-  account        Account  @relation(fields: [accountId], references: [id])
-  accountId      String
+  account        Account? @relation(fields: [accountId], references: [id])
+  /// Null for the "Total Portfolio" aggregate row extracted from the Performance PDF's Total line — see isAggregate.
+  accountId      String?
+  /// True for the Total-row aggregate entry (accountId is null in that case). Postgres doesn't dedupe NULL accountId rows against the (accountId, period, asOfDate) unique index, so the aggregate row is upserted by application-level find-then-write instead — see performance-pdf/confirm/route.ts.
+  isAggregate    Boolean  @default(false)
   /// "1m" | "3m" | "ytd" | "1y" | "3y" | "5y" | "life"
   period         String
   returnPct      Float
@@ -112,6 +115,7 @@ model AccountPerformance {
 
   @@unique([accountId, period, asOfDate])
   @@index([accountId, period])
+  @@index([isAggregate, period])
 }
 
 model Holding {
