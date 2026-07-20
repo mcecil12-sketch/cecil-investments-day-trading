@@ -61,6 +61,7 @@ model Account {
   importBatches    ImportBatch[]
   benchmarkResults BenchmarkResult[]
   actionItems      ActionItem[]
+  performances     AccountPerformance[]
 }
 
 model Instrument {
@@ -88,6 +89,29 @@ model ImportBatch {
   benchmarkResults BenchmarkResult[]
 
   @@index([accountId, asOfDate])
+}
+
+/// A single Fidelity-reported rolling-period return for one account, as
+/// extracted from the weekly Performance PDF, alongside the S&P 500 return
+/// for the same period so alpha can be read directly off this row instead of
+/// recomputed from price history. One row per (accountId, period, asOfDate);
+/// a re-upload for the same as-of date replaces the prior row for that period.
+model AccountPerformance {
+  id             String   @id @default(cuid())
+  account        Account  @relation(fields: [accountId], references: [id])
+  accountId      String
+  /// "1m" | "3m" | "ytd" | "1y" | "3y" | "5y" | "life"
+  period         String
+  returnPct      Float
+  sp500ReturnPct Float?
+  alpha          Float?
+  /// Only set when period is "life" — the start date Fidelity used for the account's life-of-data return.
+  startDate      DateTime?
+  asOfDate       DateTime
+  createdAt      DateTime @default(now())
+
+  @@unique([accountId, period, asOfDate])
+  @@index([accountId, period])
 }
 
 model Holding {

@@ -4,6 +4,7 @@ import { formatDate } from "@/lib/format";
 import { ImportForm } from "./ImportForm";
 import { ScreenshotImportForm } from "./ScreenshotImportForm";
 import { PdfImportForm } from "./PdfImportForm";
+import { PerformancePdfImportForm } from "./PerformancePdfImportForm";
 
 export const dynamic = "force-dynamic";
 
@@ -16,6 +17,7 @@ const STATUS_COLOR: Record<ImportBatchStatus, string> = {
 
 const SOURCE_LABEL: Record<string, string> = {
   pdf: "PDF Import",
+  "performance-pdf": "Performance PDF",
   screenshot: "Screenshot",
   fidelity: "Fidelity CSV",
 };
@@ -63,6 +65,17 @@ export default async function ImportPage() {
         </div>
       ) : (
         <PdfImportForm accounts={accounts} />
+      )}
+
+      <h2>Upload Fidelity Performance PDF</h2>
+      {accounts.length === 0 ? (
+        <div className="card">
+          <p style={{ color: "var(--text-muted)" }}>
+            Add an account first — performance returns need an account to import into.
+          </p>
+        </div>
+      ) : (
+        <PerformancePdfImportForm accounts={accounts} />
       )}
 
       <h2>Upload Screenshot</h2>
