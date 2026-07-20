@@ -212,6 +212,8 @@ model WeeklyBrief {
   id          String       @id @default(cuid())
   weekOf      DateTime     @unique
   cioSummary  String
+  /// The CIO's taxable-account trim/sector-gap/momentum-add analysis for this week, shaped like CioTaxableOpportunities in lib/agents/cio.ts. Null when no taxable account data was available at synthesis time.
+  taxableOpportunities Json?
   actionItems ActionItem[]
   createdAt   DateTime     @default(now())
 }

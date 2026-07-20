@@ -4,6 +4,7 @@ import type { AgentType } from "@/lib/generated/prisma";
 import type { RelativeStrengthEntry, RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
 import type { SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import type { RiskManagerOutput, RiskFlag } from "@/lib/agents/riskManager";
+import type { CioTaxableOpportunities } from "@/lib/agents/cio";
 import { alphaColor, formatCurrency, formatDate, formatDateTime, formatPercent } from "@/lib/format";
 import { RunAgentButton } from "./RunAgentButton";
 import { AgentStatusPoller } from "./AgentStatusPoller";
@@ -330,6 +331,7 @@ export default async function AgentsPage() {
   }
 
   const hasAnyRun = latestRuns.some((run) => run != null);
+  const taxableOpportunities = weeklyBrief?.taxableOpportunities as CioTaxableOpportunities | null | undefined;
 
   const initialStatuses: AgentStatusResponse = {
     relativeStrength: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "RELATIVE_STRENGTH")]?.status ?? null,
@@ -383,6 +385,56 @@ export default async function AgentsPage() {
           </div>
         )}
       </div>
+
+      {taxableOpportunities && (
+        <div className="card card-accent">
+          <strong>Taxable Account Opportunities</strong>
+
+          <div className="agent-card-header" style={{ marginTop: "0.75rem" }}>
+            <span className="agent-card-name" style={{ fontSize: "0.85rem" }}>Trim Candidates</span>
+          </div>
+          {taxableOpportunities.trimCandidates.length === 0 ? (
+            <p style={{ color: "var(--text-muted)", fontSize: "0.82rem" }}>Nothing worth trimming this week.</p>
+          ) : (
+            taxableOpportunities.trimCandidates.map((t, i) => (
+              <div className="finding-row" key={`trim-${i}`}>
+                <span className="finding-symbol">{t.symbol}</span>
+                <span className="finding-detail">
+                  {t.rationale} — est. gain {t.estimatedGain}. {t.taxImpact}
+                </span>
+              </div>
+            ))
+          )}
+
+          <div className="agent-card-header" style={{ marginTop: "0.75rem" }}>
+            <span className="agent-card-name" style={{ fontSize: "0.85rem" }}>Leading Sectors — Zero Taxable Exposure</span>
+          </div>
+          {taxableOpportunities.leadingSectorsNoExposure.length === 0 ? (
+            <p style={{ color: "var(--text-muted)", fontSize: "0.82rem" }}>No coverage gaps this week.</p>
+          ) : (
+            taxableOpportunities.leadingSectorsNoExposure.map((s, i) => (
+              <div className="finding-row" key={`sector-gap-${i}`}>
+                <span className="finding-symbol">{s.sector}</span>
+                <span className="finding-detail">{s.rationale}</span>
+              </div>
+            ))
+          )}
+
+          <div className="agent-card-header" style={{ marginTop: "0.75rem" }}>
+            <span className="agent-card-name" style={{ fontSize: "0.85rem" }}>Momentum Adds</span>
+          </div>
+          {taxableOpportunities.momentumAdds.length === 0 ? (
+            <p style={{ color: "var(--text-muted)", fontSize: "0.82rem" }}>Nothing flagged this week.</p>
+          ) : (
+            taxableOpportunities.momentumAdds.map((m, i) => (
+              <div className="finding-row" key={`momentum-${i}`}>
+                <span className="finding-symbol">{m.symbol}</span>
+                <span className="finding-detail">{m.rationale}</span>
+              </div>
+            ))
+          )}
+        </div>
+      )}
 
       <div className="agent-grid">
         {AGENT_DEFINITIONS.map((def, i) => {

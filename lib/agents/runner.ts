@@ -1,8 +1,10 @@
 import { prisma } from "@/lib/prisma";
+import { Prisma } from "@/lib/generated/prisma";
 import { runRelativeStrengthAgent, type RelativeStrengthEntry, type RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
 import { runSectorRotationAgent, type SectorScore, type SectorRotationFlag, type SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import { runRiskManagerAgent, type RiskFlag, type OpportunityCostEntry, type RiskManagerOutput } from "@/lib/agents/riskManager";
 import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
+import { buildTaxableAnalysisContext, type TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
 import { sendWeeklyBriefNotification } from "@/lib/notifications/weeklyBrief";
 
 function formatPercent(value: number | null): string {
@@ -300,6 +302,7 @@ async function buildCioCandidates(): Promise<{
   riskRun: { id: string } | null;
   relativeRun: { id: string } | null;
   sectorRun: { id: string } | null;
+  taxableContext: TaxableAnalysisContext | null;
 }> {
   const [riskRun, relativeRun, sectorRun] = await Promise.all([
     prisma.agentRun.findFirst({ where: { agentType: "RISK_MANAGER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
@@ -422,7 +425,12 @@ async function buildCioCandidates(): Promise<{
     });
   }
 
-  return { candidates, riskRun, relativeRun, sectorRun };
+  const taxableContext = await buildTaxableAnalysisContext(
+    sectorRun?.output ? (sectorRun.output as unknown as SectorRotationOutput) : null,
+    relativeRun?.output ? (relativeRun.output as unknown as RelativeStrengthOutput) : null,
+  );
+
+  return { candidates, riskRun, relativeRun, sectorRun, taxableContext };
 }
 
 /**
@@ -434,10 +442,10 @@ async function buildCioCandidates(): Promise<{
  * recently.
  */
 export async function synthesizeWeeklyBrief(): Promise<void> {
-  const { candidates } = await buildCioCandidates();
+  const { candidates, taxableContext } = await buildCioCandidates();
   if (candidates.length === 0) return;
 
-  const brief = await synthesizeCioBrief(candidates);
+  const brief = await synthesizeCioBrief(candidates, taxableContext);
   if (brief.orderedItems.length === 0) return;
 
   const weekOf = startOfWeekUTC(new Date());
@@ -449,6 +457,7 @@ export async function synthesizeWeeklyBrief(): Promise<void> {
     accountId: item.accountId,
     priority: i + 1,
   }));
+  const taxableOpportunities = (brief.taxableOpportunities ?? Prisma.JsonNull) as unknown as Prisma.InputJsonValue;
 
   const existing = await prisma.weeklyBrief.findUnique({ where: { weekOf } });
   if (existing) {
@@ -456,12 +465,12 @@ export async function synthesizeWeeklyBrief(): Promise<void> {
       prisma.actionItem.deleteMany({ where: { weeklyBriefId: existing.id } }),
       prisma.weeklyBrief.update({
         where: { id: existing.id },
-        data: { cioSummary: brief.summary, actionItems: { create: actionItemsData } },
+        data: { cioSummary: brief.summary, taxableOpportunities, actionItems: { create: actionItemsData } },
       }),
     ]);
   } else {
     await prisma.weeklyBrief.create({
-      data: { weekOf, cioSummary: brief.summary, actionItems: { create: actionItemsData } },
+      data: { weekOf, cioSummary: brief.summary, taxableOpportunities, actionItems: { create: actionItemsData } },
     });
   }
 }
