@@ -4,11 +4,7 @@ import { useRef, useState, type DragEvent } from "react";
 import { useRouter } from "next/navigation";
 import { formatCurrency, formatPercent } from "@/lib/format";
 import type { ExtractedPosition, ScreenshotExtractionResult } from "@/lib/portfolio/screenshotImport";
-
-interface AccountOption {
-  id: string;
-  name: string;
-}
+import { findMatchingAccountId, type AccountOption } from "@/lib/portfolio/accountMatch";
 
 interface ConfirmResult {
   accountId: string;
@@ -19,18 +15,6 @@ interface ConfirmResult {
 }
 
 type Stage = "idle" | "extracting" | "preview" | "importing" | "done" | "error";
-
-/** Matches Claude's extracted account name against the known accounts list so the picker can default to it instead of always falling back to the first account. */
-function findMatchingAccountId(accounts: AccountOption[], extractedName: string): string | undefined {
-  const normalize = (value: string) => value.trim().toLowerCase();
-  const target = normalize(extractedName);
-  const exact = accounts.find((account) => normalize(account.name) === target);
-  if (exact) return exact.id;
-  const partial = accounts.find(
-    (account) => normalize(account.name).includes(target) || target.includes(normalize(account.name)),
-  );
-  return partial?.id;
-}
 
 export function ScreenshotImportForm({ accounts }: { accounts: AccountOption[] }) {
   const router = useRouter();

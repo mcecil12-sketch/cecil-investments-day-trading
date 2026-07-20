@@ -1,4 +1,5 @@
 import type { FidelityHoldingRow, FidelityInstrumentType } from "@/lib/portfolio/csv/fidelity";
+import { stripMarkdownFence } from "@/lib/portfolio/jsonExtract";
 
 export interface ExtractedPosition {
   symbol: string;
@@ -37,14 +38,6 @@ export const EXTRACTION_SYSTEM_PROMPT = `You are a financial data extractor. Ext
     ytdReturn: number | null (year-to-date return as a decimal fraction, e.g. 0.1046 for +10.46%, -0.0186 for -1.86% — only if the screenshot shows a YTD figure for this position, otherwise null)
   }]
 }`;
-
-/** Claude sometimes wraps JSON in a markdown fence despite instructions not to — strip it before parsing. */
-function stripMarkdownFence(text: string): string {
-  return text
-    .trim()
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/, "");
-}
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
@@ -93,8 +86,8 @@ export function parseExtractionResponse(text: string): ScreenshotExtractionResul
   };
 }
 
-/** No "Type" column comes back from the screenshot extraction, so it's inferred from the name/symbol, same signal Fidelity's own CSV type strings key off of. */
-function classifyExtractedType(position: ExtractedPosition): FidelityInstrumentType {
+/** No "Type" column comes back from AI-extracted positions (screenshot or PDF), so it's inferred from the name/symbol, same signal Fidelity's own CSV type strings key off of. */
+export function classifyExtractedType(position: { name: string; symbol: string }): FidelityInstrumentType {
   const label = `${position.name} ${position.symbol}`.toUpperCase();
   if (label.includes("MONEY MARKET") || /\*\*$/.test(position.symbol.trim())) return "CASH";
   if (label.includes("FUND") || label.includes("ETF") || label.includes("INDEX")) return "FUND";

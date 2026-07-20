@@ -1,15 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
-import { EXTRACTION_SYSTEM_PROMPT, parseExtractionResponse } from "@/lib/portfolio/screenshotImport";
+import { PDF_EXTRACTION_SYSTEM_PROMPT, parsePdfExtractionResponse } from "@/lib/portfolio/pdfImport";
 import { normalizeAsOfDate } from "@/lib/portfolio/dateNormalize";
 
-const ALLOWED_MEDIA_TYPES: Record<string, "image/png" | "image/jpeg"> = {
-  "image/png": "image/png",
-  "image/jpeg": "image/jpeg",
-  "image/jpg": "image/jpeg",
-};
-
-const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_FILE_BYTES = 32 * 1024 * 1024;
 
 export async function POST(request: NextRequest) {
   const formData = await request.formData().catch(() => null);
@@ -18,16 +12,11 @@ export async function POST(request: NextRequest) {
   if (!file || !(file instanceof File)) {
     return NextResponse.json({ error: "Missing 'file' in form data" }, { status: 400 });
   }
-
-  const mediaType = ALLOWED_MEDIA_TYPES[file.type];
-  if (!mediaType) {
-    return NextResponse.json(
-      { error: "Only PNG and JPG screenshots are supported" },
-      { status: 400 },
-    );
+  if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+    return NextResponse.json({ error: "Only PDF files are supported" }, { status: 400 });
   }
   if (file.size > MAX_FILE_BYTES) {
-    return NextResponse.json({ error: "Screenshot must be under 10MB" }, { status: 400 });
+    return NextResponse.json({ error: "PDF must be under 32MB" }, { status: 400 });
   }
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -44,12 +33,13 @@ export async function POST(request: NextRequest) {
   let responseText: string;
   try {
     const message = await client.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 4096,
+      model: "claude-sonnet-5",
+      max_tokens: 8192,
+      thinking: { type: "disabled" },
       system: [
         {
           type: "text",
-          text: EXTRACTION_SYSTEM_PROMPT,
+          text: PDF_EXTRACTION_SYSTEM_PROMPT,
           cache_control: { type: "ephemeral" },
         },
       ],
@@ -57,8 +47,11 @@ export async function POST(request: NextRequest) {
         {
           role: "user",
           content: [
-            { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
-            { type: "text", text: "Extract the portfolio positions from this screenshot as JSON." },
+            {
+              type: "document",
+              source: { type: "base64", media_type: "application/pdf", data: base64 },
+            },
+            { type: "text", text: "Extract all portfolio positions from this Fidelity PDF as JSON." },
           ],
         },
       ],
@@ -67,7 +60,7 @@ export async function POST(request: NextRequest) {
     const textBlock = message.content.find((block) => block.type === "text");
     if (!textBlock || textBlock.type !== "text") {
       return NextResponse.json(
-        { error: "Claude didn't return any readable content for this screenshot" },
+        { error: "Claude didn't return any readable content for this PDF" },
         { status: 502 },
       );
     }
@@ -96,7 +89,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const extracted = parseExtractionResponse(responseText);
+    const extracted = parsePdfExtractionResponse(responseText);
     return NextResponse.json({ ...extracted, asOfDate: normalizeAsOfDate(extracted.asOfDate) });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
