@@ -39,3 +39,42 @@ export function trendStrengthScore(currentPrice: number, sma50: number | null, s
   const part200 = sma200 == null ? 25 : currentPrice > sma200 ? 50 : 0;
   return part50 + part200;
 }
+
+export interface PriceSeriesScore {
+  currentPrice: number;
+  momentum: number | null;
+  sma50: number | null;
+  sma200: number | null;
+  aboveSma50: boolean | null;
+  aboveSma200: boolean | null;
+  /** 0-100, 52-week momentum (60%) + 50d/200d trend strength (40%). */
+  score: number;
+}
+
+/**
+ * The composite score used by every agent that ranks a price series against
+ * the S&P 500: 52-week momentum (60%) blended with 50d/200d trend strength
+ * (40%). Shared by Relative Strength (scoring current holdings) and the
+ * Candidate Scanner (scoring the buy-candidate universe) so both use
+ * identical math against identical baselines.
+ */
+export function scorePriceSeries(rawPoints: PricePoint[]): PriceSeriesScore {
+  const points = [...rawPoints].sort((a, b) => a.date.getTime() - b.date.getTime());
+  const last = points[points.length - 1];
+  const momentum = momentumOverDays(points, 364);
+  const sma50Value = sma(points, 50);
+  const sma200Value = sma(points, 200);
+  const trend = trendStrengthScore(last.close, sma50Value, sma200Value);
+  const momentumScore = momentumTo100(momentum);
+  const score = Math.max(0, Math.min(100, Math.round(momentumScore * 0.6 + trend * 0.4)));
+
+  return {
+    currentPrice: last.close,
+    momentum,
+    sma50: sma50Value,
+    sma200: sma200Value,
+    aboveSma50: sma50Value == null ? null : last.close > sma50Value,
+    aboveSma200: sma200Value == null ? null : last.close > sma200Value,
+    score,
+  };
+}

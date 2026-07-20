@@ -1,7 +1,7 @@
 import { getPriceHistory, getSp500Series, type PricePoint } from "@/lib/agents/marketData";
 import { getFundProxy, getKnownFundReturns, KNOWN_SP500_RETURNS, ACTIVE_FUND_NOTE } from "@/lib/agents/fundMappings";
 import { getCurrentHoldings } from "@/lib/agents/holdings";
-import { momentumOverDays, momentumTo100, sma, trendStrengthScore } from "@/lib/agents/technicals";
+import { momentumTo100, trendStrengthScore, scorePriceSeries } from "@/lib/agents/technicals";
 
 export interface RelativeStrengthEntry {
   symbol: string;
@@ -61,36 +61,7 @@ const FIVE_YEAR_WEIGHT = 0.2;
 /** Minimum gap (percentage points, as a fraction) between YTD and 1Y returns, in opposite directions, before it's worth flagging as a divergence to verify. */
 const DIVERGENCE_THRESHOLD = 0.15;
 
-interface ScoredSeries {
-  currentPrice: number;
-  momentum: number | null;
-  sma50: number | null;
-  sma200: number | null;
-  aboveSma50: boolean | null;
-  aboveSma200: boolean | null;
-  score: number;
-}
-
-function scoreSeries(rawPoints: PricePoint[]): ScoredSeries {
-  const points = [...rawPoints].sort((a, b) => a.date.getTime() - b.date.getTime());
-  const last = points[points.length - 1];
-  const momentum = momentumOverDays(points, 364);
-  const sma50 = sma(points, 50);
-  const sma200 = sma(points, 200);
-  const trend = trendStrengthScore(last.close, sma50, sma200);
-  const momentumScore = momentumTo100(momentum);
-  const score = Math.max(0, Math.min(100, Math.round(momentumScore * 0.6 + trend * 0.4)));
-
-  return {
-    currentPrice: last.close,
-    momentum,
-    sma50,
-    sma200,
-    aboveSma50: sma50 == null ? null : last.close > sma50,
-    aboveSma200: sma200 == null ? null : last.close > sma200,
-    score,
-  };
-}
+const scoreSeries = scorePriceSeries;
 
 /**
  * Scores every current holding 0-100 on momentum (60%) + trend strength vs.

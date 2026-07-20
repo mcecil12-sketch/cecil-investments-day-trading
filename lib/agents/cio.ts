@@ -9,7 +9,8 @@ export type CioItemSource =
   | "relative_strength_candidate"
   | "relative_strength_underperformer"
   | "sector_flag"
-  | "sector_top";
+  | "sector_top"
+  | "candidate_new";
 
 export interface CioCandidateItem {
   /** Stable identifier so Claude can reference an item without re-typing its content — never shown to the user. */

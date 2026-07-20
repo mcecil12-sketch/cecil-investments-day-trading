@@ -4,6 +4,7 @@ import type { AgentType } from "@/lib/generated/prisma";
 import type { RelativeStrengthEntry, RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
 import type { SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import type { RiskManagerOutput, RiskFlag } from "@/lib/agents/riskManager";
+import type { CandidateScannerOutput, CandidateEntry } from "@/lib/agents/candidateScanner";
 import type { CioTaxableOpportunities } from "@/lib/agents/cio";
 import { alphaColor, formatCurrency, formatDate, formatDateTime, formatPercent } from "@/lib/format";
 import { RunAgentButton } from "./RunAgentButton";
@@ -37,6 +38,12 @@ const AGENT_DEFINITIONS: AgentDefinition[] = [
     name: "Risk Manager",
     implemented: true,
     endpoint: "/api/agents/risk-manager",
+  },
+  {
+    type: "CANDIDATE_SCANNER",
+    name: "Candidate Scanner",
+    implemented: true,
+    endpoint: "/api/agents/candidates",
   },
 ];
 
@@ -297,6 +304,89 @@ function renderRiskManagerReport(output: RiskManagerOutput) {
   );
 }
 
+function renderCandidateScannerReport(output: CandidateScannerOutput) {
+  return (
+    <div className="card">
+      <div style={{ marginBottom: "1rem" }}>
+        <div style={{ fontWeight: 600, marginBottom: "0.4rem" }}>Top Candidates</div>
+        {output.topCandidates.length === 0 ? (
+          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+            No candidates scored above the S&amp;P 500 baseline this run.
+          </p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Sector</th>
+                  <th>Score</th>
+                  <th>vs S&amp;P</th>
+                  <th>Momentum (1Y)</th>
+                  <th>Account</th>
+                </tr>
+              </thead>
+              <tbody>
+                {output.topCandidates.map((c: CandidateEntry) => (
+                  <tr key={c.symbol}>
+                    <td>
+                      {c.symbol}
+                      <div style={{ color: "var(--text-muted)", fontSize: "0.72rem", fontWeight: 400 }}>{c.name}</div>
+                    </td>
+                    <td>{c.sector}</td>
+                    <td className="mono">{c.score}</td>
+                    <td className="mono" style={{ color: "var(--positive)" }}>
+                      +{c.vsSpx}
+                    </td>
+                    <td className="mono">{formatPercent(c.momentum1Y)}</td>
+                    <td className="mono" style={{ color: "var(--text-muted)" }}>{c.accountType}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div style={{ marginBottom: "1rem" }}>
+        <div style={{ fontWeight: 600, marginBottom: "0.4rem" }}>Sector Alignment</div>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Sector</th>
+                <th>Rank</th>
+                <th>Current Exposure</th>
+                <th>Recommended</th>
+                <th>Top Candidate</th>
+              </tr>
+            </thead>
+            <tbody>
+              {output.sectorAlignment.map((s) => (
+                <tr key={s.sector}>
+                  <td>{s.sector}</td>
+                  <td className="mono">{s.rotationRank}</td>
+                  <td className="mono">{formatPercent(s.currentExposure)}</td>
+                  <td>{s.recommendedExposure}</td>
+                  <td className="mono">{s.topCandidate}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {output.sectorsWithoutUniverse.length > 0 && (
+        <p style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>
+          No candidate universe defined for: {output.sectorsWithoutUniverse.join(", ")}.
+        </p>
+      )}
+
+      {renderSkipped(output.skipped)}
+    </div>
+  );
+}
+
 export default async function AgentsPage() {
   const [weeklyBrief, latestRuns] = await Promise.all([
     prisma.weeklyBrief.findFirst({
@@ -337,6 +427,7 @@ export default async function AgentsPage() {
     relativeStrength: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "RELATIVE_STRENGTH")]?.status ?? null,
     sectorRotation: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "SECTOR_ROTATION")]?.status ?? null,
     riskManager: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "RISK_MANAGER")]?.status ?? null,
+    candidateScanner: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "CANDIDATE_SCANNER")]?.status ?? null,
   };
 
   return (
@@ -495,8 +586,10 @@ export default async function AgentsPage() {
           report = renderRelativeStrengthReport(run.output as unknown as RelativeStrengthOutput);
         } else if (def.type === "SECTOR_ROTATION") {
           report = renderSectorRotationReport(run.output as unknown as SectorRotationOutput);
-        } else {
+        } else if (def.type === "RISK_MANAGER") {
           report = renderRiskManagerReport(run.output as unknown as RiskManagerOutput);
+        } else {
+          report = renderCandidateScannerReport(run.output as unknown as CandidateScannerOutput);
         }
 
         return (

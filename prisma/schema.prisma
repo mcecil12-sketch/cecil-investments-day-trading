@@ -39,6 +39,7 @@ enum AgentType {
   RELATIVE_STRENGTH
   SECTOR_ROTATION
   RISK_MANAGER
+  CANDIDATE_SCANNER
 }
 
 enum AgentRunStatus {
@@ -219,7 +220,32 @@ model WeeklyBrief {
   /// The CIO's taxable-account trim/sector-gap/momentum-add analysis for this week, shaped like CioTaxableOpportunities in lib/agents/cio.ts. Null when no taxable account data was available at synthesis time.
   taxableOpportunities Json?
   actionItems ActionItem[]
+  recommendationOutcomes RecommendationOutcome[]
   createdAt   DateTime     @default(now())
+}
+
+/// Tracks what actually happened after a CIO recommendation was made — the
+/// track record foundation for Phase 4 productization. Keyed by
+/// (weeklyBriefId, actionItemIndex) rather than the ActionItem's own id,
+/// since synthesizeWeeklyBrief() deletes and recreates that week's
+/// ActionItem rows (and their ids) every time it resynthesizes; the index
+/// within a given brief is the stable reference.
+model RecommendationOutcome {
+  id              String       @id @default(cuid())
+  weeklyBrief     WeeklyBrief  @relation(fields: [weeklyBriefId], references: [id])
+  weeklyBriefId   String
+  /// 1-based position of the recommendation within that week's action item list (matches ActionItem.priority).
+  actionItemIndex Int
+  executed        Boolean      @default(false)
+  executedDate    DateTime?
+  /// Relative performance (symbol return minus S&P 500 return, decimal fraction) 30/90 days after executedDate. Null until enough time has elapsed, or when no ticker could be identified from the recommendation text.
+  outcome30d      Float?
+  outcome90d      Float?
+  notes           String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@unique([weeklyBriefId, actionItemIndex])
 }
 
 /// A tiny key-value store for cross-cutting notification state that doesn't

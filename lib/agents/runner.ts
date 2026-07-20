@@ -3,6 +3,7 @@ import { Prisma } from "@/lib/generated/prisma";
 import { runRelativeStrengthAgent, type RelativeStrengthEntry, type RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
 import { runSectorRotationAgent, type SectorScore, type SectorRotationFlag, type SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import { runRiskManagerAgent, type RiskFlag, type OpportunityCostEntry, type RiskManagerOutput } from "@/lib/agents/riskManager";
+import { runCandidateScannerAgent, type CandidateEntry, type CandidateScannerOutput } from "@/lib/agents/candidateScanner";
 import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
 import { buildTaxableAnalysisContext, type TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
 import { sendWeeklyBriefNotification } from "@/lib/notifications/weeklyBrief";
@@ -264,14 +265,78 @@ export async function runAndPersistRiskManager(): Promise<RiskManagerRunResult> 
     ]);
 
     try {
+      await runAndPersistCandidateScanner();
       await synthesizeWeeklyBrief();
       const notificationResult = await sendWeeklyBriefNotification();
       if (!notificationResult.sent) {
         console.log("Weekly brief notification not sent:", notificationResult.reason);
       }
     } catch (err) {
-      console.error("CIO synthesis after Risk Manager run failed:", err);
+      console.error("Candidate Scanner / CIO synthesis after Risk Manager run failed:", err);
     }
+
+    return { runId: run.id, status: "COMPLETE", output };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "FAILED", completedAt: new Date(), errorMessage: message },
+    });
+    return { runId: run.id, status: "FAILED", error: message };
+  }
+}
+
+function candidateAddItem(entry: CandidateEntry, priority: number): DraftActionItem {
+  return {
+    priority,
+    action: `ADD ${entry.symbol} — new candidate`,
+    rationale: entry.rationale,
+    expectedImpact: `New position in ${entry.sector}, scoring ${entry.vsSpx > 0 ? "+" : ""}${entry.vsSpx} vs S&P 500 (${entry.accountType === "taxable" ? "taxable only" : entry.accountType === "401k" ? "401k only" : "taxable or 401k"}).`,
+    accountId: null,
+  };
+}
+
+export interface CandidateScannerRunResult {
+  runId: string;
+  status: "COMPLETE" | "FAILED";
+  output?: CandidateScannerOutput;
+  error?: string;
+}
+
+/**
+ * Runs the Candidate Scanner agent and persists its AgentRun + derived
+ * ActionItems. Auto-triggered after every Risk Manager run (see
+ * runAndPersistRiskManager above) so a fresh candidate list is always ready
+ * before the CIO synthesis step reads it.
+ */
+export async function runAndPersistCandidateScanner(): Promise<CandidateScannerRunResult> {
+  const run = await prisma.agentRun.create({
+    data: { agentType: "CANDIDATE_SCANNER", status: "RUNNING" },
+  });
+
+  try {
+    const output = await runCandidateScannerAgent();
+
+    const draftItems: DraftActionItem[] = output.topCandidates.slice(0, 5).map((c, i) => candidateAddItem(c, i + 1));
+
+    await prisma.$transaction([
+      prisma.agentRun.update({
+        where: { id: run.id },
+        data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },
+      }),
+      ...draftItems.map((item) =>
+        prisma.actionItem.create({
+          data: {
+            agentRunId: run.id,
+            priority: item.priority,
+            action: item.action,
+            rationale: item.rationale,
+            expectedImpact: item.expectedImpact,
+            accountId: item.accountId,
+          },
+        }),
+      ),
+    ]);
 
     return { runId: run.id, status: "COMPLETE", output };
   } catch (err) {
@@ -302,12 +367,14 @@ async function buildCioCandidates(): Promise<{
   riskRun: { id: string } | null;
   relativeRun: { id: string } | null;
   sectorRun: { id: string } | null;
+  candidateRun: { id: string } | null;
   taxableContext: TaxableAnalysisContext | null;
 }> {
-  const [riskRun, relativeRun, sectorRun] = await Promise.all([
+  const [riskRun, relativeRun, sectorRun, candidateRun] = await Promise.all([
     prisma.agentRun.findFirst({ where: { agentType: "RISK_MANAGER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
     prisma.agentRun.findFirst({ where: { agentType: "RELATIVE_STRENGTH", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
     prisma.agentRun.findFirst({ where: { agentType: "SECTOR_ROTATION", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
+    prisma.agentRun.findFirst({ where: { agentType: "CANDIDATE_SCANNER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
   ]);
 
   const candidates: CioCandidateItem[] = [];
@@ -425,21 +492,36 @@ async function buildCioCandidates(): Promise<{
     });
   }
 
+  if (candidateRun?.output) {
+    const output = candidateRun.output as unknown as CandidateScannerOutput;
+    output.topCandidates.slice(0, 5).forEach((c, i) => {
+      candidates.push({
+        key: `candidate-add-${i}`,
+        source: "candidate_new",
+        agentRunId: candidateRun.id,
+        action: `ADD ${c.symbol} — new candidate`,
+        rationale: c.rationale,
+        expectedImpact: `New position in ${c.sector}, scoring ${c.vsSpx > 0 ? "+" : ""}${c.vsSpx} vs S&P 500 (${c.accountType === "taxable" ? "taxable only" : c.accountType === "401k" ? "401k only" : "taxable or 401k"}).`,
+        accountId: null,
+      });
+    });
+  }
+
   const taxableContext = await buildTaxableAnalysisContext(
     sectorRun?.output ? (sectorRun.output as unknown as SectorRotationOutput) : null,
     relativeRun?.output ? (relativeRun.output as unknown as RelativeStrengthOutput) : null,
   );
 
-  return { candidates, riskRun, relativeRun, sectorRun, taxableContext };
+  return { candidates, riskRun, relativeRun, sectorRun, candidateRun, taxableContext };
 }
 
 /**
  * Rebuilds the current week's WeeklyBrief by sending the latest completed
  * run of each agent to Claude for natural-language synthesis and priority
  * ranking (see lib/agents/cio.ts). Called after the post-import agent
- * sequence, and after every standalone Risk Manager run, so the CIO Weekly
- * Action List reflects all three agents instead of just whichever ran most
- * recently.
+ * sequence, and after every standalone Risk Manager run (which itself
+ * triggers a fresh Candidate Scanner run first), so the CIO Weekly Action
+ * List reflects all four agents instead of just whichever ran most recently.
  */
 export async function synthesizeWeeklyBrief(): Promise<void> {
   const { candidates, taxableContext } = await buildCioCandidates();
@@ -476,11 +558,12 @@ export async function synthesizeWeeklyBrief(): Promise<void> {
 }
 
 /**
- * Fire-and-forget trigger for the import pipeline — runs all three agents in
- * sequence (Relative Strength → Sector Rotation → Risk Manager). Risk
- * Manager's own persistence resynthesizes the CIO Weekly Action List once all
- * three have fresh output. Logs failures instead of throwing, since an
- * agent-scoring failure should never surface as an import error to the user.
+ * Fire-and-forget trigger for the import pipeline — runs the agent sequence
+ * (Relative Strength → Sector Rotation → Risk Manager → Candidate Scanner).
+ * Risk Manager's own persistence runs Candidate Scanner and resynthesizes the
+ * CIO Weekly Action List once all four have fresh output. Logs failures
+ * instead of throwing, since an agent-scoring failure should never surface
+ * as an import error to the user.
  */
 export function triggerAllAgentsRun(): void {
   (async () => {

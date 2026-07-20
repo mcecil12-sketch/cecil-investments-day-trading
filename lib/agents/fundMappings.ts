@@ -67,6 +67,19 @@ export function getFundProxy(symbol: string, name?: string | null): FundProxy | 
 }
 
 /**
+ * Reverse lookup: given a publicly traded symbol (e.g. a Candidate Scanner
+ * result), returns the Verizon plan fund name(s) that use it as their price
+ * proxy — i.e. the closest available 401k fund for that symbol's exposure.
+ * Empty array when no plan fund proxies to this symbol.
+ */
+export function closestPlanFundsForProxy(symbol: string): string[] {
+  const target = symbol.trim().toUpperCase();
+  return Object.entries(FUND_PROXY_MAP)
+    .filter(([, proxy]) => proxy.proxy.toUpperCase() === target)
+    .map(([fundName]) => fundName);
+}
+
+/**
  * Manually reported fund performance (plan statement data as of Jun 30,
  * 2026, plus YTD figures from the Fidelity balance overview screenshots as
  * of Jul 13, 2026 where noted), used in place of proxy-ETF price history
