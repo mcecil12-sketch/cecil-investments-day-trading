@@ -9,6 +9,7 @@ const NAV_ITEMS = [
   { href: "/import", label: "Import" },
   { href: "/benchmark", label: "Benchmark" },
   { href: "/agents", label: "Agents" },
+  { href: "/recommendations", label: "Ideas" },
 ];
 
 export function BottomNav() {
