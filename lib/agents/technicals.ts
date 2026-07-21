@@ -26,11 +26,20 @@ export function momentumOverDays(points: PricePoint[], days: number): number | n
   return computeReturn(start.close, last.close);
 }
 
-/** Maps a -50%..+50% return to a 0-100 scale; missing data scores neutral (50) rather than penalized. */
+/**
+ * Maps a -50%..+200% return to a 0-100 scale; missing data scores neutral
+ * (50) rather than penalized. The ceiling used to be +50%, which meant any
+ * stock with a 1-year return above 50% (not unusual for individual equities,
+ * as opposed to indices) clipped to the same 100 regardless of whether it
+ * returned 51% or 220% — collapsing real momentum differences into ties.
+ * +200% is wide enough that only truly exceptional movers approach the cap,
+ * while ordinary double-digit-to-double-percent returns still scale
+ * proportionally against each other.
+ */
 export function momentumTo100(momentum: number | null): number {
   if (momentum == null) return 50;
-  const clamped = Math.max(-0.5, Math.min(0.5, momentum));
-  return (clamped + 0.5) * 100;
+  const clamped = Math.max(-0.5, Math.min(2.0, momentum));
+  return ((clamped + 0.5) / 2.5) * 100;
 }
 
 /** 0-100: half credit for trading above the 50-day SMA, half for the 200-day. Missing SMAs (short history) score neutral rather than penalized. */

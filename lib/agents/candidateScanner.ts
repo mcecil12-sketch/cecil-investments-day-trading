@@ -55,12 +55,31 @@ const CANDIDATE_NAMES: Record<string, string> = {
 /** How many of the top-scoring candidates to surface across all scanned sectors. */
 const MAX_TOP_CANDIDATES = 10;
 
+/**
+ * Weights for the two composite factors implemented today, renormalized from
+ * the target 35% momentum/trend + 25% sector leadership (out of a full
+ * 35/30/25/10 momentum-trend/earnings-acceleration/sector-leadership/sentiment
+ * split) so the implemented factors still sum to 100%. Earnings acceleration
+ * and sentiment/news are deferred until this app has a data source for them.
+ */
+const MOMENTUM_TREND_WEIGHT = 35 / 60;
+const SECTOR_LEADERSHIP_WEIGHT = 25 / 60;
+
 export interface CandidateEntry {
   symbol: string;
   name: string;
   sector: string;
+  /**
+   * 0-100 composite. The target composite is momentum/trend (35%) +
+   * earnings acceleration (30%) + sector leadership (25%) + sentiment/news
+   * (10%); earnings acceleration and sentiment have no data source in this
+   * app yet, so those two factors are deferred and the two implemented
+   * factors are renormalized to fill 100%: momentum/trend at 35/60 = 58.3%,
+   * sector leadership at 25/60 = 41.7%. See MOMENTUM_TREND_WEIGHT /
+   * SECTOR_LEADERSHIP_WEIGHT below.
+   */
   score: number;
-  /** Score minus the S&P 500's score over the same window (points, not a percentage). */
+  /** This symbol's own 1-year return minus the S&P 500's 1-year return over the same window, in percentage points. Computed per-symbol, not shared. */
   vsSpx: number;
   momentum1Y: number | null;
   aboveSma50: boolean | null;
@@ -98,7 +117,7 @@ function buildRationale(
   planFunds: string[],
 ): string {
   const parts = [
-    `Score ${entry.score}/100 (${entry.vsSpx > 0 ? "+" : ""}${entry.vsSpx} vs S&P 500), 52-week momentum ${formatPercent(entry.momentum1Y)}`,
+    `Score ${entry.score}/100, outperforming the S&P 500 by ${entry.vsSpx > 0 ? "+" : ""}${entry.vsSpx} points on 1-year return, 52-week momentum ${formatPercent(entry.momentum1Y)}`,
     `trading ${entry.aboveSma50 ? "above" : "below"} its 50-day average and ${entry.aboveSma200 ? "above" : "below"} its 200-day average`,
     `${sector.sector} ranks #${sector.rank} in current sector rotation`,
   ];
@@ -138,7 +157,7 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
   const topSectors = sectorOutput.topSectors.slice(0, 3);
 
   const [sp500Points, holdings] = await Promise.all([getSp500Series(), getCurrentHoldings()]);
-  const sp500Score = scorePriceSeries(sp500Points).score;
+  const sp500Momentum = scorePriceSeries(sp500Points).momentum ?? 0;
   const portfolioValue = totalPortfolioValue(holdings);
 
   const skipped: Array<{ symbol: string; reason: string }> = [];
@@ -156,23 +175,32 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
       try {
         const { points } = await getPriceHistory(symbol);
         const priceScored = scorePriceSeries(points);
-        if (priceScored.score <= sp500Score) continue;
+
+        // Per-symbol excess return vs. the S&P 500 over the same window —
+        // each candidate's own 1-year return minus the S&P's own 1-year
+        // return, not a shared/derived score delta.
+        const vsSpx = Math.round(((priceScored.momentum ?? 0) - sp500Momentum) * 1000) / 10;
+        if (vsSpx <= 0) continue;
+
+        const compositeScore = Math.max(
+          0,
+          Math.min(100, Math.round(priceScored.score * MOMENTUM_TREND_WEIGHT + sector.score * SECTOR_LEADERSHIP_WEIGHT)),
+        );
 
         const planFunds = closestPlanFundsForProxy(symbol);
         const accountType: CandidateAccountType = planFunds.length > 0 ? "both" : "taxable";
-        const vsSpx = priceScored.score - sp500Score;
 
         scored.push({
           symbol,
           name: CANDIDATE_NAMES[symbol] ?? symbol,
           sector: sector.sector,
-          score: priceScored.score,
+          score: compositeScore,
           vsSpx,
           momentum1Y: priceScored.momentum,
           aboveSma50: priceScored.aboveSma50,
           aboveSma200: priceScored.aboveSma200,
           rationale: buildRationale(
-            { symbol, score: priceScored.score, vsSpx, momentum1Y: priceScored.momentum, aboveSma50: priceScored.aboveSma50, aboveSma200: priceScored.aboveSma200 },
+            { symbol, score: compositeScore, vsSpx, momentum1Y: priceScored.momentum, aboveSma50: priceScored.aboveSma50, aboveSma200: priceScored.aboveSma200 },
             sector,
             planFunds,
           ),
