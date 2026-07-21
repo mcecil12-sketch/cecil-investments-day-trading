@@ -26,6 +26,31 @@ export function momentumOverDays(points: PricePoint[], days: number): number | n
   return computeReturn(start.close, last.close);
 }
 
+/** Closest point at-or-before `daysAgo` days before the series' last date. Assumes ascending sort, mirrors momentumOverDays' scan. */
+function priceAtDaysAgo(points: PricePoint[], daysAgo: number): PricePoint {
+  const last = points[points.length - 1];
+  const targetTime = last.date.getTime() - daysAgo * 24 * 60 * 60 * 1000;
+  let candidate = points[0];
+  for (const p of points) {
+    if (p.date.getTime() <= targetTime) candidate = p;
+    else break;
+  }
+  return candidate;
+}
+
+/**
+ * Trailing 12-month return EXCLUDING the most recent month — the standard
+ * "12-1" academic momentum convention (Jegadeesh & Titman / Antonacci). Unlike
+ * a plain trailing-12-month return, this isolates the durable trend from
+ * short-term reversal noise by dropping the most recent month.
+ */
+export function momentum12to1(points: PricePoint[]): number | null {
+  if (points.length < 2) return null;
+  const twelveMonthsAgo = priceAtDaysAgo(points, 365);
+  const oneMonthAgo = priceAtDaysAgo(points, 30);
+  return computeReturn(twelveMonthsAgo.close, oneMonthAgo.close);
+}
+
 /**
  * Maps a -50%..+200% return to a 0-100 scale; missing data scores neutral
  * (50) rather than penalized. The ceiling used to be +50%, which meant any
@@ -49,37 +74,135 @@ export function trendStrengthScore(currentPrice: number, sma50: number | null, s
   return part50 + part200;
 }
 
+/**
+ * Scales a return to 0-100 using a horizon-appropriate range instead of the
+ * fixed -50%..+200% ceiling in momentumTo100. Shorter windows have a
+ * narrower realistic return range than a full year, so the range is derived
+ * from momentumTo100's calibrated 12-month bounds via sqrt-time scaling (the
+ * standard heuristic for how return dispersion shrinks with horizon length) —
+ * a 6-month window scales by sqrt(0.5), a 3-month window by sqrt(0.25), etc.
+ * Missing data scores neutral (50), matching momentumTo100.
+ */
+function momentumToScoreForHorizon(momentum: number | null, horizonYears: number): number {
+  if (momentum == null) return 50;
+  const scale = Math.sqrt(horizonYears);
+  const floor = -0.5 * scale;
+  const ceiling = 2.0 * scale;
+  const clamped = Math.max(floor, Math.min(ceiling, momentum));
+  return ((clamped - floor) / (ceiling - floor)) * 100;
+}
+
+const MOMENTUM_12M_WEIGHT = 0.5;
+const MOMENTUM_6M_WEIGHT = 0.3;
+const MOMENTUM_3M_WEIGHT = 0.2;
+
+/**
+ * Dampens the 3-month leg's weight when it's a positive pop unconfirmed by
+ * the longer-term trend (6-month or 12-month flat/negative), so a recent
+ * breakout alone can't drive the score — this keeps the model
+ * momentum/trend-based rather than breakout-chasing. The multiplier is 1
+ * (no dampening) whenever 3-month isn't a positive pop, or when both longer
+ * legs are positive; otherwise it tapers from 0.5 (longer leg flat) down to 0
+ * (longer leg down ~50%+). Weight removed from the 3-month leg is
+ * redistributed to the 6/12-month legs so the three weights always sum to 1.
+ */
+function blendedMomentumWeights(
+  m3: number | null,
+  m6: number | null,
+  m12: number | null,
+): { weight3m: number; weight6m: number; weight12m: number } {
+  let weight3m = MOMENTUM_3M_WEIGHT;
+  if (m3 != null && m3 > 0) {
+    const longTermWorst = Math.min(m6 ?? 0, m12 ?? 0);
+    if (longTermWorst <= 0) {
+      const multiplier = Math.max(0, 0.5 + longTermWorst);
+      weight3m = MOMENTUM_3M_WEIGHT * multiplier;
+    }
+  }
+  const freed = MOMENTUM_3M_WEIGHT - weight3m;
+  const longTermTotal = MOMENTUM_6M_WEIGHT + MOMENTUM_12M_WEIGHT;
+  const weight6m = MOMENTUM_6M_WEIGHT + (freed * MOMENTUM_6M_WEIGHT) / longTermTotal;
+  const weight12m = MOMENTUM_12M_WEIGHT + (freed * MOMENTUM_12M_WEIGHT) / longTermTotal;
+  return { weight3m, weight6m, weight12m };
+}
+
+export interface MomentumBlend {
+  momentum12to1: number | null;
+  momentum6m: number | null;
+  momentum3m: number | null;
+  /** 0-100 composite of the three legs' horizon-scaled scores, guardrail-adjusted. */
+  score: number;
+  /** Weighted blend of the three raw (fractional) returns, using the same guardrail-adjusted weights as `score`. */
+  raw: number | null;
+}
+
+/**
+ * Multi-horizon momentum blend replacing a single trailing-12-month window,
+ * matching institutional trend-following methodology: 12-month "12-1" return
+ * (50%, excludes the most recent month to isolate durable trend from
+ * short-term reversal noise) + 6-month full trailing return (30%) + 3-month
+ * full trailing return (20%, dampened by blendedMomentumWeights when it's an
+ * unconfirmed pop). Each leg scales within its own horizon-appropriate range
+ * (momentumToScoreForHorizon) rather than a single fixed ceiling, so the
+ * three windows can actually differentiate instead of collapsing together.
+ */
+export function blendedMomentum(points: PricePoint[]): MomentumBlend {
+  const m12 = momentum12to1(points);
+  const m6 = momentumOverDays(points, 182);
+  const m3 = momentumOverDays(points, 91);
+
+  const { weight3m, weight6m, weight12m } = blendedMomentumWeights(m3, m6, m12);
+
+  const score12 = momentumToScoreForHorizon(m12, 1);
+  const score6 = momentumToScoreForHorizon(m6, 0.5);
+  const score3 = momentumToScoreForHorizon(m3, 0.25);
+  const score = score12 * weight12m + score6 * weight6m + score3 * weight3m;
+
+  const raw = m12 == null && m6 == null && m3 == null
+    ? null
+    : (m12 ?? 0) * weight12m + (m6 ?? 0) * weight6m + (m3 ?? 0) * weight3m;
+
+  return { momentum12to1: m12, momentum6m: m6, momentum3m: m3, score, raw };
+}
+
 export interface PriceSeriesScore {
   currentPrice: number;
+  /** Weighted blend of the three momentum legs' raw returns — see MomentumBlend.raw. */
   momentum: number | null;
+  momentum12to1: number | null;
+  momentum6m: number | null;
+  momentum3m: number | null;
   sma50: number | null;
   sma200: number | null;
   aboveSma50: boolean | null;
   aboveSma200: boolean | null;
-  /** 0-100, 52-week momentum (60%) + 50d/200d trend strength (40%). */
+  /** 0-100, multi-horizon momentum blend (60%) + 50d/200d trend strength (40%). */
   score: number;
 }
 
 /**
  * The composite score used by every agent that ranks a price series against
- * the S&P 500: 52-week momentum (60%) blended with 50d/200d trend strength
- * (40%). Shared by Relative Strength (scoring current holdings) and the
- * Candidate Scanner (scoring the buy-candidate universe) so both use
- * identical math against identical baselines.
+ * the S&P 500: multi-horizon momentum blend (60%, see blendedMomentum)
+ * blended with 50d/200d trend strength (40%). Shared by Relative Strength
+ * (scoring current holdings) and the Candidate Scanner (scoring the
+ * buy-candidate universe) so both use identical math against identical
+ * baselines.
  */
 export function scorePriceSeries(rawPoints: PricePoint[]): PriceSeriesScore {
   const points = [...rawPoints].sort((a, b) => a.date.getTime() - b.date.getTime());
   const last = points[points.length - 1];
-  const momentum = momentumOverDays(points, 364);
+  const momentum = blendedMomentum(points);
   const sma50Value = sma(points, 50);
   const sma200Value = sma(points, 200);
   const trend = trendStrengthScore(last.close, sma50Value, sma200Value);
-  const momentumScore = momentumTo100(momentum);
-  const score = Math.max(0, Math.min(100, Math.round(momentumScore * 0.6 + trend * 0.4)));
+  const score = Math.max(0, Math.min(100, Math.round(momentum.score * 0.6 + trend * 0.4)));
 
   return {
     currentPrice: last.close,
-    momentum,
+    momentum: momentum.raw,
+    momentum12to1: momentum.momentum12to1,
+    momentum6m: momentum.momentum6m,
+    momentum3m: momentum.momentum3m,
     sma50: sma50Value,
     sma200: sma200Value,
     aboveSma50: sma50Value == null ? null : last.close > sma50Value,
