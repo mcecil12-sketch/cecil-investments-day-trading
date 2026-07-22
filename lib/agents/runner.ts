@@ -4,6 +4,7 @@ import { runRelativeStrengthAgent, type RelativeStrengthEntry, type RelativeStre
 import { runSectorRotationAgent, type SectorScore, type SectorRotationFlag, type SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import { runRiskManagerAgent, type RiskFlag, type OpportunityCostEntry, type RiskManagerOutput } from "@/lib/agents/riskManager";
 import { runCandidateScannerAgent, type CandidateEntry, type CandidateScannerOutput } from "@/lib/agents/candidateScanner";
+import { refreshCandidateUniverse, type UniverseRefreshResult } from "@/lib/agents/candidateUniverse";
 import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
 import { buildTaxableAnalysisContext, type TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
 import { sendWeeklyBriefNotification } from "@/lib/notifications/weeklyBrief";
@@ -338,6 +339,42 @@ export async function runAndPersistCandidateScanner(): Promise<CandidateScannerR
       ),
     ]);
 
+    return { runId: run.id, status: "COMPLETE", output };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "FAILED", completedAt: new Date(), errorMessage: message },
+    });
+    return { runId: run.id, status: "FAILED", error: message };
+  }
+}
+
+export interface UniverseRefreshRunResult {
+  runId: string;
+  status: "COMPLETE" | "FAILED";
+  output?: UniverseRefreshResult[];
+  error?: string;
+}
+
+/**
+ * Runs the monthly candidate-universe refresh (pulls fresh SPDR sector
+ * holdings from SSGA for the dynamic sectors — see candidateUniverse.ts) and
+ * persists an AgentRun audit trail, same lifecycle pattern as the analysis
+ * agents above. No ActionItems: this is a data refresh, not a
+ * recommendation.
+ */
+export async function runAndPersistCandidateUniverseRefresh(): Promise<UniverseRefreshRunResult> {
+  const run = await prisma.agentRun.create({
+    data: { agentType: "UNIVERSE_REFRESH", status: "RUNNING" },
+  });
+
+  try {
+    const output = await refreshCandidateUniverse();
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },
+    });
     return { runId: run.id, status: "COMPLETE", output };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

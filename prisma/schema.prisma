@@ -40,6 +40,7 @@ enum AgentType {
   SECTOR_ROTATION
   RISK_MANAGER
   CANDIDATE_SCANNER
+  UNIVERSE_REFRESH
 }
 
 enum AgentRunStatus {
@@ -246,6 +247,22 @@ model RecommendationOutcome {
   updatedAt       DateTime     @updatedAt
 
   @@unique([weeklyBriefId, actionItemIndex])
+}
+
+/// The current data-driven candidate universe for one sector, refreshed
+/// monthly from official SPDR sector fund holdings (see
+/// lib/agents/sectorHoldings.ts + lib/agents/candidateUniverse.ts) — replaces
+/// the hand-picked hardcoded list that used to live in candidateScanner.ts for
+/// sectors covered by this refresh. Sectors not yet migrated keep using a
+/// static list directly in candidateScanner.ts.
+model CandidateUniverse {
+  id        String   @id @default(cuid())
+  sector    String   @unique
+  sectorEtf String
+  /// Top-weighted constituent tickers as of the last refresh (string[]).
+  symbols   Json
+  asOf      DateTime
+  updatedAt DateTime @updatedAt
 }
 
 /// A tiny key-value store for cross-cutting notification state that doesn't

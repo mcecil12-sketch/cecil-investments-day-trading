@@ -4,27 +4,20 @@ import { scorePriceSeries } from "@/lib/agents/technicals";
 import { getCurrentHoldings, totalPortfolioValue } from "@/lib/agents/holdings";
 import { getHoldingSector, type SectorRotationOutput, type SectorScore } from "@/lib/agents/sectorRotation";
 import { closestPlanFundsForProxy } from "@/lib/agents/fundMappings";
+import { getDynamicCandidateUniverse, type SectorUniverse } from "@/lib/agents/candidateUniverse";
 import { formatPercent } from "@/lib/format";
 
 export type CandidateAccountType = "taxable" | "401k" | "both";
 
-interface SectorUniverse {
-  sectorEtf: string;
-  symbols: string[];
-}
-
 /**
- * Fixed buy-candidate universe for the top-ranked sectors coming out of the
- * Sector Rotation agent. Only sectors with an entry here are scanned — a
- * sector that ranks in the top 3 but has no universe defined (e.g. Consumer
- * Staples, Materials) is reported in `sectorsWithoutUniverse` instead of
- * silently skipped.
+ * Hand-picked buy-candidate universe for sectors not yet migrated to the
+ * SSGA-derived monthly refresh (see lib/agents/candidateUniverse.ts).
+ * Technology, Healthcare, and Energy used to be hardcoded here too; they're
+ * now sourced from CandidateUniverse (DB, refreshed monthly) and merged in at
+ * runtime in runCandidateScannerAgent — see DYNAMIC_SECTORS.
  */
-const CANDIDATE_UNIVERSE: Record<string, SectorUniverse> = {
-  Technology: { sectorEtf: "XLK", symbols: ["NVDA", "MSFT", "AAPL", "AVGO", "AMD", "PLTR", "META", "TSM", "ASML", "SMCI"] },
-  Healthcare: { sectorEtf: "XLV", symbols: ["UNH", "LLY", "ABBV", "JNJ", "MRK", "PFE", "TMO", "DHR", "ISRG", "DXCM"] },
+const STATIC_CANDIDATE_UNIVERSE: Record<string, SectorUniverse> = {
   Financials: { sectorEtf: "XLF", symbols: ["BRK-B", "JPM", "V", "MA", "GS", "MS", "BAC", "AXP", "BX", "KKR"] },
-  Energy: { sectorEtf: "XLE", symbols: ["XOM", "CVX", "COP", "EOG", "SLB", "PSX", "MPC", "OXY", "VLO", "HAL"] },
   Industrials: { sectorEtf: "XLI", symbols: ["CAT", "DE", "HON", "UPS", "RTX", "GE", "LMT", "ETN", "EMR", "PH"] },
   Communications: { sectorEtf: "XLC", symbols: ["GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS"] },
   "Consumer Discretionary": { sectorEtf: "XLY", symbols: ["AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "TGT", "LOW"] },
@@ -156,7 +149,12 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
   const sectorOutput = latestSectorRun.output as unknown as SectorRotationOutput;
   const topSectors = sectorOutput.topSectors.slice(0, 3);
 
-  const [sp500Points, holdings] = await Promise.all([getSp500Series(), getCurrentHoldings()]);
+  const [sp500Points, holdings, dynamicUniverse] = await Promise.all([
+    getSp500Series(),
+    getCurrentHoldings(),
+    getDynamicCandidateUniverse(),
+  ]);
+  const universeMap: Record<string, SectorUniverse> = { ...STATIC_CANDIDATE_UNIVERSE, ...dynamicUniverse };
   const sp500Momentum = scorePriceSeries(sp500Points).momentum ?? 0;
   const portfolioValue = totalPortfolioValue(holdings);
 
@@ -165,7 +163,7 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
   const scored: CandidateEntry[] = [];
 
   for (const sector of topSectors) {
-    const universe = CANDIDATE_UNIVERSE[sector.sector];
+    const universe = universeMap[sector.sector];
     if (!universe) {
       sectorsWithoutUniverse.push(sector.sector);
       continue;
@@ -225,7 +223,7 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
     const currentValue = exposureBySector.get(sector.sector) ?? 0;
     const currentExposure = portfolioValue > 0 ? currentValue / portfolioValue : 0;
     const sectorCandidates = topCandidates.filter((c) => c.sector === sector.sector);
-    const topCandidate = sectorCandidates[0]?.symbol ?? CANDIDATE_UNIVERSE[sector.sector]?.sectorEtf ?? "—";
+    const topCandidate = sectorCandidates[0]?.symbol ?? universeMap[sector.sector]?.sectorEtf ?? "—";
 
     return {
       sector: sector.sector,
