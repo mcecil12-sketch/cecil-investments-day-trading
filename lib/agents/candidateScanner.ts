@@ -46,7 +46,7 @@ const CANDIDATE_NAMES: Record<string, string> = {
 };
 
 /** How many of the top-scoring candidates to surface across all scanned sectors. */
-const MAX_TOP_CANDIDATES = 10;
+const MAX_TOP_CANDIDATES = 15;
 
 /**
  * Weights for the two composite factors implemented today, renormalized from
