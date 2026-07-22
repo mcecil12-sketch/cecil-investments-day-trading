@@ -117,17 +117,23 @@ export interface PriceHistoryResult {
 }
 
 /**
- * Fetches ~1y of daily closes for a symbol, preferring Yahoo Finance and
+ * Fetches ~2y of daily closes for a symbol, preferring Yahoo Finance and
  * falling back to Alpaca (if credentials are configured) when Yahoo fails —
- * e.g. rate limiting.
+ * e.g. rate limiting. Deliberately requests more than the ~1y of history any
+ * single momentum window actually needs: momentum12to1 (technicals.ts)
+ * distinguishes a genuinely short trading history (recent spinoff/IPO) from
+ * an established stock by checking whether the fetched series spans a full
+ * 365 days, which only works if the fetch window itself is wider than that —
+ * a "1y" request caps every symbol at ~364 days regardless of how long it's
+ * actually traded, making that check meaningless.
  */
 export async function getPriceHistory(symbol: string): Promise<PriceHistoryResult> {
   try {
-    const points = await fetchYahooHistory(symbol, "1y");
+    const points = await fetchYahooHistory(symbol, "2y");
     return { symbol, points, source: "yahoo" };
   } catch (yahooError) {
     if (!hasAlpacaCreds()) throw yahooError;
-    const points = await fetchAlpacaHistory(symbol, 400);
+    const points = await fetchAlpacaHistory(symbol, 730);
     return { symbol, points, source: "alpaca" };
   }
 }

@@ -38,14 +38,27 @@ function priceAtDaysAgo(points: PricePoint[], daysAgo: number): PricePoint {
   return candidate;
 }
 
+const TWELVE_MONTHS_MS = 365 * 24 * 60 * 60 * 1000;
+
 /**
  * Trailing 12-month return EXCLUDING the most recent month — the standard
  * "12-1" academic momentum convention (Jegadeesh & Titman / Antonacci). Unlike
  * a plain trailing-12-month return, this isolates the durable trend from
  * short-term reversal noise by dropping the most recent month.
+ *
+ * Returns null when the series doesn't actually span 365 days — without this
+ * check, priceAtDaysAgo silently falls back to the earliest available point,
+ * which for a recent spinoff or IPO is an artificial post-listing floor price
+ * rather than a genuine 12-months-ago price (e.g. a stock spun off ~11 months
+ * ago would compute "12-month return" as its entire lifetime-since-spinoff
+ * return, wildly overstating durable trend). blendedMomentum reweights to the
+ * 6/12-month legs when this comes back null.
  */
 export function momentum12to1(points: PricePoint[]): number | null {
   if (points.length < 2) return null;
+  const last = points[points.length - 1];
+  const earliest = points[0];
+  if (last.date.getTime() - earliest.date.getTime() < TWELVE_MONTHS_MS) return null;
   const twelveMonthsAgo = priceAtDaysAgo(points, 365);
   const oneMonthAgo = priceAtDaysAgo(points, 30);
   return computeReturn(twelveMonthsAgo.close, oneMonthAgo.close);
@@ -126,6 +139,41 @@ function blendedMomentumWeights(
   return { weight3m, weight6m, weight12m };
 }
 
+/**
+ * Zeroes out the weight of any leg whose momentum value is null (data
+ * unavailable — e.g. momentum12to1 nulled out for a recent spinoff/IPO) and
+ * redistributes it proportionally across the remaining available legs, so an
+ * unavailable leg is genuinely excluded rather than defaulting to a neutral
+ * score at its normal (often large) weight. Leaves weights untouched when
+ * every leg is available.
+ */
+function redistributeMissingWeight(
+  weights: { weight12m: number; weight6m: number; weight3m: number },
+  available: { m12: boolean; m6: boolean; m3: boolean },
+): { weight12m: number; weight6m: number; weight3m: number } {
+  let { weight12m, weight6m, weight3m } = weights;
+  let missing = 0;
+  if (!available.m12) {
+    missing += weight12m;
+    weight12m = 0;
+  }
+  if (!available.m6) {
+    missing += weight6m;
+    weight6m = 0;
+  }
+  if (!available.m3) {
+    missing += weight3m;
+    weight3m = 0;
+  }
+  const remainingTotal = weight12m + weight6m + weight3m;
+  if (missing > 0 && remainingTotal > 0) {
+    weight12m += (missing * weight12m) / remainingTotal;
+    weight6m += (missing * weight6m) / remainingTotal;
+    weight3m += (missing * weight3m) / remainingTotal;
+  }
+  return { weight12m, weight6m, weight3m };
+}
+
 export interface MomentumBlend {
   momentum12to1: number | null;
   momentum6m: number | null;
@@ -151,16 +199,23 @@ export function blendedMomentum(points: PricePoint[]): MomentumBlend {
   const m6 = momentumOverDays(points, 182);
   const m3 = momentumOverDays(points, 91);
 
-  const { weight3m, weight6m, weight12m } = blendedMomentumWeights(m3, m6, m12);
+  if (m12 == null && m6 == null && m3 == null) {
+    return { momentum12to1: null, momentum6m: null, momentum3m: null, score: 50, raw: null };
+  }
+
+  const guardrailWeights = blendedMomentumWeights(m3, m6, m12);
+  const { weight12m, weight6m, weight3m } = redistributeMissingWeight(guardrailWeights, {
+    m12: m12 != null,
+    m6: m6 != null,
+    m3: m3 != null,
+  });
 
   const score12 = momentumToScoreForHorizon(m12, 1);
   const score6 = momentumToScoreForHorizon(m6, 0.5);
   const score3 = momentumToScoreForHorizon(m3, 0.25);
   const score = score12 * weight12m + score6 * weight6m + score3 * weight3m;
 
-  const raw = m12 == null && m6 == null && m3 == null
-    ? null
-    : (m12 ?? 0) * weight12m + (m6 ?? 0) * weight6m + (m3 ?? 0) * weight3m;
+  const raw = (m12 ?? 0) * weight12m + (m6 ?? 0) * weight6m + (m3 ?? 0) * weight3m;
 
   return { momentum12to1: m12, momentum6m: m6, momentum3m: m3, score, raw };
 }
