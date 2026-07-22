@@ -222,7 +222,7 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
   const sectorAlignment: SectorAlignmentEntry[] = topSectors.map((sector) => {
     const currentValue = exposureBySector.get(sector.sector) ?? 0;
     const currentExposure = portfolioValue > 0 ? currentValue / portfolioValue : 0;
-    const sectorCandidates = topCandidates.filter((c) => c.sector === sector.sector);
+    const sectorCandidates = scored.filter((c) => c.sector === sector.sector);
     const topCandidate = sectorCandidates[0]?.symbol ?? universeMap[sector.sector]?.sectorEtf ?? "—";
 
     return {
