@@ -188,6 +188,7 @@ model AgentRun {
   output      Json?
   errorMessage String?
   actionItems ActionItem[]
+  candidateRecommendationLogs CandidateRecommendationLog[]
 
   @@index([agentType, startedAt])
 }
@@ -247,6 +248,42 @@ model RecommendationOutcome {
   updatedAt       DateTime     @updatedAt
 
   @@unique([weeklyBriefId, actionItemIndex])
+}
+
+/// A persistent snapshot of one Candidate Scanner "Top Candidates" entry at
+/// the time it was surfaced, tracked unconditionally (unlike
+/// RecommendationOutcome, which only tracks CIO recommendations a human
+/// confirmed executing). Every successful CANDIDATE_SCANNER AgentRun logs one
+/// row per top candidate here (see logCandidateRecommendationBatch in
+/// lib/agents/candidateRecommendationLog.ts), tagged with batchTag so
+/// successive weekly refreshes are chronologically distinguishable and
+/// comparable — e.g. to see whether last week's top pick actually
+/// outperformed over the following 30/90 days.
+model CandidateRecommendationLog {
+  id                 String   @id @default(cuid())
+  sourceAgentRun     AgentRun @relation(fields: [sourceAgentRunId], references: [id])
+  sourceAgentRunId   String
+  /// Groups the rows produced by one scan into a comparable batch — routine automatic batches use "top15-YYYY-MM-DD" (the scan date); see notes for batches with special provenance (e.g. this table's first batch, logged after the SPDR-derived universe expansion).
+  batchTag           String
+  symbol             String
+  sector             String
+  accountType        String
+  /// 0-100 composite score at the time of recommendation.
+  score              Int
+  /// This symbol's own return minus the S&P 500's return over the same window, in percentage points, at the time of recommendation.
+  vsSpx              Float
+  /// Blended multi-horizon momentum (decimal fraction) at the time of recommendation — see MomentumBlend.raw in technicals.ts. Null if unavailable.
+  momentum1Y         Float?
+  recommendationType String
+  recommendedAt      DateTime
+  /// Relative performance (symbol return minus S&P 500 return, decimal fraction) 30/90 days after recommendedAt. Null until enough time has elapsed.
+  outcome30d         Float?
+  outcome90d         Float?
+  notes              String?
+  createdAt          DateTime @default(now())
+
+  @@index([batchTag])
+  @@index([symbol, recommendedAt])
 }
 
 /// The current data-driven candidate universe for one sector, refreshed

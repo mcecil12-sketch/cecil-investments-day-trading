@@ -5,6 +5,7 @@ import { runSectorRotationAgent, type SectorScore, type SectorRotationFlag, type
 import { runRiskManagerAgent, type RiskFlag, type OpportunityCostEntry, type RiskManagerOutput } from "@/lib/agents/riskManager";
 import { runCandidateScannerAgent, type CandidateEntry, type CandidateScannerOutput } from "@/lib/agents/candidateScanner";
 import { refreshCandidateUniverse, type UniverseRefreshResult } from "@/lib/agents/candidateUniverse";
+import { logCandidateRecommendationBatch } from "@/lib/agents/candidateRecommendationLog";
 import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
 import { buildTaxableAnalysisContext, type TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
 import { sendWeeklyBriefNotification } from "@/lib/notifications/weeklyBrief";
@@ -338,6 +339,12 @@ export async function runAndPersistCandidateScanner(): Promise<CandidateScannerR
         }),
       ),
     ]);
+
+    try {
+      await logCandidateRecommendationBatch(run.id, output);
+    } catch (err) {
+      console.error("logCandidateRecommendationBatch failed:", err);
+    }
 
     return { runId: run.id, status: "COMPLETE", output };
   } catch (err) {

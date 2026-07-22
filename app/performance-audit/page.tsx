@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { refreshRecommendationOutcomes } from "@/lib/agents/performanceAudit";
+import { refreshCandidateRecommendationOutcomes } from "@/lib/agents/candidateRecommendationLog";
 import { formatDate, formatPercent, alphaColor } from "@/lib/format";
 import { OutcomeControls } from "./OutcomeControls";
 
@@ -33,6 +34,12 @@ export default async function PerformanceAuditPage() {
     await refreshRecommendationOutcomes();
   } catch (err) {
     console.error("refreshRecommendationOutcomes failed:", err);
+  }
+
+  try {
+    await refreshCandidateRecommendationOutcomes();
+  } catch (err) {
+    console.error("refreshCandidateRecommendationOutcomes failed:", err);
   }
 
   const weeklyBriefs = await prisma.weeklyBrief.findMany({
