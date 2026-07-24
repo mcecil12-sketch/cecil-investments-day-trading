@@ -2,6 +2,8 @@ import { prisma } from "@/lib/prisma";
 import { computeBenchmark, FIDELITY_PERIODS } from "@/lib/benchmark/engine";
 import type { AccountBenchmarkResult, BenchmarkComputation, FidelityPeriodKey } from "@/lib/benchmark/engine";
 import { alphaColor, formatCompactCurrency, formatCurrency, formatPercent } from "@/lib/format";
+import { getRecommendationPerformance } from "@/lib/agents/recommendationPerformance";
+import { RecommendationPerformanceCharts } from "./RecommendationPerformanceCharts";
 
 export const dynamic = "force-dynamic";
 
@@ -22,6 +24,13 @@ export default async function DashboardPage() {
   }
 
   const accounts = await prisma.account.findMany({ orderBy: { createdAt: "asc" } });
+
+  let recPerformance: Awaited<ReturnType<typeof getRecommendationPerformance>> | null = null;
+  try {
+    recPerformance = await getRecommendationPerformance(computation?.totalCurrentValue);
+  } catch (err) {
+    console.error("getRecommendationPerformance failed:", err);
+  }
 
   if (computeError || !computation) {
     return (
@@ -162,6 +171,27 @@ export default async function DashboardPage() {
           <p style={{ color: "var(--text-muted)" }}>No accounts yet — add one and import a statement first.</p>
         )}
       </div>
+
+      {recPerformance && (
+        <RecommendationPerformanceCharts
+          pickQuality={recPerformance.pickQuality.map((p) => ({
+            date: p.date.toISOString().slice(0, 10),
+            pickReturn: p.pickReturn,
+            spxReturn: p.spxReturn,
+            activeCount: p.activeCount,
+          }))}
+          simulatedPortfolio={recPerformance.simulatedPortfolio.map((p) => ({
+            date: p.date.toISOString().slice(0, 10),
+            portfolioValue: p.portfolioValue,
+            pnl: p.pnl,
+            pnlPct: p.pnlPct,
+            activeCount: p.activeCount,
+          }))}
+          baseValue={recPerformance.baseValue}
+          trackedSince={recPerformance.trackedSince ? recPerformance.trackedSince.toISOString() : null}
+          totalRecommendations={recPerformance.totalRecommendations}
+        />
+      )}
     </div>
   );
 }

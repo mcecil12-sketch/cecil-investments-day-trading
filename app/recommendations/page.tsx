@@ -6,16 +6,10 @@ import type { RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
 import type { RiskManagerOutput, OpportunityCostEntry } from "@/lib/agents/riskManager";
 import type { CandidateScannerOutput, CandidateEntry } from "@/lib/agents/candidateScanner";
 import type { CioTaxableOpportunities } from "@/lib/agents/cio";
+import { convictionBand } from "@/lib/agents/positionSizing";
 import { formatCurrency, formatPercent, formatDateTime } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
-
-/** Score bands driving the "estimated position size" heuristic on the Taxable card — higher conviction gets a larger suggested slice of the taxable portfolio. */
-function convictionBand(score: number): [number, number] {
-  if (score >= 90) return [0.04, 0.06];
-  if (score >= 80) return [0.02, 0.04];
-  return [0.01, 0.02];
-}
 
 function estimatedPositionSize(score: number, totalTaxableValue: number): string {
   const [lo, hi] = convictionBand(score);
