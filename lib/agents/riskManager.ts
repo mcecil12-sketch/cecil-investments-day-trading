@@ -1,9 +1,8 @@
-import type { AccountType } from "@/lib/generated/prisma";
 import { getCurrentHoldings, totalPortfolioValue, type CurrentHolding } from "@/lib/agents/holdings";
 import { scoreCurrentHoldings } from "@/lib/agents/relativeStrength";
 import { getHoldingSector } from "@/lib/agents/sectorRotation";
 import { isLockedInstrument } from "@/lib/benchmark/lockedHoldings";
-import { getKnownFundReturns, bestAlternativeInCategory, KNOWN_SP500_RETURNS } from "@/lib/agents/fundMappings";
+import { getKnownFundReturns, bestAlternativeInCategory, KNOWN_SP500_RETURNS, type RetirementPlanId } from "@/lib/agents/fundMappings";
 import { formatPercent, formatCurrency } from "@/lib/format";
 
 export type RiskSeverity = "critical" | "watch" | "informational";
@@ -57,10 +56,22 @@ const PERSISTENCE_LAG_THRESHOLD = 0.03;
 /** Positions smaller than this aren't worth watch-level attention — they still surface, but only as informational. */
 const MIN_WATCH_POSITION_VALUE = 5000;
 
-const RETIREMENT_PLAN_ACCOUNT_TYPES: AccountType[] = ["VZ_SAVINGS_401K", "VZ_LEGACY_401K", "VZ_EDP"];
-
 function singleAccountId(holding: Pick<CurrentHolding, "accounts">): string | null {
   return holding.accounts.length === 1 ? holding.accounts[0].accountId : null;
+}
+
+/**
+ * The single retirement plan a holding belongs to, or null when it isn't a
+ * same-plan-menu holding (taxable, EDP — which has no fund menu modeled yet,
+ * or split across more than one account type). Used to scope
+ * bestAlternativeInCategory so it can never suggest swapping into a fund
+ * from a plan menu the holder isn't actually enrolled in.
+ */
+function retirementPlanId(holding: Pick<CurrentHolding, "accounts">): RetirementPlanId | null {
+  if (holding.accounts.length === 0) return null;
+  const [first, ...rest] = holding.accounts;
+  if (rest.some((a) => a.accountType !== first.accountType)) return null;
+  return first.accountType === "VZ_SAVINGS_401K" || first.accountType === "VZ_LEGACY_401K" ? first.accountType : null;
 }
 
 /** Below the minimum position size, a would-be watch flag is downgraded to informational — small positions aren't worth the attention. */
@@ -169,10 +180,10 @@ export async function runRiskManagerAgent(): Promise<RiskManagerOutput> {
     }
   }
 
-  // 5. Underperformer persistence — known returns lagging the S&P by a meaningful margin over both 3Y and 5Y.
+  // 5. Underperformer persistence — known returns lagging the S&P by a meaningful margin over both 3Y and 5Y. Funds with a short history (no 3Y/5Y on file yet) can't be evaluated here and are skipped.
   for (const holding of holdings) {
     const known = getKnownFundReturns(holding.symbol, holding.name);
-    if (!known) continue;
+    if (!known || known.threeYear == null || known.fiveYear == null) continue;
     const threeYearLag = KNOWN_SP500_RETURNS.threeYear - known.threeYear;
     const fiveYearLag = KNOWN_SP500_RETURNS.fiveYear - known.fiveYear;
     if (threeYearLag >= PERSISTENCE_LAG_THRESHOLD && fiveYearLag >= PERSISTENCE_LAG_THRESHOLD) {
@@ -187,17 +198,16 @@ export async function runRiskManagerAgent(): Promise<RiskManagerOutput> {
     }
   }
 
-  // 7. 401k opportunity cost — a large 401k position in a fund with a better-returning known peer.
+  // 7. 401k opportunity cost — a large 401k position in a fund with a better-returning known peer in the SAME plan's menu. EDP is excluded here (no fund-menu data modeled for it yet) rather than compared against Savings/Legacy plan boundaries it isn't actually part of.
   for (const holding of holdings) {
-    const isRetirementPlanHolding =
-      holding.accounts.length > 0 && holding.accounts.every((a) => RETIREMENT_PLAN_ACCOUNT_TYPES.includes(a.accountType));
-    if (!isRetirementPlanHolding) continue;
+    const plan = retirementPlanId(holding);
+    if (!plan) continue;
 
     const known = getKnownFundReturns(holding.symbol, holding.name);
-    if (!known) continue;
+    if (!known || known.fiveYear == null) continue;
 
-    const alternative = bestAlternativeInCategory(known.fundName, known.category, "fiveYear");
-    if (!alternative) continue;
+    const alternative = bestAlternativeInCategory(plan, known.fundName, known.category, "fiveYear");
+    if (!alternative || alternative.returns.fiveYear == null) continue;
 
     const gap = alternative.returns.fiveYear - known.fiveYear;
     const share = portfolioValue > 0 ? holding.currentValue / portfolioValue : 0;

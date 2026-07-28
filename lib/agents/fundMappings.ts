@@ -17,6 +17,8 @@ const FUND_PROXY_MAP: Record<string, FundProxy> = {
   "PASS US EQ INDX MA": { proxy: "SPY", isActive: false },
   "US SMALL COMPANY": { proxy: "IWM", isActive: false },
   "SMALL CAP EQTY INDX": { proxy: "IWM", isActive: false },
+  /** Mid-Atlantic's distinct "Small Cap Eqty Indx" fund — same informal display name as the Savings Plan fund above, but a different underlying fund with its own public ticker, which is why it gets its own map key instead of colliding with "SMALL CAP EQTY INDX". See KNOWN_FUND_RETURNS for the disambiguation. */
+  "TGFD": { proxy: "IWM", isActive: false },
   "ACTV US SM CAP MA": { proxy: "IWM", isActive: true },
   "AGGRESS GRW MA": { proxy: "VONG", isActive: true },
   "MAGELLAN PORTFOLIO": { proxy: "FMAGX", isActive: true },
@@ -81,9 +83,9 @@ export function closestPlanFundsForProxy(symbol: string): string[] {
 
 /**
  * Manually reported fund performance (plan statement data as of Jun 30,
- * 2026, plus YTD figures from the Fidelity balance overview screenshots as
- * of Jul 13, 2026 where noted), used in place of proxy-ETF price history
- * when available — it's the fund's own actual return rather than an
+ * 2026, plus YTD figures verified against live Fidelity plan performance
+ * pages as of Jul 24, 2026 where noted), used in place of proxy-ETF price
+ * history when available — it's the fund's own actual return rather than an
  * approximation. Grouped into a `category` so callers (e.g. the Risk
  * Manager's 401k opportunity-cost check) can compare a fund against its
  * closest peers in the known set.
@@ -96,14 +98,29 @@ export type FundCategory =
   | "verizon-stock"
   | "active-growth";
 
+/**
+ * The two Verizon 401k plans that each have their own fund menu. A fund's
+ * `plan` tag scopes which menu it belongs to, so bestAlternativeInCategory
+ * only ever compares a holding against other funds actually available for
+ * swap within the same plan — see the Phase 1 fix in AUDIT.md history for
+ * why this matters: two plans each have a fund informally called "Small Cap
+ * Eqty Indx", and without plan scoping the risk manager could recommend
+ * "swapping into" a fund the holder's plan doesn't even offer.
+ */
+export type RetirementPlanId = "VZ_SAVINGS_401K" | "VZ_LEGACY_401K";
+
 export interface FundReturns {
   oneYear: number;
-  threeYear: number;
-  fiveYear: number;
-  tenYear: number;
+  /** Omitted for funds too recently added to a plan's menu to have a real 3/5/10-year track record — see shortHistory. */
+  threeYear?: number;
+  fiveYear?: number;
+  tenYear?: number;
   category: FundCategory;
-  /** Year-to-date return as a decimal fraction (e.g. 0.1046 for +10.46%), as reported on the plan's Fidelity balance overview screenshots. Optional — only populated for funds where a current YTD figure is on file. */
+  plan: RetirementPlanId;
+  /** Year-to-date return as a decimal fraction (e.g. 0.1046 for +10.46%), as verified against the plan's Fidelity performance page. Optional — only populated for funds where a current YTD figure is on file. */
   ytdReturn?: number;
+  /** True when this fund's absence of 3/5/10-year figures reflects it being newly added to the plan's menu, not a data gap — callers should present it as "recently added" rather than implying a novel/unproven strategy. */
+  shortHistory?: boolean;
 }
 
 export interface FundReturnsMatch extends FundReturns {
@@ -114,22 +131,36 @@ export interface FundReturnsMatch extends FundReturns {
 /** S&P 500 baseline for the same reporting period, so fund returns can be compared against actual (not price-derived) index performance. */
 export const KNOWN_SP500_RETURNS = { oneYear: 0.21, threeYear: 0.18, fiveYear: 0.13 };
 
-const KNOWN_FUND_RETURNS: Record<string, FundReturns> = {
-  "US LARGE CO INDEX": { oneYear: 0.2229, threeYear: 0.2059, fiveYear: 0.1338, tenYear: 0.1549, category: "us-large-cap", ytdReturn: 0.1046 },
-  "PASS US EQ INDX MA": { oneYear: 0.2229, threeYear: 0.2057, fiveYear: 0.1337, tenYear: 0.1548, category: "us-large-cap" },
-  "US SMALL COMPANY": { oneYear: 0.3008, threeYear: 0.1796, fiveYear: 0.0493, tenYear: 0.136, category: "us-small-cap", ytdReturn: 0.1653 },
-  "SMALL CAP EQTY INDX": { oneYear: 0.4092, threeYear: 0.1872, fiveYear: 0.0712, tenYear: 0.1047, category: "us-small-cap", ytdReturn: -0.0186 },
-  "ACTV US SM CAP MA": { oneYear: 0.3043, threeYear: 0.1805, fiveYear: 0.0527, tenYear: 0.1384, category: "us-small-cap" },
-  "AGGRESS GRW MA": { oneYear: 0.215, threeYear: 0.1707, fiveYear: 0.0674, tenYear: 0.1234, category: "active-growth" },
-  "MAGELLAN PORTFOLIO": { oneYear: 0.0767, threeYear: 0.1917, fiveYear: 0.1088, tenYear: 0.1787, category: "active-growth" },
-  "EMERGING MARKETS": { oneYear: 0.3728, threeYear: 0.1964, fiveYear: 0.0454, tenYear: 0.0902, category: "emerging-markets", ytdReturn: -0.0285 },
-  "VERIZON STOCK FUND": { oneYear: 0.0453, threeYear: 0.1169, fiveYear: 0.0066, tenYear: 0.0257, category: "verizon-stock" },
-  "INTL COMPANY INDEX": { oneYear: 0.2048, threeYear: 0.1677, fiveYear: 0.0942, tenYear: 0.0999, category: "intl-developed" },
-  "ACTV INTL EQ MA": { oneYear: 0.1411, threeYear: 0.1367, fiveYear: 0.0617, tenYear: 0.0848, category: "intl-developed" },
-  "DIVERSIFIED INTL": { oneYear: 0.2295, threeYear: 0.1749, fiveYear: 0.0838, tenYear: 0.1483, category: "intl-developed" },
+const KNOWN_FUND_RETURNS_BY_PLAN: Record<RetirementPlanId, Record<string, FundReturns>> = {
+  VZ_SAVINGS_401K: {
+    "US LARGE CO INDEX": { oneYear: 0.2229, threeYear: 0.2059, fiveYear: 0.1338, tenYear: 0.1549, category: "us-large-cap", plan: "VZ_SAVINGS_401K", ytdReturn: 0.0897 },
+    "US SMALL COMPANY": { oneYear: 0.3008, threeYear: 0.1796, fiveYear: 0.0493, tenYear: 0.136, category: "us-small-cap", plan: "VZ_SAVINGS_401K", ytdReturn: 0.1477 },
+    "SMALL CAP EQTY INDX": { oneYear: 0.4092, threeYear: 0.1872, fiveYear: 0.0712, tenYear: 0.1047, category: "us-small-cap", plan: "VZ_SAVINGS_401K", ytdReturn: -0.0261 },
+    "EMERGING MARKETS": { oneYear: 0.3728, threeYear: 0.1964, fiveYear: 0.0454, tenYear: 0.0902, category: "emerging-markets", plan: "VZ_SAVINGS_401K", ytdReturn: -0.0448 },
+    /** Company stock match fund — held under multiple Verizon plans/EDP; tagged here nominally since it has no in-category peer to compare against, so the plan tag doesn't affect any bestAlternativeInCategory match. */
+    "VERIZON STOCK FUND": { oneYear: 0.0453, threeYear: 0.1169, fiveYear: 0.0066, tenYear: 0.0257, category: "verizon-stock", plan: "VZ_SAVINGS_401K" },
+    "INTL COMPANY INDEX": { oneYear: 0.2048, threeYear: 0.1677, fiveYear: 0.0942, tenYear: 0.0999, category: "intl-developed", plan: "VZ_SAVINGS_401K" },
+    "DIVERSIFIED INTL": { oneYear: 0.2295, threeYear: 0.1749, fiveYear: 0.0838, tenYear: 0.1483, category: "intl-developed", plan: "VZ_SAVINGS_401K" },
+  },
+  VZ_LEGACY_401K: {
+    "PASS US EQ INDX MA": { oneYear: 0.2229, threeYear: 0.2057, fiveYear: 0.1337, tenYear: 0.1548, category: "us-large-cap", plan: "VZ_LEGACY_401K", ytdReturn: 0.0897 },
+    "ACTV US SM CAP MA": { oneYear: 0.3043, threeYear: 0.1805, fiveYear: 0.0527, tenYear: 0.1384, category: "us-small-cap", plan: "VZ_LEGACY_401K", ytdReturn: -0.0321 },
+    "AGGRESS GRW MA": { oneYear: 0.215, threeYear: 0.1707, fiveYear: 0.0674, tenYear: 0.1234, category: "active-growth", plan: "VZ_LEGACY_401K", ytdReturn: 0.0887 },
+    /** Corrected Phase 1 mapping — Magellan Portfolio belongs to Verizon Mid-Atlantic (VZ_LEGACY_401K), not the Savings Plan. Previously mis-mapped, which made bestAlternativeInCategory miss AGGRESS GRW MA as a real same-plan active-growth alternative. */
+    "MAGELLAN PORTFOLIO": { oneYear: 0.0767, threeYear: 0.1917, fiveYear: 0.1088, tenYear: 0.1787, category: "active-growth", plan: "VZ_LEGACY_401K", ytdReturn: 0.0347 },
+    "ACTV INTL EQ MA": { oneYear: 0.1411, threeYear: 0.1367, fiveYear: 0.0617, tenYear: 0.0848, category: "intl-developed", plan: "VZ_LEGACY_401K" },
+    /** Mid-Atlantic's own distinct "Small Cap Eqty Indx" fund (ticker TGFD) — not currently held, and recently added to this plan's menu, hence no 3/5/10-year figures on file yet. Do NOT collapse this with the Savings Plan's same-named fund above; they are different funds with different returns. */
+    "TGFD": { oneYear: 0.4095, category: "us-small-cap", plan: "VZ_LEGACY_401K", ytdReturn: 0.1887, shortHistory: true },
+  },
 };
 
-/** Looks up known reported returns by fund symbol or name, same dual-lookup convention as getFundProxy. */
+/** Flattened view across both plans, for callers (momentum scoring) that just need "the known returns for this holding" regardless of which plan it's in — safe to merge since fund identities no longer collide across plans (see RetirementPlanId). */
+const KNOWN_FUND_RETURNS: Record<string, FundReturns> = {
+  ...KNOWN_FUND_RETURNS_BY_PLAN.VZ_SAVINGS_401K,
+  ...KNOWN_FUND_RETURNS_BY_PLAN.VZ_LEGACY_401K,
+};
+
+/** Looks up known reported returns by fund symbol or name, same dual-lookup convention as getFundProxy. Plan-agnostic — use bestAlternativeInCategory for plan-scoped comparisons. */
 export function getKnownFundReturns(symbol: string, name?: string | null): FundReturnsMatch | null {
   const candidates = [symbol, name].filter((v): v is string => Boolean(v)).map((v) => v.trim().toUpperCase());
   for (const candidate of candidates) {
@@ -139,16 +170,19 @@ export function getKnownFundReturns(symbol: string, name?: string | null): FundR
   return null;
 }
 
-/** The best-returning known fund in the same category, excluding the fund itself — used to size opportunity cost. */
+/** The best-returning known fund in the same category and same plan menu, excluding the fund itself — used to size opportunity cost. Returns null (rather than a cross-plan match) when no real same-plan alternative exists. */
 export function bestAlternativeInCategory(
+  plan: RetirementPlanId,
   excludeFundName: string,
   category: FundCategory,
   horizon: "threeYear" | "fiveYear" = "fiveYear",
 ): { fundName: string; returns: FundReturns } | null {
   let best: { fundName: string; returns: FundReturns } | null = null;
-  for (const [fundName, returns] of Object.entries(KNOWN_FUND_RETURNS)) {
+  for (const [fundName, returns] of Object.entries(KNOWN_FUND_RETURNS_BY_PLAN[plan])) {
     if (fundName === excludeFundName || returns.category !== category) continue;
-    if (!best || returns[horizon] > best.returns[horizon]) best = { fundName, returns };
+    const value = returns[horizon];
+    if (value == null) continue;
+    if (!best || value > (best.returns[horizon] ?? -Infinity)) best = { fundName, returns };
   }
   return best;
 }

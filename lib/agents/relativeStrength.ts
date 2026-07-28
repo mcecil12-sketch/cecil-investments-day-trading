@@ -113,10 +113,12 @@ export async function scoreCurrentHoldings(): Promise<RelativeStrengthScoringRes
         momentum = knownReturns.oneYear;
         ytdReturn = knownReturns.ytdReturn ?? null;
 
-        // Composite return blends YTD/1Y/3Y/5Y when a YTD figure is on file;
-        // otherwise scoring falls back to 1Y momentum only, same as before.
+        // Composite return blends YTD/1Y/3Y/5Y when a YTD figure AND full 3/5-year
+        // history are on file; short-history funds (recently added to a plan's
+        // menu, no 3Y/5Y yet) fall back to 1Y momentum only, same as funds with
+        // no YTD figure on file.
         const compositeReturn =
-          ytdReturn != null
+          ytdReturn != null && knownReturns.threeYear != null && knownReturns.fiveYear != null
             ? ytdReturn * YTD_WEIGHT +
               knownReturns.oneYear * ONE_YEAR_WEIGHT +
               knownReturns.threeYear * THREE_YEAR_WEIGHT +
