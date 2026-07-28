@@ -64,6 +64,7 @@ model Account {
   benchmarkResults BenchmarkResult[]
   actionItems      ActionItem[]
   performances     AccountPerformance[]
+  planFundMenuEntries PlanFundMenuEntry[]
 }
 
 model Instrument {
@@ -89,6 +90,7 @@ model ImportBatch {
   rowCount         Int               @default(0)
   holdings         Holding[]
   benchmarkResults BenchmarkResult[]
+  planFundMenuEntries PlanFundMenuEntry[]
 
   @@index([accountId, asOfDate])
 }
@@ -140,6 +142,41 @@ model Holding {
 
   @@index([accountId, asOfDate])
   @@index([instrumentId])
+}
+
+/// One row per fund in a 401k plan's complete "Investment Choices" menu, as
+/// extracted from the plan's Fidelity fund-menu PDF — the authoritative,
+/// complete list of every fund the plan offers (typically 20-30 entries),
+/// not just the ones currently held. Scoped to a single plan via accountId
+/// (each Verizon plan — Savings, Mid-Atlantic — is its own Account), so two
+/// plans' same-named funds (e.g. both informally called "Small Cap Eqty
+/// Indx") can never collide: they're simply two rows under two different
+/// accountIds. isHeld mirrors the PDF's checkmark column and is independent
+/// of whether a Holding row exists for this fund (a fund can be in the menu
+/// without ever having been imported as a position). A re-upload of the same
+/// plan's menu upserts by (accountId, fundName) rather than duplicating.
+model PlanFundMenuEntry {
+  id            String       @id @default(cuid())
+  account       Account      @relation(fields: [accountId], references: [id])
+  accountId     String
+  fundName      String
+  assetClass    String?
+  /// Public ticker, only populated when the fund has one (most proprietary institutional 401k funds don't) — see fundMappings.ts's plan-scoped disambiguation, which prefers ticker over name when both plans have a same-named fund.
+  ticker        String?
+  oneYear       Float?
+  threeYear     Float?
+  fiveYear      Float?
+  tenYear       Float?
+  inceptionDate DateTime?
+  isHeld        Boolean      @default(false)
+  asOfDate      DateTime
+  importBatch   ImportBatch? @relation(fields: [importBatchId], references: [id])
+  importBatchId String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@unique([accountId, fundName])
+  @@index([accountId])
 }
 
 /// Cached daily S&P 500 (^GSPC) closing prices, so benchmark math doesn't hit
