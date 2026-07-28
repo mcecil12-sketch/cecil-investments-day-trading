@@ -40,9 +40,15 @@ export default async function ImportPage() {
     }),
     prisma.account.findMany({
       orderBy: { createdAt: "asc" },
-      select: { id: true, name: true, externalId: true },
+      select: { id: true, name: true, externalId: true, type: true },
     }),
   ]);
+
+  // The fund menu is a 401k-plan-only concept — a taxable brokerage account
+  // has no "menu" to speak of, so it shouldn't appear as an import target here.
+  const planAccounts = accounts.filter(
+    (account) => account.type === "VZ_SAVINGS_401K" || account.type === "VZ_LEGACY_401K",
+  );
 
   // PDF uploads create one ImportBatch per account, all sharing the source
   // file's name — group by fileName so the history table can show "PDF
@@ -81,14 +87,15 @@ export default async function ImportPage() {
       )}
 
       <h2>Upload Plan Fund Menu (PDF or Screenshot)</h2>
-      {accounts.length === 0 ? (
+      {planAccounts.length === 0 ? (
         <div className="card">
           <p style={{ color: "var(--text-muted)" }}>
-            Add an account first — the fund menu needs a plan account to import into.
+            Add a Verizon Savings Plan or Mid-Atlantic 401k account first — the fund menu needs a plan account to
+            import into.
           </p>
         </div>
       ) : (
-        <FundMenuPdfImportForm accounts={accounts} />
+        <FundMenuPdfImportForm accounts={planAccounts} />
       )}
 
       <h2>Upload Screenshot</h2>

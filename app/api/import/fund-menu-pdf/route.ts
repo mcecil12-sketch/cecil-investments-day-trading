@@ -37,23 +37,25 @@ function resolveContentBlock(
 
 export async function POST(request: NextRequest) {
   const formData = await request.formData().catch(() => null);
-  const file = formData?.get("file");
+  const files = formData?.getAll("file").filter((f): f is File => f instanceof File) ?? [];
 
-  if (!file || !(file instanceof File)) {
+  if (files.length === 0) {
     return NextResponse.json({ error: "Missing 'file' in form data" }, { status: 400 });
   }
 
-  const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
-  const isImage = Boolean(IMAGE_MEDIA_TYPES[file.type]);
-  if (!isPdf && !isImage) {
-    return NextResponse.json({ error: "Only PDF, PNG, or JPG files are supported" }, { status: 400 });
-  }
-  const maxBytes = isPdf ? MAX_PDF_BYTES : MAX_IMAGE_BYTES;
-  if (file.size > maxBytes) {
-    return NextResponse.json(
-      { error: `${isPdf ? "PDF" : "Image"} must be under ${maxBytes / (1024 * 1024)}MB` },
-      { status: 400 },
-    );
+  for (const file of files) {
+    const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+    const isImage = Boolean(IMAGE_MEDIA_TYPES[file.type]);
+    if (!isPdf && !isImage) {
+      return NextResponse.json({ error: `Only PDF, PNG, or JPG files are supported (got ${file.name})` }, { status: 400 });
+    }
+    const maxBytes = isPdf ? MAX_PDF_BYTES : MAX_IMAGE_BYTES;
+    if (file.size > maxBytes) {
+      return NextResponse.json(
+        { error: `${file.name}: ${isPdf ? "PDF" : "Image"} must be under ${maxBytes / (1024 * 1024)}MB` },
+        { status: 400 },
+      );
+    }
   }
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -64,10 +66,18 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const base64 = Buffer.from(await file.arrayBuffer()).toString("base64");
-  const contentBlock = resolveContentBlock(file, base64);
-  if (!contentBlock) {
-    return NextResponse.json({ error: "Only PDF, PNG, or JPG files are supported" }, { status: 400 });
+  // Files are sent as ordered content blocks in a single message — when more
+  // than one is provided, the prompt's MULTIPLE IMAGES section instructs
+  // Claude to treat them as sequential parts of one continuous table (e.g.
+  // successive scroll screenshots) rather than independent documents.
+  const contentBlocks = [];
+  for (const file of files) {
+    const base64 = Buffer.from(await file.arrayBuffer()).toString("base64");
+    const block = resolveContentBlock(file, base64);
+    if (!block) {
+      return NextResponse.json({ error: `Only PDF, PNG, or JPG files are supported (got ${file.name})` }, { status: 400 });
+    }
+    contentBlocks.push(block);
   }
   const client = new Anthropic({ apiKey });
 
@@ -88,8 +98,14 @@ export async function POST(request: NextRequest) {
         {
           role: "user",
           content: [
-            contentBlock,
-            { type: "text", text: "Extract the complete fund menu from this Fidelity plan performance page as JSON." },
+            ...contentBlocks,
+            {
+              type: "text",
+              text:
+                files.length > 1
+                  ? `Extract the complete fund menu from these ${files.length} images — they are sequential parts of one continuous table (e.g. successive scroll screenshots of the same plan performance page) — as a single combined JSON result.`
+                  : "Extract the complete fund menu from this Fidelity plan performance page as JSON.",
+            },
           ],
         },
       ],
