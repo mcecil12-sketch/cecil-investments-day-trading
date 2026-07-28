@@ -1,13 +1,12 @@
 import { prisma } from "@/lib/prisma";
-import { getCurrentHoldings } from "@/lib/agents/holdings";
 import { buildTaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
 import type { SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import type { RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
-import type { RiskManagerOutput, OpportunityCostEntry } from "@/lib/agents/riskManager";
 import type { CandidateScannerOutput, CandidateEntry } from "@/lib/agents/candidateScanner";
 import type { CioTaxableOpportunities } from "@/lib/agents/cio";
 import { convictionBand } from "@/lib/agents/positionSizing";
 import { formatCurrency, formatPercent, formatDateTime } from "@/lib/format";
+import { buildPlanFundComparisons, type PeerVerdictKind } from "@/lib/agents/planFundComparison";
 
 export const dynamic = "force-dynamic";
 
@@ -19,49 +18,92 @@ function estimatedPositionSize(score: number, totalTaxableValue: number): string
 }
 
 async function getRecommendationsData() {
-  const [candidateRun, riskRun, sectorRun, relativeRun, weeklyBrief, accounts, holdings] = await Promise.all([
+  const [candidateRun, sectorRun, relativeRun, weeklyBrief, planFundComparisons] = await Promise.all([
     prisma.agentRun.findFirst({ where: { agentType: "CANDIDATE_SCANNER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
-    prisma.agentRun.findFirst({ where: { agentType: "RISK_MANAGER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
     prisma.agentRun.findFirst({ where: { agentType: "SECTOR_ROTATION", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
     prisma.agentRun.findFirst({ where: { agentType: "RELATIVE_STRENGTH", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
     prisma.weeklyBrief.findFirst({ orderBy: { weekOf: "desc" } }),
-    prisma.account.findMany(),
-    getCurrentHoldings(),
+    buildPlanFundComparisons(),
   ]);
 
   const candidateOutput = candidateRun?.output as unknown as CandidateScannerOutput | undefined;
-  const riskOutput = riskRun?.output as unknown as RiskManagerOutput | undefined;
   const sectorOutput = sectorRun?.output as unknown as SectorRotationOutput | undefined;
   const relativeOutput = relativeRun?.output as unknown as RelativeStrengthOutput | undefined;
   const taxableOpportunities = (weeklyBrief?.taxableOpportunities as unknown as CioTaxableOpportunities | null) ?? null;
 
   const taxableContext = await buildTaxableAnalysisContext(sectorOutput ?? null, relativeOutput ?? null);
 
-  const accountNameById = new Map(accounts.map((a) => [a.id, a.name]));
-  const planFundRows = (riskOutput?.opportunityCost ?? []).map((entry: OpportunityCostEntry) => {
-    const holding = holdings.find((h) => h.symbol === entry.symbol);
-    const accountNames = holding
-      ? [...new Set(holding.accounts.map((a) => accountNameById.get(a.accountId) ?? a.accountId))]
-      : [];
-    return {
-      symbol: entry.symbol,
-      currentFund: entry.name ?? entry.symbol,
-      recommendedFund: entry.alternativeName,
-      performanceGap: entry.gap,
-      accounts: accountNames,
-    };
-  });
-
   return {
     candidateOutput,
     candidateRunAt: candidateRun?.completedAt ?? candidateRun?.startedAt ?? null,
-    planFundRows,
+    planFundComparisons,
     taxableOpportunities,
     totalTaxableValue: taxableContext?.totalTaxableValue ?? 0,
   };
 }
 
 const SIGNIFICANT_VS_SPX = 15;
+
+const VERDICT_COLOR: Record<PeerVerdictKind, string | undefined> = {
+  "peer-confirmed-better": "var(--negative)",
+  "held-confirmed-better": "var(--positive)",
+  mixed: undefined,
+  "peer-short-history": undefined,
+  "no-overlap": undefined,
+};
+
+function renderPlanFundComparisons(plans: Awaited<ReturnType<typeof buildPlanFundComparisons>>) {
+  const anyHeld = plans.some((p) => p.heldComparisons.length > 0);
+  if (!anyHeld) {
+    return (
+      <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+        No held 401k funds identified in either plan&apos;s imported fund menu.
+      </p>
+    );
+  }
+  return (
+    <>
+      {plans.map((plan) => (
+        <div key={plan.accountId} style={{ marginTop: "0.75rem" }}>
+          <div className="agent-card-header" style={{ marginBottom: "0.25rem" }}>
+            <span className="agent-card-name" style={{ fontSize: "0.85rem" }}>
+              {plan.accountName}
+            </span>
+            <span style={{ color: "var(--text-muted)", fontSize: "0.75rem" }}>{plan.totalFunds} funds in menu</span>
+          </div>
+          {plan.heldComparisons.length === 0 ? (
+            <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+              No held funds identified in this plan&apos;s imported menu.
+            </p>
+          ) : (
+            plan.heldComparisons.map((hc) => (
+              <div className="finding-row" key={hc.fund.fundName}>
+                <span className="finding-symbol">
+                  {hc.fund.fundName} — 1Y {formatPercent(hc.fund.oneYear)} · 3Y {formatPercent(hc.fund.threeYear)} · 5Y{" "}
+                  {formatPercent(hc.fund.fiveYear)}
+                </span>
+                <span className="finding-detail" style={{ color: hc.isBestInCategory ? "var(--positive)" : undefined }}>
+                  {hc.summary}
+                </span>
+                {hc.peers.map((pc) => (
+                  <span
+                    className="finding-detail"
+                    key={pc.peer.fundName}
+                    style={{ marginTop: "0.3rem", color: VERDICT_COLOR[pc.verdictKind] }}
+                  >
+                    vs {pc.peer.fundName}
+                    {pc.peer.isHeld ? " (also held)" : ""} — 1Y {formatPercent(pc.peer.oneYear)} · 3Y{" "}
+                    {formatPercent(pc.peer.threeYear)} · 5Y {formatPercent(pc.peer.fiveYear)}: {pc.detail}
+                  </span>
+                ))}
+              </div>
+            ))
+          )}
+        </div>
+      ))}
+    </>
+  );
+}
 
 function renderTopCandidates(candidates: CandidateEntry[]) {
   if (candidates.length === 0) {
@@ -109,7 +151,7 @@ function renderTopCandidates(candidates: CandidateEntry[]) {
 }
 
 export default async function RecommendationsPage() {
-  const { candidateOutput, candidateRunAt, planFundRows, taxableOpportunities, totalTaxableValue } =
+  const { candidateOutput, candidateRunAt, planFundComparisons, taxableOpportunities, totalTaxableValue } =
     await getRecommendationsData();
 
   const taxableCandidates = (candidateOutput?.topCandidates ?? []).filter((c) => c.accountType !== "401k");
@@ -176,37 +218,11 @@ export default async function RecommendationsPage() {
       <div className="card">
         <strong>401k Specific Recommendations</strong>
         <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginTop: "0.25rem" }}>
-          Actionable swaps within each plan&apos;s fixed fund menu — a current fund with a better-returning peer already
-          available in the same Verizon plan.
+          Every held fund compared against genuine same-plan, same-category alternatives from the plan&apos;s complete
+          imported fund menu, across 1Y/3Y/5Y — not a single cherry-picked horizon. Funds recently added to a plan&apos;s
+          menu are flagged as such rather than implied to be unproven.
         </p>
-        {planFundRows.length === 0 ? (
-          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>No actionable 401k swaps flagged this week.</p>
-        ) : (
-          <div className="table-wrap" style={{ marginTop: "0.5rem" }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Current Fund</th>
-                  <th>Recommended Fund</th>
-                  <th>Performance Gap (5Y)</th>
-                  <th>Account</th>
-                </tr>
-              </thead>
-              <tbody>
-                {planFundRows.map((row) => (
-                  <tr key={row.symbol}>
-                    <td>{row.currentFund}</td>
-                    <td>{row.recommendedFund}</td>
-                    <td className="mono" style={{ color: "var(--negative)" }}>
-                      +{formatPercent(row.performanceGap)}
-                    </td>
-                    <td style={{ fontSize: "0.85rem" }}>{row.accounts.join(", ") || "—"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+        {renderPlanFundComparisons(planFundComparisons)}
       </div>
 
       <div className="card">
