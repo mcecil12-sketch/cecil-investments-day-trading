@@ -3,7 +3,37 @@ import Anthropic from "@anthropic-ai/sdk";
 import { PDF_FUND_MENU_EXTRACTION_SYSTEM_PROMPT, parseFundMenuPdfExtractionResponse } from "@/lib/portfolio/fundMenuPdfImport";
 import { normalizeAsOfDate } from "@/lib/portfolio/dateNormalize";
 
-const MAX_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_PDF_BYTES = 32 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+const IMAGE_MEDIA_TYPES: Record<string, "image/png" | "image/jpeg"> = {
+  "image/png": "image/png",
+  "image/jpeg": "image/jpeg",
+  "image/jpg": "image/jpeg",
+};
+
+/**
+ * Fund menu documents come either as a full Fidelity PDF export or a
+ * screenshot of the same plan performance page — same columns, same
+ * extraction target, so both feed the same prompt/schema rather than
+ * duplicating the whole pipeline the way Positions PDF vs. Positions
+ * Screenshot ended up duplicated. Returns null for an unsupported type.
+ */
+function resolveContentBlock(
+  file: File,
+  base64: string,
+): { type: "document"; source: { type: "base64"; media_type: "application/pdf"; data: string } }
+  | { type: "image"; source: { type: "base64"; media_type: "image/png" | "image/jpeg"; data: string } }
+  | null {
+  if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
+    return { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } };
+  }
+  const imageMediaType = IMAGE_MEDIA_TYPES[file.type];
+  if (imageMediaType) {
+    return { type: "image", source: { type: "base64", media_type: imageMediaType, data: base64 } };
+  }
+  return null;
+}
 
 export async function POST(request: NextRequest) {
   const formData = await request.formData().catch(() => null);
@@ -12,11 +42,18 @@ export async function POST(request: NextRequest) {
   if (!file || !(file instanceof File)) {
     return NextResponse.json({ error: "Missing 'file' in form data" }, { status: 400 });
   }
-  if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
-    return NextResponse.json({ error: "Only PDF files are supported" }, { status: 400 });
+
+  const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+  const isImage = Boolean(IMAGE_MEDIA_TYPES[file.type]);
+  if (!isPdf && !isImage) {
+    return NextResponse.json({ error: "Only PDF, PNG, or JPG files are supported" }, { status: 400 });
   }
-  if (file.size > MAX_FILE_BYTES) {
-    return NextResponse.json({ error: "PDF must be under 32MB" }, { status: 400 });
+  const maxBytes = isPdf ? MAX_PDF_BYTES : MAX_IMAGE_BYTES;
+  if (file.size > maxBytes) {
+    return NextResponse.json(
+      { error: `${isPdf ? "PDF" : "Image"} must be under ${maxBytes / (1024 * 1024)}MB` },
+      { status: 400 },
+    );
   }
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -28,6 +65,10 @@ export async function POST(request: NextRequest) {
   }
 
   const base64 = Buffer.from(await file.arrayBuffer()).toString("base64");
+  const contentBlock = resolveContentBlock(file, base64);
+  if (!contentBlock) {
+    return NextResponse.json({ error: "Only PDF, PNG, or JPG files are supported" }, { status: 400 });
+  }
   const client = new Anthropic({ apiKey });
 
   let responseText: string;
@@ -47,11 +88,8 @@ export async function POST(request: NextRequest) {
         {
           role: "user",
           content: [
-            {
-              type: "document",
-              source: { type: "base64", media_type: "application/pdf", data: base64 },
-            },
-            { type: "text", text: "Extract the complete fund menu from this Fidelity plan performance PDF as JSON." },
+            contentBlock,
+            { type: "text", text: "Extract the complete fund menu from this Fidelity plan performance page as JSON." },
           ],
         },
       ],
@@ -60,7 +98,7 @@ export async function POST(request: NextRequest) {
     const textBlock = message.content.find((block) => block.type === "text");
     if (!textBlock || textBlock.type !== "text") {
       return NextResponse.json(
-        { error: "Claude didn't return any readable content for this PDF" },
+        { error: "Claude didn't return any readable content for this file" },
         { status: 502 },
       );
     }

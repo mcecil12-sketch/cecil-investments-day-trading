@@ -130,12 +130,16 @@ export function FundMenuPdfImportForm({ accounts }: { accounts: AccountOption[] 
         onDragLeave={() => setDragging(false)}
         onDrop={handleDrop}
       >
-        <div className="dropzone-title">{fileName ?? "Upload plan fund menu PDF"}</div>
-        <div className="dropzone-hint">The complete "Investment Choices" list from Fidelity's plan performance page — all funds, held or not</div>
+        <div className="dropzone-title">{fileName ?? "Upload plan fund menu (PDF or screenshot)"}</div>
+        <div className="dropzone-hint">
+          The complete "Investment Choices" list from Fidelity's plan performance page — all funds, held or not. PDF
+          export or a PNG/JPG screenshot of the same page both work; if a screenshot only captures part of a longer
+          table, check the extracted count against the plan's actual fund count before importing.
+        </div>
         <input
           ref={inputRef}
           type="file"
-          accept=".pdf,application/pdf"
+          accept=".pdf,application/pdf,.png,.jpg,.jpeg,image/png,image/jpeg"
           onChange={(e) => {
             const selected = e.target.files?.[0];
             if (selected) handleFile(selected);

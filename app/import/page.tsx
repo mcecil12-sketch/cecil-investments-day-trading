@@ -80,7 +80,7 @@ export default async function ImportPage() {
         <PerformancePdfImportForm accounts={accounts} />
       )}
 
-      <h2>Upload Plan Fund Menu PDF</h2>
+      <h2>Upload Plan Fund Menu (PDF or Screenshot)</h2>
       {accounts.length === 0 ? (
         <div className="card">
           <p style={{ color: "var(--text-muted)" }}>

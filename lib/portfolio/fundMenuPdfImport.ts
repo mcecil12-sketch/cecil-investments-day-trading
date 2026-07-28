@@ -26,7 +26,7 @@ export interface FundMenuPdfExtractionResult {
   accounts: ExtractedFundMenuAccount[];
 }
 
-export const PDF_FUND_MENU_EXTRACTION_SYSTEM_PROMPT = `You are a financial data extractor. Extract the COMPLETE fund menu ("Investment Choices") from this Fidelity 401k plan performance PDF. This is a reference document listing every fund the plan offers — not a positions/holdings statement. Extract every row, whether or not it's currently held. Return ONLY valid JSON, no markdown, no explanation:
+export const PDF_FUND_MENU_EXTRACTION_SYSTEM_PROMPT = `You are a financial data extractor. Extract the COMPLETE fund menu ("Investment Choices") from this Fidelity 401k plan performance page — either a full PDF export or a screenshot of the same page. This is a reference document listing every fund the plan offers — not a positions/holdings statement. Extract every row visible, whether or not it's currently held. If this looks like a screenshot that only captures part of a longer scrollable table (e.g. it's cut off, or the fund count looks small for a typical plan menu), extract what's visible anyway — the caller reviews the extracted count against the expected menu size before importing. Return ONLY valid JSON, no markdown, no explanation:
 {
   asOfDate: string (YYYY-MM-DD format),
   accounts: [{
