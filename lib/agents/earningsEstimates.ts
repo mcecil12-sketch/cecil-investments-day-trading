@@ -77,6 +77,7 @@ export async function selectSymbolsToFetch(quota: number = DAILY_FETCH_QUOTA): P
 }
 
 interface RawEstimateRow {
+  date?: string;
   horizon?: string;
   eps_estimate_average?: string;
   eps_estimate_average_7_days_ago?: string;
@@ -124,12 +125,13 @@ export type EarningsEstimateFetchResult =
   /** Alpha Vantage returned an empty `estimates` array — no analyst coverage at all for this symbol. */
   | { status: "no_coverage" }
   /**
-   * Alpha Vantage returned a non-empty `estimates` array, but none of its
-   * rows had horizon === "current quarter". Deliberately kept distinct from
-   * no_coverage (a genuinely different fact — there IS analyst data, just
-   * not for the horizon this app reads) so this can be watched for as a
-   * pattern once live data comes in, rather than silently counted as the
-   * same "nothing to show" bucket.
+   * Alpha Vantage returned a non-empty `estimates` array, but no
+   * "fiscal quarter" row had a `date` >= today — e.g. all rows are historical
+   * (no upcoming quarter yet estimated) or unexpectedly unlabeled/undated.
+   * Deliberately kept distinct from no_coverage (a genuinely different fact —
+   * there IS analyst data, just not a matchable current-quarter row) so this
+   * can be watched for as a pattern in real data rather than silently
+   * counted as the same "nothing to show" bucket.
    */
   | { status: "no_horizon_match"; horizons: string[] }
   | { status: "error"; message: string };
@@ -138,21 +140,26 @@ const ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query";
 
 /**
  * Fetches Alpha Vantage's EARNINGS_ESTIMATES for one symbol and extracts the
- * "current quarter" horizon row — the nearest, most actionable estimate for
- * an earnings-revision signal (confirmed as the intended horizon).
+ * current-quarter estimate row for an earnings-revision signal.
  *
- * KNOWN GAP (found via live test 2026-07-29, BRK-B): the real API does not
- * return a "current quarter" horizon label at all — it returned 40 rows
- * labeled only "fiscal quarter" (x38) and "fiscal year" (x2). So this match
- * currently — correctly, harmlessly — never succeeds; every symbol reports
- * no_horizon_match rather than fabricating a guess at which of the 38
- * "fiscal quarter" rows is the current one. Resolving this needs one more
- * live call with the full raw response logged (field names, date field,
- * row order) — not yet done, since that wasn't authorized in the same
- * session this gap was found. Do not guess at a row-selection rule (e.g.
- * "take the first fiscal quarter row") without that ground truth; a wrong
- * guess would silently write plausible-looking but incorrect EPS data
- * instead of the current, honest no_horizon_match signal.
+ * ROW-SELECTION RULE (engineering decision, not a documented vendor spec —
+ * confirmed 2026-07-29 that Alpha Vantage's own docs for this endpoint
+ * (https://www.alphavantage.co/documentation/, "Earnings Estimates
+ * Trending") say only "returns the annual and quarterly EPS and revenue
+ * estimates... along with analyst count and revision history" — no field
+ * glossary, no `horizon` value list, no guidance on picking "the current
+ * quarter"). A live test that day (BRK-B) showed the real `estimates` array
+ * never contains a `horizon === "current quarter"` row; it returns one row
+ * per historical/future fiscal quarter and year, labeled only "fiscal
+ * quarter" (38 rows back to 2017) or "fiscal year" (2 rows), each with a
+ * `date` (fiscal period end). In the absence of vendor guidance, "current
+ * quarter" here is defined as: among rows with horizon === "fiscal quarter",
+ * the one with the earliest `date` that is still >= today — i.e. the
+ * quarter the company is currently operating in but hasn't finished/reported
+ * yet, consistent with how "current quarter" estimates are conventionally
+ * used elsewhere (e.g. Zacks Consensus). If this later proves wrong against
+ * real revision behavior, treat it as a decision to revisit, not a bug in
+ * the fetch/parse plumbing around it.
  */
 export async function fetchEarningsEstimates(symbol: string): Promise<EarningsEstimateFetchResult> {
   const apiKey = process.env.ALPHA_VANTAGE_API_KEY;
@@ -181,7 +188,12 @@ export async function fetchEarningsEstimates(symbol: string): Promise<EarningsEs
     return { status: "no_coverage" };
   }
 
-  const currentQuarter = estimates.find((row) => row.horizon?.toLowerCase() === "current quarter");
+  // ISO "YYYY-MM-DD" strings compare lexicographically the same as chronologically.
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const currentQuarter = estimates
+    .filter((row) => row.horizon?.toLowerCase() === "fiscal quarter" && row.date != null && row.date >= todayIso)
+    .sort((a, b) => (a.date! < b.date! ? -1 : a.date! > b.date! ? 1 : 0))[0];
+
   if (!currentQuarter) {
     const counts = new Map<string, number>();
     for (const row of estimates) {
@@ -298,7 +310,7 @@ export async function refreshEarningsEstimates(quota: number = DAILY_FETCH_QUOTA
         },
       });
       console.warn(
-        `[earnings-estimates] ${symbol}: estimates array had ${result.horizons.length} row(s) but none matched "current quarter" (horizons: ${result.horizons.join(", ")})`,
+        `[earnings-estimates] ${symbol}: estimates array had ${result.horizons.length} row(s) but none was a "fiscal quarter" row dated today or later (horizons: ${result.horizons.join(", ")})`,
       );
       results.push({ symbol, status: "no_horizon_match", horizons: result.horizons });
       continue;
