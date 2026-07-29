@@ -5,6 +5,7 @@ import { runSectorRotationAgent, type SectorScore, type SectorRotationFlag, type
 import { runRiskManagerAgent, type RiskFlag, type OpportunityCostEntry, type RiskManagerOutput } from "@/lib/agents/riskManager";
 import { runCandidateScannerAgent, type CandidateEntry, type CandidateScannerOutput } from "@/lib/agents/candidateScanner";
 import { refreshCandidateUniverse, type UniverseRefreshResult } from "@/lib/agents/candidateUniverse";
+import { refreshEarningsEstimates, type EarningsEstimatesRefreshResult, DAILY_FETCH_QUOTA } from "@/lib/agents/earningsEstimates";
 import { logCandidateRecommendationBatch } from "@/lib/agents/candidateRecommendationLog";
 import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
 import { buildTaxableAnalysisContext, type TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
@@ -378,6 +379,44 @@ export async function runAndPersistCandidateUniverseRefresh(): Promise<UniverseR
 
   try {
     const output = await refreshCandidateUniverse();
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },
+    });
+    return { runId: run.id, status: "COMPLETE", output };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "FAILED", completedAt: new Date(), errorMessage: message },
+    });
+    return { runId: run.id, status: "FAILED", error: message };
+  }
+}
+
+export interface EarningsEstimatesRunResult {
+  runId: string;
+  status: "COMPLETE" | "FAILED";
+  output?: EarningsEstimatesRefreshResult[];
+  error?: string;
+}
+
+/**
+ * Runs the daily earnings-estimates refresh (fetches Alpha Vantage
+ * EARNINGS_ESTIMATES for today's batch of stale candidate-universe symbols —
+ * see earningsEstimates.ts) and persists an AgentRun audit trail, same
+ * lifecycle pattern as runAndPersistCandidateUniverseRefresh above. No
+ * ActionItems: this is a data refresh, not a recommendation.
+ */
+export async function runAndPersistEarningsEstimatesRefresh(
+  quota: number = DAILY_FETCH_QUOTA,
+): Promise<EarningsEstimatesRunResult> {
+  const run = await prisma.agentRun.create({
+    data: { agentType: "EARNINGS_ESTIMATES_REFRESH", status: "RUNNING" },
+  });
+
+  try {
+    const output = await refreshEarningsEstimates(quota);
     await prisma.agentRun.update({
       where: { id: run.id },
       data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },

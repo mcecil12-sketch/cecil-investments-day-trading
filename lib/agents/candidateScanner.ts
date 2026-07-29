@@ -5,6 +5,7 @@ import { getCurrentHoldings, totalPortfolioValue } from "@/lib/agents/holdings";
 import { getHoldingSector, type SectorRotationOutput, type SectorScore } from "@/lib/agents/sectorRotation";
 import { closestPlanFundsForProxy } from "@/lib/agents/fundMappings";
 import { getDynamicCandidateUniverse, type SectorUniverse } from "@/lib/agents/candidateUniverse";
+import { getEarningsAccelerationScores, type EarningsAccelerationCoverage } from "@/lib/agents/earningsAcceleration";
 import { formatPercent } from "@/lib/format";
 
 export type CandidateAccountType = "taxable" | "401k" | "both";
@@ -49,14 +50,18 @@ const CANDIDATE_NAMES: Record<string, string> = {
 const MAX_TOP_CANDIDATES = 15;
 
 /**
- * Weights for the two composite factors implemented today, renormalized from
- * the target 35% momentum/trend + 25% sector leadership (out of a full
- * 35/30/25/10 momentum-trend/earnings-acceleration/sector-leadership/sentiment
- * split) so the implemented factors still sum to 100%. Earnings acceleration
- * and sentiment/news are deferred until this app has a data source for them.
+ * Weights for the three composite factors implemented today, renormalized
+ * from the target 35% momentum/trend + 30% earnings acceleration + 25%
+ * sector leadership (out of the full 35/30/25/10
+ * momentum-trend/earnings-acceleration/sector-leadership/sentiment split) so
+ * the implemented factors still sum to 100% — each divided by their sum (90)
+ * rather than 100, same renormalization approach as before earnings
+ * acceleration was added, just with a wider denominator. Sentiment/news is
+ * still deferred: no data source yet.
  */
-const MOMENTUM_TREND_WEIGHT = 35 / 60;
-const SECTOR_LEADERSHIP_WEIGHT = 25 / 60;
+const MOMENTUM_TREND_WEIGHT = 35 / 90;
+const EARNINGS_ACCELERATION_WEIGHT = 30 / 90;
+const SECTOR_LEADERSHIP_WEIGHT = 25 / 90;
 
 export interface CandidateEntry {
   symbol: string;
@@ -65,11 +70,11 @@ export interface CandidateEntry {
   /**
    * 0-100 composite. The target composite is momentum/trend (35%) +
    * earnings acceleration (30%) + sector leadership (25%) + sentiment/news
-   * (10%); earnings acceleration and sentiment have no data source in this
-   * app yet, so those two factors are deferred and the two implemented
-   * factors are renormalized to fill 100%: momentum/trend at 35/60 = 58.3%,
-   * sector leadership at 25/60 = 41.7%. See MOMENTUM_TREND_WEIGHT /
-   * SECTOR_LEADERSHIP_WEIGHT below.
+   * (10%); sentiment/news has no data source in this app yet, so the three
+   * implemented factors are renormalized to fill 100%: momentum/trend at
+   * 35/90 = 38.9%, earnings acceleration at 30/90 = 33.3%, sector leadership
+   * at 25/90 = 27.8%. See MOMENTUM_TREND_WEIGHT / EARNINGS_ACCELERATION_WEIGHT
+   * / SECTOR_LEADERSHIP_WEIGHT below.
    */
   score: number;
   /** This symbol's own 1-year return minus the S&P 500's 1-year return over the same window, in percentage points. Computed per-symbol, not shared. */
@@ -77,6 +82,9 @@ export interface CandidateEntry {
   momentum1Y: number | null;
   aboveSma50: boolean | null;
   aboveSma200: boolean | null;
+  /** 0-100 earnings-acceleration factor (see earningsAcceleration.ts) — 50 is neutral, used both for a genuinely flat signal and for insufficient-coverage fallback (see earningsCoverage). */
+  earningsAcceleration: number;
+  earningsCoverage: EarningsAccelerationCoverage;
   rationale: string;
   accountType: CandidateAccountType;
 }
@@ -104,8 +112,17 @@ function recommendedExposureLabel(currentExposure: number): string {
   return "Adequate — maintain current allocation";
 }
 
+function earningsRationaleClause(entry: Pick<CandidateEntry, "earningsAcceleration" | "earningsCoverage">): string {
+  if (entry.earningsCoverage === "covered") return `earnings acceleration ${entry.earningsAcceleration}/100`;
+  if (entry.earningsCoverage === "no_coverage") return "no analyst earnings-estimate coverage available";
+  return "earnings-estimate data not yet fetched this week";
+}
+
 function buildRationale(
-  entry: Pick<CandidateEntry, "symbol" | "score" | "vsSpx" | "momentum1Y" | "aboveSma50" | "aboveSma200">,
+  entry: Pick<
+    CandidateEntry,
+    "symbol" | "score" | "vsSpx" | "momentum1Y" | "aboveSma50" | "aboveSma200" | "earningsAcceleration" | "earningsCoverage"
+  >,
   sector: SectorScore,
   planFunds: string[],
 ): string {
@@ -113,6 +130,7 @@ function buildRationale(
     `Score ${entry.score}/100, outperforming the S&P 500 by ${entry.vsSpx > 0 ? "+" : ""}${entry.vsSpx} points on 1-year return, 52-week momentum ${formatPercent(entry.momentum1Y)}`,
     `trading ${entry.aboveSma50 ? "above" : "below"} its 50-day average and ${entry.aboveSma200 ? "above" : "below"} its 200-day average`,
     `${sector.sector} ranks #${sector.rank} in current sector rotation`,
+    earningsRationaleClause(entry),
   ];
   let rationale = `${parts.join(", ")}.`;
   if (planFunds.length > 0) {
@@ -158,6 +176,13 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
   const sp500Momentum = scorePriceSeries(sp500Points).momentum ?? 0;
   const portfolioValue = totalPortfolioValue(holdings);
 
+  // One batched DB read for every symbol that could turn up across the scanned
+  // sectors, rather than a per-symbol round trip inside the loop below.
+  const candidateSymbols = Array.from(
+    new Set(topSectors.flatMap((sector) => universeMap[sector.sector]?.symbols ?? [])),
+  );
+  const earningsScores = await getEarningsAccelerationScores(candidateSymbols);
+
   const skipped: Array<{ symbol: string; reason: string }> = [];
   const sectorsWithoutUniverse: string[] = [];
   const scored: CandidateEntry[] = [];
@@ -180,9 +205,18 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
         const vsSpx = Math.round(((priceScored.momentum ?? 0) - sp500Momentum) * 1000) / 10;
         if (vsSpx <= 0) continue;
 
+        const earnings = earningsScores.get(symbol)!;
+
         const compositeScore = Math.max(
           0,
-          Math.min(100, Math.round(priceScored.score * MOMENTUM_TREND_WEIGHT + sector.score * SECTOR_LEADERSHIP_WEIGHT)),
+          Math.min(
+            100,
+            Math.round(
+              priceScored.score * MOMENTUM_TREND_WEIGHT +
+                earnings.score * EARNINGS_ACCELERATION_WEIGHT +
+                sector.score * SECTOR_LEADERSHIP_WEIGHT,
+            ),
+          ),
         );
 
         const planFunds = closestPlanFundsForProxy(symbol);
@@ -197,8 +231,19 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
           momentum1Y: priceScored.momentum,
           aboveSma50: priceScored.aboveSma50,
           aboveSma200: priceScored.aboveSma200,
+          earningsAcceleration: earnings.score,
+          earningsCoverage: earnings.coverage,
           rationale: buildRationale(
-            { symbol, score: compositeScore, vsSpx, momentum1Y: priceScored.momentum, aboveSma50: priceScored.aboveSma50, aboveSma200: priceScored.aboveSma200 },
+            {
+              symbol,
+              score: compositeScore,
+              vsSpx,
+              momentum1Y: priceScored.momentum,
+              aboveSma50: priceScored.aboveSma50,
+              aboveSma200: priceScored.aboveSma200,
+              earningsAcceleration: earnings.score,
+              earningsCoverage: earnings.coverage,
+            },
             sector,
             planFunds,
           ),

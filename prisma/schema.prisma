@@ -41,6 +41,7 @@ enum AgentType {
   RISK_MANAGER
   CANDIDATE_SCANNER
   UNIVERSE_REFRESH
+  EARNINGS_ESTIMATES_REFRESH
 }
 
 enum AgentRunStatus {
@@ -337,6 +338,49 @@ model CandidateUniverse {
   symbols   Json
   asOf      DateTime
   updatedAt DateTime @updatedAt
+}
+
+/// The current cached Alpha Vantage EARNINGS_ESTIMATES read for one symbol
+/// from the candidate universe, refreshed on a rolling weekly cadence (~12
+/// symbols/day, see app/api/cron/earnings-estimates/route.ts) rather than all
+/// at once, since the free tier caps at 25 calls/day. One row per symbol,
+/// upserted in place — this is the current snapshot, not a history of past
+/// pulls. All eps/revision fields are nullable and left null rather than
+/// coerced to 0 whenever Alpha Vantage itself reports "None" or omits a
+/// field for that horizon; hasEstimates distinguishes that from the other
+/// null-shaped case, an empty `estimates` array (symbol has no analyst
+/// coverage at all) — see hasEstimates doc below. Values reflect Alpha
+/// Vantage's nearest ("current quarter") horizon row; confirm this is the
+/// intended horizon before the first live pull.
+model EarningsEstimateSnapshot {
+  id        String @id @default(cuid())
+  symbol    String @unique
+
+  /// eps_estimate_average, and the same figure as Alpha Vantage reported it 7/30/60/90 days before the current pull. Null means Alpha Vantage didn't report a value for that horizon (not a real zero).
+  epsEstimateAverageCurrent   Float?
+  epsEstimateAverage7DaysAgo  Float?
+  epsEstimateAverage30DaysAgo Float?
+  epsEstimateAverage60DaysAgo Float?
+  epsEstimateAverage90DaysAgo Float?
+
+  /// eps_estimate_revision_up/down_trailing_7/30_days — analyst revision counts. Null means not reported; a real 0 (no revisions either direction) is stored as 0.
+  revisionUpTrailing7Days     Int?
+  revisionDownTrailing7Days   Int?
+  revisionUpTrailing30Days    Int?
+  revisionDownTrailing30Days  Int?
+
+  /// True when the last successful fetch returned a non-empty `estimates` array for this symbol (the eps/revision fields above reflect real, if partial, coverage). False when the last successful fetch confirmed Alpha Vantage has no analyst coverage at all for this symbol (estimates array was empty) — distinct from never having been fetched, which is lastFetchedAt == null regardless of this flag's default.
+  hasEstimates    Boolean   @default(false)
+  /// Set only when a fetch for this symbol completed successfully — the signal the daily cron uses to decide which symbols are stale/not-yet-pulled this week (see selectSymbolsToFetch in lib/agents/earningsEstimates.ts). Left as-is on a failed attempt, so a transient error doesn't make a symbol look freshly fetched.
+  lastFetchedAt   DateTime?
+  /// Set on every fetch attempt, success or failure — lets the cron tell "never tried" (both timestamps null) apart from "tried today but failed" (lastAttemptedAt today, lastFetchedAt stale) so it doesn't re-attempt a failing symbol multiple times in the same day's batch.
+  lastAttemptedAt DateTime?
+  /// Cleared on the next successful fetch; populated on failure for debugging (rate limit, malformed response, symbol not found, etc.).
+  lastErrorMessage String?
+
+  updatedAt DateTime @updatedAt
+
+  @@index([lastFetchedAt])
 }
 
 /// A tiny key-value store for cross-cutting notification state that doesn't
