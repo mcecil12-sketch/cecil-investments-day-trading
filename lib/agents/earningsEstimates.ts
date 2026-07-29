@@ -139,9 +139,20 @@ const ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query";
 /**
  * Fetches Alpha Vantage's EARNINGS_ESTIMATES for one symbol and extracts the
  * "current quarter" horizon row — the nearest, most actionable estimate for
- * an earnings-revision signal (confirmed as the intended horizon). The
- * schema doesn't record which horizon a row came from, so switching horizons
- * later means backfilling every symbol, not just changing this function.
+ * an earnings-revision signal (confirmed as the intended horizon).
+ *
+ * KNOWN GAP (found via live test 2026-07-29, BRK-B): the real API does not
+ * return a "current quarter" horizon label at all — it returned 40 rows
+ * labeled only "fiscal quarter" (x38) and "fiscal year" (x2). So this match
+ * currently — correctly, harmlessly — never succeeds; every symbol reports
+ * no_horizon_match rather than fabricating a guess at which of the 38
+ * "fiscal quarter" rows is the current one. Resolving this needs one more
+ * live call with the full raw response logged (field names, date field,
+ * row order) — not yet done, since that wasn't authorized in the same
+ * session this gap was found. Do not guess at a row-selection rule (e.g.
+ * "take the first fiscal quarter row") without that ground truth; a wrong
+ * guess would silently write plausible-looking but incorrect EPS data
+ * instead of the current, honest no_horizon_match signal.
  */
 export async function fetchEarningsEstimates(symbol: string): Promise<EarningsEstimateFetchResult> {
   const apiKey = process.env.ALPHA_VANTAGE_API_KEY;
@@ -172,7 +183,13 @@ export async function fetchEarningsEstimates(symbol: string): Promise<EarningsEs
 
   const currentQuarter = estimates.find((row) => row.horizon?.toLowerCase() === "current quarter");
   if (!currentQuarter) {
-    return { status: "no_horizon_match", horizons: estimates.map((row) => row.horizon ?? "(unlabeled)") };
+    const counts = new Map<string, number>();
+    for (const row of estimates) {
+      const label = row.horizon ?? "(unlabeled)";
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+    const horizons = Array.from(counts.entries()).map(([label, count]) => (count > 1 ? `${label} (x${count})` : label));
+    return { status: "no_horizon_match", horizons };
   }
 
   return {
@@ -199,18 +216,30 @@ export interface EarningsEstimatesRefreshResult {
   error?: string;
 }
 
+/** Alpha Vantage's free tier rejects requests faster than 1/second; a live test on 2026-07-29 firing 12 requests back-to-back (no delay) got 11 of 12 rejected with that exact rate-limit message. 1200ms clears the 1/second limit with margin. */
+const MIN_REQUEST_INTERVAL_MS = 1200;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Fetches and persists EarningsEstimateSnapshot rows for today's batch of
  * stale symbols (see selectSymbolsToFetch). Every attempt updates
  * lastAttemptedAt; only a successful fetch (covered, confirmed no_coverage,
  * or no_horizon_match) updates lastFetchedAt, so a failed attempt doesn't
  * make a symbol look freshly refreshed and skip it for the rest of the week.
+ * Requests are paced at MIN_REQUEST_INTERVAL_MS apart (see above) to stay
+ * under Alpha Vantage's free-tier per-second burst limit — at 12/day this
+ * adds ~13s to the run, well within the cron route's 60s maxDuration.
  */
 export async function refreshEarningsEstimates(quota: number = DAILY_FETCH_QUOTA): Promise<EarningsEstimatesRefreshResult[]> {
   const symbols = await selectSymbolsToFetch(quota);
   const results: EarningsEstimatesRefreshResult[] = [];
 
-  for (const symbol of symbols) {
+  for (let i = 0; i < symbols.length; i++) {
+    if (i > 0) await sleep(MIN_REQUEST_INTERVAL_MS);
+    const symbol = symbols[i];
     const result = await fetchEarningsEstimates(symbol);
     const now = new Date();
 
