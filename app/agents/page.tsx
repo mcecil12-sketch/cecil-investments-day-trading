@@ -6,6 +6,7 @@ import type { SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import type { RiskManagerOutput, RiskFlag } from "@/lib/agents/riskManager";
 import type { CandidateScannerOutput, CandidateEntry } from "@/lib/agents/candidateScanner";
 import type { CioTaxableOpportunities } from "@/lib/agents/cio";
+import type { NewsSentimentNote } from "@/lib/agents/newsSentiment";
 import { alphaColor, formatCurrency, formatDate, formatDateTime, formatPercent } from "@/lib/format";
 import { RunAgentButton } from "./RunAgentButton";
 import { AgentStatusPoller } from "./AgentStatusPoller";
@@ -422,6 +423,7 @@ export default async function AgentsPage() {
 
   const hasAnyRun = latestRuns.some((run) => run != null);
   const taxableOpportunities = weeklyBrief?.taxableOpportunities as CioTaxableOpportunities | null | undefined;
+  const newsSentimentNotes = weeklyBrief?.newsSentimentNotes as NewsSentimentNote[] | null | undefined;
 
   const initialStatuses: AgentStatusResponse = {
     relativeStrength: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "RELATIVE_STRENGTH")]?.status ?? null,
@@ -524,6 +526,25 @@ export default async function AgentsPage() {
               </div>
             ))
           )}
+        </div>
+      )}
+
+      {newsSentimentNotes && newsSentimentNotes.length > 0 && (
+        <div className="card card-accent">
+          <strong>News &amp; Sentiment Watch</strong>
+          <p style={{ color: "var(--text-muted)", fontSize: "0.78rem", marginTop: "0.25rem" }}>
+            Qualitative context only — not a scoring input, not part of the composite or the ranking above. Recent
+            (past 1-2 week) company-specific news for this week&apos;s Top Candidates, surfaced for human judgment.
+          </p>
+          {newsSentimentNotes.map((n, i) => (
+            <div className="finding-row" key={`sentiment-${i}`}>
+              <span className="finding-symbol">
+                {n.noteType === "watchout" ? "⚠️ " : "✅ "}
+                {n.symbol} ({n.name})
+              </span>
+              <span className="finding-detail">{n.note}</span>
+            </div>
+          ))}
         </div>
       )}
 

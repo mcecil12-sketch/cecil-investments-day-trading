@@ -9,6 +9,7 @@ import { refreshEarningsEstimates, type EarningsEstimatesRefreshResult, DAILY_FE
 import { logCandidateRecommendationBatch } from "@/lib/agents/candidateRecommendationLog";
 import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
 import { buildTaxableAnalysisContext, type TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
+import { generateNewsSentimentNotes, type NewsSentimentNote } from "@/lib/agents/newsSentiment";
 import { sendWeeklyBriefNotification } from "@/lib/notifications/weeklyBrief";
 
 function formatPercent(value: number | null): string {
@@ -450,7 +451,7 @@ async function buildCioCandidates(): Promise<{
   riskRun: { id: string } | null;
   relativeRun: { id: string } | null;
   sectorRun: { id: string } | null;
-  candidateRun: { id: string } | null;
+  candidateRun: { id: string; output: Prisma.JsonValue } | null;
   taxableContext: TaxableAnalysisContext | null;
 }> {
   const [riskRun, relativeRun, sectorRun, candidateRun] = await Promise.all([
@@ -607,11 +608,23 @@ async function buildCioCandidates(): Promise<{
  * List reflects all four agents instead of just whichever ran most recently.
  */
 export async function synthesizeWeeklyBrief(): Promise<void> {
-  const { candidates, taxableContext } = await buildCioCandidates();
+  const { candidates, taxableContext, candidateRun } = await buildCioCandidates();
   if (candidates.length === 0) return;
 
   const brief = await synthesizeCioBrief(candidates, taxableContext);
   if (brief.orderedItems.length === 0) return;
+
+  let newsSentimentNotes: NewsSentimentNote[] = [];
+  if (candidateRun?.output) {
+    const output = candidateRun.output as unknown as CandidateScannerOutput;
+    try {
+      newsSentimentNotes = await generateNewsSentimentNotes(
+        output.topCandidates.map((c) => ({ symbol: c.symbol, name: c.name })),
+      );
+    } catch (err) {
+      console.error("News sentiment generation failed:", err);
+    }
+  }
 
   const weekOf = startOfWeekUTC(new Date());
   const actionItemsData = brief.orderedItems.map((item, i) => ({
@@ -623,6 +636,9 @@ export async function synthesizeWeeklyBrief(): Promise<void> {
     priority: i + 1,
   }));
   const taxableOpportunities = (brief.taxableOpportunities ?? Prisma.JsonNull) as unknown as Prisma.InputJsonValue;
+  const newsSentimentNotesData = (
+    newsSentimentNotes.length > 0 ? newsSentimentNotes : Prisma.JsonNull
+  ) as unknown as Prisma.InputJsonValue;
 
   const existing = await prisma.weeklyBrief.findUnique({ where: { weekOf } });
   if (existing) {
@@ -630,12 +646,23 @@ export async function synthesizeWeeklyBrief(): Promise<void> {
       prisma.actionItem.deleteMany({ where: { weeklyBriefId: existing.id } }),
       prisma.weeklyBrief.update({
         where: { id: existing.id },
-        data: { cioSummary: brief.summary, taxableOpportunities, actionItems: { create: actionItemsData } },
+        data: {
+          cioSummary: brief.summary,
+          taxableOpportunities,
+          newsSentimentNotes: newsSentimentNotesData,
+          actionItems: { create: actionItemsData },
+        },
       }),
     ]);
   } else {
     await prisma.weeklyBrief.create({
-      data: { weekOf, cioSummary: brief.summary, taxableOpportunities, actionItems: { create: actionItemsData } },
+      data: {
+        weekOf,
+        cioSummary: brief.summary,
+        taxableOpportunities,
+        newsSentimentNotes: newsSentimentNotesData,
+        actionItems: { create: actionItemsData },
+      },
     });
   }
 }

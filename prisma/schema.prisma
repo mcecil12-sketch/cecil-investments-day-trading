@@ -259,6 +259,8 @@ model WeeklyBrief {
   cioSummary  String
   /// The CIO's taxable-account trim/sector-gap/momentum-add analysis for this week, shaped like CioTaxableOpportunities in lib/agents/cio.ts. Null when no taxable account data was available at synthesis time.
   taxableOpportunities Json?
+  /// Qualitative "News & Sentiment Watch" notes for this week's Top Candidates, shaped like NewsSentimentNote[] in lib/agents/newsSentiment.ts. Context only — never fed into the composite score or ranking. Null when no ANTHROPIC_API_KEY was configured or no Candidate Scanner run was available at synthesis time.
+  newsSentimentNotes Json?
   actionItems ActionItem[]
   recommendationOutcomes RecommendationOutcome[]
   createdAt   DateTime     @default(now())
