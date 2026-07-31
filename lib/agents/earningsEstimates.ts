@@ -1,37 +1,19 @@
 import { prisma } from "@/lib/prisma";
 import { getDynamicCandidateUniverse } from "@/lib/agents/candidateUniverse";
+import { STATIC_CANDIDATE_UNIVERSE } from "@/lib/agents/candidateScanner";
 
 /**
- * Static-sector tickers, duplicated from candidateScanner.ts's
- * STATIC_CANDIDATE_UNIVERSE rather than imported from it, because that file
- * is intentionally off-limits for this feature until the composite-weighting
- * decision (sentiment/news renormalization) is confirmed separately. Keep
- * this list in sync by hand for now; once candidateScanner.ts is safe to
- * touch, replace this with a shared export instead of two sources of truth.
- *
- * TODO: candidateScanner.ts's STATIC_CANDIDATE_UNIVERSE is the source of
- * truth this list mirrors — reconcile there (export it and import here)
- * instead of maintaining both once that file is touched again.
- */
-const STATIC_SECTOR_SYMBOLS: string[] = [
-  "BRK-B", "JPM", "V", "MA", "GS", "MS", "BAC", "AXP", "BX", "KKR",
-  "CAT", "DE", "HON", "UPS", "RTX", "GE", "LMT", "ETN", "EMR", "PH",
-  "GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
-  "AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "TGT", "LOW",
-  "EFA", "VEA", "VXUS",
-];
-
-/**
- * The full candidate universe (currently ~81 symbols): the static sectors
- * above, plus whatever's cached in CandidateUniverse for the SSGA-derived
- * dynamic sectors (Energy/Healthcare/Technology — see candidateUniverse.ts).
- * Deduped since a symbol could in principle appear in both a static sector
- * list and a dynamic sector's top holdings.
+ * The full candidate universe (currently ~81 symbols): candidateScanner.ts's
+ * static-sector tickers, plus whatever's cached in CandidateUniverse for the
+ * SSGA-derived dynamic sectors (Energy/Healthcare/Technology — see
+ * candidateUniverse.ts). Deduped since a symbol could in principle appear in
+ * both a static sector list and a dynamic sector's top holdings.
  */
 export async function getFullCandidateSymbols(): Promise<string[]> {
+  const staticSymbols = Object.values(STATIC_CANDIDATE_UNIVERSE).flatMap((sector) => sector.symbols);
   const dynamicUniverse = await getDynamicCandidateUniverse();
   const dynamicSymbols = Object.values(dynamicUniverse).flatMap((sector) => sector.symbols);
-  return Array.from(new Set([...STATIC_SECTOR_SYMBOLS, ...dynamicSymbols]));
+  return Array.from(new Set([...staticSymbols, ...dynamicSymbols]));
 }
 
 /** How many symbols to fetch per cron invocation — kept comfortably under Alpha Vantage's 25/day free-tier cap, leaving 5/day headroom for retries. */

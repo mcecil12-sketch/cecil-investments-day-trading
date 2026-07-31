@@ -17,7 +17,7 @@ export type CandidateAccountType = "taxable" | "401k" | "both";
  * now sourced from CandidateUniverse (DB, refreshed monthly) and merged in at
  * runtime in runCandidateScannerAgent — see DYNAMIC_SECTORS.
  */
-const STATIC_CANDIDATE_UNIVERSE: Record<string, SectorUniverse> = {
+export const STATIC_CANDIDATE_UNIVERSE: Record<string, SectorUniverse> = {
   Financials: { sectorEtf: "XLF", symbols: ["BRK-B", "JPM", "V", "MA", "GS", "MS", "BAC", "AXP", "BX", "KKR"] },
   Industrials: { sectorEtf: "XLI", symbols: ["CAT", "DE", "HON", "UPS", "RTX", "GE", "LMT", "ETN", "EMR", "PH"] },
   Communications: { sectorEtf: "XLC", symbols: ["GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS"] },
