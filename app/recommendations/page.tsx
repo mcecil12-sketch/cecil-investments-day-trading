@@ -7,6 +7,7 @@ import type { CioTaxableOpportunities } from "@/lib/agents/cio";
 import { convictionBand } from "@/lib/agents/positionSizing";
 import { formatCurrency, formatPercent, formatDateTime } from "@/lib/format";
 import { buildPlanFundComparisons, type PeerVerdictKind } from "@/lib/agents/planFundComparison";
+import { getAccountSnapshot } from "@/lib/benchmark/portfolioValue";
 
 export const dynamic = "force-dynamic";
 
@@ -18,12 +19,13 @@ function estimatedPositionSize(score: number, totalTaxableValue: number): string
 }
 
 async function getRecommendationsData() {
-  const [candidateRun, sectorRun, relativeRun, weeklyBrief, planFundComparisons] = await Promise.all([
+  const [candidateRun, sectorRun, relativeRun, weeklyBrief, planFundComparisons, edpAccount] = await Promise.all([
     prisma.agentRun.findFirst({ where: { agentType: "CANDIDATE_SCANNER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
     prisma.agentRun.findFirst({ where: { agentType: "SECTOR_ROTATION", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
     prisma.agentRun.findFirst({ where: { agentType: "RELATIVE_STRENGTH", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
     prisma.weeklyBrief.findFirst({ orderBy: { weekOf: "desc" } }),
     buildPlanFundComparisons(),
+    prisma.account.findFirst({ where: { type: "VZ_EDP" } }),
   ]);
 
   const candidateOutput = candidateRun?.output as unknown as CandidateScannerOutput | undefined;
@@ -32,6 +34,7 @@ async function getRecommendationsData() {
   const taxableOpportunities = (weeklyBrief?.taxableOpportunities as unknown as CioTaxableOpportunities | null) ?? null;
 
   const taxableContext = await buildTaxableAnalysisContext(sectorOutput ?? null, relativeOutput ?? null);
+  const edpSnapshot = edpAccount ? await getAccountSnapshot(edpAccount.id) : null;
 
   return {
     candidateOutput,
@@ -39,6 +42,13 @@ async function getRecommendationsData() {
     planFundComparisons,
     taxableOpportunities,
     totalTaxableValue: taxableContext?.totalTaxableValue ?? 0,
+    edpBreakdown: edpSnapshot
+      ? {
+          totalValue: edpSnapshot.totalValue,
+          lockedValue: edpSnapshot.lockedValue,
+          actionableValue: edpSnapshot.actionableValue,
+        }
+      : null,
   };
 }
 
@@ -52,7 +62,10 @@ const VERDICT_COLOR: Record<PeerVerdictKind, string | undefined> = {
   "no-overlap": undefined,
 };
 
-function renderPlanFundComparisons(plans: Awaited<ReturnType<typeof buildPlanFundComparisons>>) {
+function renderPlanFundComparisons(
+  plans: Awaited<ReturnType<typeof buildPlanFundComparisons>>,
+  edpBreakdown: { totalValue: number; lockedValue: number; actionableValue: number } | null,
+) {
   const anyHeld = plans.some((p) => p.heldComparisons.length > 0);
   if (!anyHeld) {
     return (
@@ -71,6 +84,16 @@ function renderPlanFundComparisons(plans: Awaited<ReturnType<typeof buildPlanFun
             </span>
             <span style={{ color: "var(--text-muted)", fontSize: "0.75rem" }}>{plan.totalFunds} funds in menu</span>
           </div>
+          {plan.accountType === "VZ_EDP" && edpBreakdown && (
+            <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginBottom: "0.5rem" }}>
+              Locked (Verizon Stock Fund): {formatCurrency(edpBreakdown.lockedValue)} (
+              {formatPercent(edpBreakdown.totalValue > 0 ? edpBreakdown.lockedValue / edpBreakdown.totalValue : 0)}) —
+              single-stock concentration, monitor only, never reallocated or included in return/alpha. Flexible:{" "}
+              {formatCurrency(edpBreakdown.actionableValue)} (
+              {formatPercent(edpBreakdown.totalValue > 0 ? edpBreakdown.actionableValue / edpBreakdown.totalValue : 0)}
+              ){plan.mirroredFrom && <> — recommendation below mirrors {plan.mirroredFrom.accountName}, not computed independently.</>}
+            </p>
+          )}
           {plan.heldComparisons.length === 0 ? (
             <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
               No held funds identified in this plan&apos;s imported menu.
@@ -151,7 +174,7 @@ function renderTopCandidates(candidates: CandidateEntry[]) {
 }
 
 export default async function RecommendationsPage() {
-  const { candidateOutput, candidateRunAt, planFundComparisons, taxableOpportunities, totalTaxableValue } =
+  const { candidateOutput, candidateRunAt, planFundComparisons, taxableOpportunities, totalTaxableValue, edpBreakdown } =
     await getRecommendationsData();
 
   const taxableCandidates = (candidateOutput?.topCandidates ?? []).filter((c) => c.accountType !== "401k");
@@ -222,7 +245,7 @@ export default async function RecommendationsPage() {
           imported fund menu, across 1Y/3Y/5Y — not a single cherry-picked horizon. Funds recently added to a plan&apos;s
           menu are flagged as such rather than implied to be unproven.
         </p>
-        {renderPlanFundComparisons(planFundComparisons)}
+        {renderPlanFundComparisons(planFundComparisons, edpBreakdown)}
       </div>
 
       <div className="card">

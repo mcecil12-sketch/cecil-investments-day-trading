@@ -19,12 +19,20 @@ export interface BenchmarkSincePurchaseRow {
   detail: string;
 }
 
+export interface BenchmarkConcentration {
+  lockedValue: number;
+  actionableValue: number;
+  totalValue: number;
+}
+
 export interface BenchmarkScopeView {
   id: string;
   label: string;
   meta: string;
   periods: BenchmarkPeriodRow[];
   sincePurchase: BenchmarkSincePurchaseRow | null;
+  /** Present only for accounts holding a locked, non-reallocatable position (e.g. Verizon EDP's Verizon Stock Fund) — surfaces the single-stock concentration alongside the return data. */
+  concentration?: BenchmarkConcentration | null;
 }
 
 /**
@@ -50,6 +58,15 @@ export function BenchmarkAccountPicker({ views }: { views: BenchmarkScopeView[] 
         </select>
         {view.meta && <span style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>{view.meta}</span>}
       </div>
+
+      {view.concentration && (
+        <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginTop: "0.5rem" }}>
+          Single-stock concentration: {formatPercent(view.concentration.lockedValue / view.concentration.totalValue)}{" "}
+          of this account is a locked company-stock position — included in total value above but excluded from the
+          return/alpha figures below. Flexible/actionable portion:{" "}
+          {formatPercent(view.concentration.actionableValue / view.concentration.totalValue)}.
+        </p>
+      )}
 
       {view.periods.length === 0 && !view.sincePurchase ? (
         <p style={{ color: "var(--text-muted)" }}>No position data yet — import a statement to see benchmark data.</p>

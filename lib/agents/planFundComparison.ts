@@ -142,15 +142,20 @@ export interface PlanFundComparisonResult {
   accountType: string;
   totalFunds: number;
   heldComparisons: HeldFundComparison[];
+  /** Set when heldComparisons were copied from another account's own analysis rather than derived from this account's own PlanFundMenuEntry rows. */
+  mirroredFrom?: { accountId: string; accountName: string };
 }
+
+/** The Verizon EDP account's flexible (non-locked) portion draws from this same three-fund universe as the Savings Plan. EDP has no fund menu of its own imported, so its recommendation is mirrored from the Savings Plan's own analysis rather than computed independently. */
+const EDP_MIRRORED_FUND_NAMES = new Set(["US LARGE CO INDEX", "EMERGING MARKETS", "US SMALL COMPANY"]);
 
 export async function buildPlanFundComparisons(): Promise<PlanFundComparisonResult[]> {
   const accounts = await prisma.account.findMany({
-    where: { type: { in: ["VZ_SAVINGS_401K", "VZ_LEGACY_401K"] } },
+    where: { type: { in: ["VZ_SAVINGS_401K", "VZ_LEGACY_401K", "VZ_EDP"] } },
     include: { planFundMenuEntries: true },
   });
 
-  return accounts.map((account) => {
+  const results: PlanFundComparisonResult[] = accounts.map((account) => {
     const rows: PlanFundMenuRow[] = account.planFundMenuEntries.map((f) => ({
       fundName: f.fundName,
       assetClass: f.assetClass,
@@ -184,4 +189,14 @@ export async function buildPlanFundComparisons(): Promise<PlanFundComparisonResu
       heldComparisons,
     };
   });
+
+  const edp = results.find((r) => r.accountType === "VZ_EDP");
+  const savingsPlan = results.find((r) => r.accountType === "VZ_SAVINGS_401K");
+  if (edp && savingsPlan && edp.totalFunds === 0) {
+    edp.heldComparisons = savingsPlan.heldComparisons.filter((hc) => EDP_MIRRORED_FUND_NAMES.has(hc.fund.fundName));
+    edp.totalFunds = edp.heldComparisons.length;
+    edp.mirroredFrom = { accountId: savingsPlan.accountId, accountName: savingsPlan.accountName };
+  }
+
+  return results;
 }

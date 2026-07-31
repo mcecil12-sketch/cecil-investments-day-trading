@@ -99,10 +99,21 @@ export default async function BenchmarkPage() {
   const accountViews: BenchmarkScopeView[] = accounts.map((account) => {
     const results = accountResultsByAccount.get(account.id) ?? [];
     const sincePurchase = sincePurchaseByAccount.get(account.id);
+    // currentLockedValue/currentActionableValue are point-in-time (not period-specific) and identical across every period row for this account, so any row works.
+    const currentSlice = results[0];
+    const concentration =
+      currentSlice && currentSlice.currentLockedValue > 0
+        ? {
+            lockedValue: currentSlice.currentLockedValue,
+            actionableValue: currentSlice.currentActionableValue,
+            totalValue: currentSlice.endValue,
+          }
+        : null;
     return {
       id: account.id,
       label: account.name,
       meta: `${account.type}${account.isLocked ? " · Locked" : ""}`,
+      concentration,
       periods: FIDELITY_PERIODS.map((period) => {
         const result = results.find((r) => r.period === period);
         return {
