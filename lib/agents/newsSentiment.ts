@@ -47,6 +47,12 @@ const SYSTEM_PROMPT = `You are a research analyst doing a quick, qualitative new
 
 Do not report routine price movement, generic sector commentary, or stale news older than ~2 weeks. If you don't find anything genuinely material and recent, set noteType to "none" — do not force a note where there is nothing real to say. This is qualitative color for a human reader, not a scoring input, so keep it concise and concrete (name the specific event).`;
 
+/** Guards against rare cases where the model's raw scratch reasoning leaks into the note field despite otherwise-valid JSON (e.g. "]);}}}}} Let me finalize."). Better to drop the note than surface garbage in the household brief. */
+function looksLikeLeakedReasoning(text: string): boolean {
+  if (/[{}\[\];]{2,}/.test(text)) return true;
+  return /\b(let me|i'll|wait,|need proper json)\b/i.test(text);
+}
+
 async function researchCandidate(
   client: Anthropic,
   symbol: string,
@@ -74,6 +80,7 @@ async function researchCandidate(
 
     const parsed = JSON.parse(textBlock.text) as { noteType: string; note: string; sourceHint: string };
     if (parsed.noteType !== "watchout" && parsed.noteType !== "tailwind") return null;
+    if (looksLikeLeakedReasoning(parsed.note) || looksLikeLeakedReasoning(parsed.sourceHint)) return null;
     return { symbol, name, noteType: parsed.noteType, note: parsed.note, sourceHint: parsed.sourceHint };
   } catch (err) {
     console.error(`News sentiment check failed for ${symbol}:`, err);
