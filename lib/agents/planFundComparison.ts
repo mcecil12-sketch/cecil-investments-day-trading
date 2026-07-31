@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { getKnownFundReturns, compositeReturn, ytdDivergenceFlag } from "@/lib/agents/fundMappings";
 
 /**
  * Style-based peer grouping for 401k plan fund menus — finer than the plan's
@@ -47,10 +48,16 @@ export interface PlanFundMenuRow {
   tenYear: number | null;
   isHeld: boolean;
   category: FundCategory;
+  /** Year-to-date return, when a hand-verified figure is on file for this fund (see fundMappings.ts) — the plan's own imported fund-menu PDF doesn't report YTD, so this isn't always available. */
+  ytd: number | null;
+  /** 20% YTD / 30% 1Y / 30% 3Y / 20% 5Y blend when ytd/threeYear/fiveYear are all on file, else 1Y alone — same fallback rule as relativeStrength.ts's per-holding scoring. */
+  composite: number | null;
+  /** Set when this fund's YTD and 1Y returns point in opposite directions and diverge by more than the threshold — a signal to double-check before treating either figure as representative. */
+  divergenceFlag: string | null;
 }
 
-type Horizon = "oneYear" | "threeYear" | "fiveYear";
-const HORIZONS: Horizon[] = ["oneYear", "threeYear", "fiveYear"];
+type Horizon = "oneYear" | "threeYear" | "fiveYear" | "composite";
+const HORIZONS: Horizon[] = ["oneYear", "threeYear", "fiveYear", "composite"];
 
 function compareOnAvailableHorizons(a: PlanFundMenuRow, b: PlanFundMenuRow) {
   let aWins = 0;
@@ -156,16 +163,23 @@ export async function buildPlanFundComparisons(): Promise<PlanFundComparisonResu
   });
 
   const results: PlanFundComparisonResult[] = accounts.map((account) => {
-    const rows: PlanFundMenuRow[] = account.planFundMenuEntries.map((f) => ({
-      fundName: f.fundName,
-      assetClass: f.assetClass,
-      oneYear: f.oneYear,
-      threeYear: f.threeYear,
-      fiveYear: f.fiveYear,
-      tenYear: f.tenYear,
-      isHeld: f.isHeld,
-      category: categorizeFund(f.fundName, f.assetClass),
-    }));
+    const rows: PlanFundMenuRow[] = account.planFundMenuEntries.map((f) => {
+      // The plan's own imported fund-menu PDF has no YTD column — YTD comes from the separate hand-verified figures in fundMappings.ts (see Performance PDF / plan performance page), when on file for this fund.
+      const ytd = getKnownFundReturns(f.fundName)?.ytdReturn ?? null;
+      return {
+        fundName: f.fundName,
+        assetClass: f.assetClass,
+        oneYear: f.oneYear,
+        threeYear: f.threeYear,
+        fiveYear: f.fiveYear,
+        tenYear: f.tenYear,
+        isHeld: f.isHeld,
+        category: categorizeFund(f.fundName, f.assetClass),
+        ytd,
+        composite: f.oneYear != null ? compositeReturn({ ytdReturn: ytd, oneYear: f.oneYear, threeYear: f.threeYear, fiveYear: f.fiveYear }) : null,
+        divergenceFlag: f.oneYear != null ? ytdDivergenceFlag(ytd, f.oneYear) : null,
+      };
+    });
 
     const heldComparisons: HeldFundComparison[] = rows
       .filter((r) => r.isHeld)

@@ -160,6 +160,39 @@ const KNOWN_FUND_RETURNS: Record<string, FundReturns> = {
   ...KNOWN_FUND_RETURNS_BY_PLAN.VZ_LEGACY_401K,
 };
 
+/** Composite-return weights — 20% YTD, 30% 1Y, 30% 3Y, 20% 5Y — the same blend `relativeStrength.ts` applies to held-fund momentum scoring, reused here for 401k plan fund comparisons. Kept as its own copy rather than a shared import so nothing in the momentum-scoring path is touched by callers of this one. */
+export const YTD_WEIGHT = 0.2;
+export const ONE_YEAR_WEIGHT = 0.3;
+export const THREE_YEAR_WEIGHT = 0.3;
+export const FIVE_YEAR_WEIGHT = 0.2;
+
+/** Minimum gap (percentage points, as a fraction) between YTD and 1Y returns, in opposite directions, before it's worth flagging as a divergence to verify — same threshold as relativeStrength.ts's per-holding flag. */
+export const YTD_1Y_DIVERGENCE_THRESHOLD = 0.15;
+
+/** Blends YTD/1Y/3Y/5Y into a single composite return when a YTD figure and full 3/5-year history are all on file; otherwise falls back to 1Y alone (short-history or no-YTD funds), matching relativeStrength.ts's fallback rule. */
+export function compositeReturn(returns: {
+  ytdReturn?: number | null;
+  oneYear: number;
+  threeYear?: number | null;
+  fiveYear?: number | null;
+}): number {
+  const { ytdReturn, oneYear, threeYear, fiveYear } = returns;
+  if (ytdReturn != null && threeYear != null && fiveYear != null) {
+    return ytdReturn * YTD_WEIGHT + oneYear * ONE_YEAR_WEIGHT + threeYear * THREE_YEAR_WEIGHT + fiveYear * FIVE_YEAR_WEIGHT;
+  }
+  return oneYear;
+}
+
+/** Null unless YTD and 1Y point in opposite directions and are more than YTD_1Y_DIVERGENCE_THRESHOLD apart — e.g. a strong 1Y return riding on a since-reversed rally, or a weak 1Y masking a recent recovery. */
+export function ytdDivergenceFlag(ytdReturn: number | null | undefined, oneYear: number): string | null {
+  if (ytdReturn == null) return null;
+  const oppositeSigns = (ytdReturn > 0 && oneYear < 0) || (ytdReturn < 0 && oneYear > 0);
+  if (oppositeSigns && Math.abs(ytdReturn - oneYear) > YTD_1Y_DIVERGENCE_THRESHOLD) {
+    return "YTD/1Y divergence — verify before acting";
+  }
+  return null;
+}
+
 /** Looks up known reported returns by fund symbol or name, same dual-lookup convention as getFundProxy. Plan-agnostic — use bestAlternativeInCategory for plan-scoped comparisons. */
 export function getKnownFundReturns(symbol: string, name?: string | null): FundReturnsMatch | null {
   const candidates = [symbol, name].filter((v): v is string => Boolean(v)).map((v) => v.trim().toUpperCase());

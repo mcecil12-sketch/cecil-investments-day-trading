@@ -102,12 +102,18 @@ function renderPlanFundComparisons(
             plan.heldComparisons.map((hc) => (
               <div className="finding-row" key={hc.fund.fundName}>
                 <span className="finding-symbol">
-                  {hc.fund.fundName} — 1Y {formatPercent(hc.fund.oneYear)} · 3Y {formatPercent(hc.fund.threeYear)} · 5Y{" "}
-                  {formatPercent(hc.fund.fiveYear)}
+                  {hc.fund.fundName} — YTD {formatPercent(hc.fund.ytd)} · 1Y {formatPercent(hc.fund.oneYear)} · 3Y{" "}
+                  {formatPercent(hc.fund.threeYear)} · 5Y {formatPercent(hc.fund.fiveYear)} · Composite{" "}
+                  {formatPercent(hc.fund.composite)}
                 </span>
                 <span className="finding-detail" style={{ color: hc.isBestInCategory ? "var(--positive)" : undefined }}>
                   {hc.summary}
                 </span>
+                {hc.fund.divergenceFlag && (
+                  <span className="finding-detail" style={{ color: "var(--negative)" }}>
+                    ⚠️ {hc.fund.divergenceFlag}
+                  </span>
+                )}
                 {hc.peers.map((pc) => (
                   <span
                     className="finding-detail"
@@ -115,8 +121,10 @@ function renderPlanFundComparisons(
                     style={{ marginTop: "0.3rem", color: VERDICT_COLOR[pc.verdictKind] }}
                   >
                     vs {pc.peer.fundName}
-                    {pc.peer.isHeld ? " (also held)" : ""} — 1Y {formatPercent(pc.peer.oneYear)} · 3Y{" "}
-                    {formatPercent(pc.peer.threeYear)} · 5Y {formatPercent(pc.peer.fiveYear)}: {pc.detail}
+                    {pc.peer.isHeld ? " (also held)" : ""} — YTD {formatPercent(pc.peer.ytd)} · 1Y{" "}
+                    {formatPercent(pc.peer.oneYear)} · 3Y {formatPercent(pc.peer.threeYear)} · 5Y{" "}
+                    {formatPercent(pc.peer.fiveYear)} · Composite {formatPercent(pc.peer.composite)}: {pc.detail}
+                    {pc.peer.divergenceFlag && <> ⚠️ {pc.peer.divergenceFlag}</>}
                   </span>
                 ))}
               </div>
@@ -242,8 +250,10 @@ export default async function RecommendationsPage() {
         <strong>401k Specific Recommendations</strong>
         <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginTop: "0.25rem" }}>
           Every held fund compared against genuine same-plan, same-category alternatives from the plan&apos;s complete
-          imported fund menu, across 1Y/3Y/5Y — not a single cherry-picked horizon. Funds recently added to a plan&apos;s
-          menu are flagged as such rather than implied to be unproven.
+          imported fund menu, across YTD/1Y/3Y/5Y plus a blended Composite (20% YTD / 30% 1Y / 30% 3Y / 20% 5Y) — not
+          a single cherry-picked horizon. Funds recently added to a plan&apos;s menu are flagged as such rather than
+          implied to be unproven. A fund whose YTD and 1Y returns point in opposite directions and diverge sharply is
+          flagged for a closer look before acting on either figure.
         </p>
         {renderPlanFundComparisons(planFundComparisons, edpBreakdown)}
       </div>
