@@ -34,8 +34,8 @@ export async function getFullCandidateSymbols(): Promise<string[]> {
   return Array.from(new Set([...STATIC_SECTOR_SYMBOLS, ...dynamicSymbols]));
 }
 
-/** How many symbols to fetch per cron invocation — kept comfortably under Alpha Vantage's 25/day free-tier cap. */
-export const DAILY_FETCH_QUOTA = 12;
+/** How many symbols to fetch per cron invocation — kept comfortably under Alpha Vantage's 25/day free-tier cap, leaving 5/day headroom for retries. */
+export const DAILY_FETCH_QUOTA = 20;
 
 const startOfIsoWeekUTC = (date: Date): Date => {
   const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
@@ -242,8 +242,8 @@ function sleep(ms: number): Promise<void> {
  * or no_horizon_match) updates lastFetchedAt, so a failed attempt doesn't
  * make a symbol look freshly refreshed and skip it for the rest of the week.
  * Requests are paced at MIN_REQUEST_INTERVAL_MS apart (see above) to stay
- * under Alpha Vantage's free-tier per-second burst limit — at 12/day this
- * adds ~13s to the run, well within the cron route's 60s maxDuration.
+ * under Alpha Vantage's free-tier per-second burst limit — at 20/day this
+ * adds ~23s to the run, well within the cron route's 60s maxDuration.
  */
 export async function refreshEarningsEstimates(quota: number = DAILY_FETCH_QUOTA): Promise<EarningsEstimatesRefreshResult[]> {
   const symbols = await selectSymbolsToFetch(quota);
