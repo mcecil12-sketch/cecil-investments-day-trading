@@ -13,13 +13,15 @@ function isAuthorized(request: NextRequest): boolean {
 }
 
 /**
- * Daily weekly-brief resync + Pushover notification, scheduled via
- * vercel.json (`crons`). Previously sendWeeklyBriefNotification() only fired
- * as a side effect of an import or a manual Risk Manager run — on days with
- * neither, no notification went out at all despite the once-per-day dedup
- * guard in lib/notifications/weeklyBrief.ts implying one was expected daily.
- * This resynthesizes from whatever agent runs are already on hand (no agents
- * are re-run here) and sends the notification if one hasn't gone out today.
+ * Weekly brief resync + Pushover notification, scheduled Sunday evening via
+ * vercel.json (`crons`) to match the household's weekly review cadence.
+ * Previously sendWeeklyBriefNotification() only fired as a side effect of an
+ * import or a manual Risk Manager run — on weeks with neither, no
+ * notification went out at all. This resynthesizes from whatever agent runs
+ * are already on hand (no agents are re-run here) and sends the
+ * notification if one hasn't gone out today (see the once-per-day dedup
+ * guard in lib/notifications/weeklyBrief.ts, which still applies in case an
+ * import or manual run already sent one this week).
  */
 export async function GET(request: NextRequest) {
   if (!isAuthorized(request)) {
