@@ -3,13 +3,12 @@ import type { EarningsEstimateSnapshot } from "@/lib/generated/prisma";
 
 /**
  * Converts cached EarningsEstimateSnapshot rows (see earningsEstimates.ts)
- * into a 0-100 "earnings acceleration" score per symbol — the factor the
+ * into a 0-100 "earnings acceleration" score per symbol — the factor in the
  * target composite (35% momentum/trend + 30% earnings acceleration + 25%
- * sector leadership + 10% sentiment/news) has been missing a data source
- * for. Not yet wired into candidateScanner.ts's composite — that requires a
- * separate call on how the still-unimplemented sentiment/news weight gets
- * renormalized, which is pending confirmation. This module is self-contained
- * so that wiring is a small, mechanical follow-up once that's decided.
+ * sector leadership + 10% sentiment/news). Wired into candidateScanner.ts's
+ * composite via EARNINGS_ACCELERATION_WEIGHT; sentiment/news is still the
+ * only unimplemented factor, so the three implemented factors there are
+ * renormalized to fill 100%.
  */
 
 /** Below this absolute EPS estimate, a percent-change denominator is too close to zero to be a stable signal (common for recently-unprofitable or barely-profitable companies) — treated as unavailable rather than producing a wild swing. */

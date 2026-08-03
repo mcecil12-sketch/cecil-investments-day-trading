@@ -1,20 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { getDynamicCandidateUniverse } from "@/lib/agents/candidateUniverse";
-import { STATIC_CANDIDATE_UNIVERSE } from "@/lib/agents/candidateScanner";
-
-/**
- * The full candidate universe (currently ~81 symbols): candidateScanner.ts's
- * static-sector tickers, plus whatever's cached in CandidateUniverse for the
- * SSGA-derived dynamic sectors (Energy/Healthcare/Technology — see
- * candidateUniverse.ts). Deduped since a symbol could in principle appear in
- * both a static sector list and a dynamic sector's top holdings.
- */
-export async function getFullCandidateSymbols(): Promise<string[]> {
-  const staticSymbols = Object.values(STATIC_CANDIDATE_UNIVERSE).flatMap((sector) => sector.symbols);
-  const dynamicUniverse = await getDynamicCandidateUniverse();
-  const dynamicSymbols = Object.values(dynamicUniverse).flatMap((sector) => sector.symbols);
-  return Array.from(new Set([...staticSymbols, ...dynamicSymbols]));
-}
+import { STATIC_CANDIDATE_UNIVERSE, type CandidateScannerOutput } from "@/lib/agents/candidateScanner";
 
 /** How many symbols to fetch per cron invocation — kept comfortably under Alpha Vantage's 25/day free-tier cap, leaving 5/day headroom for retries. */
 export const DAILY_FETCH_QUOTA = 20;
@@ -28,34 +14,89 @@ const startOfIsoWeekUTC = (date: Date): Date => {
 };
 
 /**
- * Picks which symbols to fetch today: prefers symbols never fetched at all,
- * then symbols not yet refreshed since the start of this ISO week (Monday
- * 00:00 UTC), oldest-fetched first, capped at `quota`. A symbol already
- * refreshed this week is left alone even if a prior attempt on it failed
- * earlier today — see lastAttemptedAt on the snapshot row for that history.
+ * Symbols from the latest completed Candidate Scanner run's Top 15
+ * ("Highest Conviction Opportunities") — these are actively driving real
+ * recommendations right now, so they take fetch priority over the rest of
+ * the universe. Empty if no Candidate Scanner run has completed yet.
+ */
+async function getLatestTopCandidateSymbols(): Promise<string[]> {
+  const run = await prisma.agentRun.findFirst({
+    where: { agentType: "CANDIDATE_SCANNER", status: "COMPLETE" },
+    orderBy: { startedAt: "desc" },
+  });
+  if (!run?.output) return [];
+  const output = run.output as unknown as CandidateScannerOutput;
+  return output.topCandidates.map((c) => c.symbol);
+}
+
+/**
+ * Builds this cron's fetch-priority tiers, highest first:
+ *  1. The latest Top 15 / Highest Conviction Opportunities symbols — these
+ *     are actively driving real recommendations right now.
+ *  2. The rest of the dynamic universe (Technology/Energy/Healthcare, the
+ *     SSGA-derived ~39-ticker list — see candidateUniverse.ts), since that's
+ *     the active candidate-scanning universe.
+ *  3. The static sector list (Financials/Industrials/Communications/
+ *     Consumer Discretionary/International Developed) — still worth
+ *     eventually covering, but shouldn't block coverage of what's actually
+ *     being scored and recommended.
+ * A symbol that appears in more than one tier keeps only its
+ * highest-priority slot.
+ */
+async function buildPriorityTiers(): Promise<string[][]> {
+  const [topCandidateSymbols, dynamicUniverse] = await Promise.all([
+    getLatestTopCandidateSymbols(),
+    getDynamicCandidateUniverse(),
+  ]);
+  const dynamicSymbols = Object.values(dynamicUniverse).flatMap((sector) => sector.symbols);
+  const staticSymbols = Object.values(STATIC_CANDIDATE_UNIVERSE).flatMap((sector) => sector.symbols);
+
+  const seen = new Set<string>();
+  return [topCandidateSymbols, dynamicSymbols, staticSymbols].map((tier) =>
+    tier.filter((symbol) => {
+      if (seen.has(symbol)) return false;
+      seen.add(symbol);
+      return true;
+    }),
+  );
+}
+
+/**
+ * Picks which symbols to fetch today. Symbols are first grouped into
+ * priority tiers (see buildPriorityTiers); within each tier, the existing
+ * staleness rule applies unchanged — symbols never fetched at all come
+ * first, then symbols not yet refreshed since the start of this ISO week
+ * (Monday 00:00 UTC), oldest-fetched first. Tiers are then concatenated in
+ * priority order and capped at `quota`, so a later tier is only reached once
+ * every stale symbol in every higher tier has been included. A symbol
+ * already refreshed this week is left alone even if a prior attempt on it
+ * failed earlier today — see lastAttemptedAt on the snapshot row for that
+ * history.
  */
 export async function selectSymbolsToFetch(quota: number = DAILY_FETCH_QUOTA): Promise<string[]> {
-  const universe = await getFullCandidateSymbols();
+  const tiers = await buildPriorityTiers();
   const weekStart = startOfIsoWeekUTC(new Date());
 
   const snapshots = await prisma.earningsEstimateSnapshot.findMany({
-    where: { symbol: { in: universe } },
+    where: { symbol: { in: tiers.flat() } },
     select: { symbol: true, lastFetchedAt: true },
   });
   const lastFetchedBySymbol = new Map(snapshots.map((s) => [s.symbol, s.lastFetchedAt]));
 
-  const stale = universe.filter((symbol) => {
-    const lastFetchedAt = lastFetchedBySymbol.get(symbol) ?? null;
-    return lastFetchedAt == null || lastFetchedAt < weekStart;
-  });
+  const staleOldestFirst = (tier: string[]): string[] => {
+    const stale = tier.filter((symbol) => {
+      const lastFetchedAt = lastFetchedBySymbol.get(symbol) ?? null;
+      return lastFetchedAt == null || lastFetchedAt < weekStart;
+    });
+    stale.sort((a, b) => {
+      const aTime = lastFetchedBySymbol.get(a)?.getTime() ?? 0;
+      const bTime = lastFetchedBySymbol.get(b)?.getTime() ?? 0;
+      return aTime - bTime;
+    });
+    return stale;
+  };
 
-  stale.sort((a, b) => {
-    const aTime = lastFetchedBySymbol.get(a)?.getTime() ?? 0;
-    const bTime = lastFetchedBySymbol.get(b)?.getTime() ?? 0;
-    return aTime - bTime;
-  });
-
-  return stale.slice(0, quota);
+  return tiers.flatMap(staleOldestFirst).slice(0, quota);
 }
 
 interface RawEstimateRow {
