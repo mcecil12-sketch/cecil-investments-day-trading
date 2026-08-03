@@ -189,7 +189,7 @@ export default async function DashboardPage() {
           }))}
           baseValue={recPerformance.baseValue}
           trackedSince={recPerformance.trackedSince ? recPerformance.trackedSince.toISOString() : null}
-          totalRecommendations={recPerformance.totalRecommendations}
+          totalPositions={recPerformance.totalPositions}
         />
       )}
     </div>

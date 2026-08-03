@@ -23,7 +23,7 @@ interface Props {
   simulatedPortfolio: SimulatedPortfolioChartPoint[];
   baseValue: number;
   trackedSince: string | null;
-  totalRecommendations: number;
+  totalPositions: number;
 }
 
 /** Dark-mode categorical pair validated for this app's --bg-elevated surface (see dataviz skill). */
@@ -91,9 +91,9 @@ export function RecommendationPerformanceCharts({
   simulatedPortfolio,
   baseValue,
   trackedSince,
-  totalRecommendations,
+  totalPositions,
 }: Props) {
-  if (totalRecommendations === 0) {
+  if (totalPositions === 0) {
     return (
       <div className="card">
         <h2 style={{ marginTop: 0 }}>Recommendation Performance</h2>
@@ -112,8 +112,9 @@ export function RecommendationPerformanceCharts({
     <div>
       <h2 style={{ marginBottom: "0.25rem" }}>Recommendation Performance</h2>
       <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginTop: 0, marginBottom: "1rem" }}>
-        Tracking {totalRecommendations} logged recommendation{totalRecommendations === 1 ? "" : "s"} since{" "}
-        {trackedSinceLabel}. Each point starts from that stock&apos;s own logged date forward — no backfilling.
+        Tracking {totalPositions} position{totalPositions === 1 ? "" : "s"} since{" "}
+        {trackedSinceLabel}. Each position starts from its entry date forward — a single missed week doesn&apos;t
+        close it, but 2 consecutive missed weeks do, and re-entry after a close starts a fresh position.
       </p>
 
       <div className="card">
