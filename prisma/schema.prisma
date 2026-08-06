@@ -385,6 +385,59 @@ model EarningsEstimateSnapshot {
   @@index([lastFetchedAt])
 }
 
+/// Per-symbol fetch-cycle bookkeeping for the earnings-history pipeline (see
+/// lib/agents/earningsHistory.ts) — the EARNINGS-endpoint analog of
+/// EarningsEstimateSnapshot's tracking fields above, kept as its own model
+/// since EarningsHistory below is many-rows-per-symbol (one per fiscal
+/// quarter) rather than a single current snapshot.
+model EarningsFetchState {
+  id     String @id @default(cuid())
+  symbol String @unique
+
+  /// True when the last successful fetch returned a non-empty `quarterlyEarnings` array for this symbol. False means Alpha Vantage's EARNINGS endpoint has no history at all — distinct from never having been fetched (lastFetchedAt == null).
+  hasHistory Boolean @default(false)
+  /// Set only when a fetch for this symbol completed successfully — the signal the daily cron uses to decide which symbols are stale this week (see selectSymbolsToFetch in lib/agents/earningsHistory.ts).
+  lastFetchedAt DateTime?
+  /// Set on every fetch attempt, success or failure.
+  lastAttemptedAt DateTime?
+  /// Cleared on the next successful fetch; populated on failure for debugging.
+  lastErrorMessage String?
+
+  updatedAt DateTime @updatedAt
+
+  @@index([lastFetchedAt])
+}
+
+/// One row per reported/estimated fiscal quarter from Alpha Vantage's EARNINGS
+/// endpoint (quarterlyEarnings array), for the symbols in EarningsFetchState.
+/// Powers the earnings-surprise-trend factor (see lib/agents/earningsSurpriseTrend.ts),
+/// which needs several quarters of reportedEPS-vs-estimatedEPS history per
+/// symbol to compute a standardized unexpected earnings (SUE) score — unlike
+/// EarningsEstimateSnapshot's single-row current-snapshot shape, this is
+/// intentionally a time series. Only the most recent QUARTERS_TO_PERSIST
+/// quarters returned by Alpha Vantage are kept (some symbols return 100+
+/// quarters of history; far more than the scoring window needs).
+model EarningsHistory {
+  id     String @id @default(cuid())
+  symbol String
+
+  /// The fiscal period this quarter's figures cover.
+  fiscalDateEnding DateTime
+  /// The date Alpha Vantage recorded this quarter as reported. Can be a future/recent date with reportedEPS still null — Alpha Vantage often lists the upcoming quarter before backfilling its actual reported figure, a normal reporting lag rather than missing data.
+  reportedDate DateTime?
+  /// Null when this quarter hasn't been reported yet (see reportedDate above) or Alpha Vantage didn't report a value — distinct from a real 0.
+  reportedEPS Float?
+  estimatedEPS Float?
+  /// Alpha Vantage's own reportedEPS - estimatedEPS, kept for reference; the SUE calculation recomputes this from reportedEPS/estimatedEPS directly rather than trusting this field, so a null here doesn't block scoring as long as both underlying fields are present.
+  surprise Float?
+  surprisePercentage Float?
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([symbol, fiscalDateEnding])
+  @@index([symbol])
+}
+
 /// A tiny key-value store for cross-cutting notification state that doesn't
 /// belong to any one domain row — e.g. the last time a Pushover push actually
 /// went out, so a same-day re-run of the agent pipeline (multiple imports in

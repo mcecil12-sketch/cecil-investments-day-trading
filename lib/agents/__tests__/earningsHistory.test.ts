@@ -3,13 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 const findFirst = vi.fn();
 const findMany = vi.fn();
 vi.mock("@/lib/prisma", () => ({
-  prisma: { agentRun: { findFirst }, earningsEstimateSnapshot: { findMany } },
+  prisma: { agentRun: { findFirst }, earningsFetchState: { findMany } },
 }));
 
 const getDynamicCandidateUniverse = vi.fn();
 vi.mock("@/lib/agents/candidateUniverse", () => ({ getDynamicCandidateUniverse }));
 
-const { selectSymbolsToFetch } = await import("@/lib/agents/earningsEstimates");
+const { selectSymbolsToFetch } = await import("@/lib/agents/earningsHistory");
 const { STATIC_CANDIDATE_UNIVERSE } = await import("@/lib/agents/candidateScanner");
 
 function scannerRun(symbols: string[]) {

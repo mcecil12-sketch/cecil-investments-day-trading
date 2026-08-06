@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { runAndPersistEarningsEstimatesRefresh } from "@/lib/agents/runner";
+import { runAndPersistEarningsHistoryRefresh } from "@/lib/agents/runner";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -12,17 +12,20 @@ function isAuthorized(request: NextRequest): boolean {
 }
 
 /**
- * Daily earnings-estimates refresh, scheduled via vercel.json (`crons`).
- * Pulls Alpha Vantage EARNINGS_ESTIMATES for today's batch of stale candidate
- * universe symbols (~12/day, well under the free tier's 25/day cap) and
- * upserts EarningsEstimateSnapshot — see lib/agents/earningsEstimates.ts.
+ * Daily earnings-history refresh, scheduled via vercel.json (`crons`). Pulls
+ * Alpha Vantage EARNINGS for today's batch of stale candidate universe
+ * symbols (20/day quota — see DAILY_FETCH_QUOTA in earningsHistory.ts) and
+ * upserts EarningsHistory + EarningsFetchState — see
+ * lib/agents/earningsHistory.ts. Route path kept as /earnings-estimates
+ * (not renamed) to avoid re-registering the Vercel cron schedule entry for
+ * what's otherwise an internal data-source swap.
  */
 export async function GET(request: NextRequest) {
   if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const result = await runAndPersistEarningsEstimatesRefresh();
+  const result = await runAndPersistEarningsHistoryRefresh();
   if (result.status === "FAILED") {
     return NextResponse.json(result, { status: 500 });
   }

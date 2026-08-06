@@ -6,7 +6,7 @@ import { runSectorRotationAgent, type SectorScore, type SectorRotationFlag, type
 import { runRiskManagerAgent, type RiskFlag, type OpportunityCostEntry, type RiskManagerOutput } from "@/lib/agents/riskManager";
 import { runCandidateScannerAgent, type CandidateEntry, type CandidateScannerOutput } from "@/lib/agents/candidateScanner";
 import { refreshCandidateUniverse, type UniverseRefreshResult } from "@/lib/agents/candidateUniverse";
-import { refreshEarningsEstimates, type EarningsEstimatesRefreshResult, DAILY_FETCH_QUOTA } from "@/lib/agents/earningsEstimates";
+import { refreshEarningsHistory, type EarningsHistoryRefreshResult, DAILY_FETCH_QUOTA } from "@/lib/agents/earningsHistory";
 import { logCandidateRecommendationBatch } from "@/lib/agents/candidateRecommendationLog";
 import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
 import { buildTaxableAnalysisContext, type TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
@@ -403,23 +403,31 @@ export async function runAndPersistCandidateUniverseRefresh(): Promise<UniverseR
   }
 }
 
-export interface EarningsEstimatesRunResult {
+export interface EarningsHistoryRunResult {
   runId?: string;
   status: "COMPLETE" | "FAILED";
-  output?: EarningsEstimatesRefreshResult[];
+  output?: EarningsHistoryRefreshResult[];
   error?: string;
 }
 
 /**
- * Runs the daily earnings-estimates refresh (fetches Alpha Vantage
- * EARNINGS_ESTIMATES for today's batch of stale candidate-universe symbols —
- * see earningsEstimates.ts) and persists an AgentRun audit trail, same
+ * Runs the daily earnings-history refresh (fetches Alpha Vantage EARNINGS
+ * for today's batch of stale candidate-universe symbols — see
+ * earningsHistory.ts, which replaced the prior EARNINGS_ESTIMATES-based
+ * fetch after live testing on 2026-08-06 confirmed EARNINGS_ESTIMATES has
+ * near-zero real coverage) and persists an AgentRun audit trail, same
  * lifecycle pattern as runAndPersistCandidateUniverseRefresh above. No
  * ActionItems: this is a data refresh, not a recommendation.
+ *
+ * The AgentType stays EARNINGS_ESTIMATES_REFRESH (not renamed to match the
+ * new data source) deliberately — renaming a Postgres enum value used by
+ * existing AgentRun audit rows is a riskier migration than the benefit of a
+ * cosmetic rename justifies; it's an internal event-log label, not part of
+ * the public "earnings surprise trend" factor rename.
  */
-export async function runAndPersistEarningsEstimatesRefresh(
+export async function runAndPersistEarningsHistoryRefresh(
   quota: number = DAILY_FETCH_QUOTA,
-): Promise<EarningsEstimatesRunResult> {
+): Promise<EarningsHistoryRunResult> {
   let run;
   try {
     run = await withColdStartRetry("EARNINGS_ESTIMATES_REFRESH", () =>
@@ -432,7 +440,7 @@ export async function runAndPersistEarningsEstimatesRefresh(
   }
 
   try {
-    const output = await refreshEarningsEstimates(quota);
+    const output = await refreshEarningsHistory(quota);
     await prisma.agentRun.update({
       where: { id: run.id },
       data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },
