@@ -80,6 +80,22 @@ describe("selectSymbolsToFetch", () => {
     expect(result).toEqual(["DELL", "MU"]);
   });
 
+  it("treats a symbol as stale only after ~80 days since its last successful fetch, not on a weekly basis", async () => {
+    findFirst.mockResolvedValueOnce(scannerRun(["RECENT", "OLD"]));
+    getDynamicCandidateUniverse.mockResolvedValueOnce({
+      Technology: { sectorEtf: "XLK", symbols: ["RECENT", "OLD"] },
+    });
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+    const eightyFiveDaysAgo = new Date(Date.now() - 85 * 24 * 60 * 60 * 1000);
+    findMany.mockResolvedValueOnce([
+      { symbol: "RECENT", lastFetchedAt: tenDaysAgo },
+      { symbol: "OLD", lastFetchedAt: eightyFiveDaysAgo },
+    ]);
+
+    const result = await selectSymbolsToFetch(1);
+    expect(result).toEqual(["OLD"]);
+  });
+
   it("falls back to dynamic-then-static universe when no Candidate Scanner run has completed yet", async () => {
     findFirst.mockResolvedValueOnce(null);
     getDynamicCandidateUniverse.mockResolvedValueOnce({

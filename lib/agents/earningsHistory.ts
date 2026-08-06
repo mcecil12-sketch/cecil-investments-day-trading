@@ -5,13 +5,19 @@ import { STATIC_CANDIDATE_UNIVERSE, type CandidateScannerOutput } from "@/lib/ag
 /** How many symbols to fetch per cron invocation. Kept unchanged from the prior EARNINGS_ESTIMATES-based pipeline for now — EARNINGS has full coverage and we're on an Alpha Vantage premium key with no daily cap, so fetching the whole universe in one run may be possible, but that's a separate rotation-design decision, not part of this factor/data-source swap. */
 export const DAILY_FETCH_QUOTA = 20;
 
-const startOfIsoWeekUTC = (date: Date): Date => {
-  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
-  const day = d.getUTCDay();
-  const diff = (day === 0 ? -6 : 1) - day;
-  d.setUTCDate(d.getUTCDate() + diff);
-  return d;
-};
+/**
+ * Minimum days between refetches for a symbol that's already been
+ * successfully fetched. Earnings are reported quarterly (~91 days apart);
+ * 80 gives an ~11-day margin so a symbol becomes eligible again shortly
+ * before its next quarter would typically be due, rather than exactly on
+ * it (real reporting dates vary a bit quarter to quarter). Replaces the
+ * prior per-ISO-week rule, which was calibrated for EARNINGS_ESTIMATES'
+ * forward-looking analyst estimates (those do move week to week); reported
+ * quarterly EPS history can't change more than once a quarter, so refetching
+ * weekly was pure waste once a symbol had already been covered.
+ */
+const REFETCH_INTERVAL_DAYS = 80;
+const REFETCH_INTERVAL_MS = REFETCH_INTERVAL_DAYS * 24 * 60 * 60 * 1000;
 
 /**
  * Symbols from the latest completed Candidate Scanner run's Top 15
@@ -64,18 +70,18 @@ async function buildPriorityTiers(): Promise<string[][]> {
 /**
  * Picks which symbols to fetch today. Symbols are first grouped into
  * priority tiers (see buildPriorityTiers); within each tier, the existing
- * staleness rule applies unchanged — symbols never fetched at all come
- * first, then symbols not yet refreshed since the start of this ISO week
- * (Monday 00:00 UTC), oldest-fetched first. Tiers are then concatenated in
- * priority order and capped at `quota`, so a later tier is only reached once
- * every stale symbol in every higher tier has been included. A symbol
- * already refreshed this week is left alone even if a prior attempt on it
- * failed earlier today — see lastAttemptedAt on EarningsFetchState for that
- * history.
+ * staleness rule applies unchanged in shape — symbols never fetched at all
+ * come first, then symbols not refetched within the trailing
+ * REFETCH_INTERVAL_DAYS days, oldest-fetched first. Tiers are then
+ * concatenated in priority order and capped at `quota`, so a later tier is
+ * only reached once every stale symbol in every higher tier has been
+ * included. A symbol still within its refetch window is left alone even if
+ * a prior attempt on it failed earlier today — see lastAttemptedAt on
+ * EarningsFetchState for that history.
  */
 export async function selectSymbolsToFetch(quota: number = DAILY_FETCH_QUOTA): Promise<string[]> {
   const tiers = await buildPriorityTiers();
-  const weekStart = startOfIsoWeekUTC(new Date());
+  const staleBefore = new Date(Date.now() - REFETCH_INTERVAL_MS);
 
   const states = await prisma.earningsFetchState.findMany({
     where: { symbol: { in: tiers.flat() } },
@@ -86,7 +92,7 @@ export async function selectSymbolsToFetch(quota: number = DAILY_FETCH_QUOTA): P
   const staleOldestFirst = (tier: string[]): string[] => {
     const stale = tier.filter((symbol) => {
       const lastFetchedAt = lastFetchedBySymbol.get(symbol) ?? null;
-      return lastFetchedAt == null || lastFetchedAt < weekStart;
+      return lastFetchedAt == null || lastFetchedAt < staleBefore;
     });
     stale.sort((a, b) => {
       const aTime = lastFetchedBySymbol.get(a)?.getTime() ?? 0;
