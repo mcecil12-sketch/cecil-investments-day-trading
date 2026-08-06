@@ -28,7 +28,14 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  await synthesizeWeeklyBrief();
+  try {
+    await synthesizeWeeklyBrief();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("weekly-brief cron: synthesizeWeeklyBrief failed:", message);
+    return NextResponse.json({ status: "FAILED", error: message }, { status: 500 });
+  }
+
   const result = await sendWeeklyBriefNotification();
   return NextResponse.json(result);
 }

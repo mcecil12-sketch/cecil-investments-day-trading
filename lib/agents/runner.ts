@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { Prisma } from "@/lib/generated/prisma";
+import { withColdStartRetry } from "@/lib/dbRetry";
 import { runRelativeStrengthAgent, type RelativeStrengthEntry, type RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
 import { runSectorRotationAgent, type SectorScore, type SectorRotationFlag, type SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import { runRiskManagerAgent, type RiskFlag, type OpportunityCostEntry, type RiskManagerOutput } from "@/lib/agents/riskManager";
@@ -360,7 +361,7 @@ export async function runAndPersistCandidateScanner(): Promise<CandidateScannerR
 }
 
 export interface UniverseRefreshRunResult {
-  runId: string;
+  runId?: string;
   status: "COMPLETE" | "FAILED";
   output?: UniverseRefreshResult[];
   error?: string;
@@ -374,9 +375,16 @@ export interface UniverseRefreshRunResult {
  * recommendation.
  */
 export async function runAndPersistCandidateUniverseRefresh(): Promise<UniverseRefreshRunResult> {
-  const run = await prisma.agentRun.create({
-    data: { agentType: "UNIVERSE_REFRESH", status: "RUNNING" },
-  });
+  let run;
+  try {
+    run = await withColdStartRetry("UNIVERSE_REFRESH", () =>
+      prisma.agentRun.create({ data: { agentType: "UNIVERSE_REFRESH", status: "RUNNING" } }),
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("UNIVERSE_REFRESH: could not start run after cold-start retries:", message);
+    return { status: "FAILED", error: message };
+  }
 
   try {
     const output = await refreshCandidateUniverse();
@@ -396,7 +404,7 @@ export async function runAndPersistCandidateUniverseRefresh(): Promise<UniverseR
 }
 
 export interface EarningsEstimatesRunResult {
-  runId: string;
+  runId?: string;
   status: "COMPLETE" | "FAILED";
   output?: EarningsEstimatesRefreshResult[];
   error?: string;
@@ -412,9 +420,16 @@ export interface EarningsEstimatesRunResult {
 export async function runAndPersistEarningsEstimatesRefresh(
   quota: number = DAILY_FETCH_QUOTA,
 ): Promise<EarningsEstimatesRunResult> {
-  const run = await prisma.agentRun.create({
-    data: { agentType: "EARNINGS_ESTIMATES_REFRESH", status: "RUNNING" },
-  });
+  let run;
+  try {
+    run = await withColdStartRetry("EARNINGS_ESTIMATES_REFRESH", () =>
+      prisma.agentRun.create({ data: { agentType: "EARNINGS_ESTIMATES_REFRESH", status: "RUNNING" } }),
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("EARNINGS_ESTIMATES_REFRESH: could not start run after cold-start retries:", message);
+    return { status: "FAILED", error: message };
+  }
 
   try {
     const output = await refreshEarningsEstimates(quota);
@@ -454,12 +469,14 @@ async function buildCioCandidates(): Promise<{
   candidateRun: { id: string; output: Prisma.JsonValue } | null;
   taxableContext: TaxableAnalysisContext | null;
 }> {
-  const [riskRun, relativeRun, sectorRun, candidateRun] = await Promise.all([
-    prisma.agentRun.findFirst({ where: { agentType: "RISK_MANAGER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
-    prisma.agentRun.findFirst({ where: { agentType: "RELATIVE_STRENGTH", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
-    prisma.agentRun.findFirst({ where: { agentType: "SECTOR_ROTATION", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
-    prisma.agentRun.findFirst({ where: { agentType: "CANDIDATE_SCANNER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
-  ]);
+  const [riskRun, relativeRun, sectorRun, candidateRun] = await withColdStartRetry("WEEKLY_BRIEF", () =>
+    Promise.all([
+      prisma.agentRun.findFirst({ where: { agentType: "RISK_MANAGER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
+      prisma.agentRun.findFirst({ where: { agentType: "RELATIVE_STRENGTH", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
+      prisma.agentRun.findFirst({ where: { agentType: "SECTOR_ROTATION", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
+      prisma.agentRun.findFirst({ where: { agentType: "CANDIDATE_SCANNER", status: "COMPLETE" }, orderBy: { startedAt: "desc" } }),
+    ]),
+  );
 
   const candidates: CioCandidateItem[] = [];
 
