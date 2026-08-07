@@ -1,6 +1,6 @@
 import { Prisma } from "@/lib/generated/prisma";
 
-const COLD_START_RETRY_DELAYS_MS = [2000, 4000];
+const COLD_START_RETRY_DELAYS_MS = [2000, 4000, 8000];
 
 /**
  * Neon's free-tier compute autosuspends after 5 minutes idle. The first
