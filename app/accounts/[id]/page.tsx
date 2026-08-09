@@ -5,6 +5,7 @@ import { computeBenchmark } from "@/lib/benchmark/engine";
 import { isLockedInstrument } from "@/lib/benchmark/lockedHoldings";
 import { alphaColor, formatCompactCurrency, formatCurrency, formatDate, formatPercent } from "@/lib/format";
 import { EditExternalId } from "./EditExternalId";
+import { DeleteImportBatch } from "./DeleteImportBatch";
 
 export const dynamic = "force-dynamic";
 
@@ -86,7 +87,10 @@ export default async function AccountDetailPage({ params }: { params: { id: stri
         )}
       </div>
 
-      <h2>Positions</h2>
+      <h2 style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        Positions
+        {latestBatch && <DeleteImportBatch importBatchId={latestBatch.id} fileName={latestBatch.fileName} />}
+      </h2>
       <div className="card">
         {holdings.length === 0 ? (
           <p style={{ color: "var(--text-muted)" }}>
