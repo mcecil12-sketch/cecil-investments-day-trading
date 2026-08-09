@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { computeBenchmark } from "@/lib/benchmark/engine";
 import { isLockedInstrument } from "@/lib/benchmark/lockedHoldings";
 import { alphaColor, formatCompactCurrency, formatCurrency, formatDate, formatPercent } from "@/lib/format";
+import { EditExternalId } from "./EditExternalId";
 
 export const dynamic = "force-dynamic";
 
@@ -55,6 +56,9 @@ export default async function AccountDetailPage({ params }: { params: { id: stri
               <span>{account.type}</span>
               <span>· {account.institution}</span>
               {account.isLocked && <span className="badge">Monitor Only</span>}
+            </div>
+            <div className="account-meta" style={{ marginTop: "0.25rem" }}>
+              <EditExternalId accountId={account.id} externalId={account.externalId} />
             </div>
           </div>
           <div style={{ textAlign: "right" }}>

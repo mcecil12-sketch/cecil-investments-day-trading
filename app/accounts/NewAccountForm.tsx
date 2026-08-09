@@ -15,6 +15,7 @@ export function NewAccountForm() {
   const [name, setName] = useState("");
   const [type, setType] = useState(ACCOUNT_TYPES[0].value);
   const [institution, setInstitution] = useState("");
+  const [externalId, setExternalId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -26,7 +27,13 @@ export function NewAccountForm() {
       const response = await fetch("/api/accounts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, type, institution, isLocked: type === "VZ_EDP" }),
+        body: JSON.stringify({
+          name,
+          type,
+          institution,
+          externalId: externalId.trim() || null,
+          isLocked: type === "VZ_EDP",
+        }),
       });
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
@@ -34,6 +41,7 @@ export function NewAccountForm() {
       }
       setName("");
       setInstitution("");
+      setExternalId("");
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -69,7 +77,17 @@ export function NewAccountForm() {
           onChange={(e) => setInstitution(e.target.value)}
           required
         />
+        <input
+          placeholder="Account number (as shown on statements)"
+          value={externalId}
+          onChange={(e) => setExternalId(e.target.value)}
+        />
       </div>
+      <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginTop: "-0.5rem" }}>
+        Setting the account number lets PDF/CSV imports match this account by number instead of
+        by name — strongly recommended, since name-based matching can misroute positions between
+        similarly-named accounts.
+      </p>
       {error && <p style={{ color: "var(--negative)" }}>{error}</p>}
       <button className="btn" type="submit" disabled={submitting}>
         {submitting ? "Adding…" : "Add account"}

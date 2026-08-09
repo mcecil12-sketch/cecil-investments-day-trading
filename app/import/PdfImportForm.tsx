@@ -68,8 +68,7 @@ export function PdfImportForm({ accounts }: { accounts: AccountOption[] }) {
           accountName: account.accountName,
           accountNumber: account.accountNumber,
           positions: account.positions,
-          selectedAccountId:
-            findMatchingAccountId(accounts, account.accountName, account.accountNumber) ?? accounts[0]?.id ?? "",
+          selectedAccountId: findMatchingAccountId(accounts, account.accountName, account.accountNumber) ?? "",
         })),
       );
       setStage("preview");
@@ -94,7 +93,11 @@ export function PdfImportForm({ accounts }: { accounts: AccountOption[] }) {
         body: JSON.stringify({
           asOfDate,
           fileName,
-          accounts: selections.map((s) => ({ accountId: s.selectedAccountId, positions: s.positions })),
+          accounts: selections.map((s) => ({
+            accountId: s.selectedAccountId,
+            accountNumber: s.accountNumber,
+            positions: s.positions,
+          })),
         }),
       });
       const body = await response.json();
@@ -184,7 +187,9 @@ export function PdfImportForm({ accounts }: { accounts: AccountOption[] }) {
                   <select
                     value={selection.selectedAccountId}
                     onChange={(e) => updateSelectedAccount(index, e.target.value)}
+                    style={selection.selectedAccountId ? undefined : { borderColor: "var(--negative)" }}
                   >
+                    <option value="">-- Select account (no confident match) --</option>
                     {accounts.map((account) => (
                       <option key={account.id} value={account.id}>
                         {account.name}

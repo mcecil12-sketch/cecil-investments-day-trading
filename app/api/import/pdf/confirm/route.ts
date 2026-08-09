@@ -6,6 +6,7 @@ import { triggerAllAgentsRun } from "@/lib/agents/runner";
 
 interface ConfirmAccountInput {
   accountId: string;
+  accountNumber?: string;
   positions: ExtractedPdfPosition[];
 }
 
@@ -57,6 +58,22 @@ export async function POST(request: NextRequest) {
         status: "FAILED",
         rowCount: 0,
         errorMessage: "Account not found",
+      });
+      continue;
+    }
+
+    // Last line of defense against misrouted sections: if this account has a
+    // known external account number, the PDF section being written to it
+    // must report that same number. A mismatch means the extraction or the
+    // preview's account selection put the wrong section's positions here —
+    // fail loudly instead of silently overwriting the wrong account's data.
+    if (dbAccount.externalId && account.accountNumber && dbAccount.externalId !== account.accountNumber) {
+      batches.push({
+        accountId: dbAccount.id,
+        accountName: dbAccount.name,
+        status: "FAILED",
+        rowCount: 0,
+        errorMessage: `Account number mismatch: "${dbAccount.name}" has external ID ${dbAccount.externalId}, but this PDF section reported account number ${account.accountNumber}. Not imported.`,
       });
       continue;
     }
