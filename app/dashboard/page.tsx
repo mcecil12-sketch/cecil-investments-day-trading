@@ -3,7 +3,8 @@ import { computeBenchmark, FIDELITY_PERIODS } from "@/lib/benchmark/engine";
 import type { AccountBenchmarkResult, BenchmarkComputation, FidelityPeriodKey } from "@/lib/benchmark/engine";
 import { alphaColor, formatCompactCurrency, formatCurrency, formatPercent } from "@/lib/format";
 import { getRecommendationPerformance } from "@/lib/agents/recommendationPerformance";
-import { RecommendationPerformanceCharts } from "./RecommendationPerformanceCharts";
+import type { TimeframeKey } from "@/lib/timeframes";
+import { RecommendationPerformanceCharts, type PickQualityChartPoint } from "./RecommendationPerformanceCharts";
 
 export const dynamic = "force-dynamic";
 
@@ -174,12 +175,19 @@ export default async function DashboardPage() {
 
       {recPerformance && (
         <RecommendationPerformanceCharts
-          pickQuality={recPerformance.pickQuality.map((p) => ({
-            date: p.date.toISOString().slice(0, 10),
-            pickReturn: p.pickReturn,
-            spxReturn: p.spxReturn,
-            activeCount: p.activeCount,
-          }))}
+          pickQualityByTimeframe={
+            Object.fromEntries(
+              Object.entries(recPerformance.pickQualityByTimeframe).map(([key, points]) => [
+                key,
+                points.map((p) => ({
+                  date: p.date.toISOString().slice(0, 10),
+                  pickReturn: p.pickReturn,
+                  spxReturn: p.spxReturn,
+                  activeCount: p.activeCount,
+                })),
+              ]),
+            ) as Record<TimeframeKey, PickQualityChartPoint[]>
+          }
           simulatedPortfolio={recPerformance.simulatedPortfolio.map((p) => ({
             date: p.date.toISOString().slice(0, 10),
             portfolioValue: p.portfolioValue,

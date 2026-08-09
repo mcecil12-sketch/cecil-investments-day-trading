@@ -2,6 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { getPriceHistory, getSp500Series, type PricePoint } from "@/lib/agents/marketData";
 import { computeReturn } from "@/lib/agents/technicals";
 import { convictionMidpoint, resolvePortfolioBaseValue } from "@/lib/agents/positionSizing";
+import { TIMEFRAME_DAYS, type TimeframeKey } from "@/lib/timeframes";
 
 export interface PickQualityPoint {
   date: Date;
@@ -22,7 +23,8 @@ export interface SimulatedPortfolioPoint {
 }
 
 export interface RecommendationPerformanceResult {
-  pickQuality: PickQualityPoint[];
+  /** Pick Quality re-based to each timeframe's own window start (not sliced-after-the-fact from the "All" series) — an average-of-returns can't be re-based algebraically once positions are mixed, so each variant is computed from its own per-position pass. */
+  pickQualityByTimeframe: Record<TimeframeKey, PickQualityPoint[]>;
   simulatedPortfolio: SimulatedPortfolioPoint[];
   baseValue: number;
   trackedSince: Date | null;
@@ -152,6 +154,66 @@ function returnOverWindow(points: PricePoint[], fromDate: Date, toDate: Date): n
   return computeReturn(startClose, endClose);
 }
 
+function subtractDaysUtc(date: Date, days: number): Date {
+  const d = new Date(date);
+  d.setUTCDate(d.getUTCDate() - days);
+  return d;
+}
+
+/** A position can't be re-based before it existed — for positions that entered after the window opened, the window start collapses to the position's own entryDate, so its contribution is just its ordinary since-entry return. */
+export function effectiveStartFor(entryDate: Date, windowStart: Date | null): Date {
+  if (windowStart == null) return entryDate;
+  return entryDate.getTime() > windowStart.getTime() ? entryDate : windowStart;
+}
+
+/** Equal-weighted Pick Quality for one date, with every active position's return re-based to `windowStart` (null = since each position's own entryDate, i.e. the "All" view). */
+export function buildPickQualityPoint(
+  date: Date,
+  activePositions: TrackedPosition[],
+  priceBySymbol: Map<string, PricePoint[]>,
+  spxPoints: PricePoint[],
+  windowStart: Date | null,
+): PickQualityPoint {
+  const pickReturns: number[] = [];
+  const spxReturns: number[] = [];
+
+  for (const position of activePositions) {
+    const start = effectiveStartFor(position.entryDate, windowStart);
+    const points = priceBySymbol.get(position.symbol);
+    const stockReturn = points ? returnOverWindow(points, start, date) : null;
+    const spxReturn = returnOverWindow(spxPoints, start, date);
+    if (stockReturn != null) pickReturns.push(stockReturn);
+    if (spxReturn != null) spxReturns.push(spxReturn);
+  }
+
+  return {
+    date,
+    pickReturn: pickReturns.length > 0 ? average(pickReturns) : null,
+    spxReturn: spxReturns.length > 0 ? average(spxReturns) : null,
+    activeCount: activePositions.length,
+  };
+}
+
+/** Rebuilds Pick Quality for a single trailing-N-day window, using each date's already-known active positions rather than re-filtering the full position list. */
+function computeWindowedPickQuality(
+  timeline: Date[],
+  activePositionsByDate: Map<number, TrackedPosition[]>,
+  priceBySymbol: Map<string, PricePoint[]>,
+  spxPoints: PricePoint[],
+  days: number,
+): PickQualityPoint[] {
+  if (timeline.length === 0) return [];
+  const windowStart = subtractDaysUtc(timeline[timeline.length - 1], days - 1);
+  const points: PickQualityPoint[] = [];
+  for (const date of timeline) {
+    if (date.getTime() < windowStart.getTime()) continue;
+    const activePositions = activePositionsByDate.get(date.getTime());
+    if (!activePositions || activePositions.length === 0) continue;
+    points.push(buildPickQualityPoint(date, activePositions, priceBySymbol, spxPoints, windowStart));
+  }
+  return points;
+}
+
 /**
  * Builds both Dashboard "Recommendation Performance" views from
  * CandidateRecommendationLog and existing market data — no new scoring
@@ -169,7 +231,10 @@ function returnOverWindow(points: PricePoint[], fromDate: Date, toDate: Date): n
  * View 1 (pick quality): each tracked position's own price return since
  * its entryDate, averaged equal-weighted across every position active as
  * of a given date, vs the S&P 500's return over that same per-position
- * window.
+ * window. Computed separately per timeframe (see pickQualityByTimeframe) —
+ * for the 1W/2W/1M variants, each position's return is re-based to the
+ * window's own start date (or its entryDate if that's later), since an
+ * equal-weighted average can't be re-based after the fact.
  *
  * View 2 (simulated portfolio): a paper portfolio anchored to the real
  * "Total Portfolio Value" (see resolvePortfolioBaseValue) where each
@@ -189,7 +254,7 @@ export async function getRecommendationPerformance(
 
   if (rows.length === 0) {
     return {
-      pickQuality: [],
+      pickQualityByTimeframe: { "1W": [], "2W": [], "1M": [], All: [] },
       simulatedPortfolio: [],
       baseValue,
       trackedSince: null,
@@ -225,8 +290,9 @@ export async function getRecommendationPerformance(
     timeline.push(today);
   }
 
-  const pickQuality: PickQualityPoint[] = [];
+  const pickQualityAll: PickQualityPoint[] = [];
   const simulatedPortfolio: SimulatedPortfolioPoint[] = [];
+  const activePositionsByDate = new Map<number, TrackedPosition[]>();
 
   for (const date of timeline) {
     const activePositions = positions.filter((p) => {
@@ -237,18 +303,14 @@ export async function getRecommendationPerformance(
     });
     if (activePositions.length === 0) continue;
 
-    const pickReturns: number[] = [];
-    const spxReturns: number[] = [];
+    activePositionsByDate.set(date.getTime(), activePositions);
+
     let pnl = 0;
     let sizedCount = 0;
 
     for (const position of activePositions) {
       const points = priceBySymbol.get(position.symbol);
       const stockReturn = points ? returnOverWindow(points, position.entryDate, date) : null;
-      const spxReturn = returnOverWindow(spxPoints, position.entryDate, date);
-
-      if (stockReturn != null) pickReturns.push(stockReturn);
-      if (spxReturn != null) spxReturns.push(spxReturn);
 
       if (stockReturn != null) {
         const allocation = convictionMidpoint(position.entryScore) * baseValue;
@@ -257,12 +319,7 @@ export async function getRecommendationPerformance(
       }
     }
 
-    pickQuality.push({
-      date,
-      pickReturn: pickReturns.length > 0 ? average(pickReturns) : null,
-      spxReturn: spxReturns.length > 0 ? average(spxReturns) : null,
-      activeCount: activePositions.length,
-    });
+    pickQualityAll.push(buildPickQualityPoint(date, activePositions, priceBySymbol, spxPoints, null));
 
     simulatedPortfolio.push({
       date,
@@ -273,8 +330,15 @@ export async function getRecommendationPerformance(
     });
   }
 
+  const pickQualityByTimeframe: Record<TimeframeKey, PickQualityPoint[]> = {
+    "1W": computeWindowedPickQuality(timeline, activePositionsByDate, priceBySymbol, spxPoints, TIMEFRAME_DAYS["1W"]!),
+    "2W": computeWindowedPickQuality(timeline, activePositionsByDate, priceBySymbol, spxPoints, TIMEFRAME_DAYS["2W"]!),
+    "1M": computeWindowedPickQuality(timeline, activePositionsByDate, priceBySymbol, spxPoints, TIMEFRAME_DAYS["1M"]!),
+    All: pickQualityAll,
+  };
+
   return {
-    pickQuality,
+    pickQualityByTimeframe,
     simulatedPortfolio,
     baseValue,
     trackedSince: positions[0].entryDate,

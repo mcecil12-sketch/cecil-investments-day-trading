@@ -553,3 +553,25 @@ select {
   font-size: 0.72rem;
   margin: 0.75rem 0 0;
 }
+
+.rec-perf-timeframe {
+  display: flex;
+  gap: 0.4rem;
+  margin: 0 0 1rem;
+}
+
+.rec-perf-timeframe-btn {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.3rem 0.7rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.rec-perf-timeframe-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}

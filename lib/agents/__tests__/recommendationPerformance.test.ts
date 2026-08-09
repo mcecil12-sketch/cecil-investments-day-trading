@@ -1,5 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { buildTrackedPositions, groupIntoWeeklyBatches } from "@/lib/agents/recommendationPerformance";
+import {
+  buildPickQualityPoint,
+  buildTrackedPositions,
+  effectiveStartFor,
+  groupIntoWeeklyBatches,
+  type TrackedPosition,
+} from "@/lib/agents/recommendationPerformance";
+import type { PricePoint } from "@/lib/agents/marketData";
+
+function utcDate(y: number, m: number, d: number): Date {
+  return new Date(Date.UTC(y, m, d));
+}
+
+function price(dateStr: string, close: number): PricePoint {
+  return { date: new Date(`${dateStr}T00:00:00Z`), close };
+}
 
 function batchDate(n: number): Date {
   return new Date(Date.UTC(2026, 0, 1 + n * 7));
@@ -96,5 +111,80 @@ describe("buildTrackedPositions", () => {
     ]);
     const positions = buildTrackedPositions(batches);
     expect(positions).toHaveLength(1);
+  });
+});
+
+describe("effectiveStartFor", () => {
+  it("uses the window start for a position that entered before the window opened", () => {
+    const entry = utcDate(2026, 0, 1);
+    const windowStart = utcDate(2026, 0, 15);
+    expect(effectiveStartFor(entry, windowStart)).toEqual(windowStart);
+  });
+
+  it("uses the position's own entryDate when it entered after the window opened — can't re-base before it existed", () => {
+    const entry = utcDate(2026, 0, 20);
+    const windowStart = utcDate(2026, 0, 15);
+    expect(effectiveStartFor(entry, windowStart)).toEqual(entry);
+  });
+
+  it("uses entryDate unchanged when windowStart is null (the 'All' view)", () => {
+    const entry = utcDate(2026, 0, 20);
+    expect(effectiveStartFor(entry, null)).toEqual(entry);
+  });
+});
+
+describe("buildPickQualityPoint", () => {
+  const position = (symbol: string, entryDate: Date): TrackedPosition => ({
+    symbol,
+    entryDate,
+    entryScore: 80,
+    exitDate: null,
+  });
+
+  it("re-bases a pick's return to the window start rather than its since-inception return", () => {
+    // AAPL entered well before the window; its price only moves within the window (100 -> 110 -> 121).
+    const aaplPrices = [price("2026-01-01", 100), price("2026-01-08", 110), price("2026-01-15", 121)];
+    const spxPrices = [price("2026-01-01", 1000), price("2026-01-08", 1000), price("2026-01-15", 1000)];
+    const priceBySymbol = new Map([["AAPL", aaplPrices]]);
+    const positions = [position("AAPL", utcDate(2026, 0, 1))];
+    const windowStart = utcDate(2026, 0, 8);
+    const date = utcDate(2026, 0, 15);
+
+    const point = buildPickQualityPoint(date, positions, priceBySymbol, spxPrices, windowStart);
+
+    // Since-inception return would be (121-100)/100 = 0.21; the correct windowed return is (121-110)/110 = 0.10.
+    expect(point.pickReturn).toBeCloseTo(0.1, 6);
+  });
+
+  it("falls back to since-entry return for a pick that entered inside the window (nothing to re-base to)", () => {
+    const msftPrices = [price("2026-01-10", 200), price("2026-01-15", 220)];
+    const spxPrices = [price("2026-01-10", 1000), price("2026-01-15", 1000)];
+    const priceBySymbol = new Map([["MSFT", msftPrices]]);
+    const positions = [position("MSFT", utcDate(2026, 0, 10))];
+    const windowStart = utcDate(2026, 0, 8);
+    const date = utcDate(2026, 0, 15);
+
+    const point = buildPickQualityPoint(date, positions, priceBySymbol, spxPrices, windowStart);
+
+    expect(point.pickReturn).toBeCloseTo((220 - 200) / 200, 6);
+  });
+
+  it("averages equal-weighted across positions that entered at different times relative to the window", () => {
+    const aaplPrices = [price("2026-01-01", 100), price("2026-01-08", 110), price("2026-01-15", 132)];
+    const msftPrices = [price("2026-01-10", 200), price("2026-01-15", 220)];
+    const spxPrices = [price("2026-01-01", 1000), price("2026-01-08", 1000), price("2026-01-10", 1000), price("2026-01-15", 1000)];
+    const priceBySymbol = new Map([
+      ["AAPL", aaplPrices],
+      ["MSFT", msftPrices],
+    ]);
+    const positions = [position("AAPL", utcDate(2026, 0, 1)), position("MSFT", utcDate(2026, 0, 10))];
+    const windowStart = utcDate(2026, 0, 8);
+    const date = utcDate(2026, 0, 15);
+
+    const point = buildPickQualityPoint(date, positions, priceBySymbol, spxPrices, windowStart);
+
+    // AAPL windowed: (132-110)/110 = 0.2. MSFT since-entry (entered inside window): (220-200)/200 = 0.1.
+    expect(point.pickReturn).toBeCloseTo((0.2 + 0.1) / 2, 6);
+    expect(point.activeCount).toBe(2);
   });
 });

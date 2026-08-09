@@ -1,7 +1,9 @@
 "use client";
 
+import { useMemo, useState } from "react";
 import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, XAxis, YAxis, Tooltip } from "recharts";
 import { alphaColor, formatCurrency, formatDate, formatPercent } from "@/lib/format";
+import { TIMEFRAME_DAYS, TIMEFRAMES, type TimeframeKey } from "@/lib/timeframes";
 
 export interface PickQualityChartPoint {
   date: string;
@@ -19,7 +21,7 @@ export interface SimulatedPortfolioChartPoint {
 }
 
 interface Props {
-  pickQuality: PickQualityChartPoint[];
+  pickQualityByTimeframe: Record<TimeframeKey, PickQualityChartPoint[]>;
   simulatedPortfolio: SimulatedPortfolioChartPoint[];
   baseValue: number;
   trackedSince: string | null;
@@ -29,6 +31,27 @@ interface Props {
 /** Dark-mode categorical pair validated for this app's --bg-elevated surface (see dataviz skill). */
 const SERIES_PICKS = "#3987e5";
 const SERIES_SPX = "#d95926";
+
+/** Slices a date-ascending series to the trailing N days ending on its own last point — dates are "YYYY-MM-DD" strings, so lexicographic comparison is chronological. */
+function filterByTimeframe<T extends { date: string }>(points: T[], days: number | null): T[] {
+  if (days == null || points.length === 0) return points;
+  const cutoff = new Date(`${points[points.length - 1].date}T00:00:00Z`);
+  cutoff.setUTCDate(cutoff.getUTCDate() - (days - 1));
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+  return points.filter((p) => p.date >= cutoffStr);
+}
+
+/** True compounded return over the displayed window, using the portfolio's actual mark-to-market value at each end — not a subtraction of the cumulative pnlPct field, which would give a percentage-point difference rather than a genuine window return. */
+function windowReturnFromValue(startValue: number | null | undefined, endValue: number | null | undefined): number | null {
+  if (startValue == null || endValue == null || startValue === 0) return null;
+  return (endValue - startValue) / startValue;
+}
+
+/** Dollar P&L over the window (last minus first) — unlike pnlPct, dollar amounts subtract linearly regardless of compounding, so no re-basing is needed. */
+function windowDelta(first: number | null | undefined, last: number | null | undefined): number | null {
+  if (first == null || last == null) return null;
+  return last - first;
+}
 
 function tickDate(value: string): string {
   return new Date(value).toLocaleDateString("en-US", { month: "short", day: "numeric" });
@@ -87,12 +110,20 @@ function LegendRow({ items }: { items: { label: string; color: string }[] }) {
 }
 
 export function RecommendationPerformanceCharts({
-  pickQuality,
+  pickQualityByTimeframe,
   simulatedPortfolio,
   baseValue,
   trackedSince,
   totalPositions,
 }: Props) {
+  const [timeframe, setTimeframe] = useState<TimeframeKey>("All");
+
+  const windowPickQuality = pickQualityByTimeframe[timeframe] ?? [];
+  const windowSimulatedPortfolio = useMemo(
+    () => filterByTimeframe(simulatedPortfolio, TIMEFRAME_DAYS[timeframe]),
+    [simulatedPortfolio, timeframe],
+  );
+
   if (totalPositions === 0) {
     return (
       <div className="card">
@@ -104,8 +135,17 @@ export function RecommendationPerformanceCharts({
     );
   }
 
-  const latestPick = pickQuality[pickQuality.length - 1] ?? null;
-  const latestSim = simulatedPortfolio[simulatedPortfolio.length - 1] ?? null;
+  // Each timeframe's pickQuality series is already re-based to that window's own start server-side
+  // (see recommendationPerformance.ts), so the last point's values ARE the window's return — no further diffing needed.
+  const lastPick = windowPickQuality[windowPickQuality.length - 1] ?? null;
+  const firstSim = windowSimulatedPortfolio[0] ?? null;
+  const lastSim = windowSimulatedPortfolio[windowSimulatedPortfolio.length - 1] ?? null;
+
+  const windowPickReturn = lastPick?.pickReturn ?? null;
+  const windowSpxReturn = lastPick?.spxReturn ?? null;
+  const windowPnl = windowDelta(firstSim?.pnl, lastSim?.pnl);
+  const windowPnlPct = windowReturnFromValue(firstSim?.portfolioValue, lastSim?.portfolioValue);
+
   const trackedSinceLabel = trackedSince ? formatDate(new Date(trackedSince)) : "—";
 
   return (
@@ -117,11 +157,24 @@ export function RecommendationPerformanceCharts({
         close it, but 2 consecutive missed weeks do, and re-entry after a close starts a fresh position.
       </p>
 
+      <div className="rec-perf-timeframe">
+        {TIMEFRAMES.map((tf) => (
+          <button
+            key={tf.key}
+            type="button"
+            className={`rec-perf-timeframe-btn${timeframe === tf.key ? " active" : ""}`}
+            onClick={() => setTimeframe(tf.key)}
+          >
+            {tf.label}
+          </button>
+        ))}
+      </div>
+
       <div className="card">
         <div className="agent-card-header">
           <strong>View 1 — Pure Pick Quality</strong>
-          {latestPick && (
-            <span style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>{latestPick.activeCount} tracked</span>
+          {lastPick && (
+            <span style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>{lastPick.activeCount} tracked</span>
           )}
         </div>
         <p style={{ color: "var(--text-muted)", fontSize: "0.78rem", marginTop: 0 }}>
@@ -136,7 +189,7 @@ export function RecommendationPerformanceCharts({
         />
         <div style={{ width: "100%", height: 220 }}>
           <ResponsiveContainer>
-            <LineChart data={pickQuality} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+            <LineChart data={windowPickQuality} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
               <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
               <XAxis
                 dataKey="date"
@@ -179,16 +232,16 @@ export function RecommendationPerformanceCharts({
             </LineChart>
           </ResponsiveContainer>
         </div>
-        {latestPick && (
+        {lastPick && (
           <div className="rec-perf-summary">
             <span>
               Picks:{" "}
-              <strong className="mono" style={{ color: alphaColor(latestPick.pickReturn) }}>
-                {formatPercent(latestPick.pickReturn)}
+              <strong className="mono" style={{ color: alphaColor(windowPickReturn) }}>
+                {formatPercent(windowPickReturn)}
               </strong>
             </span>
             <span>
-              S&amp;P 500: <strong className="mono">{formatPercent(latestPick.spxReturn)}</strong>
+              S&amp;P 500: <strong className="mono">{formatPercent(windowSpxReturn)}</strong>
             </span>
           </div>
         )}
@@ -207,7 +260,7 @@ export function RecommendationPerformanceCharts({
                 </tr>
               </thead>
               <tbody>
-                {[...pickQuality].reverse().map((p) => (
+                {[...windowPickQuality].reverse().map((p) => (
                   <tr key={p.date}>
                     <td className="mono">{formatDate(new Date(p.date))}</td>
                     <td className="mono">{formatPercent(p.pickReturn)}</td>
@@ -224,8 +277,8 @@ export function RecommendationPerformanceCharts({
       <div className="card">
         <div className="agent-card-header">
           <strong>View 2 — Simulated Position-Sized Portfolio</strong>
-          {latestSim && (
-            <span style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>{latestSim.activeCount} positions</span>
+          {lastSim && (
+            <span style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>{lastSim.activeCount} positions</span>
           )}
         </div>
         <p style={{ color: "var(--text-muted)", fontSize: "0.78rem", marginTop: 0 }}>
@@ -234,7 +287,7 @@ export function RecommendationPerformanceCharts({
         </p>
         <div style={{ width: "100%", height: 220 }}>
           <ResponsiveContainer>
-            <LineChart data={simulatedPortfolio} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+            <LineChart data={windowSimulatedPortfolio} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
               <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
               <XAxis
                 dataKey="date"
@@ -267,15 +320,15 @@ export function RecommendationPerformanceCharts({
             </LineChart>
           </ResponsiveContainer>
         </div>
-        {latestSim && (
+        {lastSim && (
           <div className="rec-perf-summary">
             <span>
-              Value: <strong className="mono">{formatCurrency(latestSim.portfolioValue)}</strong>
+              Value: <strong className="mono">{formatCurrency(lastSim.portfolioValue)}</strong>
             </span>
             <span>
               P&amp;L:{" "}
-              <strong className="mono" style={{ color: alphaColor(latestSim.pnl) }}>
-                {formatCurrency(latestSim.pnl)} ({formatPercent(latestSim.pnlPct)})
+              <strong className="mono" style={{ color: alphaColor(windowPnl) }}>
+                {formatCurrency(windowPnl)} ({formatPercent(windowPnlPct)})
               </strong>
             </span>
           </div>
@@ -295,7 +348,7 @@ export function RecommendationPerformanceCharts({
                 </tr>
               </thead>
               <tbody>
-                {[...simulatedPortfolio].reverse().map((p) => (
+                {[...windowSimulatedPortfolio].reverse().map((p) => (
                   <tr key={p.date}>
                     <td className="mono">{formatDate(new Date(p.date))}</td>
                     <td className="mono">{formatCurrency(p.portfolioValue)}</td>
