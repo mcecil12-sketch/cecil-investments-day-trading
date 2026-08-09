@@ -2,7 +2,7 @@
   "crons": [
     { "path": "/api/cron/refresh-candidate-universe", "schedule": "0 6 1 * *" },
     { "path": "/api/cron/db-keepalive", "schedule": "58 21 * * 1-5" },
-    { "path": "/api/cron/earnings-estimates", "schedule": "0 22 * * 1-5" },
+    { "path": "/api/cron/earnings-estimates", "schedule": "0 22 * * 2,5" },
     { "path": "/api/cron/weekly-brief", "schedule": "30 22 * * 0" }
   ]
 }
