@@ -18,7 +18,7 @@ export interface SimulatedPortfolioPoint {
   portfolioValue: number;
   pnl: number;
   pnlPct: number;
-  /** Number of positions with a priced return contributing to this point's P&L. */
+  /** Number of currently-open positions with a live priced return contributing to this point's P&L. Closed positions' realized P&L is folded into pnl/portfolioValue too (see buildRealizationEvents) but isn't counted here — this reflects live, still-open exposure only. */
   activeCount: number;
 }
 
@@ -214,6 +214,57 @@ function computeWindowedPickQuality(
   return points;
 }
 
+export interface RealizationEvent {
+  exitDate: Date;
+  amount: number;
+}
+
+/**
+ * Realized dollar P&L for one closed position, sized the same way a live
+ * position is (conviction-midpoint allocation × price return), but over its
+ * full entryDate-to-exitDate holding period rather than to "today." Null
+ * when price history doesn't cover the entry or exit date — the same
+ * graceful skip the live per-date loop already applies.
+ */
+export function computeRealizedPnl(
+  position: TrackedPosition,
+  priceBySymbol: Map<string, PricePoint[]>,
+  baseValue: number,
+): number | null {
+  if (position.exitDate == null) return null;
+  const points = priceBySymbol.get(position.symbol);
+  if (!points) return null;
+  const stockReturn = returnOverWindow(points, position.entryDate, position.exitDate);
+  if (stockReturn == null) return null;
+  return convictionMidpoint(position.entryScore) * baseValue * stockReturn;
+}
+
+/**
+ * One-time realized-P&L events for every closed, priced position, sorted
+ * ascending by exitDate. Folded into a running total in
+ * getRecommendationPerformance's timeline loop so a sold position's gain or
+ * loss stays in portfolioValue for every date after its exit — proceeds
+ * treated as moving to cash, held flat — instead of disappearing
+ * retroactively the way excluding exited positions from every subsequent
+ * date's total would (a survivorship-bias bug: a sold position's P&L is
+ * real and permanent, the same way real time-weighted-return reporting
+ * keeps a closed position's contribution in the cumulative total).
+ */
+export function buildRealizationEvents(
+  positions: TrackedPosition[],
+  priceBySymbol: Map<string, PricePoint[]>,
+  baseValue: number,
+): RealizationEvent[] {
+  const events: RealizationEvent[] = [];
+  for (const position of positions) {
+    if (position.exitDate == null) continue;
+    const amount = computeRealizedPnl(position, priceBySymbol, baseValue);
+    if (amount == null) continue;
+    events.push({ exitDate: toUtcMidnight(position.exitDate), amount });
+  }
+  return events.sort((a, b) => a.exitDate.getTime() - b.exitDate.getTime());
+}
+
 /**
  * Builds both Dashboard "Recommendation Performance" views from
  * CandidateRecommendationLog and existing market data — no new scoring
@@ -239,7 +290,12 @@ function computeWindowedPickQuality(
  * View 2 (simulated portfolio): a paper portfolio anchored to the real
  * "Total Portfolio Value" (see resolvePortfolioBaseValue) where each
  * position gets a slice sized at the midpoint of its entry conviction
- * band, held from its entryDate forward.
+ * band, held from its entryDate forward. A position that exits doesn't
+ * drop out of the total: its final dollar P&L as of the exit date is
+ * realized into a running bucket (see buildRealizationEvents) that keeps
+ * contributing to every later date's portfolioValue, so the simulation's
+ * cumulative return reflects the full history of every position ever
+ * tracked, not just currently-open ones.
  *
  * Tracking starts at each position's own entryDate — no backfilling or
  * estimating pre-entry performance.
@@ -294,6 +350,10 @@ export async function getRecommendationPerformance(
   const simulatedPortfolio: SimulatedPortfolioPoint[] = [];
   const activePositionsByDate = new Map<number, TrackedPosition[]>();
 
+  const realizationEvents = buildRealizationEvents(positions, priceBySymbol, baseValue);
+  let realizedPnlToDate = 0;
+  let nextRealizationIdx = 0;
+
   for (const date of timeline) {
     const activePositions = positions.filter((p) => {
       const entry = toUtcMidnight(p.entryDate).getTime();
@@ -301,11 +361,20 @@ export async function getRecommendationPerformance(
       if (p.exitDate == null) return true;
       return toUtcMidnight(p.exitDate).getTime() >= date.getTime();
     });
-    if (activePositions.length === 0) continue;
 
-    activePositionsByDate.set(date.getTime(), activePositions);
+    // activePositions still includes a closed position through its exitDate
+    // inclusive, so its final day's contribution comes from the live loop
+    // below — only fold its realized P&L into the running bucket starting
+    // the day AFTER exit, so it's counted exactly once.
+    while (
+      nextRealizationIdx < realizationEvents.length &&
+      realizationEvents[nextRealizationIdx].exitDate.getTime() < date.getTime()
+    ) {
+      realizedPnlToDate += realizationEvents[nextRealizationIdx].amount;
+      nextRealizationIdx += 1;
+    }
 
-    let pnl = 0;
+    let livePnl = 0;
     let sizedCount = 0;
 
     for (const position of activePositions) {
@@ -314,13 +383,22 @@ export async function getRecommendationPerformance(
 
       if (stockReturn != null) {
         const allocation = convictionMidpoint(position.entryScore) * baseValue;
-        pnl += allocation * stockReturn;
+        livePnl += allocation * stockReturn;
         sizedCount += 1;
       }
     }
 
-    pickQualityAll.push(buildPickQualityPoint(date, activePositions, priceBySymbol, spxPoints, null));
+    if (activePositions.length > 0) {
+      activePositionsByDate.set(date.getTime(), activePositions);
+      pickQualityAll.push(buildPickQualityPoint(date, activePositions, priceBySymbol, spxPoints, null));
+    }
 
+    // Emitted for every timeline date (even ones with zero currently-open
+    // positions) so portfolioValue reflects the full history of every
+    // position ever tracked, not just currently-open ones — unlike
+    // activePositions/pickQualityAll above, which legitimately have nothing
+    // to show when nothing is open.
+    const pnl = livePnl + realizedPnlToDate;
     simulatedPortfolio.push({
       date,
       portfolioValue: baseValue + pnl,

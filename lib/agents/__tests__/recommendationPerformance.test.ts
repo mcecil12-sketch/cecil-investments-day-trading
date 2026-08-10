@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   buildPickQualityPoint,
+  buildRealizationEvents,
   buildTrackedPositions,
+  computeRealizedPnl,
   effectiveStartFor,
   groupIntoWeeklyBatches,
   type TrackedPosition,
@@ -186,5 +188,80 @@ describe("buildPickQualityPoint", () => {
     // AAPL windowed: (132-110)/110 = 0.2. MSFT since-entry (entered inside window): (220-200)/200 = 0.1.
     expect(point.pickReturn).toBeCloseTo((0.2 + 0.1) / 2, 6);
     expect(point.activeCount).toBe(2);
+  });
+});
+
+describe("computeRealizedPnl", () => {
+  const closedPosition = (symbol: string, entryDate: Date, exitDate: Date, score = 90): TrackedPosition => ({
+    symbol,
+    entryDate,
+    entryScore: score,
+    exitDate,
+  });
+
+  it("computes the conviction-sized dollar P&L over the full entry-to-exit holding period", () => {
+    const prices = [price("2026-01-01", 100), price("2026-01-15", 110)];
+    const priceBySymbol = new Map([["AAPL", prices]]);
+    const position = closedPosition("AAPL", utcDate(2026, 0, 1), utcDate(2026, 0, 15), 90);
+
+    const pnl = computeRealizedPnl(position, priceBySymbol, 100_000);
+
+    // score 90 -> conviction midpoint 0.05; return (110-100)/100 = 0.10; 0.05 * 100000 * 0.10 = 500.
+    expect(pnl).toBeCloseTo(500, 6);
+  });
+
+  it("returns null for a position that hasn't exited yet", () => {
+    const prices = [price("2026-01-01", 100), price("2026-01-15", 110)];
+    const priceBySymbol = new Map([["AAPL", prices]]);
+    const position: TrackedPosition = {
+      symbol: "AAPL",
+      entryDate: utcDate(2026, 0, 1),
+      entryScore: 90,
+      exitDate: null,
+    };
+
+    expect(computeRealizedPnl(position, priceBySymbol, 100_000)).toBeNull();
+  });
+
+  it("returns null when there's no price history at all for the symbol", () => {
+    const position = closedPosition("AAPL", utcDate(2026, 0, 1), utcDate(2026, 0, 15));
+    expect(computeRealizedPnl(position, new Map(), 100_000)).toBeNull();
+  });
+
+  it("returns null when price history doesn't cover the entry/exit window", () => {
+    const priceBySymbol = new Map([["AAPL", [] as PricePoint[]]]);
+    const position = closedPosition("AAPL", utcDate(2026, 0, 1), utcDate(2026, 0, 15));
+    expect(computeRealizedPnl(position, priceBySymbol, 100_000)).toBeNull();
+  });
+});
+
+describe("buildRealizationEvents", () => {
+  it("includes only closed, priced positions, sorted ascending by exitDate", () => {
+    const priceBySymbol = new Map([
+      ["AAPL", [price("2026-01-01", 100), price("2026-01-15", 120)]],
+      ["MSFT", [price("2026-01-01", 200), price("2026-01-08", 180)]],
+    ]);
+    const positions: TrackedPosition[] = [
+      { symbol: "AAPL", entryDate: utcDate(2026, 0, 1), entryScore: 90, exitDate: utcDate(2026, 0, 15) },
+      { symbol: "MSFT", entryDate: utcDate(2026, 0, 1), entryScore: 90, exitDate: utcDate(2026, 0, 8) },
+      { symbol: "GOOG", entryDate: utcDate(2026, 0, 1), entryScore: 90, exitDate: null },
+    ];
+
+    const events = buildRealizationEvents(positions, priceBySymbol, 100_000);
+
+    expect(events).toHaveLength(2);
+    expect(events[0].exitDate).toEqual(utcDate(2026, 0, 8));
+    expect(events[1].exitDate).toEqual(utcDate(2026, 0, 15));
+    // MSFT: (180-200)/200 = -0.10 -> 0.05 * 100000 * -0.10 = -500.
+    expect(events[0].amount).toBeCloseTo(-500, 6);
+    // AAPL: (120-100)/100 = 0.20 -> 0.05 * 100000 * 0.20 = 1000.
+    expect(events[1].amount).toBeCloseTo(1000, 6);
+  });
+
+  it("excludes an unpriceable closed position rather than throwing", () => {
+    const positions: TrackedPosition[] = [
+      { symbol: "ZZZZ", entryDate: utcDate(2026, 0, 1), entryScore: 90, exitDate: utcDate(2026, 0, 15) },
+    ];
+    expect(buildRealizationEvents(positions, new Map(), 100_000)).toEqual([]);
   });
 });
