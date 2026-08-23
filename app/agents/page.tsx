@@ -5,6 +5,7 @@ import type { RelativeStrengthEntry, RelativeStrengthOutput } from "@/lib/agents
 import type { SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import type { RiskManagerOutput, RiskFlag } from "@/lib/agents/riskManager";
 import type { CandidateScannerOutput, CandidateEntry } from "@/lib/agents/candidateScanner";
+import type { MonthlyScanOutput, MonthlyScanCandidateEntry } from "@/lib/agents/monthlyScan";
 import type { CioTaxableOpportunities } from "@/lib/agents/cio";
 import type { NewsSentimentNote } from "@/lib/agents/newsSentiment";
 import { alphaColor, formatCurrency, formatDate, formatDateTime, formatPercent } from "@/lib/format";
@@ -45,6 +46,12 @@ const AGENT_DEFINITIONS: AgentDefinition[] = [
     name: "Candidate Scanner",
     implemented: true,
     endpoint: "/api/agents/candidates",
+  },
+  {
+    type: "MONTHLY_SCAN",
+    name: "Monthly Scan (Group 3)",
+    implemented: true,
+    endpoint: "/api/agents/monthly-scan",
   },
 ];
 
@@ -388,6 +395,68 @@ function renderCandidateScannerReport(output: CandidateScannerOutput) {
   );
 }
 
+function renderMonthlyScanReport(output: MonthlyScanOutput) {
+  return (
+    <div className="card">
+      <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginTop: 0 }}>
+        Triggered by: {output.triggerSource === "cron" ? "monthly cron cycle" : "manual run"}. See{" "}
+        <a href="/tracking-groups" className="link-back">
+          Tracking Groups
+        </a>{" "}
+        for the buy/hold/sell banding view and trading-readiness status.
+      </p>
+      <div style={{ marginBottom: "1rem" }}>
+        <div style={{ fontWeight: 600, marginBottom: "0.4rem" }}>Ranked Candidates</div>
+        {output.rankedCandidates.length === 0 ? (
+          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+            No candidates scored above the S&amp;P 500 baseline this run.
+          </p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Rank</th>
+                  <th>Symbol</th>
+                  <th>Sector</th>
+                  <th>Score</th>
+                  <th>vs S&amp;P</th>
+                  <th>Earnings Coverage</th>
+                </tr>
+              </thead>
+              <tbody>
+                {output.rankedCandidates.map((c: MonthlyScanCandidateEntry) => (
+                  <tr key={c.symbol}>
+                    <td className="mono">{c.rank}</td>
+                    <td>
+                      {c.symbol}
+                      <div style={{ color: "var(--text-muted)", fontSize: "0.72rem", fontWeight: 400 }}>{c.name}</div>
+                    </td>
+                    <td>{c.sector}</td>
+                    <td className="mono">{c.score}</td>
+                    <td className="mono" style={{ color: "var(--positive)" }}>
+                      +{c.vsSpx}
+                    </td>
+                    <td className="mono" style={{ color: "var(--text-muted)" }}>{c.earningsSurpriseCoverage}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {output.sectorsWithoutUniverse.length > 0 && (
+        <p style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>
+          No candidate universe defined for: {output.sectorsWithoutUniverse.join(", ")}.
+        </p>
+      )}
+
+      {renderSkipped(output.skipped)}
+    </div>
+  );
+}
+
 export default async function AgentsPage() {
   const [weeklyBrief, latestRuns] = await Promise.all([
     prisma.weeklyBrief.findFirst({
@@ -430,6 +499,7 @@ export default async function AgentsPage() {
     sectorRotation: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "SECTOR_ROTATION")]?.status ?? null,
     riskManager: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "RISK_MANAGER")]?.status ?? null,
     candidateScanner: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "CANDIDATE_SCANNER")]?.status ?? null,
+    monthlyScan: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "MONTHLY_SCAN")]?.status ?? null,
   };
 
   return (
@@ -609,6 +679,8 @@ export default async function AgentsPage() {
           report = renderSectorRotationReport(run.output as unknown as SectorRotationOutput);
         } else if (def.type === "RISK_MANAGER") {
           report = renderRiskManagerReport(run.output as unknown as RiskManagerOutput);
+        } else if (def.type === "MONTHLY_SCAN") {
+          report = renderMonthlyScanReport(run.output as unknown as MonthlyScanOutput);
         } else {
           report = renderCandidateScannerReport(run.output as unknown as CandidateScannerOutput);
         }

@@ -8,6 +8,8 @@ import { runCandidateScannerAgent, type CandidateEntry, type CandidateScannerOut
 import { refreshCandidateUniverse, type UniverseRefreshResult } from "@/lib/agents/candidateUniverse";
 import { refreshEarningsHistory, type EarningsHistoryRefreshResult, DAILY_FETCH_QUOTA } from "@/lib/agents/earningsHistory";
 import { logCandidateRecommendationBatch } from "@/lib/agents/candidateRecommendationLog";
+import { runMonthlyScanAgent, type MonthlyScanOutput } from "@/lib/agents/monthlyScan";
+import { logMonthlyScanBatch } from "@/lib/agents/monthlyScanRecommendationLog";
 import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
 import { buildTaxableAnalysisContext, type TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
 import { generateNewsSentimentNotes, type NewsSentimentNote } from "@/lib/agents/newsSentiment";
@@ -347,6 +349,52 @@ export async function runAndPersistCandidateScanner(): Promise<CandidateScannerR
       await logCandidateRecommendationBatch(run.id, output);
     } catch (err) {
       console.error("logCandidateRecommendationBatch failed:", err);
+    }
+
+    return { runId: run.id, status: "COMPLETE", output };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "FAILED", completedAt: new Date(), errorMessage: message },
+    });
+    return { runId: run.id, status: "FAILED", error: message };
+  }
+}
+
+export interface MonthlyScanRunResult {
+  runId: string;
+  status: "COMPLETE" | "FAILED";
+  output?: MonthlyScanOutput;
+  error?: string;
+}
+
+/**
+ * Runs the Group 3 monthly scan agent and persists its AgentRun +
+ * CandidateRecommendationLog rows (group: GROUP_3). No ActionItems — Group
+ * 3 isn't wired into the CIO Weekly Action List; its ranked output is
+ * surfaced on its own tracking-groups page instead. `triggerSource`
+ * distinguishes the real monthly cron cycle from a manual test/rerun (see
+ * MonthlyScanOutput) — only "cron" runs count toward Group 3's
+ * trading-readiness banner.
+ */
+export async function runAndPersistMonthlyScan(triggerSource: "cron" | "manual"): Promise<MonthlyScanRunResult> {
+  const run = await prisma.agentRun.create({
+    data: { agentType: "MONTHLY_SCAN", status: "RUNNING" },
+  });
+
+  try {
+    const output = await runMonthlyScanAgent(triggerSource);
+
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },
+    });
+
+    try {
+      await logMonthlyScanBatch(run.id, output);
+    } catch (err) {
+      console.error("logMonthlyScanBatch failed:", err);
     }
 
     return { runId: run.id, status: "COMPLETE", output };

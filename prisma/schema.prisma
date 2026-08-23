@@ -42,12 +42,24 @@ enum AgentType {
   CANDIDATE_SCANNER
   UNIVERSE_REFRESH
   EARNINGS_ESTIMATES_REFRESH
+  MONTHLY_SCAN
 }
 
 enum AgentRunStatus {
   RUNNING
   COMPLETE
   FAILED
+}
+
+/// Which recommendation-tracking group a CandidateRecommendationLog row
+/// belongs to. GROUP_1 is the original weekly Candidate Scanner (unchanged
+/// behavior, existing rows default here). GROUP_3 is the monthly-cadence
+/// scanner with rank-based buy/sell banding (see lib/agents/monthlyScan.ts).
+/// Group 2 (zero-miss monthly aggregation) has no rows of its own — it's a
+/// read-only report computed over GROUP_1's rows.
+enum RecommendationGroup {
+  GROUP_1
+  GROUP_3
 }
 
 model Account {
@@ -303,8 +315,12 @@ model CandidateRecommendationLog {
   id                 String   @id @default(cuid())
   sourceAgentRun     AgentRun @relation(fields: [sourceAgentRunId], references: [id])
   sourceAgentRunId   String
-  /// Groups the rows produced by one scan into a comparable batch — routine automatic batches use "top15-YYYY-MM-DD" (the scan date); see notes for batches with special provenance (e.g. this table's first batch, logged after the SPDR-derived universe expansion).
+  /// Groups the rows produced by one scan into a comparable batch — routine automatic batches use "top15-YYYY-MM-DD" (the scan date) for GROUP_1 and "monthly-YYYY-MM" for GROUP_3; see notes for batches with special provenance (e.g. this table's first batch, logged after the SPDR-derived universe expansion).
   batchTag           String
+  /// Which recommendation-tracking group this row belongs to — see RecommendationGroup. Defaults to GROUP_1 so existing rows and all Group 1 code are unaffected.
+  group              RecommendationGroup @default(GROUP_1)
+  /// 1-based rank within its batch at the time of recommendation. Null for GROUP_1 (rank there is implicit array order, never persisted); populated for GROUP_3, whose buy/sell banding logic (lib/agents/monthlyScanBanding.ts) needs to replay historical rank over time.
+  rank               Int?
   symbol             String
   sector             String
   accountType        String
@@ -314,6 +330,8 @@ model CandidateRecommendationLog {
   vsSpx              Float
   /// Blended multi-horizon momentum (decimal fraction) at the time of recommendation — see MomentumBlend.raw in technicals.ts. Null if unavailable.
   momentum1Y         Float?
+  /// Earnings-surprise-trend data-completeness tag at the time of recommendation (see EarningsSurpriseTrendCoverage in lib/agents/earningsSurpriseTrend.ts) — "sue" | "raw_surprise_fallback" | "insufficient_data" | "no_coverage" | "not_yet_fetched". Null for rows logged before this column existed.
+  earningsSurpriseCoverage String?
   recommendationType String
   recommendedAt      DateTime
   /// Relative performance (symbol return minus S&P 500 return, decimal fraction) 30/90 days after recommendedAt. Null until enough time has elapsed.
@@ -324,6 +342,7 @@ model CandidateRecommendationLog {
 
   @@index([batchTag])
   @@index([symbol, recommendedAt])
+  @@index([group, recommendedAt])
 }
 
 /// The current data-driven candidate universe for one sector, refreshed
@@ -436,6 +455,25 @@ model EarningsHistory {
 
   @@unique([symbol, fiscalDateEnding])
   @@index([symbol])
+}
+
+/// Per-symbol bookkeeping for Group 3's quarterly-triggered earnings-surprise-
+/// trend recompute (see lib/agents/monthlyScan.ts). Earnings data only
+/// changes ~4x/year regardless of how often the monthly scan runs, so this
+/// records which reported fiscal quarter a symbol's earnings-surprise-trend
+/// sub-score was last computed from; the monthly scan only recomputes it via
+/// getEarningsSurpriseTrendScores (earningsSurpriseTrend.ts) when
+/// EarningsHistory has a newer reported quarter than lastScoredFiscalDateEnding,
+/// otherwise it reuses lastEarningsSurpriseScore/lastEarningsSurpriseCoverage
+/// unchanged. Distinct from EarningsFetchState, which tracks the shared
+/// fetch-cycle cadence, not a scoring cycle.
+model MonthlyScanEarningsState {
+  id                           String    @id @default(cuid())
+  symbol                       String    @unique
+  lastScoredFiscalDateEnding   DateTime?
+  lastEarningsSurpriseScore    Int?
+  lastEarningsSurpriseCoverage String?
+  updatedAt                    DateTime  @updatedAt
 }
 
 /// A tiny key-value store for cross-cutting notification state that doesn't

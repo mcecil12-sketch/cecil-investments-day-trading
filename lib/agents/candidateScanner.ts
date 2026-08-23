@@ -4,64 +4,24 @@ import { scorePriceSeries } from "@/lib/agents/technicals";
 import { getCurrentHoldings, totalPortfolioValue } from "@/lib/agents/holdings";
 import { getHoldingSector, type SectorRotationOutput, type SectorScore } from "@/lib/agents/sectorRotation";
 import { closestPlanFundsForProxy } from "@/lib/agents/fundMappings";
-import { getDynamicCandidateUniverse, type SectorUniverse } from "@/lib/agents/candidateUniverse";
 import { getEarningsSurpriseTrendScores, type EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
+import {
+  MOMENTUM_TREND_WEIGHT,
+  EARNINGS_SURPRISE_TREND_WEIGHT,
+  SECTOR_LEADERSHIP_WEIGHT,
+  STATIC_CANDIDATE_UNIVERSE,
+  CANDIDATE_NAMES,
+  getMergedCandidateUniverse,
+} from "@/lib/agents/scoringShared";
 import { formatPercent } from "@/lib/format";
 
 export type CandidateAccountType = "taxable" | "401k" | "both";
 
-/**
- * Hand-picked buy-candidate universe for sectors not yet migrated to the
- * SSGA-derived monthly refresh (see lib/agents/candidateUniverse.ts).
- * Technology, Healthcare, and Energy used to be hardcoded here too; they're
- * now sourced from CandidateUniverse (DB, refreshed monthly) and merged in at
- * runtime in runCandidateScannerAgent — see DYNAMIC_SECTORS.
- */
-export const STATIC_CANDIDATE_UNIVERSE: Record<string, SectorUniverse> = {
-  Financials: { sectorEtf: "XLF", symbols: ["BRK-B", "JPM", "V", "MA", "GS", "MS", "BAC", "AXP", "BX", "KKR"] },
-  Industrials: { sectorEtf: "XLI", symbols: ["CAT", "DE", "HON", "UPS", "RTX", "GE", "LMT", "ETN", "EMR", "PH"] },
-  Communications: { sectorEtf: "XLC", symbols: ["GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS"] },
-  "Consumer Discretionary": { sectorEtf: "XLY", symbols: ["AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "TGT", "LOW"] },
-  "International Developed": { sectorEtf: "EFA", symbols: ["EFA", "VEA", "VXUS"] },
-};
-
-/** Display names for the fixed candidate universe above — hardcoded since there's no ticker-name lookup API in this app. */
-const CANDIDATE_NAMES: Record<string, string> = {
-  NVDA: "NVIDIA", MSFT: "Microsoft", AAPL: "Apple", AVGO: "Broadcom", AMD: "Advanced Micro Devices",
-  PLTR: "Palantir Technologies", META: "Meta Platforms", TSM: "Taiwan Semiconductor Manufacturing",
-  ASML: "ASML Holding", SMCI: "Super Micro Computer",
-  UNH: "UnitedHealth Group", LLY: "Eli Lilly", ABBV: "AbbVie", JNJ: "Johnson & Johnson", MRK: "Merck",
-  PFE: "Pfizer", TMO: "Thermo Fisher Scientific", DHR: "Danaher", ISRG: "Intuitive Surgical", DXCM: "Dexcom",
-  "BRK-B": "Berkshire Hathaway (Class B)", JPM: "JPMorgan Chase", V: "Visa", MA: "Mastercard",
-  GS: "Goldman Sachs", MS: "Morgan Stanley", BAC: "Bank of America", AXP: "American Express",
-  BX: "Blackstone", KKR: "KKR & Co.",
-  XOM: "Exxon Mobil", CVX: "Chevron", COP: "ConocoPhillips", EOG: "EOG Resources", SLB: "Schlumberger",
-  PSX: "Phillips 66", MPC: "Marathon Petroleum", OXY: "Occidental Petroleum", VLO: "Valero Energy", HAL: "Halliburton",
-  CAT: "Caterpillar", DE: "Deere & Co.", HON: "Honeywell", UPS: "United Parcel Service", RTX: "RTX Corporation",
-  GE: "GE Aerospace", LMT: "Lockheed Martin", ETN: "Eaton", EMR: "Emerson Electric", PH: "Parker Hannifin",
-  GOOGL: "Alphabet (Class A)", NFLX: "Netflix", DIS: "Walt Disney", CMCSA: "Comcast", T: "AT&T",
-  VZ: "Verizon Communications", TMUS: "T-Mobile US",
-  AMZN: "Amazon", TSLA: "Tesla", HD: "Home Depot", MCD: "McDonald's", NKE: "Nike", SBUX: "Starbucks",
-  TGT: "Target", LOW: "Lowe's",
-  EFA: "iShares MSCI EAFE ETF", VEA: "Vanguard FTSE Developed Markets ETF", VXUS: "Vanguard Total International Stock ETF",
-};
+/** Re-exported from scoringShared.ts (the canonical source, shared with the monthly scan agent) so existing imports of this symbol from candidateScanner.ts keep working unchanged. */
+export { STATIC_CANDIDATE_UNIVERSE };
 
 /** How many of the top-scoring candidates to surface across all scanned sectors. */
 const MAX_TOP_CANDIDATES = 15;
-
-/**
- * Weights for the three composite factors implemented today, renormalized
- * from the target 35% momentum/trend + 30% earnings surprise trend + 25%
- * sector leadership (out of the full 35/30/25/10
- * momentum-trend/earnings-surprise-trend/sector-leadership/sentiment split)
- * so the implemented factors still sum to 100% — each divided by their sum
- * (90) rather than 100, same renormalization approach as before this factor
- * was added, just with a wider denominator. Sentiment/news is still
- * deferred: no data source yet.
- */
-const MOMENTUM_TREND_WEIGHT = 35 / 90;
-const EARNINGS_SURPRISE_TREND_WEIGHT = 30 / 90;
-const SECTOR_LEADERSHIP_WEIGHT = 25 / 90;
 
 export interface CandidateEntry {
   symbol: string;
@@ -183,12 +143,11 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
   const sectorOutput = latestSectorRun.output as unknown as SectorRotationOutput;
   const topSectors = sectorOutput.topSectors.slice(0, 3);
 
-  const [sp500Points, holdings, dynamicUniverse] = await Promise.all([
+  const [sp500Points, holdings, universeMap] = await Promise.all([
     getSp500Series(),
     getCurrentHoldings(),
-    getDynamicCandidateUniverse(),
+    getMergedCandidateUniverse(),
   ]);
-  const universeMap: Record<string, SectorUniverse> = { ...STATIC_CANDIDATE_UNIVERSE, ...dynamicUniverse };
   const sp500Momentum = scorePriceSeries(sp500Points).momentum ?? 0;
   const portfolioValue = totalPortfolioValue(holdings);
 

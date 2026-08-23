@@ -3,6 +3,8 @@ import { getPriceHistory, getSp500Series, type PricePoint } from "@/lib/agents/m
 import { computeReturn } from "@/lib/agents/technicals";
 import { convictionMidpoint, resolvePortfolioBaseValue } from "@/lib/agents/positionSizing";
 import { TIMEFRAME_DAYS, type TimeframeKey } from "@/lib/timeframes";
+import { buildBandedMonthlyPositions, type MonthlyRanking } from "@/lib/agents/monthlyScanBanding";
+import type { RecommendationGroup } from "@/lib/generated/prisma";
 
 export interface PickQualityPoint {
   date: Date;
@@ -36,6 +38,7 @@ interface LogRow {
   batchTag: string;
   recommendedAt: Date;
   score: number;
+  rank?: number | null;
 }
 
 interface WeeklyBatch {
@@ -126,6 +129,35 @@ export function buildTrackedPositions(batches: WeeklyBatch[]): TrackedPosition[]
   }
 
   return positions.sort((a, b) => a.entryDate.getTime() - b.entryDate.getTime());
+}
+
+/**
+ * Group 3 analog of groupIntoWeeklyBatches: collapses raw GROUP_3 rows
+ * (batchTag "monthly-YYYY-MM") into one MonthlyRanking per batch, sorted by
+ * each row's persisted `rank` — the input buildBandedMonthlyPositions
+ * replays to derive tracked positions via rank-based banding rather than
+ * presence/absence.
+ */
+export function groupIntoMonthlyRankings(rows: LogRow[]): MonthlyRanking[] {
+  const byTag = new Map<string, { date: Date; bySymbol: Map<string, { score: number; rank: number }> }>();
+  for (const row of rows) {
+    if (row.rank == null) continue;
+    let batch = byTag.get(row.batchTag);
+    if (!batch) {
+      batch = { date: row.recommendedAt, bySymbol: new Map() };
+      byTag.set(row.batchTag, batch);
+    }
+    batch.bySymbol.set(row.symbol, { score: row.score, rank: row.rank });
+  }
+  return [...byTag.entries()]
+    .map(([monthKey, batch]) => ({
+      monthKey,
+      date: batch.date,
+      rankedSymbols: [...batch.bySymbol.entries()]
+        .sort((a, b) => a[1].rank - b[1].rank)
+        .map(([symbol, v]) => ({ symbol, score: v.score })),
+    }))
+    .sort((a, b) => a.date.getTime() - b.date.getTime());
 }
 
 function toUtcMidnight(date: Date): Date {
@@ -302,9 +334,11 @@ export function buildRealizationEvents(
  */
 export async function getRecommendationPerformance(
   totalCurrentValue?: number | null,
+  group: RecommendationGroup = "GROUP_1",
 ): Promise<RecommendationPerformanceResult> {
   const baseValue = resolvePortfolioBaseValue(totalCurrentValue);
   const rows = await prisma.candidateRecommendationLog.findMany({
+    where: { group },
     orderBy: { recommendedAt: "asc" },
   });
 
@@ -318,8 +352,13 @@ export async function getRecommendationPerformance(
     };
   }
 
-  const batches = groupIntoWeeklyBatches(rows);
-  const positions = buildTrackedPositions(batches);
+  // GROUP_1's presence/absence tracking (buildTrackedPositions) and GROUP_3's
+  // rank-based banding (buildBandedMonthlyPositions) are different position-
+  // construction rules, but both produce the same TrackedPosition shape, so
+  // everything downstream (pick quality, simulated portfolio, realized P&L)
+  // is identical regardless of which group this call is for.
+  const positions =
+    group === "GROUP_3" ? buildBandedMonthlyPositions(groupIntoMonthlyRankings(rows)) : buildTrackedPositions(groupIntoWeeklyBatches(rows));
 
   const uniqueSymbols = [...new Set(positions.map((p) => p.symbol))];
   const priceBySymbol = new Map<string, PricePoint[]>();

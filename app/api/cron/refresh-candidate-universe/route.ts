@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { runAndPersistCandidateUniverseRefresh } from "@/lib/agents/runner";
+import { runAndPersistCandidateUniverseRefresh, runAndPersistMonthlyScan } from "@/lib/agents/runner";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -15,6 +15,17 @@ function isAuthorized(request: NextRequest): boolean {
  * Monthly candidate-universe refresh, scheduled via vercel.json (`crons`).
  * Pulls fresh SPDR sector holdings from SSGA for the dynamic sectors and
  * updates CandidateUniverse — see lib/agents/candidateUniverse.ts.
+ *
+ * Also triggers Group 3's monthly scan (see lib/agents/monthlyScan.ts) right
+ * after a successful refresh — "No new Vercel cron jobs on Hobby" (see
+ * docs/CRON_GUARDRAILS.md) rules out giving Group 3 its own cron entry, so
+ * it piggybacks on this exact scheduled invocation instead, scanning against
+ * the universe immediately after it's freshly refreshed. Only runs on a
+ * successful universe refresh — scoring against a stale/broken universe
+ * isn't worth the risk. Never blocks or fails this route's own response:
+ * runAndPersistMonthlyScan creates and independently completes/fails its own
+ * AgentRun row, so a MONTHLY_SCAN failure is visible on the Agents status
+ * page regardless, without needing to be reflected in this JSON response.
  */
 export async function GET(request: NextRequest) {
   if (!isAuthorized(request)) {
@@ -25,5 +36,10 @@ export async function GET(request: NextRequest) {
   if (result.status === "FAILED") {
     return NextResponse.json(result, { status: 500 });
   }
+
+  runAndPersistMonthlyScan("cron").catch((err) => {
+    console.error("Post-universe-refresh monthly scan failed:", err);
+  });
+
   return NextResponse.json(result);
 }

@@ -4,11 +4,15 @@ import type { AgentRunStatus, AgentType } from "@/lib/generated/prisma";
 
 export const dynamic = "force-dynamic";
 
-const AGENT_KEYS: Record<"relativeStrength" | "sectorRotation" | "riskManager" | "candidateScanner", AgentType> = {
+const AGENT_KEYS: Record<
+  "relativeStrength" | "sectorRotation" | "riskManager" | "candidateScanner" | "monthlyScan",
+  AgentType
+> = {
   relativeStrength: "RELATIVE_STRENGTH",
   sectorRotation: "SECTOR_ROTATION",
   riskManager: "RISK_MANAGER",
   candidateScanner: "CANDIDATE_SCANNER",
+  monthlyScan: "MONTHLY_SCAN",
 };
 
 export interface AgentStatusResponse {
@@ -16,6 +20,7 @@ export interface AgentStatusResponse {
   sectorRotation: AgentRunStatus | null;
   riskManager: AgentRunStatus | null;
   candidateScanner: AgentRunStatus | null;
+  monthlyScan: AgentRunStatus | null;
 }
 
 /** Returns each agent's latest run status so the /agents page can poll for RUNNING -> COMPLETE/FAILED transitions without a full page reload. */
