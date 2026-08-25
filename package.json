@@ -15,6 +15,7 @@
     "@anthropic-ai/sdk": "^0.110.0",
     "@prisma/client": "^6.19.3",
     "@upstash/redis": "^1.35.8",
+    "@vercel/functions": "^3.9.5",
     "csv-parse": "^7.0.1",
     "dotenv": "^16.4.5",
     "exceljs": "^4.4.0",

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { waitUntil } from "@vercel/functions";
 import { runAndPersistCandidateUniverseRefresh, runAndPersistMonthlyScan } from "@/lib/agents/runner";
 
 export const dynamic = "force-dynamic";
@@ -26,6 +27,14 @@ function isAuthorized(request: NextRequest): boolean {
  * runAndPersistMonthlyScan creates and independently completes/fails its own
  * AgentRun row, so a MONTHLY_SCAN failure is visible on the Agents status
  * page regardless, without needing to be reflected in this JSON response.
+ *
+ * The scan itself runs via waitUntil(), not a bare detached promise: Vercel
+ * makes no guarantee that unawaited work continues after the response is
+ * sent (the function's execution environment can be frozen/torn down the
+ * moment the response flushes). waitUntil() is the documented primitive for
+ * "keep this invocation alive for background work without blocking the
+ * response" — it extends the invocation's own lifetime (up to maxDuration)
+ * rather than blocking on the promise before responding.
  */
 export async function GET(request: NextRequest) {
   if (!isAuthorized(request)) {
@@ -37,9 +46,11 @@ export async function GET(request: NextRequest) {
     return NextResponse.json(result, { status: 500 });
   }
 
-  runAndPersistMonthlyScan("cron").catch((err) => {
-    console.error("Post-universe-refresh monthly scan failed:", err);
-  });
+  waitUntil(
+    runAndPersistMonthlyScan("cron").catch((err) => {
+      console.error("Post-universe-refresh monthly scan failed:", err);
+    }),
+  );
 
   return NextResponse.json(result);
 }
