@@ -3,7 +3,7 @@ import { getPriceHistory, getSp500Series, type PricePoint } from "@/lib/agents/m
 import { computeReturn } from "@/lib/agents/technicals";
 import { convictionMidpoint, resolvePortfolioBaseValue } from "@/lib/agents/positionSizing";
 import { TIMEFRAME_DAYS, type TimeframeKey } from "@/lib/timeframes";
-import { buildBandedMonthlyPositions, type MonthlyRanking } from "@/lib/agents/monthlyScanBanding";
+import { buildBandedMonthlyPositions, buildFullRankTrackedPositions, type MonthlyRanking } from "@/lib/agents/monthlyScanBanding";
 import type { RecommendationGroup } from "@/lib/generated/prisma";
 
 export interface PickQualityPoint {
@@ -332,6 +332,75 @@ export function buildRealizationEvents(
  * Tracking starts at each position's own entryDate — no backfilling or
  * estimating pre-entry performance.
  */
+interface PositionTimeline {
+  timeline: Date[];
+  priceBySymbol: Map<string, PricePoint[]>;
+  spxPoints: PricePoint[];
+  activePositionsByDate: Map<number, TrackedPosition[]>;
+  pickQualityByTimeframe: Record<TimeframeKey, PickQualityPoint[]>;
+}
+
+/**
+ * Shared timeline/pick-quality construction for any TrackedPosition[] list —
+ * factored out so both the position-sized simulated-portfolio view
+ * (getRecommendationPerformance) and pick-quality-only views (e.g. Group 3's
+ * Top 30 full-rank series) build their timeline and per-timeframe pick
+ * quality identically, off a single price-history fetch, rather than each
+ * re-deriving it.
+ */
+async function buildPositionTimeline(positions: TrackedPosition[]): Promise<PositionTimeline> {
+  const uniqueSymbols = [...new Set(positions.map((p) => p.symbol))];
+  const priceBySymbol = new Map<string, PricePoint[]>();
+  await Promise.all(
+    uniqueSymbols.map(async (symbol) => {
+      try {
+        const { points } = await getPriceHistory(symbol);
+        priceBySymbol.set(symbol, points);
+      } catch {
+        // Skip — this symbol just won't contribute to the aggregate until its price history is fetchable again.
+      }
+    }),
+  );
+
+  const spxPoints = await getSp500Series();
+
+  const earliestEntryDate = toUtcMidnight(positions[0].entryDate);
+  const timeline = spxPoints
+    .map((p) => toUtcMidnight(p.date))
+    .filter((d) => d.getTime() >= earliestEntryDate.getTime());
+
+  const today = toUtcMidnight(new Date());
+  if (timeline.length === 0 || timeline[timeline.length - 1].getTime() < today.getTime()) {
+    timeline.push(today);
+  }
+
+  const pickQualityAll: PickQualityPoint[] = [];
+  const activePositionsByDate = new Map<number, TrackedPosition[]>();
+
+  for (const date of timeline) {
+    const activePositions = positions.filter((p) => {
+      const entry = toUtcMidnight(p.entryDate).getTime();
+      if (entry > date.getTime()) return false;
+      if (p.exitDate == null) return true;
+      return toUtcMidnight(p.exitDate).getTime() >= date.getTime();
+    });
+
+    if (activePositions.length > 0) {
+      activePositionsByDate.set(date.getTime(), activePositions);
+      pickQualityAll.push(buildPickQualityPoint(date, activePositions, priceBySymbol, spxPoints, null));
+    }
+  }
+
+  const pickQualityByTimeframe: Record<TimeframeKey, PickQualityPoint[]> = {
+    "1W": computeWindowedPickQuality(timeline, activePositionsByDate, priceBySymbol, spxPoints, TIMEFRAME_DAYS["1W"]!),
+    "2W": computeWindowedPickQuality(timeline, activePositionsByDate, priceBySymbol, spxPoints, TIMEFRAME_DAYS["2W"]!),
+    "1M": computeWindowedPickQuality(timeline, activePositionsByDate, priceBySymbol, spxPoints, TIMEFRAME_DAYS["1M"]!),
+    All: pickQualityAll,
+  };
+
+  return { timeline, priceBySymbol, spxPoints, activePositionsByDate, pickQualityByTimeframe };
+}
+
 export async function getRecommendationPerformance(
   totalCurrentValue?: number | null,
   group: RecommendationGroup = "GROUP_1",
@@ -360,47 +429,15 @@ export async function getRecommendationPerformance(
   const positions =
     group === "GROUP_3" ? buildBandedMonthlyPositions(groupIntoMonthlyRankings(rows)) : buildTrackedPositions(groupIntoWeeklyBatches(rows));
 
-  const uniqueSymbols = [...new Set(positions.map((p) => p.symbol))];
-  const priceBySymbol = new Map<string, PricePoint[]>();
-  await Promise.all(
-    uniqueSymbols.map(async (symbol) => {
-      try {
-        const { points } = await getPriceHistory(symbol);
-        priceBySymbol.set(symbol, points);
-      } catch {
-        // Skip — this symbol just won't contribute to the aggregate until its price history is fetchable again.
-      }
-    }),
-  );
+  const { timeline, priceBySymbol, activePositionsByDate, pickQualityByTimeframe } = await buildPositionTimeline(positions);
 
-  const spxPoints = await getSp500Series();
-
-  const earliestEntryDate = toUtcMidnight(positions[0].entryDate);
-  const timeline = spxPoints
-    .map((p) => toUtcMidnight(p.date))
-    .filter((d) => d.getTime() >= earliestEntryDate.getTime());
-
-  const today = toUtcMidnight(new Date());
-  if (timeline.length === 0 || timeline[timeline.length - 1].getTime() < today.getTime()) {
-    timeline.push(today);
-  }
-
-  const pickQualityAll: PickQualityPoint[] = [];
   const simulatedPortfolio: SimulatedPortfolioPoint[] = [];
-  const activePositionsByDate = new Map<number, TrackedPosition[]>();
 
   const realizationEvents = buildRealizationEvents(positions, priceBySymbol, baseValue);
   let realizedPnlToDate = 0;
   let nextRealizationIdx = 0;
 
   for (const date of timeline) {
-    const activePositions = positions.filter((p) => {
-      const entry = toUtcMidnight(p.entryDate).getTime();
-      if (entry > date.getTime()) return false;
-      if (p.exitDate == null) return true;
-      return toUtcMidnight(p.exitDate).getTime() >= date.getTime();
-    });
-
     // activePositions still includes a closed position through its exitDate
     // inclusive, so its final day's contribution comes from the live loop
     // below — only fold its realized P&L into the running bucket starting
@@ -412,6 +449,13 @@ export async function getRecommendationPerformance(
       realizedPnlToDate += realizationEvents[nextRealizationIdx].amount;
       nextRealizationIdx += 1;
     }
+
+    // Emitted for every timeline date (even ones with zero currently-open
+    // positions) so portfolioValue reflects the full history of every
+    // position ever tracked, not just currently-open ones — unlike
+    // activePositionsByDate above, which legitimately has nothing to show
+    // when nothing is open.
+    const activePositions = activePositionsByDate.get(date.getTime()) ?? [];
 
     let livePnl = 0;
     let sizedCount = 0;
@@ -427,16 +471,6 @@ export async function getRecommendationPerformance(
       }
     }
 
-    if (activePositions.length > 0) {
-      activePositionsByDate.set(date.getTime(), activePositions);
-      pickQualityAll.push(buildPickQualityPoint(date, activePositions, priceBySymbol, spxPoints, null));
-    }
-
-    // Emitted for every timeline date (even ones with zero currently-open
-    // positions) so portfolioValue reflects the full history of every
-    // position ever tracked, not just currently-open ones — unlike
-    // activePositions/pickQualityAll above, which legitimately have nothing
-    // to show when nothing is open.
     const pnl = livePnl + realizedPnlToDate;
     simulatedPortfolio.push({
       date,
@@ -447,13 +481,6 @@ export async function getRecommendationPerformance(
     });
   }
 
-  const pickQualityByTimeframe: Record<TimeframeKey, PickQualityPoint[]> = {
-    "1W": computeWindowedPickQuality(timeline, activePositionsByDate, priceBySymbol, spxPoints, TIMEFRAME_DAYS["1W"]!),
-    "2W": computeWindowedPickQuality(timeline, activePositionsByDate, priceBySymbol, spxPoints, TIMEFRAME_DAYS["2W"]!),
-    "1M": computeWindowedPickQuality(timeline, activePositionsByDate, priceBySymbol, spxPoints, TIMEFRAME_DAYS["1M"]!),
-    All: pickQualityAll,
-  };
-
   return {
     pickQualityByTimeframe,
     simulatedPortfolio,
@@ -461,4 +488,35 @@ export async function getRecommendationPerformance(
     trackedSince: positions[0].entryDate,
     totalPositions: positions.length,
   };
+}
+
+export interface FullRankPickQualityResult {
+  pickQualityByTimeframe: Record<TimeframeKey, PickQualityPoint[]>;
+  trackedSince: Date | null;
+  totalPositions: number;
+}
+
+/**
+ * Group 3's "Top 30" view: pure pick quality over every ranked candidate
+ * each month, regardless of whether banding ever bought it — answers "was
+ * the ranking model itself directionally sound," independent of the
+ * Top 10 execution/banding layer (getRecommendationPerformance with
+ * group: "GROUP_3"). No simulated-portfolio equivalent: sizing 30
+ * largely-unbought candidates against a hypothetical portfolio wouldn't map
+ * to anything real.
+ */
+export async function getGroup3FullRankPickQuality(): Promise<FullRankPickQualityResult> {
+  const rows = await prisma.candidateRecommendationLog.findMany({
+    where: { group: "GROUP_3" },
+    orderBy: { recommendedAt: "asc" },
+  });
+
+  if (rows.length === 0) {
+    return { pickQualityByTimeframe: { "1W": [], "2W": [], "1M": [], All: [] }, trackedSince: null, totalPositions: 0 };
+  }
+
+  const positions = buildFullRankTrackedPositions(groupIntoMonthlyRankings(rows));
+  const { pickQualityByTimeframe } = await buildPositionTimeline(positions);
+
+  return { pickQualityByTimeframe, trackedSince: positions[0].entryDate, totalPositions: positions.length };
 }

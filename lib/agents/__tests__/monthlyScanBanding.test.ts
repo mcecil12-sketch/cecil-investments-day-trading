@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildBandedMonthlyPositions,
+  buildFullRankTrackedPositions,
   currentlyHeldSymbols,
   BUY_RANK_THRESHOLD,
   SELL_RANK_THRESHOLD,
@@ -96,5 +97,42 @@ describe("currentlyHeldSymbols", () => {
     const held = currentlyHeldSymbols([batch(0, symbols)]);
     expect(held.size).toBe(TARGET_PORTFOLIO_SIZE);
     for (const s of symbols) expect(held.has(s)).toBe(true);
+  });
+});
+
+describe("buildFullRankTrackedPositions", () => {
+  it("tracks every symbol in the batch, not just the top BUY_RANK_THRESHOLD", () => {
+    const symbols = Array.from({ length: 30 }, (_, i) => `S${i}`);
+    const positions = buildFullRankTrackedPositions([batch(0, symbols)]);
+    const open = positions.filter((p) => p.exitDate == null).map((p) => p.symbol).sort();
+    expect(open).toEqual([...symbols].sort());
+  });
+
+  it("closes a symbol the very first month it's absent — no grace period", () => {
+    const month0 = ["S1", ...Array.from({ length: 29 }, (_, i) => `X${i}`)];
+    const month1 = Array.from({ length: 29 }, (_, i) => `X${i}`); // S1 dropped out of the top 30 entirely
+    const positions = buildFullRankTrackedPositions([batch(0, month0), batch(1, month1)]);
+    const s1 = positions.find((p) => p.symbol === "S1")!;
+    expect(s1.exitDate).toEqual(monthDate(1));
+  });
+
+  it("treats re-entry after a close as a brand-new position with a fresh cost basis", () => {
+    const month0 = ["S1", ...Array.from({ length: 29 }, (_, i) => `X${i}`)];
+    const month1 = Array.from({ length: 29 }, (_, i) => `X${i}`); // S1 absent — closes
+    const month2 = ["S1", ...Array.from({ length: 29 }, (_, i) => `X${i}`)]; // S1 reappears
+    const positions = buildFullRankTrackedPositions([batch(0, month0), batch(1, month1), batch(2, month2)]);
+    const s1Positions = positions.filter((p) => p.symbol === "S1");
+    expect(s1Positions).toHaveLength(2);
+    expect(s1Positions[0].exitDate).toEqual(monthDate(1));
+    expect(s1Positions[1].entryDate).toEqual(monthDate(2));
+    expect(s1Positions[1].exitDate).toBeNull();
+  });
+
+  it("keeps tracking a symbol that stays in the 11-30 range without ever being bought by the Top 10 banding", () => {
+    const symbols = Array.from({ length: 30 }, (_, i) => `S${i}`); // S20 sits at rank 21 every month
+    const positions = buildFullRankTrackedPositions([batch(0, symbols), batch(1, symbols)]);
+    const s20 = positions.find((p) => p.symbol === "S20")!;
+    expect(s20.exitDate).toBeNull();
+    expect(s20.entryDate).toEqual(monthDate(0));
   });
 });

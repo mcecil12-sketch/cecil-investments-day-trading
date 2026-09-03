@@ -103,3 +103,46 @@ export function currentlyHeldSymbols(monthlyBatches: MonthlyRanking[]): Set<stri
   const positions = buildBandedMonthlyPositions(monthlyBatches);
   return new Set(positions.filter((p) => p.exitDate == null).map((p) => p.symbol));
 }
+
+/**
+ * Group 3's "Top 30" analog of buildBandedMonthlyPositions: tracks every
+ * ranked symbol from every monthly batch regardless of buy/sell banding, so
+ * it answers "was the ranking model itself directionally sound" independent
+ * of the execution/banding layer above.
+ *
+ * Unlike the Top 10 banding replay, there's no grace period on absence — a
+ * symbol closes the very first month it's missing from the batch, and a
+ * later re-appearance opens a brand-new position with a fresh cost basis.
+ * Monthly cadence makes even one missed month a meaningful signal, unlike
+ * Group 1's weekly "one miss is noise" rule.
+ */
+export function buildFullRankTrackedPositions(monthlyBatches: MonthlyRanking[]): TrackedPosition[] {
+  const sorted = [...monthlyBatches].sort((a, b) => a.date.getTime() - b.date.getTime());
+
+  const positions: TrackedPosition[] = [];
+  const open = new Map<string, { entryDate: Date; entryScore: number }>();
+
+  for (const batch of sorted) {
+    const bySymbol = new Map(batch.rankedSymbols.map((entry) => [entry.symbol, entry]));
+
+    for (const symbol of [...open.keys()]) {
+      if (!bySymbol.has(symbol)) {
+        const entry = open.get(symbol)!;
+        positions.push({ symbol, entryDate: entry.entryDate, entryScore: entry.entryScore, exitDate: batch.date });
+        open.delete(symbol);
+      }
+    }
+
+    for (const entry of batch.rankedSymbols) {
+      if (!open.has(entry.symbol)) {
+        open.set(entry.symbol, { entryDate: batch.date, entryScore: entry.score });
+      }
+    }
+  }
+
+  for (const [symbol, entry] of open) {
+    positions.push({ symbol, entryDate: entry.entryDate, entryScore: entry.entryScore, exitDate: null });
+  }
+
+  return positions.sort((a, b) => a.entryDate.getTime() - b.entryDate.getTime());
+}

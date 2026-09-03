@@ -1,6 +1,11 @@
 import { prisma } from "@/lib/prisma";
 import { listZeroMissMonths } from "@/lib/agents/zeroMissAggregation";
-import { getRecommendationPerformance, groupIntoMonthlyRankings } from "@/lib/agents/recommendationPerformance";
+import {
+  getRecommendationPerformance,
+  getGroup3FullRankPickQuality,
+  groupIntoMonthlyRankings,
+  type FullRankPickQualityResult,
+} from "@/lib/agents/recommendationPerformance";
 import {
   buildBandedMonthlyPositions,
   currentlyHeldSymbols,
@@ -51,9 +56,21 @@ async function getGroup3State() {
   const sectorFlags = sectorRun?.output ? (sectorRun.output as unknown as SectorRotationOutput).flags : [];
   const sectorFlagsAsOf = sectorRun?.output ? (sectorRun.output as unknown as SectorRotationOutput).generatedAt : null;
 
-  const performance = await getRecommendationPerformance(null, "GROUP_3");
+  const [performance, fullRankPerformance] = await Promise.all([
+    getRecommendationPerformance(null, "GROUP_3"),
+    getGroup3FullRankPickQuality(),
+  ]);
 
-  return { latestMonth, heldSymbols, soldThisMonth, firstLiveRun, sectorFlags, sectorFlagsAsOf, performance };
+  return {
+    latestMonth,
+    heldSymbols,
+    soldThisMonth,
+    firstLiveRun,
+    sectorFlags,
+    sectorFlagsAsOf,
+    performance,
+    fullRankPerformance,
+  };
 }
 
 function chartProps(performance: Awaited<ReturnType<typeof getRecommendationPerformance>>) {
@@ -77,6 +94,24 @@ function chartProps(performance: Awaited<ReturnType<typeof getRecommendationPerf
       activeCount: p.activeCount,
     })),
     baseValue: performance.baseValue,
+    trackedSince: performance.trackedSince ? performance.trackedSince.toISOString() : null,
+    totalPositions: performance.totalPositions,
+  };
+}
+
+function fullRankChartProps(performance: FullRankPickQualityResult) {
+  return {
+    pickQualityByTimeframe: Object.fromEntries(
+      Object.entries(performance.pickQualityByTimeframe).map(([key, points]) => [
+        key,
+        points.map((p) => ({
+          date: p.date.toISOString().slice(0, 10),
+          pickReturn: p.pickReturn,
+          spxReturn: p.spxReturn,
+          activeCount: p.activeCount,
+        })),
+      ]),
+    ) as Record<TimeframeKey, PickQualityChartPoint[]>,
     trackedSince: performance.trackedSince ? performance.trackedSince.toISOString() : null,
     totalPositions: performance.totalPositions,
   };
@@ -230,13 +265,40 @@ export default async function TrackingGroupsPage() {
             )}
           </>
         )}
-
-        {group3.performance.totalPositions > 0 && (
-          <div style={{ marginTop: "1rem" }}>
-            <RecommendationPerformanceCharts {...chartProps(group3.performance)} />
-          </div>
-        )}
       </div>
+
+      {group3.performance.totalPositions > 0 && (
+        <div className="card">
+          <div className="agent-card-header">
+            <strong>Group 3 — Top 10 (Bought/Held) Performance</strong>
+          </div>
+          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginTop: 0 }}>
+            Tracks the actual banding-driven portfolio — how the positions actually held for the Kennedy account
+            performed.
+          </p>
+          <RecommendationPerformanceCharts
+            {...chartProps(group3.performance)}
+            trackingNote="Bought at rank ≤10, sold once a held position's rank drops below 20, backfilled toward 10 open positions, capped at 15 — carried forward month to month rather than reset each cycle."
+          />
+        </div>
+      )}
+
+      {group3.fullRankPerformance.totalPositions > 0 && (
+        <div className="card">
+          <div className="agent-card-header">
+            <strong>Group 3 — Top 30 (Full Ranked List) Performance</strong>
+          </div>
+          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginTop: 0 }}>
+            Tracks every ranked candidate equal-weighted, regardless of whether it was bought — answers whether the
+            ranking model itself is directionally sound, independent of the banding/execution layer above.
+          </p>
+          <RecommendationPerformanceCharts
+            {...fullRankChartProps(group3.fullRankPerformance)}
+            showSimulatedPortfolio={false}
+            trackingNote="Tracks every ranked candidate from each monthly batch — no grace period on absence: a symbol closes the month it drops out of the top 30, and re-entry later starts a fresh position."
+          />
+        </div>
+      )}
     </div>
   );
 }

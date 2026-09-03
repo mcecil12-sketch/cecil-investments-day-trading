@@ -198,6 +198,7 @@ export default async function DashboardPage() {
           baseValue={recPerformance.baseValue}
           trackedSince={recPerformance.trackedSince ? recPerformance.trackedSince.toISOString() : null}
           totalPositions={recPerformance.totalPositions}
+          trackingNote="Each position starts from its entry date forward — a single missed week doesn't close it, but 2 consecutive missed weeks do, and re-entry after a close starts a fresh position."
         />
       )}
     </div>

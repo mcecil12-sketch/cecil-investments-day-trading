@@ -22,10 +22,16 @@ export interface SimulatedPortfolioChartPoint {
 
 interface Props {
   pickQualityByTimeframe: Record<TimeframeKey, PickQualityChartPoint[]>;
-  simulatedPortfolio: SimulatedPortfolioChartPoint[];
-  baseValue: number;
+  simulatedPortfolio?: SimulatedPortfolioChartPoint[];
+  baseValue?: number;
   trackedSince: string | null;
   totalPositions: number;
+  /** Sentence appended to "Tracking N positions since {date}." — describes this view's specific entry/exit rule, since Group 1, Group 3 Top 10, and Group 3 Top 30 each use a different one. */
+  trackingNote: string;
+  /** Suppresses View 2 (Simulated Position-Sized Portfolio) — used for pick-quality-only views like Group 3's Top 30, where dollar-sizing unbought candidates wouldn't map to anything real. Defaults to true. */
+  showSimulatedPortfolio?: boolean;
+  /** Card heading — defaults to "Recommendation Performance". */
+  title?: string;
 }
 
 /** Dark-mode categorical pair validated for this app's --bg-elevated surface (see dataviz skill). */
@@ -111,10 +117,13 @@ function LegendRow({ items }: { items: { label: string; color: string }[] }) {
 
 export function RecommendationPerformanceCharts({
   pickQualityByTimeframe,
-  simulatedPortfolio,
-  baseValue,
+  simulatedPortfolio = [],
+  baseValue = 0,
   trackedSince,
   totalPositions,
+  trackingNote,
+  showSimulatedPortfolio = true,
+  title = "Recommendation Performance",
 }: Props) {
   const [timeframe, setTimeframe] = useState<TimeframeKey>("All");
 
@@ -127,7 +136,7 @@ export function RecommendationPerformanceCharts({
   if (totalPositions === 0) {
     return (
       <div className="card">
-        <h2 style={{ marginTop: 0 }}>Recommendation Performance</h2>
+        <h2 style={{ marginTop: 0 }}>{title}</h2>
         <p style={{ color: "var(--text-muted)" }}>
           No recommendations logged yet — this fills in once the Candidate Scanner&apos;s weekly batch runs.
         </p>
@@ -150,11 +159,10 @@ export function RecommendationPerformanceCharts({
 
   return (
     <div>
-      <h2 style={{ marginBottom: "0.25rem" }}>Recommendation Performance</h2>
+      <h2 style={{ marginBottom: "0.25rem" }}>{title}</h2>
       <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginTop: 0, marginBottom: "1rem" }}>
         Tracking {totalPositions} position{totalPositions === 1 ? "" : "s"} since{" "}
-        {trackedSinceLabel}. Each position starts from its entry date forward — a single missed week doesn&apos;t
-        close it, but 2 consecutive missed weeks do, and re-entry after a close starts a fresh position.
+        {trackedSinceLabel}. {trackingNote}
       </p>
 
       <div className="rec-perf-timeframe">
@@ -274,96 +282,98 @@ export function RecommendationPerformanceCharts({
         </details>
       </div>
 
-      <div className="card">
-        <div className="agent-card-header">
-          <strong>View 2 — Simulated Position-Sized Portfolio</strong>
+      {showSimulatedPortfolio && (
+        <div className="card">
+          <div className="agent-card-header">
+            <strong>View 2 — Simulated Position-Sized Portfolio</strong>
+            {lastSim && (
+              <span style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>{lastSim.activeCount} positions</span>
+            )}
+          </div>
+          <p style={{ color: "var(--text-muted)", fontSize: "0.78rem", marginTop: 0 }}>
+            Each recommendation sized at the midpoint of its conviction band (e.g. a 4.0%–6.0% suggestion uses 5.0%)
+            against a fixed hypothetical {formatCurrency(baseValue)} starting portfolio.
+          </p>
+          <div style={{ width: "100%", height: 220 }}>
+            <ResponsiveContainer>
+              <LineChart data={windowSimulatedPortfolio} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+                <XAxis
+                  dataKey="date"
+                  tickFormatter={tickDate}
+                  stroke="var(--text-muted)"
+                  fontSize={11}
+                  tickLine={false}
+                  axisLine={false}
+                  minTickGap={32}
+                />
+                <YAxis
+                  tickFormatter={(v: number) => formatCurrency(v)}
+                  stroke="var(--text-muted)"
+                  fontSize={11}
+                  tickLine={false}
+                  axisLine={false}
+                  width={64}
+                />
+                <Tooltip content={<ChartTooltip formatValue={formatCurrency} />} />
+                <ReferenceLine y={baseValue} stroke="var(--text-muted)" strokeDasharray="3 3" />
+                <Line
+                  type="monotone"
+                  dataKey="portfolioValue"
+                  name="Simulated Portfolio"
+                  stroke={SERIES_PICKS}
+                  strokeWidth={2}
+                  dot={false}
+                  activeDot={{ r: 4 }}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
           {lastSim && (
-            <span style={{ color: "var(--text-muted)", fontSize: "0.78rem" }}>{lastSim.activeCount} positions</span>
+            <div className="rec-perf-summary">
+              <span>
+                Value: <strong className="mono">{formatCurrency(lastSim.portfolioValue)}</strong>
+              </span>
+              <span>
+                P&amp;L:{" "}
+                <strong className="mono" style={{ color: alphaColor(windowPnl) }}>
+                  {formatCurrency(windowPnl)} ({formatPercent(windowPnlPct)})
+                </strong>
+              </span>
+            </div>
           )}
-        </div>
-        <p style={{ color: "var(--text-muted)", fontSize: "0.78rem", marginTop: 0 }}>
-          Each recommendation sized at the midpoint of its conviction band (e.g. a 4.0%–6.0% suggestion uses 5.0%)
-          against a fixed hypothetical {formatCurrency(baseValue)} starting portfolio.
-        </p>
-        <div style={{ width: "100%", height: 220 }}>
-          <ResponsiveContainer>
-            <LineChart data={windowSimulatedPortfolio} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-              <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
-              <XAxis
-                dataKey="date"
-                tickFormatter={tickDate}
-                stroke="var(--text-muted)"
-                fontSize={11}
-                tickLine={false}
-                axisLine={false}
-                minTickGap={32}
-              />
-              <YAxis
-                tickFormatter={(v: number) => formatCurrency(v)}
-                stroke="var(--text-muted)"
-                fontSize={11}
-                tickLine={false}
-                axisLine={false}
-                width={64}
-              />
-              <Tooltip content={<ChartTooltip formatValue={formatCurrency} />} />
-              <ReferenceLine y={baseValue} stroke="var(--text-muted)" strokeDasharray="3 3" />
-              <Line
-                type="monotone"
-                dataKey="portfolioValue"
-                name="Simulated Portfolio"
-                stroke={SERIES_PICKS}
-                strokeWidth={2}
-                dot={false}
-                activeDot={{ r: 4 }}
-              />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-        {lastSim && (
-          <div className="rec-perf-summary">
-            <span>
-              Value: <strong className="mono">{formatCurrency(lastSim.portfolioValue)}</strong>
-            </span>
-            <span>
-              P&amp;L:{" "}
-              <strong className="mono" style={{ color: alphaColor(windowPnl) }}>
-                {formatCurrency(windowPnl)} ({formatPercent(windowPnlPct)})
-              </strong>
-            </span>
-          </div>
-        )}
-        <details style={{ marginTop: "0.6rem" }}>
-          <summary style={{ cursor: "pointer", color: "var(--text-muted)", fontSize: "0.78rem" }}>
-            View data table
-          </summary>
-          <div className="table-wrap" style={{ marginTop: "0.5rem" }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Date</th>
-                  <th>Portfolio Value</th>
-                  <th>P&amp;L</th>
-                  <th>Positions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[...windowSimulatedPortfolio].reverse().map((p) => (
-                  <tr key={p.date}>
-                    <td className="mono">{formatDate(new Date(p.date))}</td>
-                    <td className="mono">{formatCurrency(p.portfolioValue)}</td>
-                    <td className="mono">{formatCurrency(p.pnl)}</td>
-                    <td className="mono">{p.activeCount}</td>
+          <details style={{ marginTop: "0.6rem" }}>
+            <summary style={{ cursor: "pointer", color: "var(--text-muted)", fontSize: "0.78rem" }}>
+              View data table
+            </summary>
+            <div className="table-wrap" style={{ marginTop: "0.5rem" }}>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Portfolio Value</th>
+                    <th>P&amp;L</th>
+                    <th>Positions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </details>
-        <p className="rec-perf-disclaimer">
-          Simulated performance based on recommended position sizing — not a real account and not investment advice.
-        </p>
-      </div>
+                </thead>
+                <tbody>
+                  {[...windowSimulatedPortfolio].reverse().map((p) => (
+                    <tr key={p.date}>
+                      <td className="mono">{formatDate(new Date(p.date))}</td>
+                      <td className="mono">{formatCurrency(p.portfolioValue)}</td>
+                      <td className="mono">{formatCurrency(p.pnl)}</td>
+                      <td className="mono">{p.activeCount}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+          <p className="rec-perf-disclaimer">
+            Simulated performance based on recommended position sizing — not a real account and not investment advice.
+          </p>
+        </div>
+      )}
     </div>
   );
 }
