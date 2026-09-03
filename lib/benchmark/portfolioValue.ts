@@ -61,6 +61,13 @@ export async function getAccountSnapshot(
     where: {
       accountId,
       status: { in: USABLE_STATUSES },
+      // Some import sources (e.g. the Performance PDF, which carries only
+      // rolling-period returns) legitimately create a COMPLETE batch with no
+      // Holding rows at all. Without this filter, that batch can out-sort a
+      // real holdings snapshot once its asOfDate catches up, collapsing the
+      // account's value to zero even though the actual holdings data is
+      // untouched.
+      holdings: { some: {} },
       ...(onOrBefore ? { asOfDate: { lte: onOrBefore } } : {}),
     },
     orderBy: [{ asOfDate: "desc" }, { uploadedAt: "desc" }],
@@ -74,7 +81,7 @@ export async function getEarliestAccountSnapshot(
   accountId: string,
 ): Promise<AccountSnapshotValue | null> {
   const batch = await prisma.importBatch.findFirst({
-    where: { accountId, status: { in: USABLE_STATUSES } },
+    where: { accountId, status: { in: USABLE_STATUSES }, holdings: { some: {} } },
     orderBy: [{ asOfDate: "asc" }, { uploadedAt: "asc" }],
     select: { id: true, asOfDate: true },
   });
