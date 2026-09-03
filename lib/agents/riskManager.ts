@@ -45,9 +45,9 @@ export interface RiskManagerOutput {
 }
 
 const CONCENTRATION_THRESHOLD = 0.3;
-/** Locked-stock severity tiers, by combined share of total portfolio across every Verizon-linked holding (EDP's captive fund + LTI's real shares) — a small locked slice should read as low-key, a large and growing one should escalate, rather than every locked position getting the same fixed severity regardless of size. */
+/** Locked-stock severity tiers, by combined share of total portfolio across every Verizon-linked holding (EDP's captive fund + LTI's real shares) — a small locked slice should read as low-key, a large and growing one should escalate, rather than every locked position getting the same fixed severity regardless of size. Critical matches CONCENTRATION_THRESHOLD rather than a separate, lower bar. */
 const LOCKED_STOCK_WATCH_THRESHOLD = 0.1;
-const LOCKED_STOCK_CRITICAL_THRESHOLD = 0.2;
+const LOCKED_STOCK_CRITICAL_THRESHOLD = CONCENTRATION_THRESHOLD;
 const SECTOR_CONCENTRATION_THRESHOLD = 0.5;
 const DRAWDOWN_CRITICAL_THRESHOLD = -0.15;
 const OPPORTUNITY_COST_GAP_THRESHOLD = 0.02;
