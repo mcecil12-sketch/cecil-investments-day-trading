@@ -8,7 +8,10 @@ const ACCOUNT_TYPES = [
   { value: "VZ_SAVINGS_401K", label: "Verizon Savings Plan 401k" },
   { value: "VZ_LEGACY_401K", label: "Verizon Mid-Atlantic Legacy 401k" },
   { value: "VZ_EDP", label: "Verizon EDP (locked)" },
+  { value: "VZ_LTI", label: "Verizon LTI Plan (locked)" },
 ];
+
+const LOCKED_BY_DEFAULT = new Set(["VZ_EDP", "VZ_LTI"]);
 
 export function NewAccountForm() {
   const router = useRouter();
@@ -32,7 +35,7 @@ export function NewAccountForm() {
           type,
           institution,
           externalId: externalId.trim() || null,
-          isLocked: type === "VZ_EDP",
+          isLocked: LOCKED_BY_DEFAULT.has(type),
         }),
       });
       if (!response.ok) {
@@ -55,7 +58,7 @@ export function NewAccountForm() {
       <h2>Add account</h2>
       <p style={{ color: "var(--text-muted)", fontSize: "0.875rem" }}>
         Fidelity taxable accounts are usually created automatically on first CSV import — use
-        this form for the Verizon 401k/EDP accounts, which have no CSV import path yet.
+        this form for the Verizon 401k/EDP/LTI accounts, which have no CSV import path yet.
       </p>
       <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginBottom: "0.75rem" }}>
         <input

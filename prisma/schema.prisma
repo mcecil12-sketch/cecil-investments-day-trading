@@ -14,6 +14,7 @@ enum AccountType {
   VZ_SAVINGS_401K
   VZ_LEGACY_401K
   VZ_EDP
+  VZ_LTI
 }
 
 enum InstrumentType {
@@ -78,6 +79,7 @@ model Account {
   actionItems      ActionItem[]
   performances     AccountPerformance[]
   planFundMenuEntries PlanFundMenuEntry[]
+  vzLtiTranches    VzLtiTranche[]
 }
 
 model Instrument {
@@ -104,6 +106,7 @@ model ImportBatch {
   holdings         Holding[]
   benchmarkResults BenchmarkResult[]
   planFundMenuEntries PlanFundMenuEntry[]
+  vzLtiTranches    VzLtiTranche[]
 
   @@index([accountId, asOfDate])
 }
@@ -155,6 +158,33 @@ model Holding {
 
   @@index([accountId, asOfDate])
   @@index([instrumentId])
+}
+
+/// One remaining unvested third of a Verizon LTI stock grant, as extracted
+/// from Fidelity's "Stock Plans" tab — batch-scoped like Holding (one
+/// snapshot per import; the latest batch's rows are the current truth, and a
+/// vested-out third simply stops being recreated in the next batch rather
+/// than being deleted). currentValue is computed at import time (shares ×
+/// VZ's price at that moment, see lib/agents/marketData.ts) and frozen —
+/// never recomputed live — same "snapshot, not live-priced" convention every
+/// other account's Holding.currentValue already follows.
+model VzLtiTranche {
+  id            String      @id @default(cuid())
+  account       Account     @relation(fields: [accountId], references: [id])
+  accountId     String
+  importBatch   ImportBatch @relation(fields: [importBatchId], references: [id])
+  importBatchId String
+  /// Fidelity's grant cohort label, e.g. "RD24" for the 2024 grant.
+  cohortLabel   String
+  /// Calendar year the underlying grant was awarded (e.g. 2024 for "RD24") — parsed from cohortLabel, stored for sorting/display without re-parsing.
+  grantYear     Int
+  /// Always a March 1 — the date this specific third vests and pays out net of tax to a separate account.
+  vestDate      DateTime
+  shares        Float
+  currentValue  Float
+
+  @@index([accountId, vestDate])
+  @@unique([importBatchId, cohortLabel, vestDate])
 }
 
 /// One row per fund in a 401k plan's complete "Investment Choices" menu, as

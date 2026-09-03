@@ -13,20 +13,39 @@ export default async function AccountDetailPage({ params }: { params: { id: stri
   const account = await prisma.account.findUnique({ where: { id: params.id } });
   if (!account) notFound();
 
+  const isVzLti = account.type === "VZ_LTI";
+
+  // Filtered to batches that actually carry this account's value — some
+  // import sources (e.g. the Performance PDF) legitimately create a
+  // COMPLETE batch with no Holding/VzLtiTranche rows at all, and without
+  // this filter that batch can out-sort the real snapshot once its asOfDate
+  // catches up (see the identical fix in lib/benchmark/portfolioValue.ts).
   const latestBatch = await prisma.importBatch.findFirst({
-    where: { accountId: account.id, status: { in: ["COMPLETE", "PARTIAL"] } },
+    where: {
+      accountId: account.id,
+      status: { in: ["COMPLETE", "PARTIAL"] },
+      ...(isVzLti ? { vzLtiTranches: { some: {} } } : { holdings: { some: {} } }),
+    },
     orderBy: [{ asOfDate: "desc" }, { uploadedAt: "desc" }],
   });
 
-  const holdings = latestBatch
-    ? await prisma.holding.findMany({
-        where: { importBatchId: latestBatch.id },
-        include: { instrument: true },
-        orderBy: { currentValue: "desc" },
-      })
-    : [];
+  const holdings =
+    !isVzLti && latestBatch
+      ? await prisma.holding.findMany({
+          where: { importBatchId: latestBatch.id },
+          include: { instrument: true },
+          orderBy: { currentValue: "desc" },
+        })
+      : [];
 
-  const totalValue = holdings.reduce((sum, h) => sum + h.currentValue, 0);
+  const tranches =
+    isVzLti && latestBatch
+      ? await prisma.vzLtiTranche.findMany({ where: { importBatchId: latestBatch.id }, orderBy: { vestDate: "asc" } })
+      : [];
+
+  const totalValue = isVzLti
+    ? tranches.reduce((sum, t) => sum + t.currentValue, 0)
+    : holdings.reduce((sum, h) => sum + h.currentValue, 0);
 
   let alpha: number | null = null;
   let split: { locked: number; actionable: number } | null = null;
@@ -88,11 +107,50 @@ export default async function AccountDetailPage({ params }: { params: { id: stri
       </div>
 
       <h2 style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        Positions
+        {isVzLti ? "Grant / Vesting Schedule" : "Positions"}
         {latestBatch && <DeleteImportBatch importBatchId={latestBatch.id} fileName={latestBatch.fileName} />}
       </h2>
+      {isVzLti && (
+        <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+          Balance drops each March as prior grants&apos; vesting thirds pay out net of tax to a separate account —
+          an expected distribution, not a market loss. Value below is shares × VZ&apos;s price at the time of the
+          last import, frozen until the next update — not live-repriced.
+        </p>
+      )}
       <div className="card">
-        {holdings.length === 0 ? (
+        {isVzLti ? (
+          tranches.length === 0 ? (
+            <p style={{ color: "var(--text-muted)" }}>
+              No grant schedule yet — import a Stock Plans screenshot for this account.
+            </p>
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Cohort</th>
+                    <th>Vest Date</th>
+                    <th>Shares</th>
+                    <th>Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {tranches.map((tranche) => (
+                    <tr key={tranche.id}>
+                      <td>
+                        {tranche.cohortLabel}
+                        <div className="account-meta">{tranche.grantYear} grant</div>
+                      </td>
+                      <td className="mono">{formatDate(tranche.vestDate)}</td>
+                      <td className="mono">{tranche.shares.toLocaleString()}</td>
+                      <td className="mono">{formatCurrency(tranche.currentValue)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        ) : holdings.length === 0 ? (
           <p style={{ color: "var(--text-muted)" }}>
             No positions yet — import a statement for this account.
           </p>

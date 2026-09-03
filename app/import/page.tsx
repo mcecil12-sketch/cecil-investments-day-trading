@@ -6,6 +6,7 @@ import { ScreenshotImportForm } from "./ScreenshotImportForm";
 import { PdfImportForm } from "./PdfImportForm";
 import { PerformancePdfImportForm } from "./PerformancePdfImportForm";
 import { FundMenuPdfImportForm } from "./FundMenuPdfImportForm";
+import { VzLtiImportForm } from "./VzLtiImportForm";
 
 export const dynamic = "force-dynamic";
 
@@ -22,6 +23,7 @@ const SOURCE_LABEL: Record<string, string> = {
   "fund-menu-pdf": "Fund Menu PDF",
   screenshot: "Screenshot",
   fidelity: "Fidelity CSV",
+  "vz-lti": "VZ LTI Grant Schedule",
 };
 
 function sourceLabel(source: string, pdfAccountCounts: Map<string, number>, fileName: string): string {
@@ -49,6 +51,10 @@ export default async function ImportPage() {
   const planAccounts = accounts.filter(
     (account) => account.type === "VZ_SAVINGS_401K" || account.type === "VZ_LEGACY_401K",
   );
+
+  // Stock Plans screenshots only apply to the LTI grant account — its value
+  // is grant/vest tranches, not the Holding rows every other import writes.
+  const vzLtiAccounts = accounts.filter((account) => account.type === "VZ_LTI");
 
   // PDF uploads create one ImportBatch per account, all sharing the source
   // file's name — group by fileName so the history table can show "PDF
@@ -96,6 +102,17 @@ export default async function ImportPage() {
         </div>
       ) : (
         <FundMenuPdfImportForm accounts={planAccounts} />
+      )}
+
+      <h2>Upload Verizon LTI Stock Plans Screenshot</h2>
+      {vzLtiAccounts.length === 0 ? (
+        <div className="card">
+          <p style={{ color: "var(--text-muted)" }}>
+            Add a Verizon LTI Plan account first — the grant/vesting schedule needs an LTI account to import into.
+          </p>
+        </div>
+      ) : (
+        <VzLtiImportForm accounts={vzLtiAccounts} />
       )}
 
       <h2>Upload Screenshot</h2>

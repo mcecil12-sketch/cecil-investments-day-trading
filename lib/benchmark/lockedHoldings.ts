@@ -12,3 +12,17 @@ export function isLockedInstrument(instrument: { symbol: string; name: string | 
   const symbol = instrument.symbol.toUpperCase();
   return name.includes(LOCKED_INSTRUMENT_NEEDLE) || symbol.includes(LOCKED_INSTRUMENT_NEEDLE);
 }
+
+/**
+ * Broader than isLockedInstrument: also matches real VZ common stock (e.g.
+ * the LTI plan's grant shares), which isn't a "locked fund" by name but is
+ * the same underlying company-stock risk. Used only to combine EDP's
+ * captive stock fund and LTI's real shares for concentration-risk purposes
+ * in lib/agents/riskManager.ts — isLockedInstrument itself stays name-based
+ * and unchanged, since it also drives the actionable/locked $ split, where
+ * conflating "real VZ shares held anywhere" with "this specific captive
+ * fund" would be wrong.
+ */
+export function isVerizonStockExposure(instrument: { symbol: string; name: string | null }): boolean {
+  return isLockedInstrument(instrument) || instrument.symbol.toUpperCase() === "VZ";
+}

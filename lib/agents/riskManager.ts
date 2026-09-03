@@ -1,7 +1,7 @@
 import { getCurrentHoldings, totalPortfolioValue, type CurrentHolding } from "@/lib/agents/holdings";
 import { scoreCurrentHoldings } from "@/lib/agents/relativeStrength";
 import { getHoldingSector } from "@/lib/agents/sectorRotation";
-import { isLockedInstrument } from "@/lib/benchmark/lockedHoldings";
+import { isVerizonStockExposure } from "@/lib/benchmark/lockedHoldings";
 import { getKnownFundReturns, bestAlternativeInCategory, KNOWN_SP500_RETURNS, type RetirementPlanId } from "@/lib/agents/fundMappings";
 import { formatPercent, formatCurrency } from "@/lib/format";
 
@@ -45,6 +45,9 @@ export interface RiskManagerOutput {
 }
 
 const CONCENTRATION_THRESHOLD = 0.3;
+/** Locked-stock severity tiers, by combined share of total portfolio across every Verizon-linked holding (EDP's captive fund + LTI's real shares) — a small locked slice should read as low-key, a large and growing one should escalate, rather than every locked position getting the same fixed severity regardless of size. */
+const LOCKED_STOCK_WATCH_THRESHOLD = 0.1;
+const LOCKED_STOCK_CRITICAL_THRESHOLD = 0.2;
 const SECTOR_CONCENTRATION_THRESHOLD = 0.5;
 const DRAWDOWN_CRITICAL_THRESHOLD = -0.15;
 const OPPORTUNITY_COST_GAP_THRESHOLD = 0.02;
@@ -120,16 +123,51 @@ export async function runRiskManagerAgent(): Promise<RiskManagerOutput> {
     }
   }
 
-  // 2. Single stock risk — the Verizon Stock Fund can't be reallocated.
-  for (const holding of holdings) {
-    if (!isLockedInstrument({ symbol: holding.symbol, name: holding.name })) continue;
+  // 1b. Combined Verizon-stock concentration — EDP's captive stock fund and
+  // LTI's real VZ shares are different instruments (so the per-holding loop
+  // above evaluates each alone), but they're the same underlying company-
+  // stock risk. Checking the combined total too catches the case where
+  // either alone sits under the threshold but together they're over it.
+  const verizonHoldings = holdings.filter((h) => isVerizonStockExposure({ symbol: h.symbol, name: h.name }));
+  if (verizonHoldings.length > 1 && portfolioValue > 0) {
+    const combinedValue = verizonHoldings.reduce((sum, h) => sum + h.currentValue, 0);
+    const combinedShare = combinedValue / portfolioValue;
+    if (combinedShare > CONCENTRATION_THRESHOLD) {
+      critical.push({
+        severity: "critical",
+        check: "concentration",
+        symbol: null,
+        title: `Verizon stock is ${formatPercent(combinedShare)} of total portfolio (combined)`,
+        detail: `Combined across ${verizonHoldings.map((h) => h.symbol).join(" + ")}: ${formatCurrency(combinedValue)} of ${formatCurrency(portfolioValue)} exceeds the ${formatPercent(CONCENTRATION_THRESHOLD)} threshold, even though none of these positions individually crosses it alone.`,
+        accountId: null,
+      });
+    }
+  }
+
+  // 2. Single stock risk — Verizon-linked holdings (EDP's captive stock fund,
+  // LTI's real VZ shares) can't be reallocated. Severity is driven by the
+  // COMBINED share across all of them, not each holding's own share — a
+  // small locked slice next to a much larger one should read as more urgent
+  // than either would in isolation, and a fixed "informational" severity
+  // regardless of size would treat EDP's small slice and a much larger LTI
+  // balance as equivalent.
+  const combinedVerizonValue = verizonHoldings.reduce((sum, h) => sum + h.currentValue, 0);
+  const combinedVerizonShare = portfolioValue > 0 ? combinedVerizonValue / portfolioValue : 0;
+  const lockedStockSeverity: RiskSeverity =
+    combinedVerizonShare > LOCKED_STOCK_CRITICAL_THRESHOLD
+      ? "critical"
+      : combinedVerizonShare > LOCKED_STOCK_WATCH_THRESHOLD
+        ? "watch"
+        : "informational";
+
+  for (const holding of verizonHoldings) {
     const share = portfolioValue > 0 ? holding.currentValue / portfolioValue : 0;
-    informational.push({
-      severity: "informational",
+    pushFlag({
+      severity: lockedStockSeverity,
       check: "locked-stock",
       symbol: holding.symbol,
       title: `${holding.symbol} is a locked company-stock position`,
-      detail: `${formatCurrency(holding.currentValue)} (${formatPercent(share)} of portfolio) is matched company stock and can't be reallocated.`,
+      detail: `${formatCurrency(holding.currentValue)} (${formatPercent(share)} of portfolio, ${formatPercent(combinedVerizonShare)} combined across all Verizon-linked holdings) is matched company stock and can't be reallocated.`,
       accountId: singleAccountId(holding),
     });
   }
@@ -231,11 +269,19 @@ export async function runRiskManagerAgent(): Promise<RiskManagerOutput> {
   // already tells the CIO everything they need to know about a position; a
   // watch flag for that same symbol (e.g. Verizon Stock Fund also flagged as
   // a lagging performer) is redundant noise on top of a stronger signal.
-  // One entry per position: highest severity wins.
+  // One entry per position: highest severity wins. locked-stock flags can
+  // now themselves land in `watch` (severity is size-driven, see check #2
+  // above), so they're looked up across all three arrays, and explicitly
+  // exempted from the filter below — otherwise a watch-severity locked-stock
+  // flag would end up suppressing itself.
   const strongerSignalSymbols = new Set<string>();
   for (const flag of critical) if (flag.symbol) strongerSignalSymbols.add(flag.symbol);
-  for (const flag of informational) if (flag.check === "locked-stock" && flag.symbol) strongerSignalSymbols.add(flag.symbol);
-  const dedupedWatch = watch.filter((flag) => !(flag.symbol && strongerSignalSymbols.has(flag.symbol)));
+  for (const flag of [...critical, ...watch, ...informational]) {
+    if (flag.check === "locked-stock" && flag.symbol) strongerSignalSymbols.add(flag.symbol);
+  }
+  const dedupedWatch = watch.filter(
+    (flag) => flag.check === "locked-stock" || !(flag.symbol && strongerSignalSymbols.has(flag.symbol)),
+  );
 
   return {
     generatedAt: new Date().toISOString(),

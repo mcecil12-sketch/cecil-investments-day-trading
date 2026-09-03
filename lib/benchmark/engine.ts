@@ -158,8 +158,15 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
     }
   }
 
+  // VZ_LTI has no real purchase cost basis — it's compensation, not a
+  // brokerage purchase — so a "return since purchase" figure for it would be
+  // either nonsensical (basis $0 → always +∞%) or meaningless (basis =
+  // current value → always flat). Excluded from this calc entirely, both
+  // per-account and from the aggregate blend below.
+  const accountsForSincePurchase = accountsWithData.filter((a) => a.type !== "VZ_LTI");
+
   const sincePurchaseResults: AccountSincePurchaseResult[] = [];
-  for (const account of accountsWithData) {
+  for (const account of accountsForSincePurchase) {
     const latest = latestByAccount.get(account.id)!;
     const portfolioReturn = computeReturn(latest.costBasisTotal, latest.totalValue);
 
@@ -184,9 +191,9 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
   }
 
   let aggregateSincePurchase: AggregateSincePurchaseResult | null = null;
-  if (accountsWithData.length > 0) {
-    const costBasis = accountsWithData.reduce((sum, a) => sum + latestByAccount.get(a.id)!.costBasisTotal, 0);
-    const currentValue = accountsWithData.reduce((sum, a) => sum + latestByAccount.get(a.id)!.totalValue, 0);
+  if (accountsForSincePurchase.length > 0) {
+    const costBasis = accountsForSincePurchase.reduce((sum, a) => sum + latestByAccount.get(a.id)!.costBasisTotal, 0);
+    const currentValue = accountsForSincePurchase.reduce((sum, a) => sum + latestByAccount.get(a.id)!.totalValue, 0);
     const portfolioReturn = computeReturn(costBasis, currentValue);
 
     let weightedSp500 = 0;
@@ -199,7 +206,7 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
 
     aggregateSincePurchase = {
       scope: "AGGREGATE_SINCE_PURCHASE",
-      asOfDate: new Date(Math.max(...accountsWithData.map((a) => latestByAccount.get(a.id)!.asOfDate.getTime()))),
+      asOfDate: new Date(Math.max(...accountsForSincePurchase.map((a) => latestByAccount.get(a.id)!.asOfDate.getTime()))),
       costBasis,
       currentValue,
       portfolioReturn,

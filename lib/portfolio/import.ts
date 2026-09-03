@@ -150,15 +150,17 @@ async function importAccountGroup(
 /**
  * Removes an ImportBatch and everything tied to it — for undoing a batch
  * that got written to the wrong account (e.g. a confirm-step mis-selection).
- * BenchmarkResult rows require an ImportBatch, so those are deleted too;
- * PlanFundMenuEntry's link is optional, so those are detached rather than
- * deleted (the fund menu data itself isn't specific to this batch).
+ * BenchmarkResult and VzLtiTranche rows require an ImportBatch, so those are
+ * deleted too; PlanFundMenuEntry's link is optional, so those are detached
+ * rather than deleted (the fund menu data itself isn't specific to this
+ * batch).
  */
 export async function deleteImportBatch(importBatchId: string): Promise<void> {
   await prisma.$transaction([
     prisma.benchmarkResult.deleteMany({ where: { importBatchId } }),
     prisma.planFundMenuEntry.updateMany({ where: { importBatchId }, data: { importBatchId: null } }),
     prisma.holding.deleteMany({ where: { importBatchId } }),
+    prisma.vzLtiTranche.deleteMany({ where: { importBatchId } }),
     prisma.importBatch.delete({ where: { id: importBatchId } }),
   ]);
 }

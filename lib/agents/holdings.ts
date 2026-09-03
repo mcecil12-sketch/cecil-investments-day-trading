@@ -1,7 +1,10 @@
 import { prisma } from "@/lib/prisma";
 import type { AccountType, ImportBatchStatus } from "@/lib/generated/prisma";
+import { getAccountSnapshot } from "@/lib/benchmark/portfolioValue";
 
 const USABLE_STATUSES: ImportBatchStatus[] = ["COMPLETE", "PARTIAL"];
+/** Display name for the "VZ" bucket folded in below — no Instrument row backs it, so there's nothing else to read a name from. */
+const VZ_LTI_INSTRUMENT_NAME = "Verizon Communications Inc.";
 
 export interface AccountContribution {
   accountId: string;
@@ -32,8 +35,41 @@ export async function getCurrentHoldings(): Promise<CurrentHolding[]> {
   >();
 
   for (const account of accounts) {
+    // VZ_LTI has no Holding rows at all — its value lives in VzLtiTranche
+    // instead (see portfolioValue.ts) — so fold its derived value into the
+    // "VZ" bucket directly rather than trying to read Holdings for it.
+    if (account.type === "VZ_LTI") {
+      const snap = await getAccountSnapshot(account.id);
+      if (!snap || snap.totalValue <= 0) continue;
+      const key = "VZ";
+      const entry = byInstrument.get(key) ?? {
+        symbol: key,
+        name: VZ_LTI_INSTRUMENT_NAME,
+        currentValue: 0,
+        accounts: new Map<string, AccountContribution>(),
+      };
+      entry.currentValue += snap.totalValue;
+      const existing = entry.accounts.get(account.id);
+      entry.accounts.set(account.id, {
+        accountId: account.id,
+        accountType: account.type,
+        value: (existing?.value ?? 0) + snap.totalValue,
+      });
+      byInstrument.set(key, entry);
+      continue;
+    }
+
     const batch = await prisma.importBatch.findFirst({
-      where: { accountId: account.id, status: { in: USABLE_STATUSES } },
+      where: {
+        accountId: account.id,
+        status: { in: USABLE_STATUSES },
+        // Same fix as getAccountSnapshot (lib/benchmark/portfolioValue.ts):
+        // without this, a holdings-less batch (e.g. a Performance PDF import)
+        // can out-sort the real holdings snapshot once its asOfDate catches
+        // up, making this function silently see zero holdings for the
+        // account even though the actual data is untouched.
+        holdings: { some: {} },
+      },
       orderBy: [{ asOfDate: "desc" }, { uploadedAt: "desc" }],
       select: { id: true },
     });
