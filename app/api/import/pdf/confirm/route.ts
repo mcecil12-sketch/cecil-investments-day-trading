@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { importHoldingsBatch } from "@/lib/portfolio/import";
 import { pdfPositionsToHoldingRows, type ExtractedPdfPosition } from "@/lib/portfolio/pdfImport";
+import { findCrossConsistencyMismatches } from "@/lib/portfolio/accountMatch";
 import { triggerAllAgentsRun } from "@/lib/agents/runner";
 
 interface ConfirmAccountInput {
@@ -48,6 +49,16 @@ export async function POST(request: NextRequest) {
     }
   }
 
+  // Cross-consistency: catches account-number contradictions *across* this
+  // PDF's own sections (e.g. two sections targeting the same account report
+  // different numbers, or the same number is claimed by two different target
+  // accounts) — independent of whether either number matches the target
+  // account's stored externalId, which the per-section self-consistency
+  // check below handles.
+  const crossMismatches = findCrossConsistencyMismatches(
+    accountInputs.map((account) => ({ accountId: account.accountId, accountNumber: account.accountNumber })),
+  );
+
   const batches: ConfirmAccountResult[] = [];
   for (const account of accountInputs) {
     const dbAccount = await prisma.account.findUnique({ where: { id: account.accountId } });
@@ -58,6 +69,18 @@ export async function POST(request: NextRequest) {
         status: "FAILED",
         rowCount: 0,
         errorMessage: "Account not found",
+      });
+      continue;
+    }
+
+    const crossMismatch = crossMismatches.get(account.accountId);
+    if (crossMismatch) {
+      batches.push({
+        accountId: dbAccount.id,
+        accountName: dbAccount.name,
+        status: "FAILED",
+        rowCount: 0,
+        errorMessage: `Cross-consistency check failed for "${dbAccount.name}": ${crossMismatch}. Not imported.`,
       });
       continue;
     }

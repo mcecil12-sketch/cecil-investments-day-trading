@@ -34,3 +34,66 @@ export function findMatchingAccountId(
   const exact = accounts.find((account) => normalize(account.name) === target);
   return exact?.id;
 }
+
+export interface CrossConsistencySection {
+  accountId: string;
+  accountNumber?: string | null;
+}
+
+/**
+ * Checks account-number consistency *across* the sections of a single
+ * uploaded document — distinct from the self-consistency check in
+ * app/api/import/pdf/confirm/route.ts, which only compares one section's
+ * reported number against its target account's stored externalId.
+ *
+ * A single PDF can contain multiple sections; if the extraction or the
+ * preview's account selection is wrong, two symptoms are possible that
+ * self-consistency alone can't catch:
+ *  - the same target account receives sections that reported different
+ *    account numbers (contradicts itself about which account this is)
+ *  - the same account number is reported by sections routed to different
+ *    target accounts (one physical account can't be two destinations)
+ *
+ * Returns a map of accountId -> reason for every section that should be
+ * blocked, so the caller can fail loudly instead of guessing which section
+ * is right.
+ */
+export function findCrossConsistencyMismatches(sections: CrossConsistencySection[]): Map<string, string> {
+  const numbersByAccountId = new Map<string, Set<string>>();
+  const accountIdsByNumber = new Map<string, Set<string>>();
+
+  for (const { accountId, accountNumber } of sections) {
+    if (!accountNumber) continue;
+    if (!numbersByAccountId.has(accountId)) numbersByAccountId.set(accountId, new Set());
+    numbersByAccountId.get(accountId)!.add(accountNumber);
+
+    if (!accountIdsByNumber.has(accountNumber)) accountIdsByNumber.set(accountNumber, new Set());
+    accountIdsByNumber.get(accountNumber)!.add(accountId);
+  }
+
+  const mismatches = new Map<string, string>();
+
+  for (const [accountId, numbers] of numbersByAccountId) {
+    if (numbers.size > 1) {
+      mismatches.set(
+        accountId,
+        `this PDF's sections report conflicting account numbers for the same target account: ${[...numbers].join(", ")}`,
+      );
+    }
+  }
+
+  for (const [number, accountIds] of accountIdsByNumber) {
+    if (accountIds.size > 1) {
+      for (const accountId of accountIds) {
+        if (!mismatches.has(accountId)) {
+          mismatches.set(
+            accountId,
+            `account number ${number} is reported by sections routed to ${accountIds.size} different target accounts in this PDF`,
+          );
+        }
+      }
+    }
+  }
+
+  return mismatches;
+}
