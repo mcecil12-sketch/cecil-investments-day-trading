@@ -193,6 +193,9 @@ export default async function RecommendationsPage() {
       <a href="/performance-audit" className="link-back" style={{ display: "inline-block" }}>
         View Performance Audit Trail →
       </a>
+      <a href="/tracking-groups" className="link-back" style={{ display: "inline-block", marginLeft: "1rem" }}>
+        View Recommendation Tracking Groups →
+      </a>
 
       {!candidateOutput && (
         <div className="card">
