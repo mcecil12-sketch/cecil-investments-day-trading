@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
-import { VZ_LTI_EXTRACTION_SYSTEM_PROMPT, parseVzLtiExtractionResponse } from "@/lib/portfolio/vzLtiImport";
+import {
+  VZ_LTI_EXTRACTION_SYSTEM_PROMPT,
+  isPlausibleVzLtiAsOfDate,
+  parseVzLtiExtractionResponse,
+} from "@/lib/portfolio/vzLtiImport";
 import { normalizeAsOfDate } from "@/lib/portfolio/dateNormalize";
 
 const ALLOWED_MEDIA_TYPES: Record<string, "image/png" | "image/jpeg"> = {
@@ -94,7 +98,12 @@ export async function POST(request: NextRequest) {
 
   try {
     const extracted = parseVzLtiExtractionResponse(responseText);
-    return NextResponse.json({ ...extracted, asOfDate: normalizeAsOfDate(extracted.asOfDate) });
+    const normalized = normalizeAsOfDate(extracted.asOfDate);
+    // Claude can misread the year (e.g. "2020" for "2026") since this
+    // screenshot has no printed as-of date to anchor against — fall back to
+    // today rather than trust a wildly implausible extracted value.
+    const asOfDate = isPlausibleVzLtiAsOfDate(new Date(normalized)) ? normalized : new Date().toISOString().slice(0, 10);
+    return NextResponse.json({ ...extracted, asOfDate });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json(

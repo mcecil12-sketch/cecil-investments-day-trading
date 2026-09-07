@@ -81,3 +81,64 @@ export function parseVzLtiExtractionResponse(text: string): VzLtiExtractionResul
     tranches: result.tranches as ExtractedVzLtiTranche[],
   };
 }
+
+const MAX_ASOF_DRIFT_DAYS = 30;
+
+/**
+ * Fidelity's Stock Plans tab is a live snapshot with no printed as-of date,
+ * so Claude is asked to report today's date — a value far from "now" (e.g.
+ * a misread year) is almost certainly a misread, not a real historical
+ * as-of date, unlike PDF-sourced imports that carry a real printed date.
+ */
+export function isPlausibleVzLtiAsOfDate(date: Date, now: Date = new Date()): boolean {
+  if (Number.isNaN(date.getTime())) return false;
+  const driftDays = Math.abs(date.getTime() - now.getTime()) / (24 * 60 * 60 * 1000);
+  return driftDays <= MAX_ASOF_DRIFT_DAYS;
+}
+
+export interface VzLtiTrancheConflict {
+  cohortLabel: string;
+  vestDate: string;
+  shareValues: number[];
+}
+
+export interface MergedVzLtiTranches {
+  tranches: ExtractedVzLtiTranche[];
+  conflicts: VzLtiTrancheConflict[];
+}
+
+const SHARE_TOLERANCE = 0.01;
+
+/**
+ * Merges tranches extracted from multiple Stock Plans screenshots into one
+ * list, de-duping entries that appear on more than one screenshot (the
+ * tab's cohort/year views overlap). A (cohort, vest date) pair with
+ * matching share counts across screenshots collapses to a single row; the
+ * same pair with differing share counts is a conflict the caller must
+ * surface instead of silently picking a winner.
+ */
+export function mergeVzLtiTranches(perScreenshot: ExtractedVzLtiTranche[][]): MergedVzLtiTranches {
+  const byKey = new Map<string, ExtractedVzLtiTranche[]>();
+  for (const tranches of perScreenshot) {
+    for (const tranche of tranches) {
+      const key = `${tranche.cohortLabel}::${tranche.vestDate}`;
+      const group = byKey.get(key);
+      if (group) group.push(tranche);
+      else byKey.set(key, [tranche]);
+    }
+  }
+
+  const tranches: ExtractedVzLtiTranche[] = [];
+  const conflicts: VzLtiTrancheConflict[] = [];
+  for (const group of byKey.values()) {
+    const first = group[0];
+    const allMatch = group.every((t) => Math.abs(t.shares - first.shares) <= SHARE_TOLERANCE);
+    if (allMatch) {
+      tranches.push(first);
+    } else {
+      conflicts.push({ cohortLabel: first.cohortLabel, vestDate: first.vestDate, shareValues: group.map((t) => t.shares) });
+    }
+  }
+
+  return { tranches, conflicts };
+}

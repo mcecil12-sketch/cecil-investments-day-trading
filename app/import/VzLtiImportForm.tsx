@@ -3,7 +3,8 @@
 import { useRef, useState, type DragEvent } from "react";
 import { useRouter } from "next/navigation";
 import { formatCurrency } from "@/lib/format";
-import type { VzLtiExtractionResult } from "@/lib/portfolio/vzLtiImport";
+import type { ExtractedVzLtiTranche, VzLtiExtractionResult, VzLtiTrancheConflict } from "@/lib/portfolio/vzLtiImport";
+import { mergeVzLtiTranches } from "@/lib/portfolio/vzLtiImport";
 import type { AccountOption } from "@/lib/portfolio/accountMatch";
 
 interface ConfirmResult {
@@ -14,50 +15,79 @@ interface ConfirmResult {
   totalValue: number;
 }
 
-type Stage = "idle" | "extracting" | "preview" | "importing" | "done" | "error";
+interface FileEntry {
+  id: string;
+  file: File;
+  status: "extracting" | "done" | "error";
+  result?: VzLtiExtractionResult;
+  error?: string;
+}
+
+type Phase = "idle" | "collecting" | "importing" | "done";
+
+function todayIso(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function extractFile(file: File): Promise<VzLtiExtractionResult> {
+  const formData = new FormData();
+  formData.set("file", file);
+  const response = await fetch("/api/import/vz-lti", { method: "POST", body: formData });
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error ?? "Extraction failed");
+  return body as VzLtiExtractionResult;
+}
 
 export function VzLtiImportForm({ accounts }: { accounts: AccountOption[] }) {
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement>(null);
-  const [stage, setStage] = useState<Stage>("idle");
+  const nextId = useRef(0);
+  const [phase, setPhase] = useState<Phase>("idle");
   const [dragging, setDragging] = useState(false);
-  const [fileName, setFileName] = useState<string | null>(null);
-  const [extraction, setExtraction] = useState<VzLtiExtractionResult | null>(null);
+  const [files, setFiles] = useState<FileEntry[]>([]);
   const [accountId, setAccountId] = useState(accounts[0]?.id ?? "");
+  const [asOfDate, setAsOfDate] = useState(todayIso());
   const [confirmResult, setConfirmResult] = useState<ConfirmResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   function reset() {
-    setStage("idle");
-    setFileName(null);
-    setExtraction(null);
+    setPhase("idle");
+    setFiles([]);
     setConfirmResult(null);
     setError(null);
+    setAsOfDate(todayIso());
     if (inputRef.current) inputRef.current.value = "";
   }
 
-  async function handleFile(selected: File) {
-    setFileName(selected.name);
+  async function addFiles(selected: File[]) {
+    if (selected.length === 0) return;
     setError(null);
     setConfirmResult(null);
-    setStage("extracting");
-    try {
-      const formData = new FormData();
-      formData.set("file", selected);
-      const response = await fetch("/api/import/vz-lti", { method: "POST", body: formData });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error ?? "Extraction failed");
-      setExtraction(body as VzLtiExtractionResult);
-      setStage("preview");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setStage("error");
-    }
+    setPhase("collecting");
+
+    const entries: FileEntry[] = selected.map((file) => ({ id: String(nextId.current++), file, status: "extracting" }));
+    setFiles((prev) => [...prev, ...entries]);
+
+    await Promise.all(
+      entries.map(async (entry) => {
+        try {
+          const result = await extractFile(entry.file);
+          setFiles((prev) => prev.map((f) => (f.id === entry.id ? { ...f, status: "done", result } : f)));
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          setFiles((prev) => prev.map((f) => (f.id === entry.id ? { ...f, status: "error", error: message } : f)));
+        }
+      }),
+    );
+  }
+
+  function removeFile(id: string) {
+    setFiles((prev) => prev.filter((f) => f.id !== id));
   }
 
   async function handleConfirm() {
-    if (!extraction || !accountId) return;
-    setStage("importing");
+    if (!accountId || merged.tranches.length === 0) return;
+    setPhase("importing");
     setError(null);
     try {
       const response = await fetch("/api/import/vz-lti/confirm", {
@@ -65,31 +95,33 @@ export function VzLtiImportForm({ accounts }: { accounts: AccountOption[] }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           accountId,
-          asOfDate: extraction.asOfDate,
-          tranches: extraction.tranches,
-          fileName,
+          asOfDate,
+          tranches: merged.tranches,
+          fileName: files.map((f) => f.file.name).join(", "),
         }),
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error ?? "Import failed");
       setConfirmResult(body as ConfirmResult);
-      setStage("done");
+      setPhase("done");
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-      setStage("error");
+      setPhase("collecting");
     }
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     setDragging(false);
-    const dropped = event.dataTransfer.files?.[0];
-    if (dropped) handleFile(dropped);
+    addFiles(Array.from(event.dataTransfer.files ?? []));
   }
 
-  const busy = stage === "extracting" || stage === "importing";
-  const totalShares = extraction?.tranches.reduce((sum, t) => sum + t.shares, 0) ?? 0;
+  const extracting = files.some((f) => f.status === "extracting");
+  const successfulResults = files.filter((f) => f.status === "done" && f.result).map((f) => f.result!.tranches);
+  const merged = mergeVzLtiTranches(successfulResults);
+  const totalShares = merged.tranches.reduce((sum, t) => sum + t.shares, 0);
+  const busy = extracting || phase === "importing";
 
   return (
     <div>
@@ -103,89 +135,152 @@ export function VzLtiImportForm({ accounts }: { accounts: AccountOption[] }) {
         onDragLeave={() => setDragging(false)}
         onDrop={handleDrop}
       >
-        <div className="dropzone-title">{fileName ?? "Upload Fidelity Stock Plans Screenshot"}</div>
+        <div className="dropzone-title">
+          {files.length > 0 ? `${files.length} screenshot${files.length === 1 ? "" : "s"} added` : "Upload Fidelity Stock Plans Screenshot(s)"}
+        </div>
         <div className="dropzone-hint">
           The LTI grant/vesting schedule from Fidelity&apos;s Stock Plans tab — shares per grant cohort and vest
-          year, not a flat balance. Balance is computed from shares × VZ&apos;s current price, not typed in.
+          year, not a flat balance. Balance is computed from shares × VZ&apos;s current price, not typed in. Add
+          one screenshot per grant-year view if a single screenshot doesn&apos;t show every year — overlapping
+          cohorts across screenshots are merged automatically.
         </div>
         <input
           ref={inputRef}
           type="file"
+          multiple
           accept=".png,.jpg,.jpeg,image/png,image/jpeg"
           onChange={(e) => {
-            const selected = e.target.files?.[0];
-            if (selected) handleFile(selected);
+            addFiles(Array.from(e.target.files ?? []));
+            e.target.value = "";
           }}
         />
       </div>
 
-      {stage === "extracting" && (
-        <div className="card">
-          <p style={{ color: "var(--text-muted)" }}>Reading screenshot with Claude…</p>
-        </div>
-      )}
-
       {error && (
         <div className="card">
           <p style={{ color: "var(--negative)" }}>{error}</p>
-          <button className="btn" type="button" onClick={reset}>
-            Try again
-          </button>
         </div>
       )}
 
-      {extraction && (stage === "preview" || stage === "importing") && (
+      {files.length > 0 && phase !== "done" && (
         <div className="card">
-          <h2>Extracted Grant Schedule</h2>
-          <p style={{ color: "var(--text-muted)" }}>
-            As of {extraction.asOfDate} — {extraction.tranches.length} unvested third
-            {extraction.tranches.length === 1 ? "" : "s"}, {totalShares.toFixed(2)} total shares
-          </p>
-
-          <div style={{ marginBottom: "0.75rem" }}>
-            <label style={{ marginRight: "0.5rem" }}>Account:</label>
-            <select value={accountId} onChange={(e) => setAccountId(e.target.value)}>
-              {accounts.map((account) => (
-                <option key={account.id} value={account.id}>
-                  {account.name}
-                </option>
-              ))}
-            </select>
-          </div>
-
+          <h2>Screenshots</h2>
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>Cohort</th>
-                  <th>Vest Date</th>
-                  <th>Shares</th>
+                  <th>File</th>
+                  <th>Status</th>
+                  <th>Tranches</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
-                {extraction.tranches.map((t, i) => (
-                  <tr key={`${t.cohortLabel}-${t.vestDate}-${i}`}>
-                    <td>{t.cohortLabel}</td>
-                    <td className="mono">{t.vestDate}</td>
-                    <td className="mono">{t.shares.toFixed(2)}</td>
+                {files.map((f) => (
+                  <tr key={f.id}>
+                    <td>{f.file.name}</td>
+                    <td>
+                      {f.status === "extracting" && <span style={{ color: "var(--text-muted)" }}>Reading with Claude…</span>}
+                      {f.status === "done" && <span style={{ color: "var(--positive)" }}>Extracted</span>}
+                      {f.status === "error" && <span style={{ color: "var(--negative)" }}>{f.error}</span>}
+                    </td>
+                    <td className="mono">{f.result?.tranches.length ?? "—"}</td>
+                    <td>
+                      <button className="btn-secondary" type="button" onClick={() => removeFile(f.id)} disabled={busy}>
+                        Remove
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
 
-          <div style={{ display: "flex", gap: "0.75rem", marginTop: "1rem" }}>
-            <button className="btn" type="button" disabled={busy || !accountId} onClick={handleConfirm}>
-              {stage === "importing" ? "Importing…" : "Import Grant Schedule"}
-            </button>
-            <button className="btn-secondary" type="button" onClick={reset} disabled={busy}>
-              Choose a different screenshot
-            </button>
-          </div>
+          {merged.conflicts.length > 0 && (
+            <div style={{ marginTop: "1rem", color: "var(--negative)" }}>
+              <p>
+                <strong>Conflicting tranches — resolve before importing:</strong> the same cohort/vest date shows
+                different share counts across screenshots. Remove the screenshot with the stale number and re-add
+                the correct one.
+              </p>
+              <ul>
+                {merged.conflicts.map((c: VzLtiTrancheConflict) => (
+                  <li key={`${c.cohortLabel}-${c.vestDate}`}>
+                    {c.cohortLabel} vesting {c.vestDate}: {c.shareValues.join(" vs. ")} shares
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {!extracting && merged.tranches.length > 0 && (
+            <>
+              <h2 style={{ marginTop: "1.5rem" }}>Merged Grant Schedule</h2>
+              <div style={{ marginBottom: "0.75rem", display: "flex", gap: "1.5rem", flexWrap: "wrap" }}>
+                <div>
+                  <label style={{ marginRight: "0.5rem" }}>Account:</label>
+                  <select value={accountId} onChange={(e) => setAccountId(e.target.value)}>
+                    {accounts.map((account) => (
+                      <option key={account.id} value={account.id}>
+                        {account.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label style={{ marginRight: "0.5rem" }}>As of:</label>
+                  <input type="date" value={asOfDate} onChange={(e) => setAsOfDate(e.target.value)} />
+                </div>
+              </div>
+
+              <p style={{ color: "var(--text-muted)" }}>
+                {merged.tranches.length} unvested third{merged.tranches.length === 1 ? "" : "s"}, {totalShares.toFixed(2)}{" "}
+                total shares
+              </p>
+
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Cohort</th>
+                      <th>Vest Date</th>
+                      <th>Shares</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {merged.tranches
+                      .slice()
+                      .sort((a: ExtractedVzLtiTranche, b: ExtractedVzLtiTranche) => a.vestDate.localeCompare(b.vestDate) || a.cohortLabel.localeCompare(b.cohortLabel))
+                      .map((t) => (
+                        <tr key={`${t.cohortLabel}-${t.vestDate}`}>
+                          <td>{t.cohortLabel}</td>
+                          <td className="mono">{t.vestDate}</td>
+                          <td className="mono">{t.shares.toFixed(2)}</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div style={{ display: "flex", gap: "0.75rem", marginTop: "1rem" }}>
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={busy || !accountId || merged.conflicts.length > 0}
+                  onClick={handleConfirm}
+                >
+                  {phase === "importing" ? "Importing…" : "Import Grant Schedule"}
+                </button>
+                <button className="btn-secondary" type="button" onClick={reset} disabled={busy}>
+                  Start over
+                </button>
+              </div>
+            </>
+          )}
         </div>
       )}
 
-      {confirmResult && stage === "done" && (
+      {confirmResult && phase === "done" && (
         <div className="card">
           <h2>Import complete</h2>
           <p>

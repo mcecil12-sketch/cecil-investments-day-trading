@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getPriceHistory } from "@/lib/agents/marketData";
-import { parseGrantYear, type ExtractedVzLtiTranche } from "@/lib/portfolio/vzLtiImport";
+import { isPlausibleVzLtiAsOfDate, parseGrantYear, type ExtractedVzLtiTranche } from "@/lib/portfolio/vzLtiImport";
 
 const VZ_SYMBOL = "VZ";
 
@@ -38,9 +38,19 @@ export async function POST(request: NextRequest) {
   if (Number.isNaN(asOfDate.getTime())) {
     return NextResponse.json({ error: "asOfDate is not a valid date" }, { status: 400 });
   }
+  // Final gate against the same misread-year bug the extraction step guards
+  // against — checked again here since this is the value actually written
+  // to the batch, regardless of what the client sent.
+  if (!isPlausibleVzLtiAsOfDate(asOfDate)) {
+    return NextResponse.json(
+      { error: `asOfDate ${asOfDate.toISOString().slice(0, 10)} is more than 30 days from today — double-check the date before confirming` },
+      { status: 400 },
+    );
+  }
 
   const tranches = body.tranches as ExtractedVzLtiTranche[];
   const grantYearByLabel = new Map<string, number>();
+  const seenKeys = new Set<string>();
   for (const tranche of tranches) {
     const grantYear = parseGrantYear(tranche.cohortLabel);
     if (grantYear == null) {
@@ -50,6 +60,17 @@ export async function POST(request: NextRequest) {
       );
     }
     grantYearByLabel.set(tranche.cohortLabel, grantYear);
+
+    // Guards against double-counting when tranches merged from multiple
+    // screenshots weren't fully de-duped before hitting this endpoint.
+    const key = `${tranche.cohortLabel}::${tranche.vestDate}`;
+    if (seenKeys.has(key)) {
+      return NextResponse.json(
+        { error: `Duplicate tranche for cohort ${tranche.cohortLabel} vesting ${tranche.vestDate} — merge overlapping screenshots before confirming` },
+        { status: 400 },
+      );
+    }
+    seenKeys.add(key);
   }
 
   // currentValue is computed here, once, from the same live price source
