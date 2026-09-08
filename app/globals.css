@@ -298,10 +298,17 @@ select {
   border-left: 1px solid var(--border);
   border-right: 1px solid var(--border);
   z-index: 20;
+  /* Without its own compositor layer, mobile browsers defer repainting a
+     fixed element during scroll, so it visually drags with the content and
+     only snaps to its true position once scrolling stops. Promoting it to
+     its own layer keeps it pinned throughout the scroll, not just at rest. */
+  transform: translateZ(0);
+  will-change: transform;
 }
 
 .bottom-nav-item {
   flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -310,6 +317,17 @@ select {
   font-size: 0.8rem;
   font-weight: 600;
   touch-action: manipulation;
+  padding: 0 0.35rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 480px) {
+  .bottom-nav-item {
+    font-size: 0.55rem;
+    padding: 0;
+  }
 }
 
 .bottom-nav-item.active {
