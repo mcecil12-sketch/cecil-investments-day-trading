@@ -25,15 +25,18 @@ const SECTOR_ETFS: Array<{ symbol: string; sector: string }> = [
  * Portfolio holdings mapped to the sector (or style bucket) whose rotation
  * signal they're most exposed to. Entries that match a SECTOR_ETFS sector
  * name (e.g. "Technology", "Communications") plug directly into the ranked
- * sector table; the style buckets ("Broad Market", "Small Cap", "Active
- * Growth", "Growth/Multi-Sector") have no single-sector ETF equivalent and
- * only appear in the exposure summary.
+ * sector table; the style buckets ("Broad Market", "Mid Cap", "Small Cap",
+ * "Active Growth", "Growth/Multi-Sector") have no single-sector ETF
+ * equivalent and only appear in the exposure summary. FLCSX (Large Blend)
+ * and FSMVX (Mid Cap Value) are genuinely diversified across sectors — not
+ * mis-tagged, there's no single GICS sector to give them.
  */
 const HOLDING_SECTOR_MAP: Record<string, string> = {
   FSELX: "Technology",
   FSPGX: "Growth/Multi-Sector",
   IWF: "Growth/Multi-Sector",
   FXAIX: "Broad Market",
+  FLCSX: "Broad Market",
   "US LARGE CO INDEX": "Broad Market",
   "PASS US EQ INDX MA": "Broad Market",
   FTIHX: "International Developed",
@@ -44,10 +47,34 @@ const HOLDING_SECTOR_MAP: Record<string, string> = {
   "US SMALL COMPANY": "Small Cap",
   "SMALL CAP EQTY INDX": "Small Cap",
   "ACTV US SM CAP MA": "Small Cap",
+  FSMVX: "Mid Cap",
   "AGGRESS GRW MA": "Active Growth",
   "MAGELLAN PORTFOLIO": "Active Growth",
   "VERIZON STOCK FUND": "Communications",
 };
+
+/**
+ * Below this length, a truncated candidate is more likely to coincidentally
+ * prefix-match an unrelated fund name than to be a genuine truncation, so
+ * matchFundSector requires exact equality instead.
+ */
+const MIN_TRUNCATED_NAME_MATCH_LENGTH = 10;
+
+/**
+ * Verizon 401k plan exports have, at different times, stored a fund's name
+ * truncated to an inconsistent column width (e.g. "SMALL CAP EQTY I" instead
+ * of the full "SMALL CAP EQTY INDX"), so an exact match against
+ * HOLDING_SECTOR_MAP silently misses funds that ARE in the map under their
+ * full name. Falls back to a prefix match — only when it's unambiguous
+ * (exactly one map key starts with the candidate) — before giving up.
+ */
+function matchFundSector(candidate: string): string | null {
+  const exact = HOLDING_SECTOR_MAP[candidate];
+  if (exact) return exact;
+  if (candidate.length < MIN_TRUNCATED_NAME_MATCH_LENGTH) return null;
+  const prefixMatches = Object.entries(HOLDING_SECTOR_MAP).filter(([key]) => key.startsWith(candidate));
+  return prefixMatches.length === 1 ? prefixMatches[0][1] : null;
+}
 
 /**
  * Inverts the buy-candidate universe (sector -> symbols) into symbol ->
@@ -66,7 +93,7 @@ export function buildStockSectorIndex(universe: Record<string, SectorUniverse>):
 export function getHoldingSector(symbol: string, name?: string | null, stockSectorIndex?: Map<string, string>): string | null {
   const candidates = [symbol, name].filter((v): v is string => Boolean(v)).map((v) => v.trim().toUpperCase());
   for (const candidate of candidates) {
-    const match = HOLDING_SECTOR_MAP[candidate];
+    const match = matchFundSector(candidate);
     if (match) return match;
   }
   return stockSectorIndex?.get(symbol.trim().toUpperCase()) ?? null;
