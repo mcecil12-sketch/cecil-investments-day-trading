@@ -1,6 +1,8 @@
 import { getPriceHistory, getSp500Series, type PricePoint } from "@/lib/agents/marketData";
 import { getCurrentHoldings, totalPortfolioValue } from "@/lib/agents/holdings";
 import { momentumOverDays, momentumTo100 } from "@/lib/agents/technicals";
+import { getMergedCandidateUniverse } from "@/lib/agents/scoringShared";
+import type { SectorUniverse } from "@/lib/agents/candidateUniverse";
 import { formatPercent } from "@/lib/format";
 
 const SECTOR_ETFS: Array<{ symbol: string; sector: string }> = [
@@ -47,13 +49,27 @@ const HOLDING_SECTOR_MAP: Record<string, string> = {
   "VERIZON STOCK FUND": "Communications",
 };
 
-export function getHoldingSector(symbol: string, name?: string | null): string | null {
+/**
+ * Inverts the buy-candidate universe (sector -> symbols) into symbol ->
+ * sector, so individual stock holdings can be classified against the same
+ * sector data the scanning agents already use — HOLDING_SECTOR_MAP only
+ * covers 401k fund tickers/names and has no stock coverage at all.
+ */
+export function buildStockSectorIndex(universe: Record<string, SectorUniverse>): Map<string, string> {
+  const index = new Map<string, string>();
+  for (const [sector, { symbols }] of Object.entries(universe)) {
+    for (const symbol of symbols) index.set(symbol.trim().toUpperCase(), sector);
+  }
+  return index;
+}
+
+export function getHoldingSector(symbol: string, name?: string | null, stockSectorIndex?: Map<string, string>): string | null {
   const candidates = [symbol, name].filter((v): v is string => Boolean(v)).map((v) => v.trim().toUpperCase());
   for (const candidate of candidates) {
     const match = HOLDING_SECTOR_MAP[candidate];
     if (match) return match;
   }
-  return null;
+  return stockSectorIndex?.get(symbol.trim().toUpperCase()) ?? null;
 }
 
 export interface SectorMomentum {
@@ -119,7 +135,12 @@ function scoreSectorSeries(rawPoints: PricePoint[]): SectorMomentum {
  * and where relative strength is currently rotating.
  */
 export async function runSectorRotationAgent(): Promise<SectorRotationOutput> {
-  const [sp500Points, holdings] = await Promise.all([getSp500Series(), getCurrentHoldings()]);
+  const [sp500Points, holdings, universeMap] = await Promise.all([
+    getSp500Series(),
+    getCurrentHoldings(),
+    getMergedCandidateUniverse(),
+  ]);
+  const stockSectorIndex = buildStockSectorIndex(universeMap);
   const sp500 = scoreSectorSeries(sp500Points);
 
   const scored: Array<SectorScore> = [];
@@ -141,7 +162,7 @@ export async function runSectorRotationAgent(): Promise<SectorRotationOutput> {
   const totalValue = totalPortfolioValue(holdings);
   const exposureMap = new Map<string, number>();
   for (const holding of holdings) {
-    const sector = getHoldingSector(holding.symbol, holding.name) ?? "Unclassified";
+    const sector = getHoldingSector(holding.symbol, holding.name, stockSectorIndex) ?? "Unclassified";
     exposureMap.set(sector, (exposureMap.get(sector) ?? 0) + holding.currentValue);
   }
 

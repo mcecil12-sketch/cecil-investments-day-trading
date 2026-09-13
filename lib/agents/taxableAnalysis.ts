@@ -1,8 +1,9 @@
 import { prisma } from "@/lib/prisma";
 import type { ImportBatchStatus } from "@/lib/generated/prisma";
-import { getHoldingSector } from "@/lib/agents/sectorRotation";
+import { getHoldingSector, buildStockSectorIndex } from "@/lib/agents/sectorRotation";
 import type { SectorRotationOutput } from "@/lib/agents/sectorRotation";
 import type { RelativeStrengthOutput, RelativeStrengthEntry } from "@/lib/agents/relativeStrength";
+import { getMergedCandidateUniverse } from "@/lib/agents/scoringShared";
 
 const USABLE_STATUSES: ImportBatchStatus[] = ["COMPLETE", "PARTIAL"];
 
@@ -118,9 +119,10 @@ export async function buildTaxableAnalysisContext(
   const fselxConcentrationPct =
     positions.find((p) => p.symbol === "FSELX")?.percentOfTaxablePortfolio ?? 0;
 
+  const stockSectorIndex = buildStockSectorIndex(await getMergedCandidateUniverse());
   const exposureMap = new Map<string, number>();
   for (const position of positions) {
-    const sector = getHoldingSector(position.symbol, position.name) ?? "Unclassified";
+    const sector = getHoldingSector(position.symbol, position.name, stockSectorIndex) ?? "Unclassified";
     exposureMap.set(sector, (exposureMap.get(sector) ?? 0) + position.totalValue);
   }
 

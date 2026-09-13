@@ -2,7 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { getPriceHistory, getSp500Series } from "@/lib/agents/marketData";
 import { scorePriceSeries } from "@/lib/agents/technicals";
 import { getCurrentHoldings, totalPortfolioValue } from "@/lib/agents/holdings";
-import { getHoldingSector, type SectorRotationOutput, type SectorScore } from "@/lib/agents/sectorRotation";
+import { getHoldingSector, buildStockSectorIndex, type SectorRotationOutput, type SectorScore } from "@/lib/agents/sectorRotation";
 import { closestPlanFundsForProxy } from "@/lib/agents/fundMappings";
 import { getEarningsSurpriseTrendScores, type EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
 import {
@@ -150,6 +150,9 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
   ]);
   const sp500Momentum = scorePriceSeries(sp500Points).momentum ?? 0;
   const portfolioValue = totalPortfolioValue(holdings);
+  const stockSectorIndex = buildStockSectorIndex(universeMap);
+  /** Symbols already held across any account — never recommended as a new ADD candidate, no matter how well they score. */
+  const heldSymbols = new Set(holdings.map((h) => h.symbol));
 
   // One batched DB read for every symbol that could turn up across the scanned
   // sectors, rather than a per-symbol round trip inside the loop below.
@@ -170,6 +173,8 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
     }
 
     for (const symbol of universe.symbols) {
+      if (heldSymbols.has(symbol)) continue;
+
       try {
         const { points } = await getPriceHistory(symbol);
         const priceScored = scorePriceSeries(points);
@@ -235,7 +240,7 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
 
   const exposureBySector = new Map<string, number>();
   for (const holding of holdings) {
-    const sector = getHoldingSector(holding.symbol, holding.name) ?? "Unclassified";
+    const sector = getHoldingSector(holding.symbol, holding.name, stockSectorIndex) ?? "Unclassified";
     exposureBySector.set(sector, (exposureBySector.get(sector) ?? 0) + holding.currentValue);
   }
 

@@ -1,8 +1,9 @@
 import { getCurrentHoldings, totalPortfolioValue, type CurrentHolding } from "@/lib/agents/holdings";
 import { scoreCurrentHoldings } from "@/lib/agents/relativeStrength";
-import { getHoldingSector } from "@/lib/agents/sectorRotation";
+import { getHoldingSector, buildStockSectorIndex } from "@/lib/agents/sectorRotation";
 import { isVerizonStockExposure } from "@/lib/benchmark/lockedHoldings";
 import { getKnownFundReturns, bestAlternativeInCategory, KNOWN_SP500_RETURNS, type RetirementPlanId } from "@/lib/agents/fundMappings";
+import { getMergedCandidateUniverse } from "@/lib/agents/scoringShared";
 import { formatPercent, formatCurrency } from "@/lib/format";
 
 export type RiskSeverity = "critical" | "watch" | "informational";
@@ -93,7 +94,12 @@ function sizeAdjustedSeverity(baseSeverity: RiskSeverity, currentValue: number):
  * it stays correct when run standalone.
  */
 export async function runRiskManagerAgent(): Promise<RiskManagerOutput> {
-  const [holdings, { sp500, scored: rsScored }] = await Promise.all([getCurrentHoldings(), scoreCurrentHoldings()]);
+  const [holdings, { sp500, scored: rsScored }, universeMap] = await Promise.all([
+    getCurrentHoldings(),
+    scoreCurrentHoldings(),
+    getMergedCandidateUniverse(),
+  ]);
+  const stockSectorIndex = buildStockSectorIndex(universeMap);
   const portfolioValue = totalPortfolioValue(holdings);
 
   const critical: RiskFlag[] = [];
@@ -175,7 +181,7 @@ export async function runRiskManagerAgent(): Promise<RiskManagerOutput> {
   // 3. Sector concentration — over the threshold in one sector/style bucket.
   const exposureBySector = new Map<string, number>();
   for (const holding of holdings) {
-    const sector = getHoldingSector(holding.symbol, holding.name) ?? "Unclassified";
+    const sector = getHoldingSector(holding.symbol, holding.name, stockSectorIndex) ?? "Unclassified";
     exposureBySector.set(sector, (exposureBySector.get(sector) ?? 0) + holding.currentValue);
   }
   for (const [sector, value] of exposureBySector) {
