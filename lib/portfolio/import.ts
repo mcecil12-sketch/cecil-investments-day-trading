@@ -69,10 +69,42 @@ export async function importHoldingsBatch(input: {
       }
 
       for (const row of input.rows) {
+        // Funds with no real ticker use their display name as a pseudo-symbol
+        // (always contains a space — a real ticker never does). AI-extracted
+        // screenshots/PDFs don't always transcribe a long fund name to the
+        // same length from one import to the next (e.g. "VERIZON STOCK FUND"
+        // vs. "VERIZON STOCK F"), and an exact-match upsert treated that as a
+        // brand-new instrument instead of continuing the existing one —
+        // forking its value history and letting the FUND/STOCK type
+        // misclassify off the truncated name. Only fires for space-containing
+        // symbols, and only when exactly one existing named instrument
+        // prefix-matches, so it can't misfire on real tickers or collide two
+        // different funds.
+        let existingNamed: { symbol: string; name: string | null; type: (typeof row)["type"] } | null = null;
+        if (row.symbol.includes(" ")) {
+          const candidates = await tx.instrument.findMany({ where: { symbol: { contains: " " } } });
+          const matches = candidates.filter((c) => c.symbol.startsWith(row.symbol) || row.symbol.startsWith(c.symbol));
+          if (matches.length === 1) existingNamed = matches[0];
+        }
+
+        const lookupSymbol = existingNamed?.symbol ?? row.symbol;
+        const canonicalSymbol =
+          existingNamed && existingNamed.symbol.length >= row.symbol.length ? existingNamed.symbol : row.symbol;
+        const canonicalName =
+          existingNamed && (existingNamed.name?.length ?? 0) >= (row.description?.length ?? 0)
+            ? existingNamed.name
+            : row.description || null;
+
         const instrument = await tx.instrument.upsert({
-          where: { symbol: row.symbol },
-          create: { symbol: row.symbol, name: row.description || null, type: row.type },
-          update: { type: row.type, name: row.description || undefined },
+          where: { symbol: lookupSymbol },
+          create: { symbol: canonicalSymbol, name: canonicalName, type: row.type },
+          // A single truncated extraction shouldn't flip an already-established
+          // instrument's type (e.g. FUND -> STOCK just because this week's
+          // name was cut short before "FUND" appeared) — type only comes from
+          // the fresh row when there's no existing instrument to preserve.
+          update: existingNamed
+            ? { symbol: canonicalSymbol, name: canonicalName ?? undefined }
+            : { type: row.type, name: canonicalName ?? undefined },
         });
 
         await tx.holding.create({
