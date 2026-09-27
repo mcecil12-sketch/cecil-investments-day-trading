@@ -35,15 +35,12 @@ export async function POST(request: NextRequest) {
   const accountInputs = body.accounts as ConfirmAccountInput[];
 
   for (const account of accountInputs) {
-    if (
-      !account ||
-      typeof account.accountId !== "string" ||
-      !account.accountId.trim() ||
-      !Array.isArray(account.positions) ||
-      account.positions.length === 0
-    ) {
+    // A zero-position account (e.g. a cash-only account like "Gifts and
+    // Trips") is valid — positions: [] just imports zero rows for it. Only
+    // reject a truly malformed entry, not a sparse one.
+    if (!account || typeof account.accountId !== "string" || !account.accountId.trim() || !Array.isArray(account.positions)) {
       return NextResponse.json(
-        { error: "Each account requires an accountId and a non-empty positions array" },
+        { error: "Each account requires an accountId and a positions array" },
         { status: 400 },
       );
     }
