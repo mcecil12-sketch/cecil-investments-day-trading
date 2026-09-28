@@ -677,6 +677,28 @@ tr.muted {
   margin: 0 0 1.25rem;
 }
 
+.signin-dots {
+  display: flex;
+  justify-content: center;
+  gap: 0.6rem;
+  cursor: text;
+  margin-bottom: 0.75rem;
+  min-height: 1rem;
+}
+
+.signin-dot {
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 50%;
+  border: 1.5px solid var(--text-muted);
+  box-sizing: border-box;
+}
+
+.signin-dot-filled {
+  background: var(--text);
+  border-color: var(--text);
+}
+
 .signin-input {
   width: 100%;
   text-align: center;
@@ -692,6 +714,17 @@ tr.muted {
 .signin-input::-webkit-inner-spin-button {
   -webkit-appearance: none;
   margin: 0;
+}
+
+.signin-input-hidden {
+  position: absolute;
+  opacity: 0;
+  height: 1px;
+  width: 1px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  overflow: hidden;
 }
 
 .signin-error {

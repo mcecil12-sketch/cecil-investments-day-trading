@@ -7,11 +7,15 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 // typing, rather than guessing wrong mid-entry.
 const AUTO_SUBMIT_DEBOUNCE_MS = 500;
 
+const MIN_PIN_LENGTH = 4;
+const MAX_PIN_LENGTH = 6;
+
 export default function SignInPage() {
   const [pin, setPin] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const submittedPinRef = useRef<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   async function submit(candidate: string) {
     if (loading || submittedPinRef.current === candidate) return;
@@ -44,8 +48,8 @@ export default function SignInPage() {
   }
 
   useEffect(() => {
-    if (pin.length < 4) return;
-    if (pin.length === 6) {
+    if (pin.length < MIN_PIN_LENGTH) return;
+    if (pin.length === MAX_PIN_LENGTH) {
       submit(pin);
       return;
     }
@@ -55,15 +59,18 @@ export default function SignInPage() {
   }, [pin]);
 
   function handleChange(value: string) {
-    const digitsOnly = value.replace(/\D/g, "").slice(0, 6);
+    const digitsOnly = value.replace(/\D/g, "").slice(0, MAX_PIN_LENGTH);
     setError(null);
     setPin(digitsOnly);
   }
 
   function handleSubmit(event: FormEvent) {
     event.preventDefault();
-    if (pin.length >= 4) submit(pin);
+    if (pin.length >= MIN_PIN_LENGTH) submit(pin);
   }
+
+  const dotCount = Math.max(MIN_PIN_LENGTH, pin.length);
+  const dots = Array.from({ length: dotCount }, (_, i) => i < pin.length);
 
   return (
     <div className="signin-wrap">
@@ -72,23 +79,34 @@ export default function SignInPage() {
         <p className="signin-subtitle">Enter PIN to continue</p>
 
         <form onSubmit={handleSubmit}>
+          <div className="signin-dots" onClick={() => inputRef.current?.focus()}>
+            {dots.map((filled, i) => (
+              <span key={i} className={filled ? "signin-dot signin-dot-filled" : "signin-dot"} />
+            ))}
+          </div>
+
           <input
-            type="number"
+            ref={inputRef}
+            type="text"
             inputMode="numeric"
             pattern="[0-9]*"
             autoComplete="off"
             autoFocus
-            maxLength={6}
-            className="signin-input"
+            maxLength={MAX_PIN_LENGTH}
+            className="signin-input signin-input-hidden"
             value={pin}
             onChange={(e) => handleChange(e.target.value)}
             disabled={loading}
-            placeholder="••••"
+            aria-label="PIN"
           />
 
           {error && <p className="signin-error">{error}</p>}
 
-          <button type="submit" className="btn signin-button" disabled={loading || pin.length < 4}>
+          <button
+            type="submit"
+            className="btn signin-button"
+            disabled={loading || pin.length < MIN_PIN_LENGTH}
+          >
             {loading ? "Checking…" : "Unlock"}
           </button>
         </form>
