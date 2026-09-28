@@ -7,6 +7,13 @@ export function formatCurrency(value: number | null): string {
   }).format(value);
 }
 
+/** Dollar amount with an explicit "+"/"-" sign, e.g. "+$4,532" or "-$1,204" — for gain/loss figures rather than plain balances. */
+export function formatSignedCurrency(value: number | null): string {
+  if (value == null) return "—";
+  const sign = value >= 0 ? "+" : "-";
+  return `${sign}${formatCurrency(Math.abs(value))}`;
+}
+
 export function formatCompactCurrency(value: number): string {
   return new Intl.NumberFormat("en-US", {
     style: "currency",

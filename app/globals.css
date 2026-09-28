@@ -8,6 +8,8 @@
   --accent: #00a8ff;
   --positive: #10b981;
   --negative: #ef4444;
+  --positive-tint: rgba(16, 185, 129, 0.14);
+  --negative-tint: rgba(239, 68, 68, 0.14);
   --radius: 4px;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --bottom-nav-height: 4rem;
@@ -194,11 +196,39 @@ select {
   font-family: var(--font-mono);
 }
 
-.period-card-alpha {
+.period-card-gain {
   font-family: var(--font-mono);
-  font-size: 1.25rem;
+  font-size: 0.78rem;
+  margin-left: 0.4rem;
+}
+
+.period-card-alpha {
+  margin-top: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.period-card-alpha.tint-positive {
+  background: var(--positive-tint);
+}
+
+.period-card-alpha.tint-negative {
+  background: var(--negative-tint);
+}
+
+.period-card-alpha-label {
+  font-size: 0.75rem;
   font-weight: 700;
-  margin-top: 0.4rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.period-card-alpha-value {
+  font-family: var(--font-mono);
+  font-size: 1.4rem;
+  font-weight: 700;
 }
 
 /* Account list */
@@ -268,6 +298,39 @@ select {
   font-family: var(--font-mono);
   font-size: 0.85rem;
   text-align: right;
+}
+
+/* Per-account performance table */
+tr.muted {
+  opacity: 0.55;
+}
+
+.account-perf-name {
+  font-weight: 600;
+}
+
+.account-perf-cell {
+  min-width: 130px;
+}
+
+.account-perf-return {
+  font-family: var(--font-mono);
+}
+
+.account-perf-gain {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.account-perf-alpha {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.account-perf-source {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  margin-top: 0.15rem;
 }
 
 .badge {

@@ -1,7 +1,18 @@
 import { prisma } from "@/lib/prisma";
 import { computeBenchmark, FIDELITY_PERIODS } from "@/lib/benchmark/engine";
-import type { AccountBenchmarkResult, BenchmarkComputation, FidelityPeriodKey } from "@/lib/benchmark/engine";
-import { alphaColor, formatCompactCurrency, formatCurrency, formatPercent } from "@/lib/format";
+import type {
+  AccountBenchmarkResult,
+  AccountSincePurchaseResult,
+  BenchmarkComputation,
+  FidelityPeriodKey,
+} from "@/lib/benchmark/engine";
+import {
+  alphaColor,
+  formatCompactCurrency,
+  formatCurrency,
+  formatPercent,
+  formatSignedCurrency,
+} from "@/lib/format";
 import { getRecommendationPerformance } from "@/lib/agents/recommendationPerformance";
 import type { TimeframeKey } from "@/lib/timeframes";
 import { RecommendationPerformanceCharts, type PickQualityChartPoint } from "./RecommendationPerformanceCharts";
@@ -14,6 +25,48 @@ const PERIOD_LABELS: Record<FidelityPeriodKey, string> = {
   "1y": "1Y",
   "3y": "3Y",
 };
+
+interface PeriodCardData {
+  key: string;
+  label: string;
+  portfolioReturn: number | null;
+  sp500Return: number | null;
+  alpha: number | null;
+  /** Dollar gain shown on the Portfolio row — an estimate (return % × current value) for YTD/1Y, exact (current value − cost basis) for Since Purchase. */
+  portfolioGain: number | null;
+  portfolioGainEstimated: boolean;
+  /** Equivalent dollar gain shown on the S&P row, had the same starting balance earned the S&P's return instead. */
+  sp500Gain: number | null;
+}
+
+/** One period's figures for a single account in the accounts table — mirrors a portfolio benchmark card's metrics. */
+function PeriodCell({
+  portfolioReturn,
+  gain,
+  gainEstimated,
+  alpha,
+  sourceLabel,
+}: {
+  portfolioReturn: number | null;
+  gain: number | null;
+  gainEstimated: boolean;
+  alpha: number | null;
+  sourceLabel: string | null;
+}) {
+  return (
+    <>
+      <div className="account-perf-return">{formatPercent(portfolioReturn)}</div>
+      <div className="account-perf-gain" style={{ color: alphaColor(gain) }}>
+        {formatSignedCurrency(gain)}
+        {gainEstimated && gain != null ? " est." : ""}
+      </div>
+      <div className="account-perf-alpha" style={{ color: alphaColor(alpha) }}>
+        {formatPercent(alpha)} α vs S&amp;P
+      </div>
+      {sourceLabel && <div className="account-perf-source">{sourceLabel}</div>}
+    </>
+  );
+}
 
 export default async function DashboardPage() {
   let computation: BenchmarkComputation | null = null;
@@ -72,6 +125,38 @@ export default async function DashboardPage() {
 
   const sincePurchase = computation.aggregateSincePurchase;
 
+  const sincePurchaseByAccount = new Map<string, AccountSincePurchaseResult>();
+  for (const result of computation.sincePurchase) {
+    sincePurchaseByAccount.set(result.accountId, result);
+  }
+
+  const periodCards: PeriodCardData[] = DASHBOARD_PERIODS.map((period) => {
+    const result = totalPortfolio.find((r) => r.period === period) ?? null;
+    const portfolioReturn = result?.portfolioReturn ?? null;
+    const sp500Return = result?.sp500Return ?? null;
+    return {
+      key: period,
+      label: PERIOD_LABELS[period],
+      portfolioReturn,
+      sp500Return,
+      alpha: result?.alpha ?? null,
+      portfolioGain: portfolioReturn != null ? computation.totalCurrentValue * portfolioReturn : null,
+      portfolioGainEstimated: true,
+      sp500Gain: sp500Return != null ? computation.totalCurrentValue * sp500Return : null,
+    };
+  });
+  periodCards.push({
+    key: "since-purchase",
+    label: "Since Purchase",
+    portfolioReturn: sincePurchase?.portfolioReturn ?? null,
+    sp500Return: sincePurchase?.sp500Return ?? null,
+    alpha: sincePurchase?.alpha ?? null,
+    portfolioGain: sincePurchase ? sincePurchase.currentValue - sincePurchase.costBasis : null,
+    portfolioGainEstimated: false,
+    sp500Gain:
+      sincePurchase?.sp500Return != null ? sincePurchase.costBasis * sincePurchase.sp500Return : null,
+  });
+
   return (
     <div>
       <div className="top-bar">
@@ -95,79 +180,125 @@ export default async function DashboardPage() {
       </div>
 
       <div className="period-cards">
-        {DASHBOARD_PERIODS.map((period) => {
-          const result = totalPortfolio.find((r) => r.period === period) ?? null;
-          return (
-            <div className="card" key={period}>
-              <div className="period-card-label">{PERIOD_LABELS[period]}</div>
-              <div className="period-card-row">
-                <span>Portfolio</span>
-                <span className="value">{formatPercent(result?.portfolioReturn ?? null)}</span>
-              </div>
-              <div className="period-card-row">
-                <span>S&amp;P 500</span>
-                <span className="value">{formatPercent(result?.sp500Return ?? null)}</span>
-              </div>
-              <div className="period-card-alpha" style={{ color: alphaColor(result?.alpha ?? null) }}>
-                {formatPercent(result?.alpha ?? null)}
+        {periodCards.map((card) => (
+          <div className="card" key={card.key}>
+            <div className="period-card-label">{card.label}</div>
+            <div className="period-card-row">
+              <span>Portfolio</span>
+              <span className="value">
+                {formatPercent(card.portfolioReturn)}
+                <span className="period-card-gain" style={{ color: alphaColor(card.portfolioGain) }}>
+                  {formatSignedCurrency(card.portfolioGain)}
+                  {card.portfolioGainEstimated && card.portfolioGain != null ? " est." : ""}
+                </span>
+              </span>
+            </div>
+            <div className="period-card-row">
+              <span>S&amp;P 500 (benchmark)</span>
+              <span className="value">
+                {formatPercent(card.sp500Return)}
+                <span className="period-card-gain" style={{ color: alphaColor(card.sp500Gain) }}>
+                  {formatSignedCurrency(card.sp500Gain)}
+                </span>
+              </span>
+            </div>
+            <div
+              className={`period-card-alpha${card.alpha != null ? (card.alpha >= 0 ? " tint-positive" : " tint-negative") : ""}`}
+            >
+              <div className="period-card-alpha-label">Alpha vs. S&amp;P 500</div>
+              <div className="period-card-alpha-value" style={{ color: alphaColor(card.alpha) }}>
+                {formatPercent(card.alpha)}
               </div>
             </div>
-          );
-        })}
-        <div className="card">
-          <div className="period-card-label">Since Purchase</div>
-          <div className="period-card-row">
-            <span>Portfolio</span>
-            <span className="value">{formatPercent(sincePurchase?.portfolioReturn ?? null)}</span>
           </div>
-          <div className="period-card-row">
-            <span>S&amp;P 500</span>
-            <span className="value">{formatPercent(sincePurchase?.sp500Return ?? null)}</span>
-          </div>
-          <div className="period-card-alpha" style={{ color: alphaColor(sincePurchase?.alpha ?? null) }}>
-            {formatPercent(sincePurchase?.alpha ?? null)}
-          </div>
-        </div>
+        ))}
       </div>
 
       <h2>Accounts</h2>
       <div className="card">
-        {accounts.map((account) => {
-          const value = accountValueByAccount.get(account.id) ?? null;
-          const split = accountSplitByAccount.get(account.id) ?? null;
-          const results = accountResultsByAccount.get(account.id) ?? [];
-          return (
-            <div className={`account-row${account.isLocked ? " muted" : ""}`} key={account.id}>
-              <div className="account-main">
-                <div className="account-info">
-                  <div className="account-name">{account.name}</div>
-                  <div className="account-meta">
-                    <span>{account.type}</span>
-                    {account.isLocked && <span className="badge">Monitor Only</span>}
-                  </div>
-                </div>
-                <div className="account-figures">
-                  <div className="account-value">{formatCurrency(value)}</div>
-                  {!account.isLocked &&
-                    DASHBOARD_PERIODS.map((period) => {
-                      const result = results.find((r) => r.period === period);
-                      return (
-                        <div key={period} className="account-alpha" style={{ color: alphaColor(result?.alpha ?? null) }}>
-                          {formatPercent(result?.alpha ?? null)} {PERIOD_LABELS[period]}
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Account</th>
+                <th>Value</th>
+                <th>YTD</th>
+                <th>1Y</th>
+                <th>Since Purchase</th>
+              </tr>
+            </thead>
+            <tbody>
+              {accounts.map((account) => {
+                const value = accountValueByAccount.get(account.id) ?? null;
+                const split = accountSplitByAccount.get(account.id) ?? null;
+                const results = accountResultsByAccount.get(account.id) ?? [];
+                const ytd = results.find((r) => r.period === "ytd");
+                const oneYear = results.find((r) => r.period === "1y");
+                const purchase = sincePurchaseByAccount.get(account.id);
+
+                return (
+                  <tr key={account.id} className={account.isLocked ? "muted" : undefined}>
+                    <td>
+                      <div className="account-perf-name">{account.name}</div>
+                      <div className="account-meta">
+                        <span>{account.type}</span>
+                        {account.isLocked && <span className="badge">Monitor Only</span>}
+                      </div>
+                      {split && (
+                        <div className="account-perf-source">
+                          {formatCompactCurrency(split.locked)} locked / {formatCompactCurrency(split.actionable)}{" "}
+                          actionable
                         </div>
-                      );
-                    })}
-                </div>
-              </div>
-              {split && (
-                <div className="account-split">
-                  ({formatCompactCurrency(split.locked)} locked / {formatCompactCurrency(split.actionable)}{" "}
-                  actionable)
-                </div>
-              )}
-            </div>
-          );
-        })}
+                      )}
+                    </td>
+                    <td className="mono">{formatCurrency(value)}</td>
+                    {account.isLocked ? (
+                      <td colSpan={3} style={{ color: "var(--text-muted)" }}>
+                        Monitor Only — excluded from alpha
+                      </td>
+                    ) : (
+                      <>
+                        <td className="account-perf-cell">
+                          <PeriodCell
+                            portfolioReturn={ytd?.portfolioReturn ?? null}
+                            gain={
+                              ytd?.portfolioReturn != null && value != null ? value * ytd.portfolioReturn : null
+                            }
+                            gainEstimated
+                            alpha={ytd?.alpha ?? null}
+                            sourceLabel={ytd?.asOfDate ? "via Fidelity Performance PDF" : "Not yet reported"}
+                          />
+                        </td>
+                        <td className="account-perf-cell">
+                          <PeriodCell
+                            portfolioReturn={oneYear?.portfolioReturn ?? null}
+                            gain={
+                              oneYear?.portfolioReturn != null && value != null
+                                ? value * oneYear.portfolioReturn
+                                : null
+                            }
+                            gainEstimated
+                            alpha={oneYear?.alpha ?? null}
+                            sourceLabel={oneYear?.asOfDate ? "via Fidelity Performance PDF" : "Not yet reported"}
+                          />
+                        </td>
+                        <td className="account-perf-cell">
+                          <PeriodCell
+                            portfolioReturn={purchase?.portfolioReturn ?? null}
+                            gain={purchase ? purchase.currentValue - purchase.costBasis : null}
+                            gainEstimated={false}
+                            alpha={purchase?.alpha ?? null}
+                            sourceLabel={null}
+                          />
+                        </td>
+                      </>
+                    )}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
         {accounts.length === 0 && (
           <p style={{ color: "var(--text-muted)" }}>No accounts yet — add one and import a statement first.</p>
         )}
