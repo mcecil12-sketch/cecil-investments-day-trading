@@ -16,6 +16,8 @@ const NAV_ITEMS = [
 export function BottomNav() {
   const pathname = usePathname();
 
+  if (pathname === "/signin") return null;
+
   return (
     <nav className="bottom-nav">
       {NAV_ITEMS.map((item) => {
