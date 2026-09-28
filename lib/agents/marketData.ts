@@ -6,6 +6,9 @@ export interface PricePoint {
   close: number;
 }
 
+/** Verizon's ticker — shared by every live/at-import VZ price lookup (LTI grant valuation) so it's spelled in exactly one place. */
+export const VZ_SYMBOL = "VZ";
+
 const YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart";
 
 /**
@@ -136,4 +139,43 @@ export async function getPriceHistory(symbol: string): Promise<PriceHistoryResul
     const points = await fetchAlpacaHistory(symbol, 730);
     return { symbol, points, source: "alpaca" };
   }
+}
+
+export interface LatestPrice {
+  price: number;
+  asOf: Date;
+  source: "yahoo" | "alpaca";
+}
+
+const LATEST_PRICE_CACHE_MS = 5 * 60 * 1000;
+const latestPriceCache = new Map<string, { value: LatestPrice; fetchedAt: number }>();
+
+/**
+ * The most recent daily close for a symbol — a small-range fetch (a few
+ * days, not years of history) for callers that just need "the current
+ * price" for live-repricing a holding on every page render (e.g. the VZ LTI
+ * grant value). Cached in-process for a few minutes so a burst of page loads
+ * doesn't turn into a burst of Yahoo requests; still "live" for any
+ * practical dashboard-refresh cadence.
+ */
+export async function getLatestPrice(symbol: string): Promise<LatestPrice> {
+  const cached = latestPriceCache.get(symbol);
+  if (cached && Date.now() - cached.fetchedAt < LATEST_PRICE_CACHE_MS) {
+    return cached.value;
+  }
+
+  let value: LatestPrice;
+  try {
+    const points = await fetchYahooHistory(symbol, "5d");
+    const latest = [...points].sort((a, b) => a.date.getTime() - b.date.getTime()).at(-1)!;
+    value = { price: latest.close, asOf: latest.date, source: "yahoo" };
+  } catch (yahooError) {
+    if (!hasAlpacaCreds()) throw yahooError;
+    const points = await fetchAlpacaHistory(symbol, 5);
+    const latest = [...points].sort((a, b) => a.date.getTime() - b.date.getTime()).at(-1)!;
+    value = { price: latest.close, asOf: latest.date, source: "alpaca" };
+  }
+
+  latestPriceCache.set(symbol, { value, fetchedAt: Date.now() });
+  return value;
 }

@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import { computeBenchmark } from "@/lib/benchmark/engine";
 import { isLockedInstrument } from "@/lib/benchmark/lockedHoldings";
+import { getLatestPrice, VZ_SYMBOL } from "@/lib/agents/marketData";
 import { alphaColor, formatCompactCurrency, formatCurrency, formatDate, formatPercent } from "@/lib/format";
 import { EditExternalId } from "./EditExternalId";
 import { DeleteImportBatch } from "./DeleteImportBatch";
@@ -43,8 +44,25 @@ export default async function AccountDetailPage({ params }: { params: { id: stri
       ? await prisma.vzLtiTranche.findMany({ where: { importBatchId: latestBatch.id }, orderBy: { vestDate: "asc" } })
       : [];
 
+  // VZ_LTI's value is repriced live (shares × VZ's current price) rather
+  // than read from the frozen import-time currentValue — same repricing
+  // lib/benchmark/portfolioValue.ts's toVzLtiSnapshotValue does for the
+  // dashboard/benchmark total. Falls back to the frozen per-tranche value if
+  // the live fetch fails, so a Yahoo outage doesn't break the page.
+  let vzPrice: { price: number; asOf: Date } | null = null;
+  if (isVzLti) {
+    try {
+      const live = await getLatestPrice(VZ_SYMBOL);
+      vzPrice = { price: live.price, asOf: live.asOf };
+    } catch {
+      vzPrice = null;
+    }
+  }
+  const trancheValue = (t: { shares: number; currentValue: number }) =>
+    vzPrice ? t.shares * vzPrice.price : t.currentValue;
+
   const totalValue = isVzLti
-    ? tranches.reduce((sum, t) => sum + t.currentValue, 0)
+    ? tranches.reduce((sum, t) => sum + trancheValue(t), 0)
     : holdings.reduce((sum, h) => sum + h.currentValue, 0);
 
   let alpha: number | null = null;
@@ -113,8 +131,10 @@ export default async function AccountDetailPage({ params }: { params: { id: stri
       {isVzLti && (
         <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
           Balance drops each March as prior grants&apos; vesting thirds pay out net of tax to a separate account —
-          an expected distribution, not a market loss. Value below is shares × VZ&apos;s price at the time of the
-          last import, frozen until the next update — not live-repriced.
+          an expected distribution, not a market loss.{" "}
+          {vzPrice
+            ? `Based on VZ @ $${vzPrice.price.toFixed(2)} (live).`
+            : "VZ's live price couldn't be fetched right now — showing each tranche's value as of the last import instead."}
         </p>
       )}
       <div className="card">
@@ -143,7 +163,7 @@ export default async function AccountDetailPage({ params }: { params: { id: stri
                       </td>
                       <td className="mono">{formatDate(tranche.vestDate)}</td>
                       <td className="mono">{tranche.shares.toLocaleString()}</td>
-                      <td className="mono">{formatCurrency(tranche.currentValue)}</td>
+                      <td className="mono">{formatCurrency(trancheValue(tranche))}</td>
                     </tr>
                   ))}
                 </tbody>

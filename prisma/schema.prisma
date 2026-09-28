@@ -164,10 +164,12 @@ model Holding {
 /// from Fidelity's "Stock Plans" tab — batch-scoped like Holding (one
 /// snapshot per import; the latest batch's rows are the current truth, and a
 /// vested-out third simply stops being recreated in the next batch rather
-/// than being deleted). currentValue is computed at import time (shares ×
-/// VZ's price at that moment, see lib/agents/marketData.ts) and frozen —
-/// never recomputed live — same "snapshot, not live-priced" convention every
-/// other account's Holding.currentValue already follows.
+/// than being deleted). shares is the durable fact; currentValue is only
+/// shares × VZ's price at import time, kept as a fallback for display when a
+/// live price fetch fails — normal rendering (account page, dashboard)
+/// reprices shares × VZ's live price on every read instead (see
+/// lib/agents/marketData.ts's getLatestPrice and
+/// lib/benchmark/portfolioValue.ts's toVzLtiSnapshotValue).
 model VzLtiTranche {
   id            String      @id @default(cuid())
   account       Account     @relation(fields: [accountId], references: [id])
@@ -181,6 +183,7 @@ model VzLtiTranche {
   /// Always a March 1 — the date this specific third vests and pays out net of tax to a separate account.
   vestDate      DateTime
   shares        Float
+  /// shares × VZ's price at import time — a fallback value only; live rendering recomputes from shares instead (see model doc comment above).
   currentValue  Float
 
   @@index([accountId, vestDate])

@@ -1,9 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getPriceHistory } from "@/lib/agents/marketData";
+import { getPriceHistory, VZ_SYMBOL } from "@/lib/agents/marketData";
 import { isPlausibleVzLtiAsOfDate, parseGrantYear, type ExtractedVzLtiTranche } from "@/lib/portfolio/vzLtiImport";
-
-const VZ_SYMBOL = "VZ";
 
 function isExtractedVzLtiTranche(value: unknown): value is ExtractedVzLtiTranche {
   if (!value || typeof value !== "object") return false;
@@ -73,9 +71,12 @@ export async function POST(request: NextRequest) {
     seenKeys.add(key);
   }
 
-  // currentValue is computed here, once, from the same live price source
-  // every other symbol in the app uses — then frozen into the row. Never
-  // recomputed later against a newer price (see VzLtiTranche's schema doc).
+  // currentValue is computed here from the price at import time and stored
+  // alongside shares — it's no longer what the app displays (the account
+  // page and dashboard now reprice shares × VZ's live price on every render,
+  // see lib/agents/marketData.ts's getLatestPrice and
+  // lib/benchmark/portfolioValue.ts's toVzLtiSnapshotValue), but it stays as
+  // a fallback value for whenever a live price fetch fails.
   let vzPrice: number;
   try {
     const { points } = await getPriceHistory(VZ_SYMBOL);

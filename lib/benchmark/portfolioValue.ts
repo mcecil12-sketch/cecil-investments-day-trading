@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { ImportBatchStatus } from "@/lib/generated/prisma";
 import { isLockedInstrument } from "@/lib/benchmark/lockedHoldings";
+import { getLatestPrice, VZ_SYMBOL } from "@/lib/agents/marketData";
 
 export interface AccountSnapshotValue {
   accountId: string;
@@ -50,16 +51,20 @@ async function toSnapshotValue(
 
 /**
  * VZ_LTI's snapshot: unlike every other account type, its value doesn't
- * live in Holding rows at all — it's summed from VzLtiTranche.currentValue
- * (shares × VZ's price at import time, already frozen there — see
- * VzLtiTranche's schema doc comment). 100% locked: this account is single-
- * stock company compensation the whole time it's held, never a mix of
- * actionable and non-actionable funds the way VZ_EDP is, so unlike EDP's
- * per-instrument partial lock, the entire balance counts as lockedValue.
- * costBasisTotal mirrors totalValue (flat, zero implied gain) only because
- * this account is excluded from the since-purchase return calc entirely
- * (lib/benchmark/engine.ts) — there's no real purchase cost basis for a
- * stock grant, so that number is never actually read.
+ * live in Holding rows at all — it's shares × VZ's current price, repriced
+ * live on every call (getLatestPrice is cached for a few minutes, see
+ * lib/agents/marketData.ts) rather than read from the frozen
+ * VzLtiTranche.currentValue captured at import time. If the live fetch
+ * fails (Yahoo unreachable, etc.), falls back to each tranche's frozen
+ * import-time value so the page/benchmark computation doesn't break. 100%
+ * locked: this account is single-stock company compensation the whole time
+ * it's held, never a mix of actionable and non-actionable funds the way
+ * VZ_EDP is, so unlike EDP's per-instrument partial lock, the entire
+ * balance counts as lockedValue. costBasisTotal mirrors totalValue (flat,
+ * zero implied gain) only because this account is excluded from the
+ * since-purchase return calc entirely (lib/benchmark/engine.ts) — there's
+ * no real purchase cost basis for a stock grant, so that number is never
+ * actually read.
  */
 async function toVzLtiSnapshotValue(
   accountId: string,
@@ -67,7 +72,14 @@ async function toVzLtiSnapshotValue(
 ): Promise<AccountSnapshotValue | null> {
   if (!batch) return null;
   const tranches = await prisma.vzLtiTranche.findMany({ where: { importBatchId: batch.id } });
-  const totalValue = tranches.reduce((sum, t) => sum + t.currentValue, 0);
+
+  let totalValue: number;
+  try {
+    const live = await getLatestPrice(VZ_SYMBOL);
+    totalValue = tranches.reduce((sum, t) => sum + t.shares * live.price, 0);
+  } catch {
+    totalValue = tranches.reduce((sum, t) => sum + t.currentValue, 0);
+  }
 
   return {
     accountId,
