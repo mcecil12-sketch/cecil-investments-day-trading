@@ -2,11 +2,6 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
-// A 6-digit PIN is unambiguous the moment it's typed, so it submits right
-// away; a shorter (4-5 digit) PIN waits a beat in case the user keeps
-// typing, rather than guessing wrong mid-entry.
-const AUTO_SUBMIT_DEBOUNCE_MS = 500;
-
 const MIN_PIN_LENGTH = 4;
 const MAX_PIN_LENGTH = 6;
 
@@ -48,13 +43,10 @@ export default function SignInPage() {
   }
 
   useEffect(() => {
-    if (pin.length < MIN_PIN_LENGTH) return;
-    if (pin.length === MAX_PIN_LENGTH) {
-      submit(pin);
-      return;
-    }
-    const timer = setTimeout(() => submit(pin), AUTO_SUBMIT_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
+    // Only auto-submit once the PIN can't get any longer — anything short of
+    // that could still be mid-entry of a 5- or 6-digit PIN, so a 4-5 digit
+    // count relies on the Unlock button (or Enter) instead of guessing.
+    if (pin.length === MAX_PIN_LENGTH) submit(pin);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pin]);
 
