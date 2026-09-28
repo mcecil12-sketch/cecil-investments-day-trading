@@ -6,8 +6,18 @@ import { SESSION_COOKIE_NAME, verifySessionToken } from "@/lib/auth/session";
 // works here as well as in the Node-runtime /api/auth/* routes.
 const PUBLIC_PATHS = ["/signin"];
 
+// Vercel Cron invokes these directly (see vercel.json) with no browser
+// session — each already checks its own `Authorization: Bearer CRON_SECRET`
+// header (see the isAuthorized() helper duplicated in each route), so the
+// PIN gate would otherwise 401 every scheduled run before that check even
+// runs. Excluded from the PIN gate entirely; each route's own check is the
+// real guard here.
+function isCronPath(pathname: string): boolean {
+  return pathname.startsWith("/api/cron/");
+}
+
 function isPublicPath(pathname: string): boolean {
-  return PUBLIC_PATHS.includes(pathname) || pathname.startsWith("/api/auth/");
+  return PUBLIC_PATHS.includes(pathname) || pathname.startsWith("/api/auth/") || isCronPath(pathname);
 }
 
 export async function middleware(request: NextRequest) {
