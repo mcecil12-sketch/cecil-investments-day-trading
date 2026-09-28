@@ -16,6 +16,21 @@ export const EARNINGS_SURPRISE_TREND_WEIGHT = 30 / 90;
 export const SECTOR_LEADERSHIP_WEIGHT = 25 / 90;
 
 /**
+ * 2026-09-28: A real sentiment/news data source now exists — Alpha Vantage
+ * NEWS_SENTIMENT, scored 0-100 by lib/agents/newsSentimentScore.ts and
+ * logged unweighted alongside the composite on every CandidateEntry /
+ * MonthlyScanCandidateEntry (sentimentScore/sentimentCoverage) — but it is
+ * deliberately NOT folded into MOMENTUM_TREND_WEIGHT /
+ * EARNINGS_SURPRISE_TREND_WEIGHT / SECTOR_LEADERSHIP_WEIGHT above yet. We
+ * already killed one factor (EARNINGS_ESTIMATES, 2026-08-06) for near-zero
+ * real coverage after trusting it before it was validated; sentiment stays
+ * observed-only until the Performance Analyst (lib/agents/performanceAnalyst.ts)
+ * has enough weeks of real data to confirm it's actually predictive of
+ * realized returns. Once validated, the three weights above go back to a
+ * real 35/30/25/10 split instead of this renormalized-over-90 one.
+ */
+
+/**
  * Hand-picked buy-candidate universe for sectors not yet migrated to the
  * SSGA-derived monthly refresh (see lib/agents/candidateUniverse.ts).
  * Technology, Healthcare, and Energy used to be hardcoded here too; they're

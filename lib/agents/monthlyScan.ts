@@ -12,6 +12,7 @@ import {
 } from "@/lib/agents/scoringShared";
 import { getMonthlyScanEarningsScores } from "@/lib/agents/monthlyScanEarnings";
 import type { EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
+import { getNewsSentimentScores, type NewsSentimentCoverage } from "@/lib/agents/newsSentimentScore";
 import type { CandidateAccountType } from "@/lib/agents/candidateScanner";
 import { formatPercent } from "@/lib/format";
 
@@ -36,6 +37,9 @@ export interface MonthlyScanCandidateEntry {
   aboveSma200: boolean | null;
   earningsSurpriseTrend: number;
   earningsSurpriseCoverage: EarningsSurpriseTrendCoverage;
+  /** 0-100 Alpha Vantage NEWS_SENTIMENT score (see newsSentimentScore.ts) — observed and logged only, NOT part of `score` yet (see the dated note in scoringShared.ts). Null when not covered or not yet fetched. */
+  sentimentScore: number | null;
+  sentimentCoverage: NewsSentimentCoverage;
   rationale: string;
   accountType: CandidateAccountType;
   /** What data this score was actually frozen against, for point-in-time auditability — never retroactively updated once written. */
@@ -109,7 +113,10 @@ export async function runMonthlyScanAgent(triggerSource: "cron" | "manual"): Pro
   const candidateSymbols = Array.from(
     new Set(topSectors.flatMap((sector) => universeMap[sector.sector]?.symbols ?? [])),
   );
-  const earningsScores = await getMonthlyScanEarningsScores(candidateSymbols);
+  const [earningsScores, sentimentScores] = await Promise.all([
+    getMonthlyScanEarningsScores(candidateSymbols),
+    getNewsSentimentScores(candidateSymbols),
+  ]);
 
   const skipped: Array<{ symbol: string; reason: string }> = [];
   const sectorsWithoutUniverse: string[] = [];
@@ -131,6 +138,7 @@ export async function runMonthlyScanAgent(triggerSource: "cron" | "manual"): Pro
         if (vsSpx <= 0) continue;
 
         const earnings = earningsScores.get(symbol)!;
+        const sentiment = sentimentScores.get(symbol)!;
 
         const compositeScore = Math.max(
           0,
@@ -161,6 +169,8 @@ export async function runMonthlyScanAgent(triggerSource: "cron" | "manual"): Pro
           aboveSma200: priceScored.aboveSma200,
           earningsSurpriseTrend: earnings.score,
           earningsSurpriseCoverage: earnings.coverage,
+          sentimentScore: sentiment.score,
+          sentimentCoverage: sentiment.coverage,
           rationale: "",
           accountType,
           dataAvailability: {

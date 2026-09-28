@@ -44,6 +44,8 @@ enum AgentType {
   UNIVERSE_REFRESH
   EARNINGS_ESTIMATES_REFRESH
   MONTHLY_SCAN
+  SENTIMENT_REFRESH
+  PERFORMANCE_ANALYST
 }
 
 enum AgentRunStatus {
@@ -306,6 +308,8 @@ model WeeklyBrief {
   taxableOpportunities Json?
   /// Qualitative "News & Sentiment Watch" notes for this week's Top Candidates, shaped like NewsSentimentNote[] in lib/agents/newsSentiment.ts. Context only — never fed into the composite score or ranking. Null when no ANTHROPIC_API_KEY was configured or no Candidate Scanner run was available at synthesis time.
   newsSentimentNotes Json?
+  /// The Performance Analyst's structured narrative research over recommendationPerformance.ts's numeric outputs, shaped like PerformanceAnalystOutput in lib/agents/performanceAnalyst.ts. Rides along with the weekly brief same as taxableOpportunities/newsSentimentNotes. Null when no ANTHROPIC_API_KEY was configured or there wasn't enough tracked-position history yet at synthesis time.
+  performanceAnalysis Json?
   actionItems ActionItem[]
   recommendationOutcomes RecommendationOutcome[]
   createdAt   DateTime     @default(now())
@@ -365,6 +369,10 @@ model CandidateRecommendationLog {
   momentum1Y         Float?
   /// Earnings-surprise-trend data-completeness tag at the time of recommendation (see EarningsSurpriseTrendCoverage in lib/agents/earningsSurpriseTrend.ts) — "sue" | "raw_surprise_fallback" | "insufficient_data" | "no_coverage" | "not_yet_fetched". Null for rows logged before this column existed.
   earningsSurpriseCoverage String?
+  /// 0-100 relevance-weighted Alpha Vantage NEWS_SENTIMENT score at the time of recommendation (see lib/agents/newsSentimentScore.ts). Observed and logged only — NOT part of the composite score yet, pending Performance Analyst validation (see the dated note in scoringShared.ts). Null when not covered/not yet fetched, or for rows logged before this column existed.
+  sentimentScore Int?
+  /// News-sentiment data-completeness tag at the time of recommendation — "scored" | "no_coverage" | "not_yet_fetched" (see NewsSentimentCoverage in lib/agents/newsSentimentScore.ts). Null for rows logged before this column existed.
+  sentimentCoverage String?
   recommendationType String
   recommendedAt      DateTime
   /// Relative performance (symbol return minus S&P 500 return, decimal fraction) 30/90 days after recommendedAt. Null until enough time has elapsed.
@@ -507,6 +515,35 @@ model MonthlyScanEarningsState {
   lastEarningsSurpriseScore    Int?
   lastEarningsSurpriseCoverage String?
   updatedAt                    DateTime  @updatedAt
+}
+
+/// Per-symbol fetch-cycle bookkeeping for the news-sentiment pipeline (see
+/// lib/agents/newsSentimentScore.ts) — the NEWS_SENTIMENT-endpoint analog of
+/// EarningsFetchState's tracking fields above. Unlike earnings (which needs a
+/// companion multi-row EarningsHistory table to compute a trend across
+/// quarters), a sentiment read is a single current fact per symbol — most
+/// recent relevance-weighted score, not a time series — so score/articleCount
+/// live directly on this row instead of a separate history table.
+model SentimentFetchState {
+  id     String @id @default(cuid())
+  symbol String @unique
+
+  /// True when the last successful fetch found at least one usable ticker-relevant article (a non-empty NEWS_SENTIMENT feed with a ticker_sentiment entry for this symbol above the relevance floor). False means Alpha Vantage returned no relevant coverage — distinct from never having been fetched (lastFetchedAt == null).
+  hasCoverage Boolean @default(false)
+  /// 0-100 relevance-weighted average news sentiment score from the last successful covered fetch. Null when hasCoverage is false or never fetched.
+  score Int?
+  /// Number of distinct articles that contributed to `score` on the last successful fetch.
+  articleCount Int?
+  /// Set only when a fetch for this symbol completed successfully — the signal the daily cron uses to decide which symbols are stale (see selectSymbolsToFetch in lib/agents/newsSentimentScore.ts).
+  lastFetchedAt DateTime?
+  /// Set on every fetch attempt, success or failure.
+  lastAttemptedAt DateTime?
+  /// Cleared on the next successful fetch; populated on failure for debugging.
+  lastErrorMessage String?
+
+  updatedAt DateTime @updatedAt
+
+  @@index([lastFetchedAt])
 }
 
 /// A tiny key-value store for cross-cutting notification state that doesn't

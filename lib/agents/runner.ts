@@ -7,6 +7,12 @@ import { runRiskManagerAgent, type RiskFlag, type OpportunityCostEntry, type Ris
 import { runCandidateScannerAgent, type CandidateEntry, type CandidateScannerOutput } from "@/lib/agents/candidateScanner";
 import { refreshCandidateUniverse, type UniverseRefreshResult } from "@/lib/agents/candidateUniverse";
 import { refreshEarningsHistory, type EarningsHistoryRefreshResult, DAILY_FETCH_QUOTA } from "@/lib/agents/earningsHistory";
+import {
+  refreshNewsSentimentScores,
+  type NewsSentimentRefreshResult,
+  DAILY_FETCH_QUOTA as SENTIMENT_DAILY_FETCH_QUOTA,
+} from "@/lib/agents/newsSentimentScore";
+import { runPerformanceAnalyst, type PerformanceAnalystOutput } from "@/lib/agents/performanceAnalyst";
 import { logCandidateRecommendationBatch } from "@/lib/agents/candidateRecommendationLog";
 import { runMonthlyScanAgent, type MonthlyScanOutput } from "@/lib/agents/monthlyScan";
 import { logMonthlyScanBatch } from "@/lib/agents/monthlyScanRecommendationLog";
@@ -504,6 +510,91 @@ export async function runAndPersistEarningsHistoryRefresh(
   }
 }
 
+export interface SentimentRefreshRunResult {
+  runId?: string;
+  status: "COMPLETE" | "FAILED";
+  output?: NewsSentimentRefreshResult[];
+  error?: string;
+}
+
+/**
+ * Runs the daily news-sentiment refresh (fetches Alpha Vantage
+ * NEWS_SENTIMENT for today's batch of stale candidate-universe symbols —
+ * see newsSentimentScore.ts) and persists an AgentRun audit trail, same
+ * lifecycle pattern as runAndPersistEarningsHistoryRefresh above. No
+ * ActionItems: this is a data refresh, not a recommendation, and the score
+ * itself isn't wired into any composite yet (see scoringShared.ts).
+ */
+export async function runAndPersistSentimentRefresh(
+  quota: number = SENTIMENT_DAILY_FETCH_QUOTA,
+): Promise<SentimentRefreshRunResult> {
+  let run;
+  try {
+    run = await withColdStartRetry("SENTIMENT_REFRESH", () =>
+      prisma.agentRun.create({ data: { agentType: "SENTIMENT_REFRESH", status: "RUNNING" } }),
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("SENTIMENT_REFRESH: could not start run after cold-start retries:", message);
+    return { status: "FAILED", error: message };
+  }
+
+  try {
+    const output = await refreshNewsSentimentScores(quota);
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },
+    });
+    return { runId: run.id, status: "COMPLETE", output };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "FAILED", completedAt: new Date(), errorMessage: message },
+    });
+    return { runId: run.id, status: "FAILED", error: message };
+  }
+}
+
+export interface PerformanceAnalystRunResult {
+  runId: string;
+  status: "COMPLETE" | "FAILED";
+  output?: PerformanceAnalystOutput;
+  error?: string;
+}
+
+/**
+ * Runs the Performance Analyst (turns recommendationPerformance.ts's numeric
+ * outputs into structured narrative research — see performanceAnalyst.ts)
+ * and persists an AgentRun audit trail. No ActionItems: this is research,
+ * not a recommendation. Called from synthesizeWeeklyBrief below so it rides
+ * the same weekly cadence as the CIO synthesis rather than running on its
+ * own schedule — see the doc comment there.
+ */
+export async function runAndPersistPerformanceAnalyst(
+  totalCurrentValue?: number | null,
+): Promise<PerformanceAnalystRunResult> {
+  const run = await prisma.agentRun.create({
+    data: { agentType: "PERFORMANCE_ANALYST", status: "RUNNING" },
+  });
+
+  try {
+    const output = await runPerformanceAnalyst(totalCurrentValue);
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },
+    });
+    return { runId: run.id, status: "COMPLETE", output };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "FAILED", completedAt: new Date(), errorMessage: message },
+    });
+    return { runId: run.id, status: "FAILED", error: message };
+  }
+}
+
 function startOfWeekUTC(date: Date): Date {
   const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
   const day = d.getUTCDay();
@@ -679,6 +770,13 @@ async function buildCioCandidates(): Promise<{
  * sequence, and after every standalone Risk Manager run (which itself
  * triggers a fresh Candidate Scanner run first), so the CIO Weekly Action
  * List reflects all four agents instead of just whichever ran most recently.
+ *
+ * Also runs the Performance Analyst (see runAndPersistPerformanceAnalyst)
+ * and attaches its output here rather than giving it its own cron schedule —
+ * this is the same "weekly cadence" the CIO synthesis itself runs on: this
+ * function upserts a single row keyed by weekOf, so re-running it more than
+ * once in the same week (e.g. on every import) just refreshes that week's
+ * one row instead of producing extra research runs.
  */
 export async function synthesizeWeeklyBrief(): Promise<void> {
   const { candidates, taxableContext, candidateRun } = await buildCioCandidates();
@@ -699,6 +797,14 @@ export async function synthesizeWeeklyBrief(): Promise<void> {
     }
   }
 
+  let performanceAnalysis: PerformanceAnalystOutput | null = null;
+  try {
+    const result = await runAndPersistPerformanceAnalyst();
+    if (result.status === "COMPLETE") performanceAnalysis = result.output ?? null;
+  } catch (err) {
+    console.error("Performance Analyst run failed:", err);
+  }
+
   const weekOf = startOfWeekUTC(new Date());
   const actionItemsData = brief.orderedItems.map((item, i) => ({
     agentRunId: item.agentRunId,
@@ -712,6 +818,7 @@ export async function synthesizeWeeklyBrief(): Promise<void> {
   const newsSentimentNotesData = (
     newsSentimentNotes.length > 0 ? newsSentimentNotes : Prisma.JsonNull
   ) as unknown as Prisma.InputJsonValue;
+  const performanceAnalysisData = (performanceAnalysis ?? Prisma.JsonNull) as unknown as Prisma.InputJsonValue;
 
   const existing = await prisma.weeklyBrief.findUnique({ where: { weekOf } });
   if (existing) {
@@ -723,6 +830,7 @@ export async function synthesizeWeeklyBrief(): Promise<void> {
           cioSummary: brief.summary,
           taxableOpportunities,
           newsSentimentNotes: newsSentimentNotesData,
+          performanceAnalysis: performanceAnalysisData,
           actionItems: { create: actionItemsData },
         },
       }),
@@ -734,6 +842,7 @@ export async function synthesizeWeeklyBrief(): Promise<void> {
         cioSummary: brief.summary,
         taxableOpportunities,
         newsSentimentNotes: newsSentimentNotesData,
+        performanceAnalysis: performanceAnalysisData,
         actionItems: { create: actionItemsData },
       },
     });

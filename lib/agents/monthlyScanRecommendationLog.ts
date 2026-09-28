@@ -41,6 +41,8 @@ export async function logMonthlyScanBatch(agentRunId: string, output: MonthlySca
       vsSpx: c.vsSpx,
       momentum1Y: c.momentum1Y,
       earningsSurpriseCoverage: c.earningsSurpriseCoverage,
+      sentimentScore: c.sentimentScore,
+      sentimentCoverage: c.sentimentCoverage,
       recommendationType: "monthly scan ranked candidate",
       recommendedAt,
     })),

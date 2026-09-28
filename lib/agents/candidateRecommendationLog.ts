@@ -32,6 +32,8 @@ export async function logCandidateRecommendationBatch(
       score: c.score,
       vsSpx: c.vsSpx,
       momentum1Y: c.momentum1Y,
+      sentimentScore: c.sentimentScore,
+      sentimentCoverage: c.sentimentCoverage,
       recommendationType: "highest conviction opportunity",
       recommendedAt,
     })),

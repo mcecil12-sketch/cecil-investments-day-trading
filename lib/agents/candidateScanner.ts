@@ -5,6 +5,7 @@ import { getCurrentHoldings, totalPortfolioValue } from "@/lib/agents/holdings";
 import { getHoldingSector, buildStockSectorIndex, type SectorRotationOutput, type SectorScore } from "@/lib/agents/sectorRotation";
 import { closestPlanFundsForProxy } from "@/lib/agents/fundMappings";
 import { getEarningsSurpriseTrendScores, type EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
+import { getNewsSentimentScores, type NewsSentimentCoverage } from "@/lib/agents/newsSentimentScore";
 import {
   MOMENTUM_TREND_WEIGHT,
   EARNINGS_SURPRISE_TREND_WEIGHT,
@@ -45,6 +46,14 @@ export interface CandidateEntry {
   /** 0-100 earnings-surprise-trend factor (see earningsSurpriseTrend.ts) — 50 is neutral, used both for a genuinely flat signal and for insufficient-coverage fallback (see earningsSurpriseCoverage). */
   earningsSurpriseTrend: number;
   earningsSurpriseCoverage: EarningsSurpriseTrendCoverage;
+  /**
+   * 0-100 Alpha Vantage NEWS_SENTIMENT score (see newsSentimentScore.ts).
+   * Observed and logged only — NOT part of `score` yet, pending Performance
+   * Analyst validation (see the dated note in scoringShared.ts). Null when
+   * not covered or not yet fetched.
+   */
+  sentimentScore: number | null;
+  sentimentCoverage: NewsSentimentCoverage;
   rationale: string;
   accountType: CandidateAccountType;
 }
@@ -159,7 +168,10 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
   const candidateSymbols = Array.from(
     new Set(topSectors.flatMap((sector) => universeMap[sector.sector]?.symbols ?? [])),
   );
-  const earningsScores = await getEarningsSurpriseTrendScores(candidateSymbols);
+  const [earningsScores, sentimentScores] = await Promise.all([
+    getEarningsSurpriseTrendScores(candidateSymbols),
+    getNewsSentimentScores(candidateSymbols),
+  ]);
 
   const skipped: Array<{ symbol: string; reason: string }> = [];
   const sectorsWithoutUniverse: string[] = [];
@@ -186,6 +198,7 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
         if (vsSpx <= 0) continue;
 
         const earnings = earningsScores.get(symbol)!;
+        const sentiment = sentimentScores.get(symbol)!;
 
         const compositeScore = Math.max(
           0,
@@ -213,6 +226,8 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
           aboveSma200: priceScored.aboveSma200,
           earningsSurpriseTrend: earnings.score,
           earningsSurpriseCoverage: earnings.coverage,
+          sentimentScore: sentiment.score,
+          sentimentCoverage: sentiment.coverage,
           rationale: buildRationale(
             {
               symbol,
