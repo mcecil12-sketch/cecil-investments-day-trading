@@ -11,12 +11,21 @@
 
 /** A symbol ranked at or above this (1 = strongest) is a buy candidate, subject to MAX_PORTFOLIO_SIZE. */
 export const BUY_RANK_THRESHOLD = 10;
-/** A currently-held symbol is only sold once its rank drops below this — wider than BUY_RANK_THRESHOLD so the gap between the two is the whipsaw-reducing buffer/band. */
-export const SELL_RANK_THRESHOLD = 20;
+/**
+ * 2026-10-02: a held symbol is now sold the moment its rank falls to 11 or
+ * worse — set equal to BUY_RANK_THRESHOLD, with no gap between the two.
+ * This used to be 20, a deliberate 10-point whipsaw-reducing buffer (don't
+ * sell a position just because it drifted from rank 9 to 11 — only sell once
+ * it falls below 20). We're removing that buffer: going forward Group 3
+ * holds a hard top 10 only, no grace band. The accepted tradeoff is higher
+ * turnover than the old banded approach — strict concentration discipline is
+ * worth more than avoiding the extra trades.
+ */
+export const SELL_RANK_THRESHOLD = 10;
 /** If banding leaves fewer than this many positions held, backfill from the next-highest-ranked unheld names up to this size. */
 export const TARGET_PORTFOLIO_SIZE = 10;
 /** Hard ceiling on held positions — buys are capped here, but the count is never forced down to it by selling; only rank-based sells and attrition reduce it. */
-export const MAX_PORTFOLIO_SIZE = 15;
+export const MAX_PORTFOLIO_SIZE = 10;
 
 export interface MonthlyRanking {
   monthKey: string;

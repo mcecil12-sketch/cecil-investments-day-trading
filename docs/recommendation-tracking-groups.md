@@ -24,11 +24,13 @@ Research/tracking only — never used for live trading decisions.
 
 A new monthly-cadence scoring agent (`lib/agents/monthlyScan.ts`) with
 rank-based buy/sell/backfill banding (`lib/agents/monthlyScanBanding.ts`):
-buy at rank ≤ `BUY_RANK_THRESHOLD` (10), sell only once a held position's
-rank drops below `SELL_RANK_THRESHOLD` (20), backfill to
-`TARGET_PORTFOLIO_SIZE` (10) if sells drop the count below it, capped at
-`MAX_PORTFOLIO_SIZE` (15) — buys are capped rather than force-selling to hit
-the ceiling. All four are plain, adjustable constants.
+hard top 10 only, no grace band (changed 2026-10-02; previously a 10-point
+whipsaw buffer let a held position drift to rank 20 before selling) — buy at
+rank ≤ `BUY_RANK_THRESHOLD` (10), sell the moment a held position's rank is
+11 or worse (`SELL_RANK_THRESHOLD`, 10), backfill to `TARGET_PORTFOLIO_SIZE`
+(10) if sells drop the count below it, capped at `MAX_PORTFOLIO_SIZE` (10) —
+buys are capped rather than force-selling to hit the ceiling. All four are
+plain, adjustable constants.
 
 Momentum and sector-leadership reuse the exact same logic as Group 1, just
 called monthly instead of weekly. Earnings-surprise-trend is

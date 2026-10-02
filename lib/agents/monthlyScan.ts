@@ -17,7 +17,7 @@ import type { CandidateAccountType } from "@/lib/agents/candidateScanner";
 import { formatPercent } from "@/lib/format";
 
 /**
- * Group 3 needs visibility well past SELL_RANK_THRESHOLD (20, see
+ * Group 3 needs visibility well past SELL_RANK_THRESHOLD (10, see
  * monthlyScanBanding.ts) so backfill candidates below the sell line are
  * still inspectable — unlike Group 1's MAX_TOP_CANDIDATES (15), which only
  * needs to cover its own display list.

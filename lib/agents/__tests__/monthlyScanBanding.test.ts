@@ -31,16 +31,17 @@ describe("buildBandedMonthlyPositions", () => {
     expect(held).toEqual(symbols.slice(0, TARGET_PORTFOLIO_SIZE).sort());
   });
 
-  it("sells a held symbol only once its rank drops below SELL_RANK_THRESHOLD (20), not merely below BUY_RANK_THRESHOLD", () => {
-    // Month 0: S1 enters at rank 1. Month 1: S1 has drifted to rank 15 (still <= 20) — stays held.
-    const month0Symbols = ["S1", ...Array.from({ length: 14 }, (_, i) => `X${i}`)];
-    const month1Symbols = [...Array.from({ length: 14 }, (_, i) => `X${i}`), "S1"]; // S1 now rank 15
+  it("sells a held symbol the moment its rank is 11 or worse — no whipsaw buffer (SELL_RANK_THRESHOLD == BUY_RANK_THRESHOLD)", () => {
+    // Month 0: S1 enters at rank 1. Month 1: S1 has drifted to rank 11 — under the old 20-rank
+    // buffer this would have stayed held; the hard top-10 rule now sells it immediately.
+    const month0Symbols = ["S1", ...Array.from({ length: 9 }, (_, i) => `X${i}`)];
+    const month1Symbols = [...Array.from({ length: 10 }, (_, i) => `X${i}`), "S1"]; // S1 now rank 11
     const positions = buildBandedMonthlyPositions([batch(0, month0Symbols), batch(1, month1Symbols)]);
     const s1 = positions.find((p) => p.symbol === "S1")!;
-    expect(s1.exitDate).toBeNull();
+    expect(s1.exitDate).toEqual(monthDate(1));
   });
 
-  it("sells a held symbol once its rank drops below SELL_RANK_THRESHOLD (below 20)", () => {
+  it("sells a held symbol once its rank drops below SELL_RANK_THRESHOLD (below 10)", () => {
     const month0Symbols = ["S1", ...Array.from({ length: 9 }, (_, i) => `X${i}`)]; // S1 rank 1, 10 held after backfill
     // Month 1: S1 pushed to rank 25 (30 total ranked, S1 at position 25) — below SELL_RANK_THRESHOLD.
     const filler = Array.from({ length: 29 }, (_, i) => `Y${i}`);
@@ -60,34 +61,33 @@ describe("buildBandedMonthlyPositions", () => {
     expect(heldAfter).toEqual(fresh.slice(0, TARGET_PORTFOLIO_SIZE).sort());
   });
 
-  it("does not force-sell to enforce MAX_PORTFOLIO_SIZE — caps new buys instead", () => {
+  it("caps held positions at MAX_PORTFOLIO_SIZE — a full monthly rotation replaces the portfolio rather than exceeding the cap", () => {
+    // With the 2026-10-02 hard-top-10 change, MAX_PORTFOLIO_SIZE == TARGET_PORTFOLIO_SIZE ==
+    // BUY_RANK_THRESHOLD == SELL_RANK_THRESHOLD (10), so there's no gap left between "sold" and
+    // "capped" to exercise independently — any held symbol pushed past rank 10 is sold outright
+    // (no more surviving in an 11-20 buffer zone the way MAX_PORTFOLIO_SIZE=15/SELL=20 used to allow).
     const aSymbols = Array.from({ length: 10 }, (_, i) => `A${i}`);
-    const bSymbols = Array.from({ length: 5 }, (_, i) => `B${i}`);
-    const cSymbols = Array.from({ length: 5 }, (_, i) => `C${i}`);
+    const bSymbols = Array.from({ length: 10 }, (_, i) => `B${i}`);
 
-    // Month 0: A0-A9 are the top 10 -> all 10 bought (backfill to TARGET_PORTFOLIO_SIZE).
+    // Month 0: A0-A9 are the top 10 -> all 10 bought.
     const month0 = [...aSymbols, ...Array.from({ length: 10 }, (_, i) => `X${i}`)];
-    // Month 1: B0-B4 take ranks 1-5, pushing A0-A9 to ranks 6-15 (still within SELL_RANK_THRESHOLD, so none sold).
-    // B0-B4 are new unheld top-10 candidates -> bought, bringing the total to exactly MAX_PORTFOLIO_SIZE (15).
+    // Month 1: B0-B9 take ranks 1-10, pushing every A to rank 11+ -> all sold under the new hard
+    // top-10 rule (previously, within the old 20-rank buffer, they'd have stayed held).
     const month1 = [...bSymbols, ...aSymbols];
-    // Month 2: C0-C4 take ranks 1-5, pushing everything else further down but still within the sell band.
-    // C0-C4 are new unheld top-10 candidates, but the portfolio is already at MAX_PORTFOLIO_SIZE -> buys are
-    // skipped entirely rather than force-selling an existing A/B holding to make room.
-    const month2 = [...cSymbols, ...bSymbols, ...aSymbols];
 
-    const positions = buildBandedMonthlyPositions([batch(0, month0), batch(1, month1), batch(2, month2)]);
+    const positions = buildBandedMonthlyPositions([batch(0, month0), batch(1, month1)]);
     const held = new Set(positions.filter((p) => p.exitDate == null).map((p) => p.symbol));
 
     expect(held.size).toBe(MAX_PORTFOLIO_SIZE);
-    for (const s of [...aSymbols, ...bSymbols]) expect(held.has(s)).toBe(true);
-    for (const s of cSymbols) expect(held.has(s)).toBe(false);
+    for (const s of bSymbols) expect(held.has(s)).toBe(true);
+    for (const s of aSymbols) expect(held.has(s)).toBe(false);
   });
 
   it("respects BUY_RANK_THRESHOLD and SELL_RANK_THRESHOLD as the configured constants (sanity check on exported values)", () => {
     expect(BUY_RANK_THRESHOLD).toBe(10);
-    expect(SELL_RANK_THRESHOLD).toBe(20);
+    expect(SELL_RANK_THRESHOLD).toBe(10);
     expect(TARGET_PORTFOLIO_SIZE).toBe(10);
-    expect(MAX_PORTFOLIO_SIZE).toBe(15);
+    expect(MAX_PORTFOLIO_SIZE).toBe(10);
   });
 });
 

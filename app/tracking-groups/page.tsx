@@ -278,7 +278,7 @@ export default async function TrackingGroupsPage() {
           </p>
           <RecommendationPerformanceCharts
             {...chartProps(group3.performance)}
-            trackingNote="Bought at rank ≤10, sold once a held position's rank drops below 20, backfilled toward 10 open positions, capped at 15 — carried forward month to month rather than reset each cycle."
+            trackingNote="Hard top 10 only: bought at rank ≤10, sold the moment a held position's rank is 11 or worse, backfilled toward 10 open positions — no whipsaw buffer, carried forward month to month rather than reset each cycle."
           />
         </div>
       )}
