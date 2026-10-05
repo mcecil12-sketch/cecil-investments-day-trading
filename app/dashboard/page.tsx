@@ -35,6 +35,9 @@ interface PeriodCardData {
   /** Dollar gain shown on the Portfolio row — an estimate (return % × current value) for YTD/1Y, exact (current value − cost basis) for Since Purchase. */
   portfolioGain: number | null;
   portfolioGainEstimated: boolean;
+  /** Wording for the S&P row and alpha row — Since Purchase says "price" because its S&P side is price-only while YTD/1Y use a total-return benchmark. */
+  sp500Label: string;
+  alphaLabel: string;
   /** Equivalent dollar gain shown on the S&P row, had the same starting balance earned the S&P's return instead. */
   sp500Gain: number | null;
 }
@@ -46,12 +49,15 @@ function PeriodCell({
   gainEstimated,
   alpha,
   sourceLabel,
+  alphaLabel = "α vs S&P",
 }: {
   portfolioReturn: number | null;
   gain: number | null;
   gainEstimated: boolean;
   alpha: number | null;
   sourceLabel: string | null;
+  /** Benchmark wording after the alpha figure — Since Purchase overrides it since its S&P side is price-only, unlike the total-return benchmark behind YTD/1Y. */
+  alphaLabel?: string;
 }) {
   return (
     <>
@@ -61,7 +67,7 @@ function PeriodCell({
         {gainEstimated && gain != null ? " est." : ""}
       </div>
       <div className="account-perf-alpha" style={{ color: alphaColor(alpha) }}>
-        {formatPercent(alpha)} α vs S&amp;P
+        {formatPercent(alpha)} {alphaLabel}
       </div>
       {sourceLabel && <div className="account-perf-source">{sourceLabel}</div>}
     </>
@@ -142,6 +148,8 @@ export default async function DashboardPage() {
       alpha: result?.alpha ?? null,
       portfolioGain: portfolioReturn != null ? computation.totalCurrentValue * portfolioReturn : null,
       portfolioGainEstimated: true,
+      sp500Label: "S&P 500 (benchmark)",
+      alphaLabel: "Alpha vs. S&P 500",
       sp500Gain: sp500Return != null ? computation.totalCurrentValue * sp500Return : null,
     };
   });
@@ -153,6 +161,8 @@ export default async function DashboardPage() {
     alpha: sincePurchase?.alpha ?? null,
     portfolioGain: sincePurchase ? sincePurchase.currentValue - sincePurchase.costBasis : null,
     portfolioGainEstimated: false,
+    sp500Label: "S&P 500 (price only)",
+    alphaLabel: "Alpha vs. S&P 500 price return",
     sp500Gain:
       sincePurchase?.sp500Return != null ? sincePurchase.costBasis * sincePurchase.sp500Return : null,
   });
@@ -194,7 +204,7 @@ export default async function DashboardPage() {
               </span>
             </div>
             <div className="period-card-row">
-              <span>S&amp;P 500 (benchmark)</span>
+              <span>{card.sp500Label}</span>
               <span className="value">
                 {formatPercent(card.sp500Return)}
                 <span className="period-card-gain" style={{ color: alphaColor(card.sp500Gain) }}>
@@ -205,7 +215,7 @@ export default async function DashboardPage() {
             <div
               className={`period-card-alpha${card.alpha != null ? (card.alpha >= 0 ? " tint-positive" : " tint-negative") : ""}`}
             >
-              <div className="period-card-alpha-label">Alpha vs. S&amp;P 500</div>
+              <div className="period-card-alpha-label">{card.alphaLabel}</div>
               <div className="period-card-alpha-value" style={{ color: alphaColor(card.alpha) }}>
                 {formatPercent(card.alpha)}
               </div>
@@ -252,7 +262,29 @@ export default async function DashboardPage() {
                       )}
                     </td>
                     <td className="mono">{formatCurrency(value)}</td>
-                    {account.isLocked ? (
+                    {account.type === "VZ_LTI" ? (
+                      // Locked/Monitor Only like before, but the stock's own YTD/1Y
+                      // total return vs the S&P 500 is shown — no dollar gain, since
+                      // that would depend on a share count this method ignores.
+                      <>
+                        {[ytd, oneYear].map((result, i) => (
+                          <td className="account-perf-cell" key={i === 0 ? "ytd" : "1y"}>
+                            <PeriodCell
+                              portfolioReturn={result?.portfolioReturn ?? null}
+                              gain={null}
+                              gainEstimated={false}
+                              alpha={result?.alpha ?? null}
+                              sourceLabel="Computed: VZ total return vs S&P 500 TR"
+                            />
+                          </td>
+                        ))}
+                        <td style={{ color: "var(--text-muted)" }}>Excluded — no purchase basis</td>
+                      </>
+                    ) : account.isLocked && ytd?.portfolioReturn == null && oneYear?.portfolioReturn == null ? (
+                      // Only when a locked account has no reported YTD/1Y at all — if
+                      // data exists (e.g. an imported Performance PDF for Verizon EDP),
+                      // it renders like any other account. The engine always emits a
+                      // row per period, so the gate checks the values, not the rows.
                       <td colSpan={3} style={{ color: "var(--text-muted)" }}>
                         Monitor Only — excluded from alpha
                       </td>
@@ -289,6 +321,7 @@ export default async function DashboardPage() {
                             gainEstimated={false}
                             alpha={purchase?.alpha ?? null}
                             sourceLabel={null}
+                            alphaLabel="α vs S&P (price only)"
                           />
                         </td>
                       </>

@@ -98,7 +98,7 @@ export function BenchmarkAccountPicker({ views }: { views: BenchmarkScopeView[] 
               ))}
               {view.sincePurchase && (
                 <tr>
-                  <td>Since Purchase (cost basis)</td>
+                  <td>Since Purchase (cost basis) — S&amp;P 500 price return only</td>
                   <td className="mono">{formatPercent(view.sincePurchase.portfolioReturn)}</td>
                   <td className="mono">{formatPercent(view.sincePurchase.sp500Return)}</td>
                   <td className="mono" style={{ color: alphaColor(view.sincePurchase.alpha) }}>

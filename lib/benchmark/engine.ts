@@ -3,6 +3,7 @@ import { Account } from "@/lib/generated/prisma";
 import { ensureSp500PriceCache, getSp500CloseOnOrBefore } from "@/lib/benchmark/priceCache";
 import { getAccountSnapshot, type AccountSnapshotValue } from "@/lib/benchmark/portfolioValue";
 import { computeAlpha, computeReturn } from "@/lib/benchmark/math";
+import { computeVzTotalReturnComparison } from "@/lib/benchmark/totalReturn";
 
 /** Rolling periods Fidelity's Performance PDF reports, in display order. "5y" and "life" are stored but not surfaced here. */
 export type FidelityPeriodKey = "ytd" | "1y" | "3y";
@@ -15,8 +16,10 @@ export interface AccountBenchmarkResult {
   accountType: string;
   isLocked: boolean;
   period: FidelityPeriodKey;
-  /** As-of date of the Fidelity Performance PDF row this came from — null if no Performance PDF has reported this account/period yet. */
+  /** As-of date of the Fidelity Performance PDF row this came from (or, for "computed_total_return", the last price date used) — null if nothing has reported this account/period yet. */
   asOfDate: Date | null;
+  /** "fidelity_pdf": imported AccountPerformance row. "computed_total_return": the held stock's own dividend-adjusted return vs the S&P 500 Total Return index (VZ_LTI only) — a different methodology from the imported accounts. */
+  dataSource: "fidelity_pdf" | "computed_total_return";
   portfolioReturn: number | null;
   sp500Return: number | null;
   alpha: number | null;
@@ -135,10 +138,38 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
     if (!latestTotalRow.has(row.period)) latestTotalRow.set(row.period, row);
   }
 
+  // VZ_LTI's YTD/1Y come from VZ's own total return vs the S&P 500's, not
+  // from AccountPerformance rows and not from the held balance (which moves
+  // with vesting/grants unrelated to market performance). Fetched once, and
+  // only when such an account exists.
+  const vzTotalReturn = accountsWithData.some((a) => a.type === "VZ_LTI")
+    ? await computeVzTotalReturnComparison()
+    : null;
+
   const accountResults: AccountBenchmarkResult[] = [];
   for (const account of accountsWithData) {
     const latest = latestByAccount.get(account.id)!;
     for (const period of FIDELITY_PERIODS) {
+      if (account.type === "VZ_LTI" && (period === "ytd" || period === "1y")) {
+        const computed = vzTotalReturn?.[period] ?? null;
+        accountResults.push({
+          scope: "ACCOUNT",
+          accountId: account.id,
+          accountName: account.name,
+          accountType: account.type,
+          isLocked: account.isLocked,
+          period,
+          asOfDate: computed?.asOfDate ?? null,
+          dataSource: "computed_total_return",
+          portfolioReturn: computed?.portfolioReturn ?? null,
+          sp500Return: computed?.sp500Return ?? null,
+          alpha: computed?.alpha ?? null,
+          endValue: latest.totalValue,
+          currentLockedValue: latest.lockedValue,
+          currentActionableValue: latest.actionableValue,
+        });
+        continue;
+      }
       const perf = latestPerformance.get(`${account.id}:${period}`) ?? null;
       accountResults.push({
         scope: "ACCOUNT",
@@ -148,6 +179,7 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
         isLocked: account.isLocked,
         period,
         asOfDate: perf?.asOfDate ?? null,
+        dataSource: "fidelity_pdf",
         portfolioReturn: perf?.returnPct ?? null,
         sp500Return: perf?.sp500ReturnPct ?? null,
         alpha: perf?.alpha ?? null,
@@ -165,6 +197,9 @@ export async function computeBenchmark(): Promise<BenchmarkComputation> {
   // per-account and from the aggregate blend below.
   const accountsForSincePurchase = accountsWithData.filter((a) => a.type !== "VZ_LTI");
 
+  // TODO(next session): Verizon Mid-Atlantic's since-purchase return reads an
+  // unusually high ~13.1% (2026-10-04) — possibly tied to its earlier
+  // account-number/import-matching fix. Not yet investigated.
   const sincePurchaseResults: AccountSincePurchaseResult[] = [];
   for (const account of accountsForSincePurchase) {
     const latest = latestByAccount.get(account.id)!;

@@ -16,7 +16,11 @@ const YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart";
  * endpoint — same source as lib/benchmark/sp500.ts, generalized to any
  * ticker instead of just ^GSPC.
  */
-async function fetchYahooHistory(symbol: string, range = "1y"): Promise<PricePoint[]> {
+async function fetchYahooHistory(
+  symbol: string,
+  range = "1y",
+  field: "close" | "adjclose" = "close",
+): Promise<PricePoint[]> {
   const url = `${YAHOO_CHART_URL}/${encodeURIComponent(symbol)}?range=${range}&interval=1d`;
   const response = await fetch(url, {
     headers: { "User-Agent": "Mozilla/5.0 (compatible; portfolio-benchmark/1.0)" },
@@ -34,7 +38,10 @@ async function fetchYahooHistory(symbol: string, range = "1y"): Promise<PricePoi
   }
 
   const timestamps: number[] = result.timestamp ?? [];
-  const closes: Array<number | null> = result.indicators?.quote?.[0]?.close ?? [];
+  const closes: Array<number | null> =
+    field === "adjclose"
+      ? result.indicators?.adjclose?.[0]?.adjclose ?? []
+      : result.indicators?.quote?.[0]?.close ?? [];
 
   const points: PricePoint[] = [];
   for (let i = 0; i < timestamps.length; i++) {
@@ -139,6 +146,20 @@ export async function getPriceHistory(symbol: string): Promise<PriceHistoryResul
     const points = await fetchAlpacaHistory(symbol, 730);
     return { symbol, points, source: "alpaca" };
   }
+}
+
+/**
+ * Daily dividend-adjusted closes (Yahoo's `adjclose`, which assumes
+ * dividends reinvested at each ex-dividend date) — a total-return proxy,
+ * unlike getPriceHistory's raw close. Separate from getPriceHistory on
+ * purpose so existing callers keep their raw-close behavior. Yahoo-only: no
+ * Alpaca fallback, since Alpaca's bars here are split-adjusted only and
+ * would silently drop the dividends this series exists to include. Note
+ * that adjclose is rebased on every new dividend, so only ratios between
+ * two points in the same fetch are meaningful, never absolute levels.
+ */
+export async function getAdjustedCloseHistory(symbol: string, range = "2y"): Promise<PricePoint[]> {
+  return fetchYahooHistory(symbol, range, "adjclose");
 }
 
 export interface LatestPrice {

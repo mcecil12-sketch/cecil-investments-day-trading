@@ -130,7 +130,7 @@ export default async function BenchmarkPage() {
             portfolioReturn: sincePurchase.portfolioReturn,
             sp500Return: sincePurchase.sp500Return,
             alpha: sincePurchase.alpha,
-            detail: `${formatCurrency(sincePurchase.costBasis)} → ${formatCurrency(sincePurchase.currentValue)} (no purchase date on record — S&P 500 side estimated from ${formatDate(sincePurchase.estimatedHoldingStart)})`,
+            detail: `${formatCurrency(sincePurchase.costBasis)} → ${formatCurrency(sincePurchase.currentValue)} (no purchase date on record — S&P 500 price-only side estimated from ${formatDate(sincePurchase.estimatedHoldingStart)})`,
           }
         : null,
     };
