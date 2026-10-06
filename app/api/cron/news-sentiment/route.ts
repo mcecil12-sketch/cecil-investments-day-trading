@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { runAndPersistSentimentRefresh } from "@/lib/agents/runner";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+export const maxDuration = 240;
 
 /** Vercel Cron sends `Authorization: Bearer <CRON_SECRET>` on scheduled invocations. If CRON_SECRET isn't configured (e.g. local dev), there's nothing to check against, so requests are allowed through. */
 function isAuthorized(request: NextRequest): boolean {
@@ -14,7 +14,7 @@ function isAuthorized(request: NextRequest): boolean {
 /**
  * Daily news-sentiment refresh, scheduled via vercel.json (`crons`). Pulls
  * Alpha Vantage NEWS_SENTIMENT for today's batch of stale candidate universe
- * symbols (20/day quota — see DAILY_FETCH_QUOTA in newsSentimentScore.ts) and
+ * symbols (the whole universe daily — see DAILY_FETCH_QUOTA in newsSentimentScore.ts; ~170s at 1.2s pacing, hence maxDuration 240) and
  * upserts SentimentFetchState — see lib/agents/newsSentimentScore.ts. This
  * factor is scored and logged for validation only; it is NOT wired into the
  * composite score yet (see the dated note in scoringShared.ts).

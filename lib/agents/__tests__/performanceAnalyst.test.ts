@@ -281,21 +281,40 @@ describe("computeFragilityStats guard", () => {
   });
 });
 
-describe("computeInsiderStats guard", () => {
-  const obs = (n: number, usd: number, ret: number, vol = 0.5) =>
-    Array.from({ length: n }, () => ({ fragilityFlag: null, vol60d: vol, forwardReturn: ret, insiderNetSoldUsd30d: usd }));
+describe("computeInsiderStats guard + relative cut", () => {
+  const obs = (n: number, top: boolean, ret: number, vol = 0.5) =>
+    Array.from({ length: n }, () => ({ fragilityFlag: null, vol60d: vol, forwardReturn: ret, insiderTopThird: top }));
 
   it("is null below 3 cycles or 10 positions with insider data", async () => {
     const { computeInsiderStats } = await import("@/lib/agents/performanceAnalyst");
-    expect(computeInsiderStats([...obs(5, 9e6, -0.1), ...obs(5, 0, 0.1)], 2)).toBeNull();
-    expect(computeInsiderStats([...obs(4, 9e6, -0.1), ...obs(5, 0, 0.1)], 3)).toBeNull();
+    expect(computeInsiderStats([...obs(5, true, -0.1), ...obs(5, false, 0.1)], 2)).toBeNull();
+    expect(computeInsiderStats([...obs(4, true, -0.1), ...obs(5, false, 0.1)], 3)).toBeNull();
   });
 
-  it("splits at the $5M threshold (above vs. at-or-below)", async () => {
+  it("compares top third vs. rest once the guard is met", async () => {
     const { computeInsiderStats } = await import("@/lib/agents/performanceAnalyst");
-    const stats = computeInsiderStats([...obs(5, 9e6, -0.1, 0.5), ...obs(5, 5e6, 0.1, 0.25)], 3)!;
-    expect(stats.heavySelling).toEqual({ count: 5, avgForwardReturn: -0.1, avgReturnPerUnitVol: -0.2 });
-    expect(stats.other).toEqual({ count: 5, avgForwardReturn: 0.1, avgReturnPerUnitVol: 0.4 });
+    const stats = computeInsiderStats([...obs(5, true, -0.1, 0.5), ...obs(5, false, 0.1, 0.25)], 3)!;
+    expect(stats.topThird).toEqual({ count: 5, avgForwardReturn: -0.1, avgReturnPerUnitVol: -0.2 });
+    expect(stats.rest).toEqual({ count: 5, avgForwardReturn: 0.1, avgReturnPerUnitVol: 0.4 });
+  });
+
+  it("markInsiderTopThird ranks within each cohort: top ceil(n/3), ties by symbol, small cohorts and nulls omitted", async () => {
+    const { markInsiderTopThird } = await import("@/lib/agents/performanceAnalyst");
+    const d1 = new Date("2026-10-01");
+    const d2 = new Date("2026-11-01");
+    const mk = (symbol: string, batchTag: string, recommendedAt: Date, usd: number | null) => ({ symbol, batchTag, recommendedAt, insiderNetSoldUsd30d: usd });
+    const marks = markInsiderTopThird([
+      mk("A", "m1", d1, 100), mk("B", "m1", d1, 900), mk("C", "m1", d1, 500), mk("D", "m1", d1, 500), mk("E", "m1", d1, 1), mk("F", "m1", d1, null),
+      mk("X", "m2", d2, 5), mk("Y", "m2", d2, 6),
+    ]);
+    // m1: 5 with data -> top ceil(5/3)=2: B (900), then C (500, ties by symbol before D)
+    expect(marks.get(`B@@${d1.getTime()}`)).toBe(true);
+    expect(marks.get(`C@@${d1.getTime()}`)).toBe(true);
+    expect(marks.get(`D@@${d1.getTime()}`)).toBe(false);
+    expect(marks.get(`A@@${d1.getTime()}`)).toBe(false);
+    expect(marks.has(`F@@${d1.getTime()}`)).toBe(false);
+    // m2: only 2 with data -> cohort omitted
+    expect(marks.has(`X@@${d2.getTime()}`)).toBe(false);
   });
 
   it("forces insiderNote to null when insider is null, even if Claude asserts a conclusion", async () => {

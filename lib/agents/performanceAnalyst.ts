@@ -44,14 +44,25 @@ const MIN_FRAGILITY_MONTHLY_CYCLES = 3;
 /** ...and at least this many closed Group 3 positions carry it. Same fabrication-guard style as the sentiment sufficiency check above. */
 const MIN_FRAGILITY_CLOSED_POSITIONS = 10;
 
-/** Oct 6 2026, hypothesis only: trailing-30d insider net sold above this dollar amount counts as "heavy insider selling" for the second cut. */
-const INSIDER_NET_SOLD_THRESHOLD_USD = 5_000_000;
+/**
+ * Oct 6 2026, hypothesis only. The insider cut is relative, not a dollar
+ * threshold: within each monthly scan cohort, candidates are ranked by
+ * insiderNetSoldUsd30d and the top third is compared with the rest. The dollar
+ * figure is an upper bound on discretionary selling — the Alpha Vantage
+ * INSIDER_TRANSACTIONS response has no transaction code, so tax withholding
+ * and exercise-and-sell lots are counted as sales — which is why only the
+ * within-cohort ordering is used here. Raw dollars stay logged unchanged.
+ */
+const INSIDER_TOP_FRACTION = 1 / 3;
+
+/** A cohort needs at least this many candidates with insider data for a "top third" to be defined. */
+const MIN_INSIDER_COHORT_SIZE = 3;
 
 export interface FragilityObservation {
   /** Null when the entry row carries no fragility data (it may still carry insider data). */
   fragilityFlag: boolean | null;
-  /** Trailing-30d insider net sold at entry (see insiderActivity.ts); null when not logged. */
-  insiderNetSoldUsd30d?: number | null;
+  /** True if this position's entry candidate was in the top third of its monthly cohort by insiderNetSoldUsd30d, false if in the rest; null when no insider data / cohort too small. */
+  insiderTopThird?: boolean | null;
   vol60d: number | null;
   /** Raw price return from entry to exit (decimal fraction) — the "forward return over the holding period". */
   forwardReturn: number;
@@ -74,10 +85,10 @@ export interface FragilityStats {
 export interface InsiderStats {
   monthlyCycles: number;
   closedPositionsWithData: number;
-  /** Positions with insiderNetSoldUsd30d above INSIDER_NET_SOLD_THRESHOLD_USD. */
-  heavySelling: FragilityGroupStats;
-  /** Positions at or below it (positions with null insider data are excluded entirely, not counted here). */
-  other: FragilityGroupStats;
+  /** Positions whose entry candidate was in the top third of its cohort by insider net sold. */
+  topThird: FragilityGroupStats;
+  /** The rest of each cohort (positions with null insider data are excluded entirely). */
+  rest: FragilityGroupStats;
 }
 
 export interface ClosedPositionSummary {
@@ -123,7 +134,7 @@ export interface PerformanceAnalystContext {
   sentimentOldestFetchDaysAgo: number | null;
   /** Flagged-vs-unflagged fragility comparison over closed Group 3 positions. Null (not zeros) until MIN_FRAGILITY_MONTHLY_CYCLES and MIN_FRAGILITY_CLOSED_POSITIONS are both met — an insufficient-data guard, not a real result. */
   fragility: FragilityStats | null;
-  /** Heavy-insider-selling vs. other comparison over closed Group 3 positions. Null (not zeros) under the same guard as `fragility`, counted over positions that carry insider data. */
+  /** Top-third-by-insider-net-sold vs. rest comparison over closed Group 3 positions. Null (not zeros) under the same guard as `fragility`, counted over positions that carry insider data. */
   insider: InsiderStats | null;
 }
 
@@ -210,9 +221,35 @@ export function computeInsiderStats(observations: FragilityObservation[], monthl
   return {
     monthlyCycles,
     closedPositionsWithData: observations.length,
-    heavySelling: fragilityGroupStats(observations.filter((o) => o.insiderNetSoldUsd30d! > INSIDER_NET_SOLD_THRESHOLD_USD)),
-    other: fragilityGroupStats(observations.filter((o) => o.insiderNetSoldUsd30d! <= INSIDER_NET_SOLD_THRESHOLD_USD)),
+    topThird: fragilityGroupStats(observations.filter((o) => o.insiderTopThird === true)),
+    rest: fragilityGroupStats(observations.filter((o) => o.insiderTopThird === false)),
   };
+}
+
+/**
+ * Within each cohort (batchTag), ranks rows with insider data by
+ * insiderNetSoldUsd30d descending (symbol breaks ties) and marks the top
+ * ceil(n/3) true, the rest false. Cohorts with fewer than
+ * MIN_INSIDER_COHORT_SIZE such rows are omitted. Keyed by `${symbol}@@${recommendedAt ms}`.
+ */
+export function markInsiderTopThird(
+  rows: Array<{ symbol: string; batchTag: string; recommendedAt: Date; insiderNetSoldUsd30d: number | null }>,
+): Map<string, boolean> {
+  const byCohort = new Map<string, typeof rows>();
+  for (const row of rows) {
+    if (row.insiderNetSoldUsd30d == null) continue;
+    const list = byCohort.get(row.batchTag) ?? [];
+    list.push(row);
+    byCohort.set(row.batchTag, list);
+  }
+  const marks = new Map<string, boolean>();
+  for (const cohort of byCohort.values()) {
+    if (cohort.length < MIN_INSIDER_COHORT_SIZE) continue;
+    const sorted = [...cohort].sort((a, b) => b.insiderNetSoldUsd30d! - a.insiderNetSoldUsd30d! || a.symbol.localeCompare(b.symbol));
+    const topCount = Math.ceil(sorted.length * INSIDER_TOP_FRACTION);
+    sorted.forEach((row, i) => marks.set(`${row.symbol}@@${row.recommendedAt.getTime()}`, i < topCount));
+  }
+  return marks;
 }
 
 /** Group 3 (monthly) fragility and insider stats from real closed positions. Never throws — these are research-only and must not break the analyst run. */
@@ -229,6 +266,7 @@ async function buildGroup3SignalStats(): Promise<{ fragility: FragilityStats | n
     }
 
     const rowLookup = new Map(rows.map((r) => [`${r.symbol}@@${r.recommendedAt.getTime()}`, r]));
+    const topThirdMarks = markInsiderTopThird(rows);
     const positions = buildBandedMonthlyPositions(
       groupIntoMonthlyRankings(rows.map((r) => ({ symbol: r.symbol, batchTag: r.batchTag, recommendedAt: r.recommendedAt, score: r.score, rank: r.rank }))),
     );
@@ -238,7 +276,8 @@ async function buildGroup3SignalStats(): Promise<{ fragility: FragilityStats | n
     await Promise.all(
       closed.map(async (position) => {
         const row = rowLookup.get(`${position.symbol}@@${position.entryDate.getTime()}`);
-        if (!row || (row.fragilityFlag == null && row.insiderNetSoldUsd30d == null)) return;
+        const topThird = topThirdMarks.get(`${position.symbol}@@${position.entryDate.getTime()}`) ?? null;
+        if (!row || (row.fragilityFlag == null && topThird == null)) return;
         try {
           const { points } = await getPriceHistory(position.symbol);
           const forwardReturn = returnOverWindow(points, position.entryDate, position.exitDate);
@@ -247,7 +286,7 @@ async function buildGroup3SignalStats(): Promise<{ fragility: FragilityStats | n
             fragilityFlag: row.fragilityFlag,
             vol60d: row.vol60d,
             forwardReturn,
-            insiderNetSoldUsd30d: row.insiderNetSoldUsd30d,
+            insiderTopThird: topThird,
           });
         } catch {
           // Skip — this position just won't contribute until its price history is fetchable again.
@@ -256,7 +295,7 @@ async function buildGroup3SignalStats(): Promise<{ fragility: FragilityStats | n
     );
     return {
       fragility: computeFragilityStats(observations.filter((o) => o.fragilityFlag != null), fragilityCycles),
-      insider: computeInsiderStats(observations.filter((o) => o.insiderNetSoldUsd30d != null), insiderCycles),
+      insider: computeInsiderStats(observations.filter((o) => o.insiderTopThird != null), insiderCycles),
     };
   } catch {
     return { fragility: null, insider: null };
@@ -407,7 +446,7 @@ Turn this into concise, structured research findings:
 
 6. fragilityNote: the data includes fragility, either null or a flagged-vs-unflagged comparison (avgForwardReturn and avgReturnPerUnitVol per group) over closed monthly-scan positions. Fragility is an unproven hypothesis. If fragility is null, you MUST return an empty string "" for this field — there is not yet enough history, and asserting any conclusion would be fabrication. If it is present, describe only the numbers given and say whether they are consistent with the hypothesis that flagged names underperform; do not claim it is validated or recommend changing the score.
 
-7. insiderNote: the data includes insider, either null or a heavySelling-vs-other comparison (avgForwardReturn and avgReturnPerUnitVol per group) over closed monthly-scan positions, where heavySelling means trailing-30d insider net sold above a dollar threshold. The insider figure is an upper bound that can include tax withholding and exercise-and-sell lots, and the idea is an unproven hypothesis. If insider is null, you MUST return an empty string "" for this field — asserting any conclusion would be fabrication. If present, describe only the numbers given and say whether they are consistent with the hypothesis that heavy insider selling precedes underperformance; do not claim it is validated.
+7. insiderNote: the data includes insider, either null or a topThird-vs-rest comparison (avgForwardReturn and avgReturnPerUnitVol per group) over closed monthly-scan positions, where topThird means the candidate was in the top third of its own monthly cohort by trailing-30d insider net sold. The insider figure is an upper bound that can include tax withholding and exercise-and-sell lots (the API has no transaction code), and the idea is an unproven hypothesis. If insider is null, you MUST return an empty string "" for this field — asserting any conclusion would be fabrication. If present, describe only the numbers given and say whether they are consistent with the hypothesis that the top third by insider selling precedes underperformance; do not claim it is validated.
 
 Base every claim strictly on the JSON data provided. Never invent dollar amounts, correlations, or symbols not present in the data.`;
 
@@ -454,7 +493,7 @@ const ANALYSIS_TOOL: Anthropic.Tool = {
       insiderNote: {
         type: "string",
         description:
-          "Empty string \"\" if insider is null. Otherwise a neutral description of the given heavySelling-vs-other numbers, with no validation claim.",
+          "Empty string \"\" if insider is null. Otherwise a neutral description of the given topThird-vs-rest numbers, with no validation claim.",
       },
     },
     required: [

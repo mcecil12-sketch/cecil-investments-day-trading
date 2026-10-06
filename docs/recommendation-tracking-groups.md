@@ -119,13 +119,15 @@ Alpha Vantage key is assumed to be premium (stated by the owner, not verifiable
 from the repo), so free-tier daily limits do not apply. Calls used are logged. A failed fetch writes nulls for that ticker and the scan
 continues.
 
-**Analysis.** The Performance Analyst's second cut compares closed Group 3
-positions with `insiderNetSoldUsd30d` above $5,000,000 (hypothesis threshold,
-Oct 6 2026) against the rest, and reports nothing until 3 monthly cycles and 10
-closed positions carry insider data.
+**Analysis.** The Performance Analyst's second cut is relative, not a dollar
+threshold (Oct 6 2026, hypothesis only): within each monthly cohort it ranks
+candidates by `insiderNetSoldUsd30d` and compares the top third against the
+rest, over closed Group 3 positions. It reports nothing until 3 monthly cycles
+and 10 closed positions carry insider data. Raw dollars stay logged unchanged;
+because the figure is an upper bound, only the within-cohort ordering is used.
 
 **Graduation rule (same as fragility):** graduates only if, across at least 3
-monthly cycles, heavy-insider-selling names underperform on risk-adjusted
+monthly cycles, top-third insider-selling names underperform on risk-adjusted
 return. If it graduates, apply as a position-size haircut in recommendations,
 never as a rank penalty.
 

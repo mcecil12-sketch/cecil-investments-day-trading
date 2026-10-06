@@ -18,20 +18,27 @@ import { STATIC_CANDIDATE_UNIVERSE, type CandidateScannerOutput } from "@/lib/ag
  * untouched by this module.
  */
 
-/** How many symbols to fetch per cron invocation. Same quota as the earnings-history pipeline (earningsHistory.ts) — same Alpha Vantage key, same premium/no-daily-cap assumption. */
-export const DAILY_FETCH_QUOTA = 20;
+/**
+ * How many symbols to fetch per cron invocation: the whole candidate
+ * universe, so every symbol refreshes daily. 120 = 81 dynamic (Energy 21,
+ * Healthcare 30, Technology 30) + 39 static unique symbols as of 2026-10-06
+ * (premium Alpha Vantage key assumed). At 1.2s pacing plus ~0.1s fetch and a
+ * DB upsert, that is ~170s of the cron's 240s maxDuration. If the universe
+ * grows past this, the oldest-first rotation just defers the tail a day.
+ */
+export const DAILY_FETCH_QUOTA = 120;
 
 /**
- * Minimum days between refetches for a symbol that's already been
- * successfully fetched. Unlike earnings (which only changes ~4x/year),
- * material news can happen anytime, so this is refreshed much more
- * frequently than EARNINGS_HISTORY's 80-day interval — 5 days keeps a
- * symbol's sentiment read from ever going stale for more than about a week,
- * while still fitting the same DAILY_FETCH_QUOTA rotation across the
- * candidate universe.
+ * Minimum hours between refetches for a symbol that's already been
+ * successfully fetched. Material news can happen anytime, so every symbol
+ * refreshes on each daily run; 20h (not 24h) so ordinary cron-time drift
+ * can't make a symbol miss a day.
  */
-const REFETCH_INTERVAL_DAYS = 5;
-const REFETCH_INTERVAL_MS = REFETCH_INTERVAL_DAYS * 24 * 60 * 60 * 1000;
+const REFETCH_INTERVAL_HOURS = 20;
+const REFETCH_INTERVAL_MS = REFETCH_INTERVAL_HOURS * 60 * 60 * 1000;
+
+/** Stop fetching new symbols after this long so a slow run ends cleanly inside the cron's 240s maxDuration; unfetched symbols are first in line (oldest-first) next run. */
+const REFRESH_TIME_BUDGET_MS = 225_000;
 
 /** Alpha Vantage's free tier rejects requests faster than 1/second; kept unchanged even on the premium key (see earningsHistory.ts's identical constant/rationale). */
 const MIN_REQUEST_INTERVAL_MS = 1200;
@@ -253,8 +260,10 @@ export interface NewsSentimentRefreshResult {
 export async function refreshNewsSentimentScores(quota: number = DAILY_FETCH_QUOTA): Promise<NewsSentimentRefreshResult[]> {
   const symbols = await selectSymbolsToFetch(quota);
   const results: NewsSentimentRefreshResult[] = [];
+  const startedAt = Date.now();
 
   for (let i = 0; i < symbols.length; i++) {
+    if (Date.now() - startedAt > REFRESH_TIME_BUDGET_MS) break;
     if (i > 0) await sleep(MIN_REQUEST_INTERVAL_MS);
     const symbol = symbols[i];
     const result = await fetchNewsSentimentScore(symbol);
