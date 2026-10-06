@@ -12,6 +12,7 @@ import {
 } from "@/lib/agents/scoringShared";
 import { getMonthlyScanEarningsScores } from "@/lib/agents/monthlyScanEarnings";
 import type { EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
+import { computeFragility } from "@/lib/agents/fragilityScore";
 import { getNewsSentimentScores, type NewsSentimentCoverage } from "@/lib/agents/newsSentimentScore";
 import type { CandidateAccountType } from "@/lib/agents/candidateScanner";
 import { formatPercent } from "@/lib/format";
@@ -40,6 +41,10 @@ export interface MonthlyScanCandidateEntry {
   /** 0-100 Alpha Vantage NEWS_SENTIMENT score (see newsSentimentScore.ts) — observed and logged only, NOT part of `score` yet (see the dated note in scoringShared.ts). Null when not covered or not yet fetched. */
   sentimentScore: number | null;
   sentimentCoverage: NewsSentimentCoverage;
+  /** Logging-only fragility signals (see fragilityScore.ts) — NOT part of `score`. Null when price history is too short. */
+  extensionVs200d: number | null;
+  vol60d: number | null;
+  fragilityFlag: boolean | null;
   rationale: string;
   accountType: CandidateAccountType;
   /** What data this score was actually frozen against, for point-in-time auditability — never retroactively updated once written. */
@@ -171,6 +176,7 @@ export async function runMonthlyScanAgent(triggerSource: "cron" | "manual"): Pro
           earningsSurpriseCoverage: earnings.coverage,
           sentimentScore: sentiment.score,
           sentimentCoverage: sentiment.coverage,
+          ...computeFragility(points),
           rationale: "",
           accountType,
           dataAvailability: {

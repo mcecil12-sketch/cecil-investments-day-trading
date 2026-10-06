@@ -430,6 +430,23 @@ function renderMonthlyScanReport(output: MonthlyScanOutput) {
                     <td className="mono">{c.rank}</td>
                     <td>
                       {c.symbol}
+                      {c.fragilityFlag && (
+                        <span
+                          title={`Extension vs 200d: ${c.extensionVs200d != null ? (c.extensionVs200d * 100).toFixed(1) + "%" : "n/a"} · 60d vol: ${c.vol60d != null ? (c.vol60d * 100).toFixed(1) + "%" : "n/a"} (logged only, not in score)`}
+                          style={{
+                            marginLeft: "0.4rem",
+                            padding: "0 0.35rem",
+                            border: "1px solid var(--border)",
+                            borderRadius: "999px",
+                            color: "var(--text-muted)",
+                            fontSize: "0.65rem",
+                            fontWeight: 400,
+                            cursor: "help",
+                          }}
+                        >
+                          Fragile
+                        </span>
+                      )}
                       <div style={{ color: "var(--text-muted)", fontSize: "0.72rem", fontWeight: 400 }}>{c.name}</div>
                     </td>
                     <td>{c.sector}</td>

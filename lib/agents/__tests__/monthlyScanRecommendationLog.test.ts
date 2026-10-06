@@ -27,6 +27,9 @@ function output(overrides: Partial<MonthlyScanOutput> = {}): MonthlyScanOutput {
         earningsSurpriseCoverage: "sue",
         sentimentScore: 62,
         sentimentCoverage: "scored",
+        extensionVs200d: 0.31,
+        vol60d: 0.72,
+        fragilityFlag: true,
         rationale: "test",
         accountType: "taxable",
         dataAvailability: {

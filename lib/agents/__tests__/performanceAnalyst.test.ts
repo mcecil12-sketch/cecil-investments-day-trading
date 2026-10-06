@@ -116,6 +116,7 @@ describe("synthesizePerformanceAnalysis / runPerformanceAnalyst", () => {
       sentimentDataSufficient: false,
       sentimentCoveredSymbolCount: 0,
       sentimentOldestFetchDaysAgo: null,
+      fragility: null,
     };
     const output = await synthesizePerformanceAnalysis(context);
     expect(messagesCreate).not.toHaveBeenCalled();
@@ -139,6 +140,7 @@ describe("synthesizePerformanceAnalysis / runPerformanceAnalyst", () => {
       sentimentDataSufficient: false,
       sentimentCoveredSymbolCount: 0,
       sentimentOldestFetchDaysAgo: null,
+      fragility: null,
     };
     const output = await synthesizePerformanceAnalysis(context);
     expect(messagesCreate).not.toHaveBeenCalled();
@@ -182,6 +184,7 @@ describe("synthesizePerformanceAnalysis / runPerformanceAnalyst", () => {
       sentimentDataSufficient: false,
       sentimentCoveredSymbolCount: 3,
       sentimentOldestFetchDaysAgo: 3,
+      fragility: null,
     };
 
     const output = await synthesizePerformanceAnalysis(context);
@@ -231,5 +234,46 @@ describe("synthesizePerformanceAnalysis / runPerformanceAnalyst", () => {
     expect(parsed.sentimentDataSufficient).toBe(false);
     expect(parsed.winners[0].symbol).toBe("AAPL");
     expect(parsed.sectorBreakdown[0]).toMatchObject({ key: "Technology", count: 1 });
+  });
+});
+
+describe("computeFragilityStats guard", () => {
+  const obs = (n: number, flagged: boolean, ret: number, vol = 0.5) =>
+    Array.from({ length: n }, () => ({ fragilityFlag: flagged, vol60d: vol, forwardReturn: ret }));
+
+  it("is null below 3 monthly cycles or below 10 closed positions", async () => {
+    const { computeFragilityStats } = await import("@/lib/agents/performanceAnalyst");
+    expect(computeFragilityStats([...obs(5, true, -0.1), ...obs(5, false, 0.1)], 2)).toBeNull();
+    expect(computeFragilityStats([...obs(4, true, -0.1), ...obs(5, false, 0.1)], 3)).toBeNull();
+  });
+
+  it("compares flagged vs unflagged once both thresholds are met", async () => {
+    const { computeFragilityStats } = await import("@/lib/agents/performanceAnalyst");
+    const stats = computeFragilityStats([...obs(5, true, -0.1, 0.5), ...obs(5, false, 0.1, 0.25)], 3)!;
+    expect(stats.flagged).toEqual({ count: 5, avgForwardReturn: -0.1, avgReturnPerUnitVol: -0.2 });
+    expect(stats.unflagged).toEqual({ count: 5, avgForwardReturn: 0.1, avgReturnPerUnitVol: 0.4 });
+  });
+
+  it("forces fragilityNote to null when fragility is null, even if Claude asserts a conclusion", async () => {
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    messagesCreate.mockResolvedValueOnce({
+      content: [
+        {
+          type: "tool_use",
+          input: {
+            topWinnerPatterns: [], topLoserPatterns: [], bestSetupTypes: [], scoreVsRealizedRNote: "n/a", earlyExitPatterns: [],
+            sentimentSignalNote: "", fragilityNote: "Fragile names clearly underperform.",
+          },
+        },
+      ],
+    });
+    const context: PerformanceAnalystContext = {
+      group: "GROUP_1", totalPositions: 1, closedPositions: 1, openPositions: 0, trackedSince: null,
+      scoreCorrelation: { coefficient: null, sampleSize: 1 }, winners: [], losers: [], sectorBreakdown: [],
+      earningsSurpriseCoverageBreakdown: [], holdingDaysStats: { avgWinnerHoldingDays: null, avgLoserHoldingDays: null },
+      sentimentDataSufficient: false, sentimentCoveredSymbolCount: 0, sentimentOldestFetchDaysAgo: null, fragility: null,
+    };
+    const output = await synthesizePerformanceAnalysis(context);
+    expect(output.fragilityNote).toBeNull();
   });
 });

@@ -373,6 +373,12 @@ model CandidateRecommendationLog {
   sentimentScore Int?
   /// News-sentiment data-completeness tag at the time of recommendation — "scored" | "no_coverage" | "not_yet_fetched" (see NewsSentimentCoverage in lib/agents/newsSentimentScore.ts). Null for rows logged before this column existed.
   sentimentCoverage String?
+  /// (lastClose / SMA200) - 1 at the time of recommendation. Logging-only fragility factor — NOT part of the composite score (see lib/agents/fragilityScore.ts and the dated note in scoringShared.ts). Null when under 200 bars of history, or for rows logged before this column existed.
+  extensionVs200d Float?
+  /// Annualized stdev of daily log returns over the last 60 bars at the time of recommendation. Logging-only. Null when under 60 bars, or for older rows.
+  vol60d Float?
+  /// True if extensionVs200d >= 0.25 OR vol60d >= 0.60 (hypothesis thresholds, see fragilityScore.ts). Logging-only. Null when neither metric was computable, or for older rows.
+  fragilityFlag Boolean?
   recommendationType String
   recommendedAt      DateTime
   /// Relative performance (symbol return minus S&P 500 return, decimal fraction) 30/90 days after recommendedAt. Null until enough time has elapsed.

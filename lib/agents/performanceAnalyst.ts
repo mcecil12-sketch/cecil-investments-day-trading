@@ -2,10 +2,13 @@ import Anthropic from "@anthropic-ai/sdk";
 import { prisma } from "@/lib/prisma";
 import {
   buildTrackedPositions,
+  groupIntoMonthlyRankings,
+  returnOverWindow,
   computeRealizedPnl,
   groupIntoWeeklyBatches,
   type TrackedPosition,
 } from "@/lib/agents/recommendationPerformance";
+import { buildBandedMonthlyPositions } from "@/lib/agents/monthlyScanBanding";
 import { getPriceHistory, type PricePoint } from "@/lib/agents/marketData";
 import { resolvePortfolioBaseValue } from "@/lib/agents/positionSizing";
 
@@ -34,6 +37,33 @@ const MIN_SENTIMENT_HISTORY_DAYS = 14;
 
 /** Below this many covered symbols, any sentiment-vs-return read would be drawn from too small a cross-section to mean anything. */
 const MIN_SENTIMENT_COVERED_SYMBOLS = 5;
+
+/** Fragility is a hypothesis (see fragilityScore.ts) — no comparison is surfaced until at least this many monthly cycles have logged fragility data... */
+const MIN_FRAGILITY_MONTHLY_CYCLES = 3;
+
+/** ...and at least this many closed Group 3 positions carry it. Same fabrication-guard style as the sentiment sufficiency check above. */
+const MIN_FRAGILITY_CLOSED_POSITIONS = 10;
+
+export interface FragilityObservation {
+  fragilityFlag: boolean;
+  vol60d: number | null;
+  /** Raw price return from entry to exit (decimal fraction) — the "forward return over the holding period". */
+  forwardReturn: number;
+}
+
+export interface FragilityGroupStats {
+  count: number;
+  avgForwardReturn: number | null;
+  /** Mean of forwardReturn / vol60d across positions with a positive vol60d. */
+  avgReturnPerUnitVol: number | null;
+}
+
+export interface FragilityStats {
+  monthlyCycles: number;
+  closedPositionsWithData: number;
+  flagged: FragilityGroupStats;
+  unflagged: FragilityGroupStats;
+}
 
 export interface ClosedPositionSummary {
   symbol: string;
@@ -76,6 +106,8 @@ export interface PerformanceAnalystContext {
   sentimentDataSufficient: boolean;
   sentimentCoveredSymbolCount: number;
   sentimentOldestFetchDaysAgo: number | null;
+  /** Flagged-vs-unflagged fragility comparison over closed Group 3 positions. Null (not zeros) until MIN_FRAGILITY_MONTHLY_CYCLES and MIN_FRAGILITY_CLOSED_POSITIONS are both met — an insufficient-data guard, not a real result. */
+  fragility: FragilityStats | null;
 }
 
 export interface PerformanceAnalystOutput {
@@ -87,6 +119,8 @@ export interface PerformanceAnalystOutput {
   earlyExitPatterns: string[];
   /** Null until sentimentDataSufficient is true — enforced in code (see synthesizePerformanceAnalysis), never trusted from Claude's own output alone. */
   sentimentSignalNote: string | null;
+  /** Null until context.fragility is non-null — enforced in code (see synthesizePerformanceAnalysis). */
+  fragilityNote: string | null;
 }
 
 function average(values: number[]): number | null {
@@ -127,6 +161,68 @@ function groupAverageReturn(summaries: ClosedPositionSummary[], keyFn: (s: Close
     .sort((a, b) => b.avgRealizedPnlPct - a.avgRealizedPnlPct);
 }
 
+function fragilityGroupStats(observations: FragilityObservation[]): FragilityGroupStats {
+  const perVol = observations.filter((o) => o.vol60d != null && o.vol60d > 0).map((o) => o.forwardReturn / o.vol60d!);
+  return {
+    count: observations.length,
+    avgForwardReturn: average(observations.map((o) => o.forwardReturn)),
+    avgReturnPerUnitVol: average(perVol),
+  };
+}
+
+/**
+ * Flagged-vs-unflagged comparison of closed positions that carry fragility
+ * data. Returns null unless there are at least MIN_FRAGILITY_MONTHLY_CYCLES
+ * cycles and MIN_FRAGILITY_CLOSED_POSITIONS observations — never zeros.
+ */
+export function computeFragilityStats(observations: FragilityObservation[], monthlyCycles: number): FragilityStats | null {
+  if (monthlyCycles < MIN_FRAGILITY_MONTHLY_CYCLES || observations.length < MIN_FRAGILITY_CLOSED_POSITIONS) return null;
+  return {
+    monthlyCycles,
+    closedPositionsWithData: observations.length,
+    flagged: fragilityGroupStats(observations.filter((o) => o.fragilityFlag)),
+    unflagged: fragilityGroupStats(observations.filter((o) => !o.fragilityFlag)),
+  };
+}
+
+/** Group 3 (monthly) fragility stats from real closed positions. Never throws — fragility is research-only and must not break the analyst run. */
+async function buildFragilityStats(): Promise<FragilityStats | null> {
+  try {
+    const rows = await prisma.candidateRecommendationLog.findMany({
+      where: { group: "GROUP_3" },
+      orderBy: { recommendedAt: "asc" },
+    });
+    const withData = rows.filter((r) => r.fragilityFlag != null);
+    const monthlyCycles = new Set(withData.map((r) => r.batchTag)).size;
+    if (monthlyCycles < MIN_FRAGILITY_MONTHLY_CYCLES) return null;
+
+    const rowLookup = new Map(withData.map((r) => [`${r.symbol}@@${r.recommendedAt.getTime()}`, r]));
+    const positions = buildBandedMonthlyPositions(
+      groupIntoMonthlyRankings(rows.map((r) => ({ symbol: r.symbol, batchTag: r.batchTag, recommendedAt: r.recommendedAt, score: r.score, rank: r.rank }))),
+    );
+    const closed = positions.filter((p): p is typeof p & { exitDate: Date } => p.exitDate != null);
+
+    const observations: FragilityObservation[] = [];
+    await Promise.all(
+      closed.map(async (position) => {
+        const row = rowLookup.get(`${position.symbol}@@${position.entryDate.getTime()}`);
+        if (!row || row.fragilityFlag == null) return;
+        try {
+          const { points } = await getPriceHistory(position.symbol);
+          const forwardReturn = returnOverWindow(points, position.entryDate, position.exitDate);
+          if (forwardReturn == null) return;
+          observations.push({ fragilityFlag: row.fragilityFlag, vol60d: row.vol60d, forwardReturn });
+        } catch {
+          // Skip — this position just won't contribute until its price history is fetchable again.
+        }
+      }),
+    );
+    return computeFragilityStats(observations, monthlyCycles);
+  } catch {
+    return null;
+  }
+}
+
 const EMPTY_CONTEXT: PerformanceAnalystContext = {
   group: "GROUP_1",
   totalPositions: 0,
@@ -142,6 +238,7 @@ const EMPTY_CONTEXT: PerformanceAnalystContext = {
   sentimentDataSufficient: false,
   sentimentCoveredSymbolCount: 0,
   sentimentOldestFetchDaysAgo: null,
+  fragility: null,
 };
 
 /**
@@ -251,6 +348,7 @@ export async function buildPerformanceAnalystContext(totalCurrentValue?: number 
     sentimentDataSufficient,
     sentimentCoveredSymbolCount: sentimentStates.length,
     sentimentOldestFetchDaysAgo,
+    fragility: await buildFragilityStats(),
   };
 }
 
@@ -262,6 +360,8 @@ Turn this into concise, structured research findings:
 3. scoreVsRealizedRNote: 1-2 sentences interpreting the ALREADY-COMPUTED correlation given in scoreCorrelation (coefficient, sampleSize) — do not compute or invent a different coefficient. If sampleSize is below 5, say plainly there isn't enough closed-position history yet to judge the score's predictive power, rather than reading anything into so few data points.
 4. earlyExitPatterns: 1-3 short observations from holdingDaysStats and the losers list about whether short holding periods correlate with worse outcomes.
 5. sentimentSignalNote: the data includes sentimentDataSufficient (boolean) plus sentimentCoveredSymbolCount/sentimentOldestFetchDaysAgo. If sentimentDataSufficient is false, you MUST return an empty string "" for this field — there is not yet enough real sentiment-score fetch history to say anything about whether it predicts returns, and guessing from insufficient data would be fabricating a signal that doesn't exist. Only when sentimentDataSufficient is true, and only from sentiment data actually present in the JSON, may you attempt a real observation.
+
+6. fragilityNote: the data includes fragility, either null or a flagged-vs-unflagged comparison (avgForwardReturn and avgReturnPerUnitVol per group) over closed monthly-scan positions. Fragility is an unproven hypothesis. If fragility is null, you MUST return an empty string "" for this field — there is not yet enough history, and asserting any conclusion would be fabrication. If it is present, describe only the numbers given and say whether they are consistent with the hypothesis that flagged names underperform; do not claim it is validated or recommend changing the score.
 
 Base every claim strictly on the JSON data provided. Never invent dollar amounts, correlations, or symbols not present in the data.`;
 
@@ -300,6 +400,11 @@ const ANALYSIS_TOOL: Anthropic.Tool = {
         description:
           "Empty string \"\" if sentimentDataSufficient is false. Otherwise a real observation grounded strictly in the sentiment data given.",
       },
+      fragilityNote: {
+        type: "string",
+        description:
+          "Empty string \"\" if fragility is null. Otherwise a neutral description of the given flagged-vs-unflagged numbers, with no validation claim.",
+      },
     },
     required: [
       "topWinnerPatterns",
@@ -308,6 +413,7 @@ const ANALYSIS_TOOL: Anthropic.Tool = {
       "scoreVsRealizedRNote",
       "earlyExitPatterns",
       "sentimentSignalNote",
+      "fragilityNote",
     ],
   },
 };
@@ -324,6 +430,7 @@ function fallbackOutput(context: PerformanceAnalystContext): PerformanceAnalystO
         : "Automatic synthesis is unavailable right now.",
     earlyExitPatterns: [],
     sentimentSignalNote: null,
+    fragilityNote: null,
   };
 }
 
@@ -368,6 +475,7 @@ export async function synthesizePerformanceAnalysis(context: PerformanceAnalystC
     scoreVsRealizedRNote: string;
     earlyExitPatterns: string[];
     sentimentSignalNote: string;
+    fragilityNote?: string;
   };
 
   return {
@@ -378,6 +486,7 @@ export async function synthesizePerformanceAnalysis(context: PerformanceAnalystC
     scoreVsRealizedRNote: input.scoreVsRealizedRNote,
     earlyExitPatterns: input.earlyExitPatterns,
     sentimentSignalNote: context.sentimentDataSufficient ? input.sentimentSignalNote?.trim() || null : null,
+    fragilityNote: context.fragility ? input.fragilityNote?.trim() || null : null,
   };
 }
 

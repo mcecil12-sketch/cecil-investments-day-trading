@@ -64,6 +64,31 @@ monthly cycle, piggybacked on the existing `refresh-candidate-universe` cron
 manual/test run never counts toward this. See `/tracking-groups` for the
 live readiness banner.
 
+## Fragility factor (logging-only)
+
+Added 2026-10-06 after the STX postmortem (ranked #2 on the Oct 1 scan, then
+fell ~14% in a week): the composite (momentum/trend, SUE earnings, sector
+leadership) is entirely backward-looking and rewards extended names. Every
+`CandidateRecommendationLog` row (Group 1 weekly and Group 3 monthly) now
+logs, from the price history the scan already fetched (no new network calls):
+
+- `extensionVs200d` — `(lastClose / SMA200) - 1`; null under 200 daily bars.
+- `vol60d` — annualized stdev of daily log returns over 60 bars; null under 60.
+- `fragilityFlag` — true if `extensionVs200d >= 0.25` OR `vol60d >= 0.60`.
+
+Thresholds are named constants in `lib/agents/fragilityScore.ts`, set from the
+STX postmortem — hypothesis only, validate before use. The factor is **not**
+in the composite, ranking, or banding; the Ranked Candidates table shows a
+muted "Fragile" badge only. The Performance Analyst compares flagged vs.
+unflagged closed Group 3 positions (average forward return, and return per
+unit of `vol60d`) and reports nothing until at least 3 monthly cycles and 10
+closed positions carry fragility data.
+
+**Pre-registered graduation rule:** Graduates only if, across at least 3
+monthly cycles, flagged names underperform unflagged on risk-adjusted return.
+If it graduates, apply as a position-size haircut in recommendations, not as
+a rank penalty.
+
 ## Evaluation ground rules
 
 No group is declared "better" than another based on early results. Minimum

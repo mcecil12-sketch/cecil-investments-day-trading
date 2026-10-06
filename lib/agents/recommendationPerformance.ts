@@ -179,7 +179,7 @@ function closeOnOrBefore(points: PricePoint[], date: Date): number | null {
   return found;
 }
 
-function returnOverWindow(points: PricePoint[], fromDate: Date, toDate: Date): number | null {
+export function returnOverWindow(points: PricePoint[], fromDate: Date, toDate: Date): number | null {
   const startClose = closeOnOrBefore(points, fromDate);
   const endClose = closeOnOrBefore(points, toDate);
   if (startClose == null || endClose == null) return null;

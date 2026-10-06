@@ -28,6 +28,12 @@ export const SECTOR_LEADERSHIP_WEIGHT = 25 / 90;
  * has enough weeks of real data to confirm it's actually predictive of
  * realized returns. Once validated, the three weights above go back to a
  * real 35/30/25/10 split instead of this renormalized-over-90 one.
+ *
+ * 2026-10-06: Fragility (extensionVs200d / vol60d / fragilityFlag, see
+ * lib/agents/fragilityScore.ts) is logged on every candidate row but is
+ * excluded from the composite pending validation — same observed-only
+ * treatment as sentiment above. The Performance Analyst tests whether
+ * flagged names underperform; no weight is changed here.
  */
 
 /**
