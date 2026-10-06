@@ -8,7 +8,7 @@ import type { CandidateScannerOutput, CandidateEntry } from "@/lib/agents/candid
 import type { MonthlyScanOutput, MonthlyScanCandidateEntry } from "@/lib/agents/monthlyScan";
 import type { CioTaxableOpportunities } from "@/lib/agents/cio";
 import type { NewsSentimentNote } from "@/lib/agents/newsSentiment";
-import { alphaColor, formatCurrency, formatDate, formatDateTime, formatPercent } from "@/lib/format";
+import { alphaColor, formatCompactCurrency, formatCurrency, formatDate, formatDateTime, formatPercent } from "@/lib/format";
 import { RunAgentButton } from "./RunAgentButton";
 import { AgentStatusPoller } from "./AgentStatusPoller";
 import type { AgentStatusResponse } from "@/app/api/agents/status/route";
@@ -432,7 +432,11 @@ function renderMonthlyScanReport(output: MonthlyScanOutput) {
                       {c.symbol}
                       {c.fragilityFlag && (
                         <span
-                          title={`Extension vs 200d: ${c.extensionVs200d != null ? (c.extensionVs200d * 100).toFixed(1) + "%" : "n/a"} · 60d vol: ${c.vol60d != null ? (c.vol60d * 100).toFixed(1) + "%" : "n/a"} (logged only, not in score)`}
+                          title={`Extension vs 200d: ${c.extensionVs200d != null ? (c.extensionVs200d * 100).toFixed(1) + "%" : "n/a"} · 60d vol: ${c.vol60d != null ? (c.vol60d * 100).toFixed(1) + "%" : "n/a"} (logged only, not in score)${
+                            c.insiderNetSoldUsd30d != null
+                              ? ` · Insider selling (30d, upper bound): net ${formatCompactCurrency(c.insiderNetSoldUsd30d)} sold, ${c.insiderSellers30d ?? 0} seller(s)`
+                              : ""
+                          }`}
                           style={{
                             marginLeft: "0.4rem",
                             padding: "0 0.35rem",

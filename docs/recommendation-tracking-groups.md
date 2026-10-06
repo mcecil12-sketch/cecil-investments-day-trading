@@ -89,6 +89,46 @@ monthly cycles, flagged names underperform unflagged on risk-adjusted return.
 If it graduates, apply as a position-size haircut in recommendations, not as
 a rank penalty.
 
+### Insider selling (logging-only, monthly scan)
+
+Added 2026-10-06 after STX's CEO sold stock under 10b5-1 plans on the day we
+bought. For **all 30 ranked candidates** of the monthly scan (cron runs only;
+weekly Group 1 rows and manual runs get nulls) we log, from
+one Alpha Vantage `INSIDER_TRANSACTIONS` call per ticker
+(`lib/agents/insiderActivity.ts`):
+
+- `insiderNetSoldUsd30d` — trailing-30d sale dollars minus purchase dollars
+  (shares x price per row; positive = net selling).
+- `insiderSaleCount30d`, `insiderSellers30d` — sale transactions / distinct sellers.
+- `insiderHas10b5_1` — **always null today**: the API has no plan indicator.
+
+**Which rows count.** Only non-derivative security rows (e.g. "Ordinary
+Shares") with a positive share price. `acquisition_or_disposal = D` is a sale;
+`A` is a purchase only if the same insider has no derivative row (option / RSU /
+PSU) that day (otherwise it is an option exercise at its strike). Awards and
+vests (A at price 0), gifts (D at price 0) and all derivative rows are
+excluded. **Known limit:** the response has no transaction code, so tax
+withholding and exercise-and-sell lots at a positive price are counted as
+sales. The figure is an upper bound on discretionary selling (for STX it
+summed ~$226M over 30 days, far above the ~$27.7M CEO sale that motivated this).
+
+**Budget.** Sequential at 1.2s pacing (about 50 requests a minute; no per-minute
+plan limit is documented in the repo, so it is not raised), 30 calls per run,
+with `INSIDER_MAX_CALLS_PER_RUN = 60` as a hard stop. As of 2026-10-06 the
+Alpha Vantage key is assumed to be premium (stated by the owner, not verifiable
+from the repo), so free-tier daily limits do not apply. Calls used are logged. A failed fetch writes nulls for that ticker and the scan
+continues.
+
+**Analysis.** The Performance Analyst's second cut compares closed Group 3
+positions with `insiderNetSoldUsd30d` above $5,000,000 (hypothesis threshold,
+Oct 6 2026) against the rest, and reports nothing until 3 monthly cycles and 10
+closed positions carry insider data.
+
+**Graduation rule (same as fragility):** graduates only if, across at least 3
+monthly cycles, heavy-insider-selling names underperform on risk-adjusted
+return. If it graduates, apply as a position-size haircut in recommendations,
+never as a rank penalty.
+
 ## Evaluation ground rules
 
 No group is declared "better" than another based on early results. Minimum

@@ -34,6 +34,10 @@ export const SECTOR_LEADERSHIP_WEIGHT = 25 / 90;
  * excluded from the composite pending validation — same observed-only
  * treatment as sentiment above. The Performance Analyst tests whether
  * flagged names underperform; no weight is changed here.
+ *
+ * 2026-10-06: Insider selling (insiderNetSoldUsd30d and friends, see
+ * lib/agents/insiderActivity.ts) is likewise logged for the monthly scan's
+ * ranked candidates (top 30) only and excluded from the composite pending validation.
  */
 
 /**

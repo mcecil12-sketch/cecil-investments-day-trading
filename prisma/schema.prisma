@@ -379,6 +379,12 @@ model CandidateRecommendationLog {
   vol60d Float?
   /// True if extensionVs200d >= 0.25 OR vol60d >= 0.60 (hypothesis thresholds, see fragilityScore.ts). Logging-only. Null when neither metric was computable, or for older rows.
   fragilityFlag Boolean?
+  /// Trailing-30d insider sale dollars minus purchase dollars (positive = net selling) at the time of recommendation, Alpha Vantage INSIDER_TRANSACTIONS. Logging-only, monthly scan's ranked candidates (top 30) — NOT part of the composite (see lib/agents/insiderActivity.ts). An upper bound: the API can't separate tax withholding/exercise-and-sell lots from open-market sales. Null on fetch failure, for weekly rows, or for older rows.
+  insiderNetSoldUsd30d Float?
+  insiderSaleCount30d Int?
+  insiderSellers30d Int?
+  /// True/false only if the data indicates planned (10b5-1) sales; the real API carries no such field today, so this is null.
+  insiderHas10b5_1 Boolean?
   recommendationType String
   recommendedAt      DateTime
   /// Relative performance (symbol return minus S&P 500 return, decimal fraction) 30/90 days after recommendedAt. Null until enough time has elapsed.

@@ -44,8 +44,14 @@ const MIN_FRAGILITY_MONTHLY_CYCLES = 3;
 /** ...and at least this many closed Group 3 positions carry it. Same fabrication-guard style as the sentiment sufficiency check above. */
 const MIN_FRAGILITY_CLOSED_POSITIONS = 10;
 
+/** Oct 6 2026, hypothesis only: trailing-30d insider net sold above this dollar amount counts as "heavy insider selling" for the second cut. */
+const INSIDER_NET_SOLD_THRESHOLD_USD = 5_000_000;
+
 export interface FragilityObservation {
-  fragilityFlag: boolean;
+  /** Null when the entry row carries no fragility data (it may still carry insider data). */
+  fragilityFlag: boolean | null;
+  /** Trailing-30d insider net sold at entry (see insiderActivity.ts); null when not logged. */
+  insiderNetSoldUsd30d?: number | null;
   vol60d: number | null;
   /** Raw price return from entry to exit (decimal fraction) — the "forward return over the holding period". */
   forwardReturn: number;
@@ -63,6 +69,15 @@ export interface FragilityStats {
   closedPositionsWithData: number;
   flagged: FragilityGroupStats;
   unflagged: FragilityGroupStats;
+}
+
+export interface InsiderStats {
+  monthlyCycles: number;
+  closedPositionsWithData: number;
+  /** Positions with insiderNetSoldUsd30d above INSIDER_NET_SOLD_THRESHOLD_USD. */
+  heavySelling: FragilityGroupStats;
+  /** Positions at or below it (positions with null insider data are excluded entirely, not counted here). */
+  other: FragilityGroupStats;
 }
 
 export interface ClosedPositionSummary {
@@ -108,6 +123,8 @@ export interface PerformanceAnalystContext {
   sentimentOldestFetchDaysAgo: number | null;
   /** Flagged-vs-unflagged fragility comparison over closed Group 3 positions. Null (not zeros) until MIN_FRAGILITY_MONTHLY_CYCLES and MIN_FRAGILITY_CLOSED_POSITIONS are both met — an insufficient-data guard, not a real result. */
   fragility: FragilityStats | null;
+  /** Heavy-insider-selling vs. other comparison over closed Group 3 positions. Null (not zeros) under the same guard as `fragility`, counted over positions that carry insider data. */
+  insider: InsiderStats | null;
 }
 
 export interface PerformanceAnalystOutput {
@@ -121,6 +138,8 @@ export interface PerformanceAnalystOutput {
   sentimentSignalNote: string | null;
   /** Null until context.fragility is non-null — enforced in code (see synthesizePerformanceAnalysis). */
   fragilityNote: string | null;
+  /** Null until context.insider is non-null — enforced in code. */
+  insiderNote: string | null;
 }
 
 function average(values: number[]): number | null {
@@ -185,18 +204,31 @@ export function computeFragilityStats(observations: FragilityObservation[], mont
   };
 }
 
-/** Group 3 (monthly) fragility stats from real closed positions. Never throws — fragility is research-only and must not break the analyst run. */
-async function buildFragilityStats(): Promise<FragilityStats | null> {
+/** Same guard as computeFragilityStats, over observations that carry insider data. Null unless 3+ cycles and 10+ such closed positions. */
+export function computeInsiderStats(observations: FragilityObservation[], monthlyCycles: number): InsiderStats | null {
+  if (monthlyCycles < MIN_FRAGILITY_MONTHLY_CYCLES || observations.length < MIN_FRAGILITY_CLOSED_POSITIONS) return null;
+  return {
+    monthlyCycles,
+    closedPositionsWithData: observations.length,
+    heavySelling: fragilityGroupStats(observations.filter((o) => o.insiderNetSoldUsd30d! > INSIDER_NET_SOLD_THRESHOLD_USD)),
+    other: fragilityGroupStats(observations.filter((o) => o.insiderNetSoldUsd30d! <= INSIDER_NET_SOLD_THRESHOLD_USD)),
+  };
+}
+
+/** Group 3 (monthly) fragility and insider stats from real closed positions. Never throws — these are research-only and must not break the analyst run. */
+async function buildGroup3SignalStats(): Promise<{ fragility: FragilityStats | null; insider: InsiderStats | null }> {
   try {
     const rows = await prisma.candidateRecommendationLog.findMany({
       where: { group: "GROUP_3" },
       orderBy: { recommendedAt: "asc" },
     });
-    const withData = rows.filter((r) => r.fragilityFlag != null);
-    const monthlyCycles = new Set(withData.map((r) => r.batchTag)).size;
-    if (monthlyCycles < MIN_FRAGILITY_MONTHLY_CYCLES) return null;
+    const fragilityCycles = new Set(rows.filter((r) => r.fragilityFlag != null).map((r) => r.batchTag)).size;
+    const insiderCycles = new Set(rows.filter((r) => r.insiderNetSoldUsd30d != null).map((r) => r.batchTag)).size;
+    if (fragilityCycles < MIN_FRAGILITY_MONTHLY_CYCLES && insiderCycles < MIN_FRAGILITY_MONTHLY_CYCLES) {
+      return { fragility: null, insider: null };
+    }
 
-    const rowLookup = new Map(withData.map((r) => [`${r.symbol}@@${r.recommendedAt.getTime()}`, r]));
+    const rowLookup = new Map(rows.map((r) => [`${r.symbol}@@${r.recommendedAt.getTime()}`, r]));
     const positions = buildBandedMonthlyPositions(
       groupIntoMonthlyRankings(rows.map((r) => ({ symbol: r.symbol, batchTag: r.batchTag, recommendedAt: r.recommendedAt, score: r.score, rank: r.rank }))),
     );
@@ -206,20 +238,28 @@ async function buildFragilityStats(): Promise<FragilityStats | null> {
     await Promise.all(
       closed.map(async (position) => {
         const row = rowLookup.get(`${position.symbol}@@${position.entryDate.getTime()}`);
-        if (!row || row.fragilityFlag == null) return;
+        if (!row || (row.fragilityFlag == null && row.insiderNetSoldUsd30d == null)) return;
         try {
           const { points } = await getPriceHistory(position.symbol);
           const forwardReturn = returnOverWindow(points, position.entryDate, position.exitDate);
           if (forwardReturn == null) return;
-          observations.push({ fragilityFlag: row.fragilityFlag, vol60d: row.vol60d, forwardReturn });
+          observations.push({
+            fragilityFlag: row.fragilityFlag,
+            vol60d: row.vol60d,
+            forwardReturn,
+            insiderNetSoldUsd30d: row.insiderNetSoldUsd30d,
+          });
         } catch {
           // Skip — this position just won't contribute until its price history is fetchable again.
         }
       }),
     );
-    return computeFragilityStats(observations, monthlyCycles);
+    return {
+      fragility: computeFragilityStats(observations.filter((o) => o.fragilityFlag != null), fragilityCycles),
+      insider: computeInsiderStats(observations.filter((o) => o.insiderNetSoldUsd30d != null), insiderCycles),
+    };
   } catch {
-    return null;
+    return { fragility: null, insider: null };
   }
 }
 
@@ -239,6 +279,7 @@ const EMPTY_CONTEXT: PerformanceAnalystContext = {
   sentimentCoveredSymbolCount: 0,
   sentimentOldestFetchDaysAgo: null,
   fragility: null,
+  insider: null,
 };
 
 /**
@@ -333,6 +374,8 @@ export async function buildPerformanceAnalystContext(totalCurrentValue?: number 
     sentimentOldestFetchDaysAgo != null &&
     sentimentOldestFetchDaysAgo >= MIN_SENTIMENT_HISTORY_DAYS;
 
+  const { fragility, insider } = await buildGroup3SignalStats();
+
   return {
     group: "GROUP_1",
     totalPositions: positions.length,
@@ -348,7 +391,8 @@ export async function buildPerformanceAnalystContext(totalCurrentValue?: number 
     sentimentDataSufficient,
     sentimentCoveredSymbolCount: sentimentStates.length,
     sentimentOldestFetchDaysAgo,
-    fragility: await buildFragilityStats(),
+    fragility,
+    insider,
   };
 }
 
@@ -362,6 +406,8 @@ Turn this into concise, structured research findings:
 5. sentimentSignalNote: the data includes sentimentDataSufficient (boolean) plus sentimentCoveredSymbolCount/sentimentOldestFetchDaysAgo. If sentimentDataSufficient is false, you MUST return an empty string "" for this field — there is not yet enough real sentiment-score fetch history to say anything about whether it predicts returns, and guessing from insufficient data would be fabricating a signal that doesn't exist. Only when sentimentDataSufficient is true, and only from sentiment data actually present in the JSON, may you attempt a real observation.
 
 6. fragilityNote: the data includes fragility, either null or a flagged-vs-unflagged comparison (avgForwardReturn and avgReturnPerUnitVol per group) over closed monthly-scan positions. Fragility is an unproven hypothesis. If fragility is null, you MUST return an empty string "" for this field — there is not yet enough history, and asserting any conclusion would be fabrication. If it is present, describe only the numbers given and say whether they are consistent with the hypothesis that flagged names underperform; do not claim it is validated or recommend changing the score.
+
+7. insiderNote: the data includes insider, either null or a heavySelling-vs-other comparison (avgForwardReturn and avgReturnPerUnitVol per group) over closed monthly-scan positions, where heavySelling means trailing-30d insider net sold above a dollar threshold. The insider figure is an upper bound that can include tax withholding and exercise-and-sell lots, and the idea is an unproven hypothesis. If insider is null, you MUST return an empty string "" for this field — asserting any conclusion would be fabrication. If present, describe only the numbers given and say whether they are consistent with the hypothesis that heavy insider selling precedes underperformance; do not claim it is validated.
 
 Base every claim strictly on the JSON data provided. Never invent dollar amounts, correlations, or symbols not present in the data.`;
 
@@ -405,6 +451,11 @@ const ANALYSIS_TOOL: Anthropic.Tool = {
         description:
           "Empty string \"\" if fragility is null. Otherwise a neutral description of the given flagged-vs-unflagged numbers, with no validation claim.",
       },
+      insiderNote: {
+        type: "string",
+        description:
+          "Empty string \"\" if insider is null. Otherwise a neutral description of the given heavySelling-vs-other numbers, with no validation claim.",
+      },
     },
     required: [
       "topWinnerPatterns",
@@ -414,6 +465,7 @@ const ANALYSIS_TOOL: Anthropic.Tool = {
       "earlyExitPatterns",
       "sentimentSignalNote",
       "fragilityNote",
+      "insiderNote",
     ],
   },
 };
@@ -431,6 +483,7 @@ function fallbackOutput(context: PerformanceAnalystContext): PerformanceAnalystO
     earlyExitPatterns: [],
     sentimentSignalNote: null,
     fragilityNote: null,
+    insiderNote: null,
   };
 }
 
@@ -476,6 +529,7 @@ export async function synthesizePerformanceAnalysis(context: PerformanceAnalystC
     earlyExitPatterns: string[];
     sentimentSignalNote: string;
     fragilityNote?: string;
+    insiderNote?: string;
   };
 
   return {
@@ -487,6 +541,7 @@ export async function synthesizePerformanceAnalysis(context: PerformanceAnalystC
     earlyExitPatterns: input.earlyExitPatterns,
     sentimentSignalNote: context.sentimentDataSufficient ? input.sentimentSignalNote?.trim() || null : null,
     fragilityNote: context.fragility ? input.fragilityNote?.trim() || null : null,
+    insiderNote: context.insider ? input.insiderNote?.trim() || null : null,
   };
 }
 

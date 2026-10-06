@@ -12,6 +12,7 @@ import {
 } from "@/lib/agents/scoringShared";
 import { getMonthlyScanEarningsScores } from "@/lib/agents/monthlyScanEarnings";
 import type { EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
+import { getInsiderActivity } from "@/lib/agents/insiderActivity";
 import { computeFragility } from "@/lib/agents/fragilityScore";
 import { getNewsSentimentScores, type NewsSentimentCoverage } from "@/lib/agents/newsSentimentScore";
 import type { CandidateAccountType } from "@/lib/agents/candidateScanner";
@@ -45,6 +46,11 @@ export interface MonthlyScanCandidateEntry {
   extensionVs200d: number | null;
   vol60d: number | null;
   fragilityFlag: boolean | null;
+  /** Logging-only insider-selling signals (see insiderActivity.ts) — NOT part of `score`. Populated for every ranked candidate of a cron run; null on manual runs or fetch failure. */
+  insiderNetSoldUsd30d: number | null;
+  insiderSaleCount30d: number | null;
+  insiderSellers30d: number | null;
+  insiderHas10b5_1: boolean | null;
   rationale: string;
   accountType: CandidateAccountType;
   /** What data this score was actually frozen against, for point-in-time auditability — never retroactively updated once written. */
@@ -177,6 +183,10 @@ export async function runMonthlyScanAgent(triggerSource: "cron" | "manual"): Pro
           sentimentScore: sentiment.score,
           sentimentCoverage: sentiment.coverage,
           ...computeFragility(points),
+          insiderNetSoldUsd30d: null,
+          insiderSaleCount30d: null,
+          insiderSellers30d: null,
+          insiderHas10b5_1: null,
           rationale: "",
           accountType,
           dataAvailability: {
@@ -198,6 +208,28 @@ export async function runMonthlyScanAgent(triggerSource: "cron" | "manual"): Pro
   const rankedCandidates: MonthlyScanCandidateEntry[] = scored
     .slice(0, MAX_TRACKED_CANDIDATES)
     .map((entry, i) => ({ ...entry, rank: i + 1 }));
+
+  // Logging-only, after ranking: fetch insider activity for every ranked
+  // candidate (all MAX_TRACKED_CANDIDATES). Cron runs only — manual reruns aren't logged, so they
+  // shouldn't spend the shared Alpha Vantage budget. Never fails the scan.
+  if (triggerSource === "cron") {
+    try {
+      const { summaries } = await getInsiderActivity(
+        rankedCandidates.map((c) => c.symbol),
+        new Date(),
+      );
+      for (const c of rankedCandidates) {
+        const s = summaries.get(c.symbol);
+        if (!s) continue;
+        c.insiderNetSoldUsd30d = s.insiderNetSoldUsd30d;
+        c.insiderSaleCount30d = s.insiderSaleCount30d;
+        c.insiderSellers30d = s.insiderSellers30d;
+        c.insiderHas10b5_1 = s.insiderHas10b5_1;
+      }
+    } catch (err) {
+      console.error("[insider] logging-only insider fetch failed; continuing without it", err);
+    }
+  }
 
   return { generatedAt: new Date().toISOString(), triggerSource, rankedCandidates, sectorsWithoutUniverse, skipped };
 }

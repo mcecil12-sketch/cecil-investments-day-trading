@@ -30,6 +30,10 @@ function output(overrides: Partial<MonthlyScanOutput> = {}): MonthlyScanOutput {
         extensionVs200d: 0.31,
         vol60d: 0.72,
         fragilityFlag: true,
+        insiderNetSoldUsd30d: 27700000,
+        insiderSaleCount30d: 4,
+        insiderSellers30d: 2,
+        insiderHas10b5_1: null,
         rationale: "test",
         accountType: "taxable",
         dataAvailability: {

@@ -117,6 +117,7 @@ describe("synthesizePerformanceAnalysis / runPerformanceAnalyst", () => {
       sentimentCoveredSymbolCount: 0,
       sentimentOldestFetchDaysAgo: null,
       fragility: null,
+      insider: null,
     };
     const output = await synthesizePerformanceAnalysis(context);
     expect(messagesCreate).not.toHaveBeenCalled();
@@ -141,6 +142,7 @@ describe("synthesizePerformanceAnalysis / runPerformanceAnalyst", () => {
       sentimentCoveredSymbolCount: 0,
       sentimentOldestFetchDaysAgo: null,
       fragility: null,
+      insider: null,
     };
     const output = await synthesizePerformanceAnalysis(context);
     expect(messagesCreate).not.toHaveBeenCalled();
@@ -185,6 +187,7 @@ describe("synthesizePerformanceAnalysis / runPerformanceAnalyst", () => {
       sentimentCoveredSymbolCount: 3,
       sentimentOldestFetchDaysAgo: 3,
       fragility: null,
+      insider: null,
     };
 
     const output = await synthesizePerformanceAnalysis(context);
@@ -271,9 +274,49 @@ describe("computeFragilityStats guard", () => {
       group: "GROUP_1", totalPositions: 1, closedPositions: 1, openPositions: 0, trackedSince: null,
       scoreCorrelation: { coefficient: null, sampleSize: 1 }, winners: [], losers: [], sectorBreakdown: [],
       earningsSurpriseCoverageBreakdown: [], holdingDaysStats: { avgWinnerHoldingDays: null, avgLoserHoldingDays: null },
-      sentimentDataSufficient: false, sentimentCoveredSymbolCount: 0, sentimentOldestFetchDaysAgo: null, fragility: null,
+      sentimentDataSufficient: false, sentimentCoveredSymbolCount: 0, sentimentOldestFetchDaysAgo: null, fragility: null, insider: null,
     };
     const output = await synthesizePerformanceAnalysis(context);
     expect(output.fragilityNote).toBeNull();
+  });
+});
+
+describe("computeInsiderStats guard", () => {
+  const obs = (n: number, usd: number, ret: number, vol = 0.5) =>
+    Array.from({ length: n }, () => ({ fragilityFlag: null, vol60d: vol, forwardReturn: ret, insiderNetSoldUsd30d: usd }));
+
+  it("is null below 3 cycles or 10 positions with insider data", async () => {
+    const { computeInsiderStats } = await import("@/lib/agents/performanceAnalyst");
+    expect(computeInsiderStats([...obs(5, 9e6, -0.1), ...obs(5, 0, 0.1)], 2)).toBeNull();
+    expect(computeInsiderStats([...obs(4, 9e6, -0.1), ...obs(5, 0, 0.1)], 3)).toBeNull();
+  });
+
+  it("splits at the $5M threshold (above vs. at-or-below)", async () => {
+    const { computeInsiderStats } = await import("@/lib/agents/performanceAnalyst");
+    const stats = computeInsiderStats([...obs(5, 9e6, -0.1, 0.5), ...obs(5, 5e6, 0.1, 0.25)], 3)!;
+    expect(stats.heavySelling).toEqual({ count: 5, avgForwardReturn: -0.1, avgReturnPerUnitVol: -0.2 });
+    expect(stats.other).toEqual({ count: 5, avgForwardReturn: 0.1, avgReturnPerUnitVol: 0.4 });
+  });
+
+  it("forces insiderNote to null when insider is null, even if Claude asserts a conclusion", async () => {
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    messagesCreate.mockResolvedValueOnce({
+      content: [
+        {
+          type: "tool_use",
+          input: {
+            topWinnerPatterns: [], topLoserPatterns: [], bestSetupTypes: [], scoreVsRealizedRNote: "n/a", earlyExitPatterns: [],
+            sentimentSignalNote: "", fragilityNote: "", insiderNote: "Insider selling clearly predicts losses.",
+          },
+        },
+      ],
+    });
+    const context: PerformanceAnalystContext = {
+      group: "GROUP_1", totalPositions: 1, closedPositions: 1, openPositions: 0, trackedSince: null,
+      scoreCorrelation: { coefficient: null, sampleSize: 1 }, winners: [], losers: [], sectorBreakdown: [],
+      earningsSurpriseCoverageBreakdown: [], holdingDaysStats: { avgWinnerHoldingDays: null, avgLoserHoldingDays: null },
+      sentimentDataSufficient: false, sentimentCoveredSymbolCount: 0, sentimentOldestFetchDaysAgo: null, fragility: null, insider: null,
+    };
+    expect((await synthesizePerformanceAnalysis(context)).insiderNote).toBeNull();
   });
 });
