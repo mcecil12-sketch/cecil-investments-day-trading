@@ -1,14 +1,17 @@
 // Standalone prototype — NOT wired into the app. Prints a sample "News & Sentiment
 // Watch" section for the current live Top 15 candidates so it can be reviewed before
 // building it into the weekly CIO brief for real. Run with:
-//   env $(grep '^DATABASE_URL=' .env.local) node scripts/preview-news-sentiment.js
+//   env $(grep '^DATABASE_URL=\|^APP_ANTHROPIC_API_KEY=' .env.local) node scripts/preview-news-sentiment.js
 "use strict";
 
 const { PrismaClient } = require("../lib/generated/prisma");
 const Anthropic = require("@anthropic-ai/sdk").default;
 
 const prisma = new PrismaClient();
-const anthropic = new Anthropic();
+if (!process.env.APP_ANTHROPIC_API_KEY) {
+  throw new Error("APP_ANTHROPIC_API_KEY is not set");
+}
+const anthropic = new Anthropic({ apiKey: process.env.APP_ANTHROPIC_API_KEY });
 
 const MODEL = "claude-sonnet-5";
 const MAX_SEARCHES_PER_CANDIDATE = 2;

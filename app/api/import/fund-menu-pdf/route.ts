@@ -58,10 +58,10 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.APP_ANTHROPIC_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "ANTHROPIC_API_KEY is not configured on the server" },
+      { error: "APP_ANTHROPIC_API_KEY is not configured on the server" },
       { status: 500 },
     );
   }
@@ -128,7 +128,7 @@ export async function POST(request: NextRequest) {
     }
     if (err instanceof Anthropic.AuthenticationError) {
       return NextResponse.json(
-        { error: "Claude API authentication failed — check ANTHROPIC_API_KEY" },
+        { error: "Claude API authentication failed — check APP_ANTHROPIC_API_KEY" },
         { status: 500 },
       );
     }

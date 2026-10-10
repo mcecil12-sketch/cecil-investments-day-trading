@@ -28,11 +28,11 @@ function batchDate(n: number): Date {
   return new Date(Date.UTC(2026, 0, 1 + n * 7));
 }
 
-const originalApiKey = process.env.ANTHROPIC_API_KEY;
+const originalApiKey = process.env.APP_ANTHROPIC_API_KEY;
 
 afterEach(() => {
   vi.clearAllMocks();
-  process.env.ANTHROPIC_API_KEY = originalApiKey;
+  process.env.APP_ANTHROPIC_API_KEY = originalApiKey;
 });
 
 /**
@@ -100,7 +100,7 @@ describe("buildPerformanceAnalystContext", () => {
 
 describe("synthesizePerformanceAnalysis / runPerformanceAnalyst", () => {
   it("falls back without calling Claude when there are zero closed positions", async () => {
-    process.env.ANTHROPIC_API_KEY = "test-key";
+    process.env.APP_ANTHROPIC_API_KEY = "test-key";
     const context: PerformanceAnalystContext = {
       group: "GROUP_1",
       totalPositions: 1,
@@ -124,8 +124,8 @@ describe("synthesizePerformanceAnalysis / runPerformanceAnalyst", () => {
     expect(output.sentimentSignalNote).toBeNull();
   });
 
-  it("falls back without calling Claude when ANTHROPIC_API_KEY is missing", async () => {
-    delete process.env.ANTHROPIC_API_KEY;
+  it("falls back without calling Claude when APP_ANTHROPIC_API_KEY is missing", async () => {
+    delete process.env.APP_ANTHROPIC_API_KEY;
     const context: PerformanceAnalystContext = {
       group: "GROUP_1",
       totalPositions: 1,
@@ -150,7 +150,7 @@ describe("synthesizePerformanceAnalysis / runPerformanceAnalyst", () => {
   });
 
   it("forces sentimentSignalNote to null when sentimentDataSufficient is false, even if Claude reports a signal anyway (guards against fabricating a correlation from <2 weeks of sentiment history)", async () => {
-    process.env.ANTHROPIC_API_KEY = "test-key";
+    process.env.APP_ANTHROPIC_API_KEY = "test-key";
     messagesCreate.mockResolvedValueOnce({
       content: [
         {
@@ -196,7 +196,7 @@ describe("synthesizePerformanceAnalysis / runPerformanceAnalyst", () => {
   });
 
   it("passes a valid JSON serialization of the real performance context as Claude's user message", async () => {
-    process.env.ANTHROPIC_API_KEY = "test-key";
+    process.env.APP_ANTHROPIC_API_KEY = "test-key";
     candidateFindMany.mockResolvedValueOnce(group1Rows());
     getPriceHistory.mockResolvedValueOnce({
       symbol: "AAPL",
@@ -258,7 +258,7 @@ describe("computeFragilityStats guard", () => {
   });
 
   it("forces fragilityNote to null when fragility is null, even if Claude asserts a conclusion", async () => {
-    process.env.ANTHROPIC_API_KEY = "test-key";
+    process.env.APP_ANTHROPIC_API_KEY = "test-key";
     messagesCreate.mockResolvedValueOnce({
       content: [
         {
@@ -318,7 +318,7 @@ describe("computeInsiderStats guard + relative cut", () => {
   });
 
   it("forces insiderNote to null when insider is null, even if Claude asserts a conclusion", async () => {
-    process.env.ANTHROPIC_API_KEY = "test-key";
+    process.env.APP_ANTHROPIC_API_KEY = "test-key";
     messagesCreate.mockResolvedValueOnce({
       content: [
         {

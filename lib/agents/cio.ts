@@ -180,7 +180,7 @@ function taxableContextPrompt(context: TaxableAnalysisContext): string {
  * Sends this week's candidate findings (and, when available, taxable account
  * data) to Claude for natural-language synthesis, priority ranking, and a
  * Taxable Account Opportunities analysis. Falls back to the raw candidate
- * order (no throw, no taxable section) if ANTHROPIC_API_KEY is missing or the
+ * order (no throw, no taxable section) if APP_ANTHROPIC_API_KEY is missing or the
  * API call fails, since a CIO synthesis hiccup shouldn't block the underlying
  * agent runs from persisting.
  */
@@ -192,7 +192,7 @@ export async function synthesizeCioBrief(
     return { summary: fallbackSummary(candidates), orderedItems: [], taxableOpportunities: null };
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.APP_ANTHROPIC_API_KEY;
   if (!apiKey) {
     return { summary: fallbackSummary(candidates), orderedItems: candidates.slice(0, 8), taxableOpportunities: null };
   }

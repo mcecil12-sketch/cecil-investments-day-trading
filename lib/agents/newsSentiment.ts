@@ -108,12 +108,12 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T)
  * sentiment/news weight pending a real data source; this does not change
  * that. Runs a low-effort Claude call with web search per candidate and
  * keeps only genuinely material (watchout/tailwind) notes. Returns [] when
- * ANTHROPIC_API_KEY is missing or there are no candidates, so weekly brief
+ * APP_ANTHROPIC_API_KEY is missing or there are no candidates, so weekly brief
  * synthesis is never blocked by this step.
  */
 export async function generateNewsSentimentNotes(candidates: CandidateInput[]): Promise<NewsSentimentNote[]> {
   if (candidates.length === 0) return [];
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.APP_ANTHROPIC_API_KEY;
   if (!apiKey) return [];
 
   const client = new Anthropic({ apiKey });

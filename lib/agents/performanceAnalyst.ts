@@ -530,7 +530,7 @@ function fallbackOutput(context: PerformanceAnalystContext): PerformanceAnalystO
  * Sends the computed performance context to Claude for narrative synthesis
  * (see cio.ts's identical synthesize-then-fall-back-on-failure shape). Falls
  * back to a deterministic, no-fabrication output if there are no closed
- * positions yet, ANTHROPIC_API_KEY is missing, or the API call fails.
+ * positions yet, APP_ANTHROPIC_API_KEY is missing, or the API call fails.
  *
  * sentimentSignalNote is forced to null in code whenever
  * context.sentimentDataSufficient is false, regardless of what Claude
@@ -542,7 +542,7 @@ function fallbackOutput(context: PerformanceAnalystContext): PerformanceAnalystO
 export async function synthesizePerformanceAnalysis(context: PerformanceAnalystContext): Promise<PerformanceAnalystOutput> {
   if (context.closedPositions === 0) return fallbackOutput(context);
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.APP_ANTHROPIC_API_KEY;
   if (!apiKey) return fallbackOutput(context);
 
   const client = new Anthropic({ apiKey });
