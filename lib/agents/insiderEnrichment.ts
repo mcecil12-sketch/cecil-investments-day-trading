@@ -7,14 +7,16 @@ import {
   INSIDER_MAX_CALLS_PER_RUN,
   INSIDER_PACING_MS,
   INSIDER_WINDOW_DAYS,
+  type InsiderSource,
   type InsiderSummary,
 } from "@/lib/agents/insiderActivity";
+import { fetchInsiderWithFallback } from "@/lib/agents/insiderSources";
 
 /** Wall-clock budget for the insider pass, measured from the start of the function (route) that runs it — the routes' maxDuration is 240s; this leaves room for the final writes/health record. Same idea as the sentiment job's 225s guard. */
 export const INSIDER_PASS_DEADLINE_MS = 200_000;
 
 /** Don't start a call unless this much budget remains (one paced wait + a slow Alpha Vantage response). */
-const CALL_HEADROOM_MS = INSIDER_PACING_MS + 8_000;
+const CALL_HEADROOM_MS = 20_000;
 
 export interface InsiderPassCounters {
   insiderCallsUsed: number;
@@ -25,6 +27,11 @@ export interface InsiderPassCounters {
   insiderFailed: number;
   insiderSkippedByDeadline: number;
   deadlineHit: boolean;
+  /** Total HTTP requests made by the pass (EDGAR submissions + filings + any Alpha Vantage fallback), and per-source ticker counts. */
+  insiderRequests: number;
+  insiderFromEdgar: number;
+  insiderFromAlphaVantage: number;
+  elapsedMs: number;
 }
 
 /** Per-ticker diagnostics, returned by dry runs. null/0 fields mean the call failed. */
@@ -38,6 +45,15 @@ export interface InsiderTickerDiagnostics {
   /** null when failed or empty (renders as "n/a"), never 0-by-default. */
   netSoldUsd: number | null;
   responseKeys: string[];
+  /** Which source supplied the rows (null when both failed). */
+  source: InsiderSource | null;
+  /** Why EDGAR was not used for this ticker (set when Alpha Vantage supplied the data or both failed). */
+  edgarFailure: string | null;
+  requests: number;
+  filings: number | null;
+  /** Sale dollars flagged as Rule 10b5-1 plan sales (null when the source has no indicator). */
+  plannedSalesUsd: number | null;
+  elapsedMs: number;
 }
 
 export interface InsiderPassItem {
@@ -51,11 +67,11 @@ export interface InsiderPassOptions {
   deadlineMs?: number;
   asOf?: Date;
   /** Injected for tests; defaults to the real Alpha Vantage fetch. null = failure, [] = no transactions. */
-  fetchRows?: (symbol: string, from: Date) => Promise<InsiderRawRow[] | null | InsiderFetchResult>;
+  fetchRows?: (symbol: string, from: Date, ctx: { deadlineAtMs: number }) => Promise<InsiderRawRow[] | null | InsiderFetchResult>;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   /** Called right after each attempted symbol (summary null on failure) — the persistence hook, so progress survives a later timeout. */
-  onResult?: (item: InsiderPassItem, summary: InsiderSummary | null) => Promise<void>;
+  onResult?: (item: InsiderPassItem, summary: InsiderSummary | null, meta: { source: InsiderSource | null }) => Promise<void>;
 }
 
 /**
@@ -66,13 +82,14 @@ export interface InsiderPassOptions {
 export async function runInsiderPass(items: InsiderPassItem[], options: InsiderPassOptions = {}): Promise<InsiderPassCounters & { summaries: Map<string, InsiderSummary | null>; diagnostics: InsiderTickerDiagnostics[] }> {
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const fetchRows = options.fetchRows ?? fetchInsiderTransactionsDetailed;
+  const fetchRows = options.fetchRows ?? ((symbol: string, from: Date, ctx: { deadlineAtMs: number }) => fetchInsiderWithFallback(symbol, from, { deadlineAtMs: ctx.deadlineAtMs, now }));
   const startedAt = options.startedAtMs ?? now();
   const deadline = options.deadlineMs ?? INSIDER_PASS_DEADLINE_MS;
   const asOf = options.asOf ?? new Date();
   const from = new Date(asOf.getTime() - INSIDER_WINDOW_DAYS * 24 * 60 * 60 * 1000);
 
-  const counters: InsiderPassCounters = { insiderCallsUsed: 0, insiderSucceeded: 0, insiderEmpty: 0, insiderFailed: 0, insiderSkippedByDeadline: 0, deadlineHit: false };
+  const counters: InsiderPassCounters = { insiderCallsUsed: 0, insiderSucceeded: 0, insiderEmpty: 0, insiderFailed: 0, insiderSkippedByDeadline: 0, deadlineHit: false, insiderRequests: 0, insiderFromEdgar: 0, insiderFromAlphaVantage: 0, elapsedMs: 0 };
+  let lastSource: InsiderSource | null = null;
   const diagnostics: InsiderTickerDiagnostics[] = [];
   const summaries = new Map<string, InsiderSummary | null>();
 
@@ -84,26 +101,35 @@ export async function runInsiderPass(items: InsiderPassItem[], options: InsiderP
       counters.insiderSkippedByDeadline = items.length - i;
       break;
     }
-    if (counters.insiderCallsUsed > 0) await sleep(INSIDER_PACING_MS);
+    // Alpha Vantage needs its own pacing; the EDGAR client rate-limits itself.
+    if (counters.insiderCallsUsed > 0 && lastSource !== "edgar") await sleep(INSIDER_PACING_MS);
+    const tickerStart = now();
     counters.insiderCallsUsed++;
 
     let summary: InsiderSummary | null = null;
-    const diag: InsiderTickerDiagnostics = { symbol: item.symbol, status: "failed", failureReason: null, rowsReturned: 0, rowsInWindow: 0, saleRowsCounted: 0, netSoldUsd: null, responseKeys: [] };
+    const diag: InsiderTickerDiagnostics = { symbol: item.symbol, status: "failed", failureReason: null, rowsReturned: 0, rowsInWindow: 0, saleRowsCounted: 0, netSoldUsd: null, responseKeys: [], source: null, edgarFailure: null, requests: 0, filings: null, plannedSalesUsd: null, elapsedMs: 0 };
+    let aborted = false;
     try {
-      const raw = await fetchRows(item.symbol, from);
+      const raw = await fetchRows(item.symbol, from, { deadlineAtMs: startedAt + deadline - 1_000 });
       const result: InsiderFetchResult = Array.isArray(raw)
         ? { ok: true, rows: raw, responseKeys: [] }
         : raw == null
           ? { ok: false, reason: "fetch returned null", responseKeys: [] }
           : raw;
       diag.responseKeys = result.responseKeys;
+      diag.requests = result.meta?.requests ?? 0;
       if (!result.ok) {
+        if (result.aborted) aborted = true;
         diag.failureReason = result.reason;
       } else {
-        const s = summarizeInsiderActivity(result.rows, asOf);
+        diag.source = result.source ?? null;
+        diag.edgarFailure = result.meta?.edgarFailure ?? null;
+        diag.filings = result.meta?.filings ?? null;
+        const s = summarizeInsiderActivity(result.rows, asOf, result.fields);
         diag.rowsReturned = s.rowsReturned;
         diag.rowsInWindow = s.rowsInWindow;
         diag.saleRowsCounted = s.insiderSaleCount30d;
+        diag.plannedSalesUsd = s.plannedSalesUsd;
         if (s.rowsReturned === 0) {
           // A valid but empty response: no data to report (n/a), not "$0 sold".
           diag.status = "empty";
@@ -116,6 +142,18 @@ export async function runInsiderPass(items: InsiderPassItem[], options: InsiderP
     } catch (err) {
       diag.failureReason = err instanceof Error ? err.message.slice(0, 120) : "error";
     }
+    diag.elapsedMs = now() - tickerStart;
+    counters.insiderRequests += diag.requests;
+    if (aborted) {
+      // Out of time mid-ticker: leave this and the rest unattempted for a resumed pass.
+      counters.insiderCallsUsed--;
+      counters.deadlineHit = true;
+      counters.insiderSkippedByDeadline = items.length - i;
+      break;
+    }
+    lastSource = diag.source;
+    if (diag.source === "edgar") counters.insiderFromEdgar++;
+    else if (diag.source === "alphavantage") counters.insiderFromAlphaVantage++;
     if (diag.status === "ok") counters.insiderSucceeded++;
     else if (diag.status === "empty") counters.insiderEmpty++;
     else counters.insiderFailed++;
@@ -123,11 +161,12 @@ export async function runInsiderPass(items: InsiderPassItem[], options: InsiderP
     diagnostics.push(diag);
 
     try {
-      await options.onResult?.(item, summary);
+      await options.onResult?.(item, summary, { source: diag.source });
     } catch (err) {
       console.error(`[insider] persisting ${item.symbol} failed:`, err instanceof Error ? err.message : err);
     }
   }
+  counters.elapsedMs = now() - startedAt;
   return { ...counters, summaries, diagnostics };
 }
 
@@ -149,7 +188,7 @@ export interface EnrichResult extends InsiderPassCounters {
 export async function enrichInsiderForLatestMonthlyScan(
   options: InsiderPassOptions & { retryFailed?: boolean; /** Restrict to rows written by this scan run (the cron path); omitted = latest batch. */ sourceAgentRunId?: string } = {},
 ): Promise<EnrichResult> {
-  const empty: EnrichResult = { batchTag: null, rowsConsidered: 0, insiderCallsUsed: 0, insiderSucceeded: 0, insiderEmpty: 0, insiderFailed: 0, insiderSkippedByDeadline: 0, deadlineHit: false };
+  const empty: EnrichResult = { batchTag: null, rowsConsidered: 0, insiderCallsUsed: 0, insiderSucceeded: 0, insiderEmpty: 0, insiderFailed: 0, insiderSkippedByDeadline: 0, deadlineHit: false, insiderRequests: 0, insiderFromEdgar: 0, insiderFromAlphaVantage: 0, elapsedMs: 0 };
   try {
     const latest = await prisma.candidateRecommendationLog.findFirst({
       where: { group: "GROUP_3", ...(options.sourceAgentRunId ? { sourceAgentRunId: options.sourceAgentRunId } : {}) },
@@ -173,11 +212,12 @@ export async function enrichInsiderForLatestMonthlyScan(
 
     const result = await runInsiderPass(rows, {
       ...options,
-      onResult: async (item, summary) => {
+      onResult: async (item, summary, meta) => {
         await prisma.candidateRecommendationLog.update({
           where: { id: item.id },
           data: {
             insiderFetchedAt: new Date(),
+            insiderSource: meta.source,
             ...(summary
               ? {
                   insiderNetSoldUsd30d: summary.insiderNetSoldUsd30d,

@@ -99,6 +99,7 @@ describe("summarizeInsiderActivity", () => {
       skippedRows: 0,
       rowsReturned: 0,
       rowsInWindow: 0,
+      plannedSalesUsd: null,
     });
   });
 

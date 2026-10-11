@@ -12,7 +12,7 @@ export interface MonthlyScanDryRunReport {
   maxDurationMs: number;
   percentOfMaxDuration: number;
   counts: { universeSymbols: number; scored: number; skipped: number; ranked: number; wouldWriteRows: number };
-  insider: { insiderCallsUsed: number; insiderSucceeded: number; insiderEmpty: number; insiderFailed: number; insiderSkippedByDeadline: number; deadlineHit: boolean };
+  insider: { insiderCallsUsed: number; insiderSucceeded: number; insiderEmpty: number; insiderFailed: number; insiderSkippedByDeadline: number; deadlineHit: boolean; insiderRequests: number; insiderFromEdgar: number; insiderFromAlphaVantage: number; elapsedMs: number; /** True when every ranked name was fetched inside INSIDER_PASS_DEADLINE_MS — if false, enrichment needs more than one pass (resume with the enrich-insider route). */ fitsTimeBudget: boolean };
   fragilityFlagCount: number;
   /** One entry per ranked ticker: what the insider call actually returned and how it was counted. */
   insiderByTicker: InsiderTickerDiagnostics[];
@@ -73,6 +73,11 @@ export async function runMonthlyScanDryRun(
       insiderFailed: pass.insiderFailed,
       insiderSkippedByDeadline: pass.insiderSkippedByDeadline,
       deadlineHit: pass.deadlineHit,
+      insiderRequests: pass.insiderRequests,
+      insiderFromEdgar: pass.insiderFromEdgar,
+      insiderFromAlphaVantage: pass.insiderFromAlphaVantage,
+      elapsedMs: pass.elapsedMs,
+      fitsTimeBudget: !pass.deadlineHit && pass.insiderSkippedByDeadline === 0,
     },
     fragilityFlagCount: ranked.filter((c) => c.fragilityFlag === true).length,
     insiderByTicker: pass.diagnostics,

@@ -62,6 +62,8 @@ export interface InsiderSummary {
   /** Diagnostics: rows in the response, and rows inside the 30-day window (any code). */
   rowsReturned: number;
   rowsInWindow: number;
+  /** Sale dollars flagged as Rule 10b5-1 plan sales; null when no row carried the indicator (Alpha Vantage never does). */
+  plannedSalesUsd: number | null;
 }
 
 /** Form 4 transaction codes that count: open-market/plan sale and purchase. */
@@ -108,6 +110,7 @@ export function summarizeInsiderActivity(
   let skippedRows = 0;
   const sellers = new Set<string>();
   const plannedFlags: boolean[] = [];
+  let plannedSalesUsd = 0;
 
   for (const row of inWindow) {
     // Derivative rows (options/RSUs/...) are never counted, whatever their code.
@@ -129,7 +132,9 @@ export function summarizeInsiderActivity(
       sellers.add(str(row[fields.insider]));
       if (fields.plannedFlag != null && row[fields.plannedFlag] != null) {
         const v = row[fields.plannedFlag];
-        plannedFlags.push(v === true || v === "true" || v === "Y" || v === "1" || v === 1);
+        const planned = v === true || v === "true" || v === "Y" || v === "1" || v === 1;
+        plannedFlags.push(planned);
+        if (planned) plannedSalesUsd += shares * price;
       }
     } else {
       purchasesUsd += shares * price;
@@ -144,6 +149,7 @@ export function summarizeInsiderActivity(
     skippedRows,
     rowsReturned: rows.length,
     rowsInWindow: inWindow.length,
+    plannedSalesUsd: plannedFlags.length === 0 ? null : plannedSalesUsd,
   };
 }
 
@@ -155,9 +161,29 @@ function isoDay(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
+/** Where an insider summary's rows came from. */
+export type InsiderSource = "edgar" | "alphavantage";
+
 export type InsiderFetchResult =
-  | { ok: true; rows: InsiderRawRow[]; responseKeys: string[] }
-  | { ok: false; reason: string; responseKeys: string[] };
+  | {
+      ok: true;
+      rows: InsiderRawRow[];
+      responseKeys: string[];
+      source?: InsiderSource;
+      /** Field map to summarize these rows with (EDGAR rows carry a 10b5-1 flag). */
+      fields?: InsiderFieldMap;
+      /** Diagnostics: HTTP requests made / EDGAR filings fetched, and why a fallback happened. */
+      meta?: { requests?: number; filings?: number; truncatedFilings?: boolean; edgarFailure?: string };
+    }
+  | {
+      ok: false;
+      reason: string;
+      responseKeys: string[];
+      source?: InsiderSource;
+      /** The time budget ran out mid-ticker: not a failure of the ticker — the pass stops and leaves it unattempted. */
+      aborted?: boolean;
+      meta?: { requests?: number };
+    };
 
 /**
  * One Alpha Vantage INSIDER_TRANSACTIONS call, with the failure reason and the
@@ -183,7 +209,7 @@ export async function fetchInsiderTransactionsDetailed(symbol: string, fromDate:
     }
     const rows = record[INSIDER_FIELD_MAP.rows];
     if (!Array.isArray(rows)) return { ok: false, reason: `no "${INSIDER_FIELD_MAP.rows}" array in response`, responseKeys };
-    return { ok: true, rows: rows as InsiderRawRow[], responseKeys };
+    return { ok: true, rows: rows as InsiderRawRow[], responseKeys, source: "alphavantage" };
   } catch (err) {
     return { ok: false, reason: err instanceof Error ? err.message.slice(0, 120) : "network error", responseKeys: [] };
   }

@@ -138,6 +138,41 @@ insider deadline hit, or any Claude failure (missing key, API/billing errors —
 each recorded with its reason). FAILED on a thrown run or zero rows. Weekly
 scans skip the expected-row-count and insider checks.
 
+### Insider data source: SEC EDGAR primary, Alpha Vantage fallback (2026-10-12)
+
+Alpha Vantage returned empty `data` for 28 of 30 ranked names on the Oct 11
+dry run (including DELL, MU, AMD, NVDA), so coverage is unreliable. The enrich
+pass now tries **SEC EDGAR first** (`lib/agents/edgarInsider.ts`), per ticker:
+`company_tickers.json` (ticker -> CIK, cached 7 days) -> `data.sec.gov`
+submissions JSON -> Form 4s filed in the last 30 days -> each filing's raw XML
+-> non-derivative transactions (code, shares, price, acquired/disposed flag,
+owner, title, date). Same rule as before: only `S` and `P` on non-derivative
+common stock at a positive price count. If the filing carries the Rule 10b5-1
+checkbox (`aff10b5One`, Form 4 since 2023) it is recorded, so planned sales
+(`plannedSalesUsd`, shown in the dry-run panel) can be separated from
+discretionary ones; `insiderHas10b5_1` is set from it (null when no filing has
+the indicator).
+
+- **Fair access:** User-Agent `CecilInvestments insider-research (<SEC_CONTACT_EMAIL>)`.
+  **Set `SEC_CONTACT_EMAIL`** (a real contact address) in the environment; with
+  it unset EDGAR is skipped and every ticker uses Alpha Vantage. Requests are
+  spaced 220ms (< 5/s); HTTP 429/403 back off (2s, then 6s) and then fail; any
+  non-200, non-JSON, or non-Form-4 body is a FAILURE, never zero rows.
+- **Fallback:** EDGAR failure for a ticker (not configured, ticker not in the
+  SEC map, throttled, bad response) -> Alpha Vantage for that ticker. Both fail
+  -> FAILED. A valid empty EDGAR result stays "n/a" with `insiderFetchedAt` set
+  and does not trigger the fallback.
+- **Provenance:** `CandidateRecommendationLog.insiderSource` ("edgar" |
+  "alphavantage"; null if not attempted or both failed), shown in the dry-run
+  table with filings/requests per ticker and the EDGAR failure reason.
+- **Time budget:** same `INSIDER_PASS_DEADLINE_MS` (200s). One ticker costs
+  ~2 + (Form 4 filings in 30d) requests at ~4.5/s, so a name with 40 filings is
+  ~9s; the dry run reports total HTTP requests and elapsed time and whether all
+  names fit (`fitsTimeBudget`). If not, the pass stops cleanly mid-ticker
+  (unattempted, not failed) and the `enrich-insider` route resumes it; it stays
+  idempotent, and `?retryFailed=1` re-attempts rows that came back with no data.
+- At most 100 filings per ticker are read (`truncatedFilings` is reported).
+
 ### Insider selling (logging-only, monthly scan)
 
 **Oct 11 2026 root-cause fix.** The first dry run showed $0 net sold for every

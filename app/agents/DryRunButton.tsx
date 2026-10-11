@@ -45,7 +45,7 @@ export function DryRunButton({ endpoint }: { endpoint: string }) {
             Symbols: {report.counts.universeSymbols} universe · {report.counts.ranked} ranked · {report.counts.skipped} skipped · would write {report.counts.wouldWriteRows} rows · {report.fragilityFlagCount} fragile
           </p>
           <p>
-            Insider: {report.insider.insiderCallsUsed} calls · {report.insider.insiderSucceeded} ok · {report.insider.insiderEmpty} empty · {report.insider.insiderFailed} failed · {report.insider.insiderSkippedByDeadline} skipped by deadline{report.insider.deadlineHit ? " (deadline hit)" : ""}
+            Insider: {report.insider.insiderCallsUsed} calls · {report.insider.insiderSucceeded} ok · {report.insider.insiderEmpty} empty · {report.insider.insiderFailed} failed · {report.insider.insiderSkippedByDeadline} skipped by deadline{report.insider.deadlineHit ? " (deadline hit)" : ""} · {report.insider.insiderRequests} HTTP requests in {(report.insider.elapsedMs / 1000).toFixed(1)}s · EDGAR {report.insider.insiderFromEdgar} / Alpha Vantage {report.insider.insiderFromAlphaVantage} · {report.insider.fitsTimeBudget ? "fits the time budget" : "does NOT fit — needs resumed passes"}
           </p>
           <div className="table-wrap">
             <table>
@@ -72,18 +72,20 @@ export function DryRunButton({ endpoint }: { endpoint: string }) {
           <div className="table-wrap">
             <table>
               <thead>
-                <tr><th>Symbol</th><th>Status</th><th>Rows returned</th><th>In 30d window</th><th>Sale rows counted</th><th>Net sold</th><th>Response keys / failure</th></tr>
+                <tr><th>Symbol</th><th>Source</th><th>Status</th><th>Filings / requests</th><th>Rows returned</th><th>In 30d window</th><th>Sale rows counted</th><th>Net sold</th><th>Response keys / failure</th></tr>
               </thead>
               <tbody>
                 {report.insiderByTicker.map((t) => (
                   <tr key={t.symbol}>
                     <td>{t.symbol}</td>
+                    <td>{t.source ?? "—"}</td>
                     <td>{t.status}</td>
+                    <td className="mono">{t.filings ?? "—"} / {t.requests}</td>
                     <td className="mono">{t.rowsReturned}</td>
                     <td className="mono">{t.rowsInWindow}</td>
                     <td className="mono">{t.saleRowsCounted}</td>
                     <td className="mono">{t.netSoldUsd == null ? "n/a" : `$${Math.round(t.netSoldUsd).toLocaleString("en-US")}`}</td>
-                    <td className="mono" style={{ color: "var(--text-muted)" }}>{t.failureReason ?? t.responseKeys.join(", ")}</td>
+                    <td className="mono" style={{ color: "var(--text-muted)" }}>{t.edgarFailure ? `EDGAR failed: ${t.edgarFailure}` : t.failureReason ?? t.responseKeys.join(", ")}{t.plannedSalesUsd != null ? ` · 10b5-1 sales $${Math.round(t.plannedSalesUsd).toLocaleString("en-US")}` : ""}</td>
                   </tr>
                 ))}
               </tbody>
