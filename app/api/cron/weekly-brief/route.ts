@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { synthesizeWeeklyBrief } from "@/lib/agents/runner";
 import { sendWeeklyBriefNotification } from "@/lib/notifications/weeklyBrief";
+import { runCron } from "@/lib/agents/cronRun";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 240;
@@ -14,28 +15,31 @@ function isAuthorized(request: NextRequest): boolean {
 
 /**
  * Weekly brief resync + Pushover notification, scheduled Sunday evening via
- * vercel.json (`crons`) to match the household's weekly review cadence.
- * Previously sendWeeklyBriefNotification() only fired as a side effect of an
- * import or a manual Risk Manager run — on weeks with neither, no
- * notification went out at all. This resynthesizes from whatever agent runs
- * are already on hand (no agents are re-run here) and sends the
- * notification if one hasn't gone out today (see the once-per-day dedup
- * guard in lib/notifications/weeklyBrief.ts, which still applies in case an
- * import or manual run already sent one this week).
+ * vercel.json (`crons`) to match the household's weekly review cadence. This
+ * resynthesizes from whatever agent runs are already on hand (no agents are
+ * re-run here) and sends the notification if one hasn't gone out today (see
+ * the once-per-day dedup guard in lib/notifications/weeklyBrief.ts).
+ *
+ * Every invocation is recorded (ScanHealth "CRON:weekly-brief": a start row,
+ * then ok / failed / skipped + reason). A brief that was NOT written is a
+ * non-2xx response (422 skipped, 500 failed) — never a quiet 200.
  */
 export async function GET(request: NextRequest) {
   if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  try {
-    await synthesizeWeeklyBrief();
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error("weekly-brief cron: synthesizeWeeklyBrief failed:", message);
-    return NextResponse.json({ status: "FAILED", error: message }, { status: 500 });
-  }
-
-  const result = await sendWeeklyBriefNotification();
-  return NextResponse.json(result);
+  return runCron("weekly-brief", request, async () => {
+    const brief = await synthesizeWeeklyBrief();
+    if (brief.outcome === "skipped") {
+      return { outcome: "skipped", reason: brief.reason, warnings: brief.warnings };
+    }
+    const notification = await sendWeeklyBriefNotification();
+    return {
+      outcome: "ok",
+      warnings: brief.warnings,
+      body: { brief: brief.outcome, weekOf: brief.weekOf, notification },
+      metrics: { brief: brief.outcome, weekOf: brief.weekOf, notificationSent: notification.sent, notificationReason: notification.reason ?? null },
+    };
+  });
 }

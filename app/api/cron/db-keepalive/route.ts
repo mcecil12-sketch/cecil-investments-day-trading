@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { runCron } from "@/lib/agents/cronRun";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -27,12 +28,14 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    return NextResponse.json({ status: "OK" });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.warn("db-keepalive: ping failed (best-effort, no retry):", message);
-    return NextResponse.json({ status: "FAILED", error: message }, { status: 500 });
-  }
+  return runCron("db-keepalive", request, async () => {
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      return { outcome: "ok" };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn("db-keepalive: ping failed (best-effort, no retry):", message);
+      return { outcome: "failed", reason: message };
+    }
+  });
 }

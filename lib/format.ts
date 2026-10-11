@@ -48,6 +48,25 @@ export function formatDateTime(date: Date | null): string {
   });
 }
 
+/** Date + time in America/New_York with an explicit "ET" marker — for operational timestamps (runs, health), which are stored in UTC. */
+export function formatDateTimeET(date: Date | null): string {
+  if (!date) return "—";
+  return `${new Date(date).toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  })} ET`;
+}
+
+/** Calendar date stored as UTC midnight (e.g. a week-of date): formatted in UTC so it never slides back a day. */
+export function formatCalendarDate(date: Date | null): string {
+  if (!date) return "—";
+  return new Date(date).toLocaleDateString("en-US", { timeZone: "UTC", year: "numeric", month: "short", day: "numeric" });
+}
+
 export function alphaColor(alpha: number | null): string | undefined {
   if (alpha == null) return undefined;
   return alpha >= 0 ? "var(--positive)" : "var(--negative)";

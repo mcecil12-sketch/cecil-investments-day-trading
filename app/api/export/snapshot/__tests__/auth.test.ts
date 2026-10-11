@@ -26,6 +26,15 @@ describe("PIN gate on /api/export/snapshot", () => {
     },
   );
 
+  it.each(["db-keepalive", "earnings-estimates", "news-sentiment", "refresh-candidate-universe", "weekly-brief"])(
+    "lets /api/cron/%s through the PIN gate without a session cookie (each route enforces CRON_SECRET itself)",
+    async (name) => {
+      const res = await middleware(new NextRequest(`http://localhost/api/cron/${name}`, { headers: { "user-agent": "vercel-cron/1.0" } }));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-middleware-next")).toBe("1");
+    },
+  );
+
   it("rejects a forged session cookie", async () => {
     const res = await middleware(
       new NextRequest("http://localhost/api/export/snapshot", { headers: { cookie: "session=forged.token.value" } }),

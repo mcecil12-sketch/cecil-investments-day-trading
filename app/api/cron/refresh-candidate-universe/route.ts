@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { waitUntil } from "@vercel/functions";
 import { runAndPersistCandidateUniverseRefresh, runAndPersistMonthlyScan } from "@/lib/agents/runner";
+import { runMonthlyScanDryRun } from "@/lib/agents/monthlyScanDryRun";
+import { isDryRun, runCron } from "@/lib/agents/cronRun";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 240;
@@ -42,16 +44,31 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const result = await runAndPersistCandidateUniverseRefresh();
-  if (result.status === "FAILED") {
-    return NextResponse.json(result, { status: 500 });
+  // `?dryRun=1` proves the whole Nov 1 path (same auth, same route, same
+  // runtime limit) without writing data: the universe refresh and the log
+  // write are skipped, the monthly pipeline runs with real pacing, and the
+  // timing/diagnostic report is returned in the response. The only rows
+  // written are the cron's own start/finish ScanHealth rows (tagged dryRun).
+  if (isDryRun(request)) {
+    return runCron("refresh-candidate-universe", request, async () => {
+      const report = await runMonthlyScanDryRun();
+      return {
+        outcome: "ok",
+        body: { dryRun: true, universeRefresh: "skipped (dry run writes nothing)", report },
+        metrics: { dryRun: true, totalMs: report.totalMs, percentOfMaxDuration: report.percentOfMaxDuration, ranked: report.counts.ranked },
+      };
+    });
   }
 
-  waitUntil(
-    runAndPersistMonthlyScan("cron", { functionStartedAtMs }).catch((err) => {
-      console.error("Post-universe-refresh monthly scan failed:", err);
-    }),
-  );
+  return runCron("refresh-candidate-universe", request, async () => {
+    const result = await runAndPersistCandidateUniverseRefresh();
+    if (result.status === "FAILED") return { outcome: "failed", reason: result.error ?? "universe refresh failed", body: { ...result } };
 
-  return NextResponse.json(result);
+    waitUntil(
+      runAndPersistMonthlyScan("cron", { functionStartedAtMs }).catch((err) => {
+        console.error("Post-universe-refresh monthly scan failed:", err);
+      }),
+    );
+    return { outcome: "ok", body: { ...result } };
+  });
 }

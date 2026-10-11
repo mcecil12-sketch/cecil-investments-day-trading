@@ -286,15 +286,22 @@ export async function runAndPersistRiskManager(): Promise<RiskManagerRunResult> 
       ),
     ]);
 
+    // Each follow-on step is independent: a failed Candidate Scanner must not
+    // skip the brief (which falls back to the latest completed scan), and each
+    // failure is recorded (ScanHealth) rather than only logged.
     try {
       await runAndPersistCandidateScanner();
-      await synthesizeWeeklyBrief();
+    } catch (err) {
+      console.error("Candidate Scanner after Risk Manager run failed:", err);
+    }
+    try {
+      await synthesizeWeeklyBrief(); // records its own WEEKLY_BRIEF health, including skips and failures
       const notificationResult = await sendWeeklyBriefNotification();
       if (!notificationResult.sent) {
         console.log("Weekly brief notification not sent:", notificationResult.reason);
       }
     } catch (err) {
-      console.error("Candidate Scanner / CIO synthesis after Risk Manager run failed:", err);
+      console.error("CIO synthesis after Risk Manager run failed:", err);
     }
 
     return { runId: run.id, status: "COMPLETE", output };
@@ -894,48 +901,81 @@ async function buildCioCandidates(): Promise<{
  * once in the same week (e.g. on every import) just refreshes that week's
  * one row instead of producing extra research runs.
  */
-export async function synthesizeWeeklyBrief(): Promise<void> {
+export type WeeklyBriefOutcome = "created" | "updated" | "skipped";
+
+export interface WeeklyBriefResult {
+  outcome: WeeklyBriefOutcome;
+  /** Why nothing was written (outcome "skipped"). */
+  reason?: string;
+  weekOf?: string;
+  /** Non-fatal step problems (a timed-out or failed enrichment); the brief itself was still written. */
+  warnings: string[];
+}
+
+/** Per-step budgets so a slow enrichment can never stop the brief from being written (see synthesizeWeeklyBriefInner). */
+export const BRIEF_NEWS_TIMEOUT_MS = 90_000;
+export const BRIEF_ANALYST_TIMEOUT_MS = 60_000;
+
+async function withTimeout<T>(label: string, ms: number, fn: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      fn(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Builds/refreshes this week's brief and records a WEEKLY_BRIEF ScanHealth
+ * row. Never returns void: every non-write is an explicit "skipped" with a
+ * reason (callers turn that into a non-2xx), and a throw is recorded as FAILED
+ * before being re-thrown.
+ */
+export async function synthesizeWeeklyBrief(): Promise<WeeklyBriefResult> {
   const startedAtMs = Date.now();
   const captured = await captureClaudeFailures(() => synthesizeWeeklyBriefInner());
+  const result = captured.value;
   await recordScanHealth(
     classifyScanHealth({
       kind: "WEEKLY_BRIEF",
-      runFailed: captured.error ? (captured.error instanceof Error ? captured.error.message : String(captured.error)) : null,
+      runFailed: captured.error
+        ? captured.error instanceof Error
+          ? captured.error.message
+          : String(captured.error)
+        : result?.outcome === "skipped"
+          ? `Brief not written: ${result.reason}`
+          : null,
+      extraReasons: result?.warnings ?? [],
       claudeFailures: captured.failures,
       durationMs: Date.now() - startedAtMs,
       limitMs: 240_000,
     }),
   );
   if (captured.error) throw captured.error;
+  return result!;
 }
 
-async function synthesizeWeeklyBriefInner(): Promise<void> {
+async function synthesizeWeeklyBriefInner(): Promise<WeeklyBriefResult> {
+  const warnings: string[] = [];
   const { candidates, taxableContext, candidateRun } = await buildCioCandidates();
-  if (candidates.length === 0) return;
+  if (candidates.length === 0) {
+    return { outcome: "skipped", reason: "No candidate items: no completed Risk Manager / Relative Strength / Sector Rotation / Candidate Scanner output to synthesize", warnings };
+  }
 
   const brief = await synthesizeCioBrief(candidates, taxableContext);
-  if (brief.orderedItems.length === 0) return;
-
-  let newsSentimentNotes: NewsSentimentNote[] = [];
-  if (candidateRun?.output) {
-    const output = candidateRun.output as unknown as CandidateScannerOutput;
-    try {
-      newsSentimentNotes = await generateNewsSentimentNotes(
-        output.topCandidates.map((c) => ({ symbol: c.symbol, name: c.name })),
-      );
-    } catch (err) {
-      console.error("News sentiment generation failed:", err);
-    }
+  if (brief.orderedItems.length === 0) {
+    return { outcome: "skipped", reason: "CIO synthesis returned no action items", warnings };
   }
 
-  let performanceAnalysis: PerformanceAnalystOutput | null = null;
-  try {
-    const result = await runAndPersistPerformanceAnalyst();
-    if (result.status === "COMPLETE") performanceAnalysis = result.output ?? null;
-  } catch (err) {
-    console.error("Performance Analyst run failed:", err);
-  }
-
+  // Log first, enrich second (same ordering as the monthly scan): write the
+  // brief row as soon as the CIO synthesis exists, THEN add the slow optional
+  // sections (news notes, Performance Analyst) by update. A slow or dead
+  // enrichment step can no longer cost the whole week's brief.
   const weekOf = startOfWeekUTC(new Date());
   const actionItemsData = brief.orderedItems.map((item, i) => ({
     agentRunId: item.agentRunId,
@@ -946,38 +986,70 @@ async function synthesizeWeeklyBriefInner(): Promise<void> {
     priority: i + 1,
   }));
   const taxableOpportunities = (brief.taxableOpportunities ?? Prisma.JsonNull) as unknown as Prisma.InputJsonValue;
-  const newsSentimentNotesData = (
-    newsSentimentNotes.length > 0 ? newsSentimentNotes : Prisma.JsonNull
-  ) as unknown as Prisma.InputJsonValue;
-  const performanceAnalysisData = (performanceAnalysis ?? Prisma.JsonNull) as unknown as Prisma.InputJsonValue;
 
   const existing = await prisma.weeklyBrief.findUnique({ where: { weekOf } });
+  let briefId: string;
   if (existing) {
     await prisma.$transaction([
       prisma.actionItem.deleteMany({ where: { weeklyBriefId: existing.id } }),
       prisma.weeklyBrief.update({
         where: { id: existing.id },
-        data: {
-          cioSummary: brief.summary,
-          taxableOpportunities,
-          newsSentimentNotes: newsSentimentNotesData,
-          performanceAnalysis: performanceAnalysisData,
-          actionItems: { create: actionItemsData },
-        },
+        data: { cioSummary: brief.summary, taxableOpportunities, actionItems: { create: actionItemsData } },
       }),
     ]);
+    briefId = existing.id;
   } else {
-    await prisma.weeklyBrief.create({
+    const created = await prisma.weeklyBrief.create({
       data: {
         weekOf,
         cioSummary: brief.summary,
         taxableOpportunities,
-        newsSentimentNotes: newsSentimentNotesData,
-        performanceAnalysis: performanceAnalysisData,
+        newsSentimentNotes: Prisma.JsonNull,
+        performanceAnalysis: Prisma.JsonNull,
         actionItems: { create: actionItemsData },
       },
     });
+    briefId = created.id;
   }
+
+  const enrichment: { newsSentimentNotes?: Prisma.InputJsonValue; performanceAnalysis?: Prisma.InputJsonValue } = {};
+
+  if (candidateRun?.output) {
+    const output = candidateRun.output as unknown as CandidateScannerOutput;
+    try {
+      const notes: NewsSentimentNote[] = await withTimeout("News sentiment notes", BRIEF_NEWS_TIMEOUT_MS, () =>
+        generateNewsSentimentNotes(output.topCandidates.map((c) => ({ symbol: c.symbol, name: c.name }))),
+      );
+      enrichment.newsSentimentNotes = (notes.length > 0 ? notes : Prisma.JsonNull) as unknown as Prisma.InputJsonValue;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("News sentiment generation failed:", err);
+      warnings.push(`News sentiment notes step failed: ${message}`);
+    }
+  }
+
+  try {
+    const result = await withTimeout("Performance Analyst", BRIEF_ANALYST_TIMEOUT_MS, () => runAndPersistPerformanceAnalyst());
+    if (result.status === "COMPLETE") {
+      enrichment.performanceAnalysis = (result.output ?? Prisma.JsonNull) as unknown as Prisma.InputJsonValue;
+    } else {
+      warnings.push(`Performance Analyst run failed: ${result.error ?? "unknown error"}`);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("Performance Analyst run failed:", err);
+    warnings.push(`Performance Analyst step failed: ${message}`);
+  }
+
+  if (Object.keys(enrichment).length > 0) {
+    try {
+      await prisma.weeklyBrief.update({ where: { id: briefId }, data: enrichment });
+    } catch (err) {
+      warnings.push(`Could not save news/analyst sections: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  return { outcome: existing ? "updated" : "created", weekOf: weekOf.toISOString().slice(0, 10), warnings };
 }
 
 /**

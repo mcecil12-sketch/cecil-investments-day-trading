@@ -8,10 +8,11 @@ import type { CandidateScannerOutput, CandidateEntry } from "@/lib/agents/candid
 import type { MonthlyScanOutput, MonthlyScanCandidateEntry } from "@/lib/agents/monthlyScan";
 import type { CioTaxableOpportunities } from "@/lib/agents/cio";
 import type { NewsSentimentNote } from "@/lib/agents/newsSentiment";
-import { alphaColor, formatCompactCurrency, formatCurrency, formatDate, formatDateTime, formatPercent } from "@/lib/format";
+import { alphaColor, formatCompactCurrency, formatCurrency, formatCalendarDate, formatDateTimeET, formatPercent } from "@/lib/format";
 import { RunAgentButton } from "./RunAgentButton";
 import { DryRunButton } from "./DryRunButton";
 import { getLatestScanHealth, type LatestScanHealth } from "@/lib/agents/scanHealth";
+import { getRecentCronRuns, summarizeCronRuns, type CronLatest } from "@/lib/agents/cronRun";
 import { AgentStatusPoller } from "./AgentStatusPoller";
 import type { AgentStatusResponse } from "@/app/api/agents/status/route";
 
@@ -525,6 +526,12 @@ export default async function AgentsPage() {
     monthlyScan: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "MONTHLY_SCAN")]?.status ?? null,
   };
 
+  let cronLatest: CronLatest[] = [];
+  try {
+    cronLatest = summarizeCronRuns(await getRecentCronRuns(40));
+  } catch (err) {
+    console.error("getRecentCronRuns failed:", err);
+  }
   let scanHealth: LatestScanHealth[] = [];
   try {
     scanHealth = await getLatestScanHealth();
@@ -542,8 +549,15 @@ export default async function AgentsPage() {
         {scanHealth.length === 0
           ? "no results yet"
           : scanHealth
-              .map((h) => `${h.kind.replace("_", " ").toLowerCase()} ${h.status}${h.status === "HEALTHY" ? "" : ` (${h.reasons.length} issue${h.reasons.length === 1 ? "" : "s"})`} · ${formatDate(h.createdAt)}`)
+              .map((h) => `${h.kind.replace("_", " ").toLowerCase()} ${h.status}${h.status === "HEALTHY" ? "" : ` (${h.reasons.length} issue${h.reasons.length === 1 ? "" : "s"})`} · ${formatDateTimeET(h.createdAt)}`)
               .join("  |  ")}
+      </p>
+
+      <p style={{ fontSize: "0.82rem", color: "var(--text-muted)" }} title={cronLatest.flatMap((c) => c.reasons).join("\n")}>
+        Cron runs (ET):{" "}
+        {cronLatest.length === 0
+          ? "none recorded yet"
+          : cronLatest.map((c) => `${c.name} ${c.state}${c.reasons[0] ? ` — ${c.reasons[0]}` : ""} · ${formatDateTimeET(c.at)}`).join("  |  ")}
       </p>
 
       <div className="card card-accent">
@@ -551,7 +565,7 @@ export default async function AgentsPage() {
           <strong>CIO Weekly Action List</strong>
           {weeklyBrief && (
             <span style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>
-              Week of {formatDate(weeklyBrief.weekOf)}
+              Week of {formatCalendarDate(weeklyBrief.weekOf)}
             </span>
           )}
         </div>
@@ -670,7 +684,7 @@ export default async function AgentsPage() {
               </div>
               <div className="agent-last-run">
                 {run
-                  ? `Last run ${formatDateTime(run.completedAt ?? run.startedAt)}`
+                  ? `Last run ${formatDateTimeET(run.completedAt ?? run.startedAt)}`
                   : def.implemented
                     ? "Never run"
                     : "Not yet built"}

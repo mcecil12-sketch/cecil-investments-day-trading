@@ -311,7 +311,7 @@ export function buildSnapshotMarkdown(data: SnapshotData): string {
   if (!data.brief) out.push(...missing("brief"));
   else {
     const age = briefAgeDays(data.brief.weekOf, now);
-    out.push(`Week of ${etDate(data.brief.weekOf)} (age: ${age} days)`);
+    out.push(`Week of ${data.brief.weekOf.toISOString().slice(0, 10)} (age: ${age} days)`);
     if (age > STALE_BRIEF_DAYS) out.push("", `**STALE: this brief is ${age} days old, treat positions and recommendations as out of date**`);
     out.push("", "### CIO narrative", data.brief.cioSummary, "", "### Performance Analyst");
     const pa = data.brief.performanceAnalysis;

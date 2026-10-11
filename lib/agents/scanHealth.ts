@@ -2,6 +2,8 @@ import { prisma } from "@/lib/prisma";
 import type { ClaudeFailure } from "@/lib/agents/claudeFailures";
 
 export type ScanHealthKind = "MONTHLY_SCAN" | "WEEKLY_SCAN" | "WEEKLY_BRIEF";
+/** Cron invocations are recorded under "CRON:<name>" (see cronRun.ts). */
+export type ScanHealthRecordKind = ScanHealthKind | `CRON:${string}`;
 export type ScanHealthStatus = "HEALTHY" | "DEGRADED" | "FAILED";
 
 export const MONTHLY_EXPECTED_ROWS = 30;
@@ -29,13 +31,15 @@ export interface ScanHealthInput {
   insiderDeadlineHit?: boolean;
   insiderCounters?: { insiderCallsUsed: number; insiderSucceeded: number; insiderEmpty?: number; insiderFailed: number; insiderSkippedByDeadline: number } | null;
   claudeFailures?: ClaudeFailure[];
+  /** Non-fatal problems that should degrade the run (e.g. a skipped enrichment step). */
+  extraReasons?: string[];
   sentimentCoveredSymbols?: number | null;
   durationMs?: number | null;
   limitMs?: number | null;
 }
 
 export interface ScanHealthResult {
-  kind: ScanHealthKind;
+  kind: ScanHealthRecordKind;
   status: ScanHealthStatus;
   reasons: string[];
   metrics: Record<string, unknown>;
@@ -84,6 +88,7 @@ export function classifyScanHealth(input: ScanHealthInput): ScanHealthResult {
     }
   }
   if (input.insiderDeadlineHit) reasons.push("Insider pass hit its wall-clock deadline; remaining rows left unattempted.");
+  for (const r of input.extraReasons ?? []) reasons.push(r);
   for (const f of input.claudeFailures ?? []) reasons.push(`Claude call failed — ${f.source}: ${f.reason}`);
 
   const status: ScanHealthStatus = failed ? "FAILED" : reasons.length > 0 ? "DEGRADED" : "HEALTHY";

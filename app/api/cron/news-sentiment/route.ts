@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { runAndPersistSentimentRefresh } from "@/lib/agents/runner";
+import { runCron } from "@/lib/agents/cronRun";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 240;
@@ -24,9 +25,9 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const result = await runAndPersistSentimentRefresh();
-  if (result.status === "FAILED") {
-    return NextResponse.json(result, { status: 500 });
-  }
-  return NextResponse.json(result);
+  return runCron("news-sentiment", request, async () => {
+    const result = await runAndPersistSentimentRefresh();
+    if (result.status === "FAILED") return { outcome: "failed", reason: result.error ?? "refresh failed", body: { ...result } };
+    return { outcome: "ok", body: { ...result } };
+  });
 }
