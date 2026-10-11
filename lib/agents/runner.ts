@@ -513,6 +513,7 @@ async function recordMonthlyScanHealth(
           ? {
               insiderCallsUsed: ctx.enrich.insiderCallsUsed,
               insiderSucceeded: ctx.enrich.insiderSucceeded,
+              insiderEmpty: ctx.enrich.insiderEmpty,
               insiderFailed: ctx.enrich.insiderFailed,
               insiderSkippedByDeadline: ctx.enrich.insiderSkippedByDeadline,
             }

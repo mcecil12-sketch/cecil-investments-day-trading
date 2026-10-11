@@ -21,17 +21,26 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Every field-name assumption about the Alpha Vantage response lives here.
- * Verified 2026-10-06 against a real STX response: { data: [ { transaction_date,
- * ticker, executive, executive_title, security_type, acquisition_or_disposal
- * ("A"|"D"), shares, share_price } ] }, all values strings. The response has
- * NO transaction code (open-market sale vs. tax withholding vs. gift vs.
- * exercise) and NO 10b5-1 indicator, hence plannedFlag: null (always null).
+ * Response: { data: [ { transaction_date, ticker, executive, executive_title,
+ * security_type, acquisition_or_disposal, shares, share_price } ] }, all values
+ * strings.
+ *
+ * Oct 11 2026 ROOT-CAUSE FIX: `acquisition_or_disposal` carries the SEC Form 4
+ * TRANSACTION CODE (S sale, P purchase, M option exercise, F tax withholding,
+ * A award, G gift, X, J, L, C ...), NOT the "A"/"D" acquired/disposed flag the
+ * 2026-10-06 version of this parser assumed. Filtering on A/D matched no row,
+ * so every ticker summarized to $0. Only S (sale) and P (purchase) count now;
+ * everything else (exercises, withholding, awards, gifts) is excluded. This
+ * also makes the figure a much tighter measure of discretionary selling than
+ * the old "D = upper bound" version — S still includes 10b5-1 plan sales (no
+ * planned-sale flag in the response, hence plannedFlag: null).
  */
 export const INSIDER_FIELD_MAP = {
   rows: "data",
   date: "transaction_date",
   insider: "executive",
   securityType: "security_type",
+  /** Holds the Form 4 transaction code (see above); name kept for compatibility. */
   direction: "acquisition_or_disposal",
   shares: "shares",
   price: "share_price",
@@ -50,9 +59,16 @@ export interface InsiderSummary {
   insiderHas10b5_1: boolean | null;
   /** Debug only — logged, not stored: in-window ordinary-share rows skipped for a missing/unparseable shares or price. */
   skippedRows: number;
+  /** Diagnostics: rows in the response, and rows inside the 30-day window (any code). */
+  rowsReturned: number;
+  rowsInWindow: number;
 }
 
-/** Derivative / non-common instruments: their own rows are never counted, and a same-day same-insider one marks an option exercise. */
+/** Form 4 transaction codes that count: open-market/plan sale and purchase. */
+const SALE_CODE = "S";
+const PURCHASE_CODE = "P";
+
+/** Derivative / non-common instruments: their own rows are never counted. */
 const DERIVATIVE_SECURITY = /option|unit|warrant|right|derivative|convertible|restricted|performance|swap|forward/i;
 
 function parseNumber(value: unknown): number | null {
@@ -67,19 +83,13 @@ function str(value: unknown): string {
 
 /**
  * Summarizes the trailing 30 days (asOf - 30d, asOf] using ONLY these rows:
- * - Sale: non-derivative security (e.g. "Ordinary Shares"), direction "D",
- *   shares > 0 and price > 0.
- * - Purchase: non-derivative security, direction "A", shares > 0 and price > 0,
- *   and the same insider has NO derivative-security row (option/RSU/PSU...)
- *   that same day — an "A" at a positive price alongside a derivative row is
- *   an option exercise acquired at its strike price, not an open-market buy.
- * Excluded: every derivative-security row; any row with price 0 (awards, RSU
- * vests, gifts); rows outside the window.
- * KNOWN LIMIT: the API has no transaction code, so "D" rows at a positive
- * price include tax withholding and exercise-and-sell lots as well as true
- * open-market sales — insiderNetSoldUsd30d is an upper bound on discretionary
- * selling. Dollar value = shares * price per row; rows missing either are
- * skipped and counted in skippedRows.
+ * - Sale: non-derivative security, transaction code "S", shares > 0, price > 0.
+ * - Purchase: non-derivative security, code "P", shares > 0, price > 0.
+ * Everything else is excluded (M exercise, F tax withholding, A award, G gift,
+ * derivative rows, price-0 rows, rows outside the window). KNOWN LIMIT: "S"
+ * includes sales under 10b5-1 plans; the response has no planned-sale flag.
+ * Dollar value = shares * price per row; rows missing either are skipped and
+ * counted in skippedRows.
  */
 export function summarizeInsiderActivity(
   rows: InsiderRawRow[],
@@ -92,12 +102,6 @@ export function summarizeInsiderActivity(
     return Number.isFinite(t) && t > windowStart && t <= asOf.getTime();
   });
 
-  const derivativeDays = new Set(
-    inWindow
-      .filter((r) => DERIVATIVE_SECURITY.test(str(r[fields.securityType])))
-      .map((r) => `${str(r[fields.insider])}@@${str(r[fields.date])}`),
-  );
-
   let salesUsd = 0;
   let purchasesUsd = 0;
   let saleCount = 0;
@@ -106,10 +110,10 @@ export function summarizeInsiderActivity(
   const plannedFlags: boolean[] = [];
 
   for (const row of inWindow) {
-    const securityType = str(row[fields.securityType]);
-    if (DERIVATIVE_SECURITY.test(securityType)) continue;
-    const direction = str(row[fields.direction]).toUpperCase();
-    if (direction !== "A" && direction !== "D") continue;
+    // Derivative rows (options/RSUs/...) are never counted, whatever their code.
+    if (DERIVATIVE_SECURITY.test(str(row[fields.securityType]))) continue;
+    const code = str(row[fields.direction]).trim().toUpperCase();
+    if (code !== SALE_CODE && code !== PURCHASE_CODE) continue;
 
     const shares = parseNumber(row[fields.shares]);
     const price = parseNumber(row[fields.price]);
@@ -119,16 +123,15 @@ export function summarizeInsiderActivity(
     }
     if (shares <= 0 || price <= 0) continue;
 
-    const insider = str(row[fields.insider]);
-    if (direction === "D") {
+    if (code === SALE_CODE) {
       salesUsd += shares * price;
       saleCount++;
-      sellers.add(insider);
+      sellers.add(str(row[fields.insider]));
       if (fields.plannedFlag != null && row[fields.plannedFlag] != null) {
         const v = row[fields.plannedFlag];
         plannedFlags.push(v === true || v === "true" || v === "Y" || v === "1" || v === 1);
       }
-    } else if (!derivativeDays.has(`${insider}@@${str(row[fields.date])}`)) {
+    } else {
       purchasesUsd += shares * price;
     }
   }
@@ -139,6 +142,8 @@ export function summarizeInsiderActivity(
     insiderSellers30d: sellers.size,
     insiderHas10b5_1: plannedFlags.length === 0 ? null : plannedFlags.some(Boolean),
     skippedRows,
+    rowsReturned: rows.length,
+    rowsInWindow: inWindow.length,
   };
 }
 
@@ -150,26 +155,44 @@ function isoDay(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
+export type InsiderFetchResult =
+  | { ok: true; rows: InsiderRawRow[]; responseKeys: string[] }
+  | { ok: false; reason: string; responseKeys: string[] };
+
 /**
- * One Alpha Vantage INSIDER_TRANSACTIONS call. Returns the raw rows ([] when
- * the symbol has none in range), or null on any failure — missing key, HTTP
- * error, rate-limit/premium message, or an unrecognized body. Never throws.
+ * One Alpha Vantage INSIDER_TRANSACTIONS call, with the failure reason and the
+ * response's top-level keys for diagnostics. Alpha Vantage answers rate-limit
+ * and plan problems with HTTP 200 and an "Information"/"Note"/"Error Message"
+ * body, so ANY response carrying one of those keys, or lacking the expected
+ * `data` array, is a FAILURE — never an ok-with-zero-rows. Never throws.
  */
-export async function fetchInsiderTransactions(symbol: string, fromDate: Date): Promise<InsiderRawRow[] | null> {
+export async function fetchInsiderTransactionsDetailed(symbol: string, fromDate: Date): Promise<InsiderFetchResult> {
   const apiKey = process.env.ALPHA_VANTAGE_API_KEY;
-  if (!apiKey) return null;
+  if (!apiKey) return { ok: false, reason: "ALPHA_VANTAGE_API_KEY is not configured", responseKeys: [] };
 
   const url = `${ALPHA_VANTAGE_BASE_URL}?function=INSIDER_TRANSACTIONS&symbol=${encodeURIComponent(symbol)}&from=${isoDay(fromDate)}&apikey=${apiKey}`;
   try {
     const response = await fetch(url, { cache: "no-store" });
-    if (!response.ok) return null;
-    const body = (await response.json()) as Record<string, unknown>;
-    if (body.Note || body.Information || body["Error Message"]) return null;
-    const rows = body[INSIDER_FIELD_MAP.rows];
-    return Array.isArray(rows) ? (rows as InsiderRawRow[]) : null;
-  } catch {
-    return null;
+    if (!response.ok) return { ok: false, reason: `HTTP ${response.status}`, responseKeys: [] };
+    const body = (await response.json()) as unknown;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, reason: "response was not a JSON object", responseKeys: [] };
+    const record = body as Record<string, unknown>;
+    const responseKeys = Object.keys(record);
+    for (const key of ["Information", "Note", "Error Message"]) {
+      if (record[key]) return { ok: false, reason: `${key}: ${String(record[key]).slice(0, 120)}`, responseKeys };
+    }
+    const rows = record[INSIDER_FIELD_MAP.rows];
+    if (!Array.isArray(rows)) return { ok: false, reason: `no "${INSIDER_FIELD_MAP.rows}" array in response`, responseKeys };
+    return { ok: true, rows: rows as InsiderRawRow[], responseKeys };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message.slice(0, 120) : "network error", responseKeys: [] };
   }
+}
+
+/** Raw rows ([] when none in range), or null on any failure. Never throws. */
+export async function fetchInsiderTransactions(symbol: string, fromDate: Date): Promise<InsiderRawRow[] | null> {
+  const result = await fetchInsiderTransactionsDetailed(symbol, fromDate);
+  return result.ok ? result.rows : null;
 }
 
 /**

@@ -12,7 +12,7 @@ import {
 } from "@/lib/agents/scoringShared";
 import { getMonthlyScanEarningsScores } from "@/lib/agents/monthlyScanEarnings";
 import type { EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
-import { computeFragility } from "@/lib/agents/fragilityScore";
+import { applyFragilityCohort, computeFragility } from "@/lib/agents/fragilityScore";
 import { getNewsSentimentScores, type NewsSentimentCoverage } from "@/lib/agents/newsSentimentScore";
 import type { CandidateAccountType } from "@/lib/agents/candidateScanner";
 import { formatPercent } from "@/lib/format";
@@ -44,6 +44,9 @@ export interface MonthlyScanCandidateEntry {
   /** Logging-only fragility signals (see fragilityScore.ts) — NOT part of `score`. Null when price history is too short. */
   extensionVs200d: number | null;
   vol60d: number | null;
+  /** 0-100 mean percentile rank of extension and vol within this scan's ranked cohort (see applyFragilityCohort). */
+  fragilityPercentile: number | null;
+  /** Top third of the cohort by fragilityPercentile. Relative since Oct 11 2026. */
   fragilityFlag: boolean | null;
   /** Logging-only insider-selling signals (see insiderActivity.ts) — NOT part of `score`. Populated for every ranked candidate of a cron run; null on manual runs or fetch failure. */
   insiderNetSoldUsd30d: number | null;
@@ -240,6 +243,8 @@ export async function runMonthlyScanAgent(
   const rankedCandidates: MonthlyScanCandidateEntry[] = scored
     .slice(0, MAX_TRACKED_CANDIDATES)
     .map((entry, i) => ({ ...entry, rank: i + 1 }));
+  // Logging-only, after ranking: cohort-relative fragility (never affects score/rank).
+  applyFragilityCohort(rankedCandidates);
 
   endPhase("pricesFragilityScoringRanking");
 

@@ -1,5 +1,5 @@
 import { runMonthlyScanAgent, MAX_TRACKED_CANDIDATES, type MonthlyScanDiagnostics } from "@/lib/agents/monthlyScan";
-import { runInsiderPass, INSIDER_PASS_DEADLINE_MS, type InsiderPassOptions } from "@/lib/agents/insiderEnrichment";
+import { runInsiderPass, INSIDER_PASS_DEADLINE_MS, type InsiderPassOptions, type InsiderTickerDiagnostics } from "@/lib/agents/insiderEnrichment";
 
 export const MONTHLY_ROUTE_MAX_DURATION_MS = 240_000;
 
@@ -12,14 +12,17 @@ export interface MonthlyScanDryRunReport {
   maxDurationMs: number;
   percentOfMaxDuration: number;
   counts: { universeSymbols: number; scored: number; skipped: number; ranked: number; wouldWriteRows: number };
-  insider: { insiderCallsUsed: number; insiderSucceeded: number; insiderFailed: number; insiderSkippedByDeadline: number; deadlineHit: boolean };
+  insider: { insiderCallsUsed: number; insiderSucceeded: number; insiderEmpty: number; insiderFailed: number; insiderSkippedByDeadline: number; deadlineHit: boolean };
   fragilityFlagCount: number;
+  /** One entry per ranked ticker: what the insider call actually returned and how it was counted. */
+  insiderByTicker: InsiderTickerDiagnostics[];
   top10: Array<{
     rank: number;
     symbol: string;
     composite: number;
     extensionVs200d: number | null;
     vol60d: number | null;
+    fragilityPercentile: number | null;
     fragilityFlag: boolean | null;
     insiderNetSoldUsd30d: number | null;
   }>;
@@ -66,17 +69,20 @@ export async function runMonthlyScanDryRun(
     insider: {
       insiderCallsUsed: pass.insiderCallsUsed,
       insiderSucceeded: pass.insiderSucceeded,
+      insiderEmpty: pass.insiderEmpty,
       insiderFailed: pass.insiderFailed,
       insiderSkippedByDeadline: pass.insiderSkippedByDeadline,
       deadlineHit: pass.deadlineHit,
     },
     fragilityFlagCount: ranked.filter((c) => c.fragilityFlag === true).length,
+    insiderByTicker: pass.diagnostics,
     top10: ranked.slice(0, 10).map((c) => ({
       rank: c.rank,
       symbol: c.symbol,
       composite: c.score,
       extensionVs200d: c.extensionVs200d,
       vol60d: c.vol60d,
+      fragilityPercentile: c.fragilityPercentile,
       fragilityFlag: c.fragilityFlag,
       insiderNetSoldUsd30d: pass.summaries.get(c.symbol)?.insiderNetSoldUsd30d ?? null,
     })),

@@ -3,6 +3,7 @@ import {
   INSIDER_FIELD_MAP,
   INSIDER_MAX_CALLS_PER_RUN,
   fetchInsiderTransactions,
+  fetchInsiderTransactionsDetailed,
   getInsiderActivity,
   summarizeInsiderActivity,
 } from "@/lib/agents/insiderActivity";
@@ -10,7 +11,7 @@ import { MOMENTUM_TREND_WEIGHT, EARNINGS_SURPRISE_TREND_WEIGHT, SECTOR_LEADERSHI
 
 const ASOF = new Date("2026-10-06T06:00:00Z");
 
-// Shape verified against a real STX response on 2026-10-06 (all values strings).
+// Shape verified against a real STX response (all values strings). `acquisition_or_disposal` holds the SEC Form 4 transaction code: S sale, P purchase, M exercise, F tax withholding, A award, G gift...
 function row(over: Partial<Record<string, string>> = {}) {
   return {
     transaction_date: "2026-09-21",
@@ -18,7 +19,7 @@ function row(over: Partial<Record<string, string>> = {}) {
     executive: "DOE, JANE",
     executive_title: "CFO",
     security_type: "Ordinary Shares",
-    acquisition_or_disposal: "D",
+    acquisition_or_disposal: "S",
     shares: "100.0",
     share_price: "50.0",
     ...over,
@@ -36,13 +37,13 @@ describe("summarizeInsiderActivity", () => {
     expect(s.insiderSellers30d).toBe(2);
   });
 
-  it("subtracts real purchases (A at positive price, no same-day derivative row)", () => {
-    const s = summarizeInsiderActivity([row({ shares: "100", share_price: "50" }), row({ acquisition_or_disposal: "A", shares: "40", share_price: "50", executive: "BUYER, BOB" })], ASOF);
+  it("subtracts real purchases (code P at a positive price)", () => {
+    const s = summarizeInsiderActivity([row({ shares: "100", share_price: "50" }), row({ acquisition_or_disposal: "P", shares: "40", share_price: "50", executive: "BUYER, BOB" })], ASOF);
     expect(s.insiderNetSoldUsd30d).toBe(5000 - 2000);
     expect(s.insiderSaleCount30d).toBe(1);
   });
 
-  it("excludes awards/RSU vests (A at price 0), derivative rows, and gifts (D at price 0)", () => {
+  it("excludes awards/RSU vests, derivative rows, and zero-price rows", () => {
     const s = summarizeInsiderActivity(
       [
         row({ acquisition_or_disposal: "A", share_price: "0.0", shares: "5000" }),
@@ -55,16 +56,27 @@ describe("summarizeInsiderActivity", () => {
     expect(s).toMatchObject({ insiderNetSoldUsd30d: 0, insiderSaleCount30d: 0, insiderSellers30d: 0, skippedRows: 0 });
   });
 
-  it("excludes option-exercise acquisitions (A at strike price alongside a same-day derivative row)", () => {
+  it("excludes every non-S/P Form 4 code: M exercise, F tax withholding, A award, G gift, X, J", () => {
     const s = summarizeInsiderActivity(
       [
+        row({ acquisition_or_disposal: "M", shares: "14000", share_price: "46.23" }),
+        row({ acquisition_or_disposal: "F", shares: "300", share_price: "898" }),
         row({ acquisition_or_disposal: "A", shares: "915", share_price: "158.4" }),
-        row({ security_type: "NQ Stock Option", shares: "915", share_price: "0.0" }),
+        row({ acquisition_or_disposal: "G", shares: "50", share_price: "10" }),
+        row({ acquisition_or_disposal: "X", shares: "50", share_price: "10" }),
+        row({ acquisition_or_disposal: "J", shares: "50", share_price: "10" }),
         row({ shares: "10", share_price: "100" }),
       ],
       ASOF,
     );
     expect(s.insiderNetSoldUsd30d).toBe(1000);
+    expect(s.insiderSaleCount30d).toBe(1);
+    expect(s.rowsReturned).toBe(7);
+    expect(s.rowsInWindow).toBe(7);
+  });
+
+  it("regression: the legacy 'A'/'D' vocabulary no longer silently counts (D is not a market sale)", () => {
+    expect(summarizeInsiderActivity([row({ acquisition_or_disposal: "D" })], ASOF).insiderSaleCount30d).toBe(0);
   });
 
   it("skips rows missing shares or price and counts them", () => {
@@ -78,13 +90,15 @@ describe("summarizeInsiderActivity", () => {
     expect(s.insiderSaleCount30d).toBe(0);
   });
 
-  it("returns zeros (not nulls) for an empty array", () => {
+  it("reports zeros plus rowsReturned: 0 for an empty array (callers treat that as 'no data', not '$0 sold')", () => {
     expect(summarizeInsiderActivity([], ASOF)).toEqual({
       insiderNetSoldUsd30d: 0,
       insiderSaleCount30d: 0,
       insiderSellers30d: 0,
       insiderHas10b5_1: null,
       skippedRows: 0,
+      rowsReturned: 0,
+      rowsInWindow: 0,
     });
   });
 
@@ -116,6 +130,20 @@ describe("fetch + budget", () => {
     expect(await fetchInsiderTransactions("STX", from)).toBeNull();
     delete process.env.ALPHA_VANTAGE_API_KEY;
     expect(await fetchInsiderTransactions("STX", from)).toBeNull();
+  });
+
+  it("treats an Information/Note/Error Message body as FAILED, even alongside a data array, and a missing data array as FAILED", async () => {
+    process.env.ALPHA_VANTAGE_API_KEY = "k";
+    const from = new Date("2026-09-06");
+    const body = (o: unknown) => new Response(JSON.stringify(o));
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(body({ Information: "plan problem", data: [row()] }));
+    expect(await fetchInsiderTransactionsDetailed("STX", from)).toMatchObject({ ok: false, reason: expect.stringContaining("Information") });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(body({ "Error Message": "bad symbol" }));
+    expect(await fetchInsiderTransactionsDetailed("STX", from)).toMatchObject({ ok: false });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(body({ foo: "bar" }));
+    expect(await fetchInsiderTransactionsDetailed("STX", from)).toMatchObject({ ok: false, responseKeys: ["foo"], reason: expect.stringContaining("data") });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(body({ data: [] }));
+    expect(await fetchInsiderTransactionsDetailed("STX", from)).toMatchObject({ ok: true, rows: [], responseKeys: ["data"] });
   });
 
   it("hard-stops at the per-run call budget and nulls the rest; a single failure doesn't stop the loop", async () => {

@@ -29,6 +29,7 @@ function output(overrides: Partial<MonthlyScanOutput> = {}): MonthlyScanOutput {
         sentimentCoverage: "scored",
         extensionVs200d: 0.31,
         vol60d: 0.72,
+        fragilityPercentile: 91,
         fragilityFlag: true,
         insiderNetSoldUsd30d: 27700000,
         insiderSaleCount30d: 4,

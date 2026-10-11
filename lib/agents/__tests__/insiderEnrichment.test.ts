@@ -21,7 +21,7 @@ vi.mock("@/lib/prisma", () => ({
 
 const { runInsiderPass, enrichInsiderForLatestMonthlyScan, INSIDER_PASS_DEADLINE_MS } = await import("@/lib/agents/insiderEnrichment");
 
-const sale = [{ transaction_date: new Date().toISOString().slice(0, 10), executive: "A", security_type: "Ordinary Shares", acquisition_or_disposal: "D", shares: "10", share_price: "5" }];
+const sale = [{ transaction_date: new Date().toISOString().slice(0, 10), executive: "A", security_type: "Ordinary Shares", acquisition_or_disposal: "S", shares: "10", share_price: "5" }];
 
 function seed(n: number) {
   state.rows = Array.from({ length: n }, (_, i) => ({ id: `r${i + 1}`, symbol: `S${i + 1}`, rank: i + 1, batchTag: "monthly-2026-11", insiderFetchedAt: null, insiderNetSoldUsd30d: null }));
@@ -57,8 +57,26 @@ describe("runInsiderPass deadline", () => {
       { ...fakeClock(0), fetchRows: async (s) => { if (s === "A") return null; if (s === "B") throw new Error("net"); return []; } },
     );
     expect(result.insiderFailed).toBe(2);
-    expect(result.insiderSucceeded).toBe(1);
+    expect(result.insiderEmpty).toBe(1);
+    expect(result.insiderSucceeded).toBe(0);
+    expect(result.diagnostics.map((d) => d.status)).toEqual(["failed", "failed", "empty"]);
     expect(result.deadlineHit).toBe(false);
+  });
+
+  it("an empty response is 'no data' (null net sold, n/a), never $0; failures carry their reason and response keys", async () => {
+    const result = await runInsiderPass(
+      [{ id: "a", symbol: "A" }, { id: "b", symbol: "B" }, { id: "c", symbol: "C" }],
+      {
+        ...fakeClock(0),
+        fetchRows: async (s) =>
+          s === "A" ? { ok: true, rows: [], responseKeys: ["data"] } : s === "B" ? { ok: false, reason: "Information: premium", responseKeys: ["Information"] } : { ok: true, rows: sale, responseKeys: ["data"] },
+      },
+    );
+    const by = Object.fromEntries(result.diagnostics.map((d) => [d.symbol, d]));
+    expect(by.A).toMatchObject({ status: "empty", netSoldUsd: null, rowsReturned: 0, responseKeys: ["data"] });
+    expect(by.B).toMatchObject({ status: "failed", failureReason: "Information: premium", responseKeys: ["Information"] });
+    expect(by.C).toMatchObject({ status: "ok", netSoldUsd: 50, rowsReturned: 1, rowsInWindow: 1, saleRowsCounted: 1 });
+    expect(result.summaries.get("A")).toBeNull();
   });
 
   it("uses a default deadline of 200s", () => {

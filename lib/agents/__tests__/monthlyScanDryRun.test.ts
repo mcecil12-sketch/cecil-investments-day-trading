@@ -70,7 +70,7 @@ const { runMonthlyScanDryRun } = await import("@/lib/agents/monthlyScanDryRun");
 const { MOMENTUM_TREND_WEIGHT, EARNINGS_SURPRISE_TREND_WEIGHT, SECTOR_LEADERSHIP_WEIGHT } = await import("@/lib/agents/scoringShared");
 const { scorePriceSeries } = await import("@/lib/agents/technicals");
 
-const sale = [{ transaction_date: new Date().toISOString().slice(0, 10), executive: "A", security_type: "Ordinary Shares", acquisition_or_disposal: "D", shares: "10", share_price: "5" }];
+const sale = [{ transaction_date: new Date().toISOString().slice(0, 10), executive: "A", security_type: "Ordinary Shares", acquisition_or_disposal: "S", shares: "10", share_price: "5" }];
 
 beforeEach(() => {
   h.writes.length = 0;
@@ -99,6 +99,16 @@ describe("monthly scan dry run", () => {
   });
 });
 
+describe("dry run insider rendering", () => {
+  it("an empty response reports null net sold (n/a) and per-ticker diagnostics, not $0", async () => {
+    const report = await runMonthlyScanDryRun({ now: Date.now, sleep: async () => {}, fetchRows: async (s) => (s === "AAA" ? { ok: true, rows: [], responseKeys: ["data"] } : sale) });
+    expect(report.top10.find((r) => r.symbol === "AAA")!.insiderNetSoldUsd30d).toBeNull();
+    expect(report.top10.find((r) => r.symbol === "BBB")!.insiderNetSoldUsd30d).toBe(50);
+    expect(report.insider).toMatchObject({ insiderEmpty: 1, insiderSucceeded: 1, insiderFailed: 0 });
+    expect(report.insiderByTicker.find((t) => t.symbol === "AAA")).toMatchObject({ status: "empty", rowsReturned: 0, responseKeys: ["data"] });
+  });
+});
+
 describe("composite and rank output is unchanged", () => {
   it("scores equal the documented weighted formula, ranks follow score, and insider fields stay null at scoring time", async () => {
     const dry = await runMonthlyScanAgent("manual", { dryRun: true });
@@ -114,6 +124,8 @@ describe("composite and rank output is unchanged", () => {
       expect(c.insiderNetSoldUsd30d).toBeNull();
       expect(c.insiderSaleCount30d).toBeNull();
     }
+    // The new relative fragility fields are populated but never feed score or rank.
+    expect(live.rankedCandidates.every((c) => c.fragilityPercentile != null)).toBe(true);
     const scores = live.rankedCandidates.map((c) => c.score);
     expect(scores).toEqual([...scores].sort((a, b) => b - a));
     expect(live.rankedCandidates.map((c) => c.rank)).toEqual([1, 2]);

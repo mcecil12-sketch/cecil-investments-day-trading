@@ -36,6 +36,7 @@ export async function logCandidateRecommendationBatch(
       sentimentCoverage: c.sentimentCoverage,
       extensionVs200d: c.extensionVs200d ?? null,
       vol60d: c.vol60d ?? null,
+      fragilityPercentile: c.fragilityPercentile ?? null,
       fragilityFlag: c.fragilityFlag ?? null,
       recommendationType: "highest conviction opportunity",
       recommendedAt,

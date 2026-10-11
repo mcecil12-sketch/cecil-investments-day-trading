@@ -377,7 +377,9 @@ model CandidateRecommendationLog {
   extensionVs200d Float?
   /// Annualized stdev of daily log returns over the last 60 bars at the time of recommendation. Logging-only. Null when under 60 bars, or for older rows.
   vol60d Float?
-  /// True if extensionVs200d >= 0.25 OR vol60d >= 0.60 (hypothesis thresholds, see fragilityScore.ts). Logging-only. Null when neither metric was computable, or for older rows.
+  /// Mean of the 0-100 percentile ranks of extensionVs200d and vol60d within the scan's ranked cohort (see applyFragilityCohort in fragilityScore.ts). Logging-only. Null for rows logged before Oct 11 2026 or when neither metric was computable.
+  fragilityPercentile Float?
+  /// Oct 11 2026 definition: fragilityPercentile in the top third of the scan's cohort (null for a cohort under 3). Rows with a null fragilityPercentile carry the SUPERSEDED absolute-threshold flag (extension >= 0.25 OR vol >= 0.60, Oct 6 2026) and are excluded from flagged-vs-unflagged analysis. Logging-only.
   fragilityFlag Boolean?
   /// Trailing-30d insider sale dollars minus purchase dollars (positive = net selling) at the time of recommendation, Alpha Vantage INSIDER_TRANSACTIONS. Logging-only, monthly scan's ranked candidates (top 30) — NOT part of the composite (see lib/agents/insiderActivity.ts). An upper bound: the API can't separate tax withholding/exercise-and-sell lots from open-market sales. Null on fetch failure, for weekly rows, or for older rows.
   insiderNetSoldUsd30d Float?

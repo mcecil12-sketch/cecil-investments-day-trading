@@ -39,6 +39,19 @@ describe("classifyScanHealth", () => {
     expect(r.reasons.join()).toMatch(/Insider pass attempted 23\/30/);
   });
 
+  it("DEGRADED: insider data suspiciously empty — more than 80% of attempted fetches with zero rows (exactly 80% is fine)", () => {
+    const counters = (empty: number) => ({ insiderCallsUsed: 30, insiderSucceeded: 30 - empty, insiderEmpty: empty, insiderFailed: 0, insiderSkippedByDeadline: 0 });
+    expect(classifyScanHealth({ ...healthyMonthly, insiderCounters: counters(24) }).status).toBe("HEALTHY");
+    const r = classifyScanHealth({ ...healthyMonthly, insiderCounters: counters(25) });
+    expect(r.status).toBe("DEGRADED");
+    expect(r.reasons.join()).toMatch(/Insider data suspiciously empty: 25 of 30/);
+  });
+
+  it("DEGRADED: more than half of insider calls failing", () => {
+    const r = classifyScanHealth({ ...healthyMonthly, insiderCounters: { insiderCallsUsed: 30, insiderSucceeded: 10, insiderEmpty: 0, insiderFailed: 16, insiderSkippedByDeadline: 0 } });
+    expect(r.reasons.join()).toMatch(/Insider fetch failures: 16 of 30/);
+  });
+
   it("DEGRADED: insider deadline hit", () => {
     const r = classifyScanHealth({ ...healthyMonthly, insiderDeadlineHit: true });
     expect(r.status).toBe("DEGRADED");

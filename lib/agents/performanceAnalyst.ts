@@ -260,7 +260,9 @@ async function buildGroup3SignalStats(): Promise<{ fragility: FragilityStats | n
       where: { group: "GROUP_3" },
       orderBy: { recommendedAt: "asc" },
     });
-    const fragilityCycles = new Set(rows.filter((r) => r.fragilityFlag != null).map((r) => r.batchTag)).size;
+    // Only rows carrying a fragilityPercentile use the current (Oct 11 2026, cohort-relative) flag definition; older rows hold the superseded absolute-threshold flag and are excluded so the two definitions never mix.
+    const currentFlag = (r: (typeof rows)[number]) => (r.fragilityPercentile != null ? r.fragilityFlag : null);
+    const fragilityCycles = new Set(rows.filter((r) => currentFlag(r) != null).map((r) => r.batchTag)).size;
     const insiderCycles = new Set(rows.filter((r) => r.insiderNetSoldUsd30d != null).map((r) => r.batchTag)).size;
     if (fragilityCycles < MIN_FRAGILITY_MONTHLY_CYCLES && insiderCycles < MIN_FRAGILITY_MONTHLY_CYCLES) {
       return { fragility: null, insider: null };
@@ -278,13 +280,13 @@ async function buildGroup3SignalStats(): Promise<{ fragility: FragilityStats | n
       closed.map(async (position) => {
         const row = rowLookup.get(`${position.symbol}@@${position.entryDate.getTime()}`);
         const topThird = topThirdMarks.get(`${position.symbol}@@${position.entryDate.getTime()}`) ?? null;
-        if (!row || (row.fragilityFlag == null && topThird == null)) return;
+        if (!row || (currentFlag(row) == null && topThird == null)) return;
         try {
           const { points } = await getPriceHistory(position.symbol);
           const forwardReturn = returnOverWindow(points, position.entryDate, position.exitDate);
           if (forwardReturn == null) return;
           observations.push({
-            fragilityFlag: row.fragilityFlag,
+            fragilityFlag: currentFlag(row),
             vol60d: row.vol60d,
             forwardReturn,
             insiderTopThird: topThird,

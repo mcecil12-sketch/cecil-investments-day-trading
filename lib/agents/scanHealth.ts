@@ -7,6 +7,10 @@ export type ScanHealthStatus = "HEALTHY" | "DEGRADED" | "FAILED";
 export const MONTHLY_EXPECTED_ROWS = 30;
 /** More than this share of rows missing extensionVs200d/vol60d => DEGRADED. */
 export const MAX_NULL_FRAGILITY_SHARE = 0.2;
+/** More than this share of attempted insider fetches returning zero rows => DEGRADED ("suspiciously empty": usually a parser/plan/coverage problem, not a quiet month). */
+export const MAX_EMPTY_INSIDER_SHARE = 0.8;
+/** More than this share of insider calls failing outright => DEGRADED. */
+export const MAX_FAILED_INSIDER_SHARE = 0.5;
 /** Fewer than this share of rows with insiderFetchedAt set => DEGRADED. */
 export const MIN_INSIDER_ATTEMPTED_SHARE = 0.8;
 
@@ -23,7 +27,7 @@ export interface ScanHealthInput {
   insiderAttemptedRows?: number;
   insiderApplicable?: boolean;
   insiderDeadlineHit?: boolean;
-  insiderCounters?: { insiderCallsUsed: number; insiderSucceeded: number; insiderFailed: number; insiderSkippedByDeadline: number } | null;
+  insiderCounters?: { insiderCallsUsed: number; insiderSucceeded: number; insiderEmpty?: number; insiderFailed: number; insiderSkippedByDeadline: number } | null;
   claudeFailures?: ClaudeFailure[];
   sentimentCoveredSymbols?: number | null;
   durationMs?: number | null;
@@ -67,6 +71,16 @@ export function classifyScanHealth(input: ScanHealthInput): ScanHealthResult {
       if (attempted < MIN_INSIDER_ATTEMPTED_SHARE) {
         reasons.push(`Insider pass attempted ${input.insiderAttemptedRows}/${rows} rows (${(attempted * 100).toFixed(0)}%, minimum ${MIN_INSIDER_ATTEMPTED_SHARE * 100}%).`);
       }
+    }
+  }
+  const c = input.insiderCounters;
+  if (c && c.insiderCallsUsed > 0) {
+    const empty = c.insiderEmpty ?? 0;
+    if (empty / c.insiderCallsUsed > MAX_EMPTY_INSIDER_SHARE) {
+      reasons.push(`Insider data suspiciously empty: ${empty} of ${c.insiderCallsUsed} fetches returned zero rows (limit ${MAX_EMPTY_INSIDER_SHARE * 100}%).`);
+    }
+    if (c.insiderFailed / c.insiderCallsUsed > MAX_FAILED_INSIDER_SHARE) {
+      reasons.push(`Insider fetch failures: ${c.insiderFailed} of ${c.insiderCallsUsed} calls failed (rate limit, plan or parse error).`);
     }
   }
   if (input.insiderDeadlineHit) reasons.push("Insider pass hit its wall-clock deadline; remaining rows left unattempted.");

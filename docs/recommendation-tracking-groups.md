@@ -74,10 +74,22 @@ logs, from the price history the scan already fetched (no new network calls):
 
 - `extensionVs200d` — `(lastClose / SMA200) - 1`; null under 200 daily bars.
 - `vol60d` — annualized stdev of daily log returns over 60 bars; null under 60.
-- `fragilityFlag` — true if `extensionVs200d >= 0.25` OR `vol60d >= 0.60`.
+- `fragilityPercentile` — mean of the cohort percentile ranks (0-100, mid-rank
+  for ties) of `extensionVs200d` and `vol60d` within the scan's ranked cohort
+  (monthly: the 30 ranked candidates; weekly: the top 15). Added Oct 11 2026.
+- `fragilityFlag` — true if `fragilityPercentile` is in the top third of the
+  cohort (at/above the `ceil(m/3)`-th highest; ties at the cut all flagged;
+  null for a cohort under 3).
 
-Thresholds are named constants in `lib/agents/fragilityScore.ts`, set from the
-STX postmortem — hypothesis only, validate before use. The factor is **not**
+**Oct 11 2026: absolute thresholds flagged 60% of candidates, no discriminating
+power; redefined as relative before any outcome data existed.** The original
+(Oct 6, STX postmortem, hypothesis only) rule — `extensionVs200d >= 0.25` OR
+`vol60d >= 0.60` — is SUPERSEDED; the constants stay in
+`lib/agents/fragilityScore.ts` for reference only. The raw `extensionVs200d`
+and `vol60d` are still logged unchanged. Rows logged before this change have a
+null `fragilityPercentile` and carry the superseded flag, so the Performance
+Analyst excludes them from the flagged-vs-unflagged comparison (the two
+definitions never mix). The factor is **not**
 in the composite, ranking, or banding; the Ranked Candidates table shows a
 muted "Fragile" badge only. The Performance Analyst compares flagged vs.
 unflagged closed Group 3 positions (average forward return, and return per
@@ -127,6 +139,22 @@ each recorded with its reason). FAILED on a thrown run or zero rows. Weekly
 scans skip the expected-row-count and insider checks.
 
 ### Insider selling (logging-only, monthly scan)
+
+**Oct 11 2026 root-cause fix.** The first dry run showed $0 net sold for every
+top name. Cause: Alpha Vantage's `acquisition_or_disposal` field carries the SEC
+Form 4 *transaction code* (S sale, P purchase, M exercise, F tax withholding,
+A award, G gift, ...), not the "A"/"D" flag the parser assumed, so no row ever
+matched. Only `S` (sale) and `P` (purchase) of non-derivative securities now
+count (STX: 101 sale rows / $206.6M net in 30d, vs $0 before). Separately,
+several tickers (DELL, MU, AMD, NVDA) return a valid `{"data": []}` with no
+history at all; that is recorded as **empty = "no data" (n/a, insider fields
+null, `insiderFetchedAt` set)**, never as $0 sold. Responses with an
+`Information`/`Note`/`Error Message` key, or without a `data` array, are
+FAILED. Both the insider pass and the sentiment cron read
+`ALPHA_VANTAGE_API_KEY`. Scan health adds a DEGRADED reason when more than 80%
+of insider fetches come back empty (or more than 50% fail); the dry-run panel
+shows per-ticker `rowsReturned / rowsInWindow / saleRowsCounted / net sold /
+response keys`.
 
 Added 2026-10-06 after STX's CEO sold stock under 10b5-1 plans on the day we
 bought. For **all 30 ranked candidates** of the monthly scan (cron runs only, filled in by the second enrichment pass above;

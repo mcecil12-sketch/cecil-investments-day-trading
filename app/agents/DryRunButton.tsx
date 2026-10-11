@@ -45,12 +45,12 @@ export function DryRunButton({ endpoint }: { endpoint: string }) {
             Symbols: {report.counts.universeSymbols} universe · {report.counts.ranked} ranked · {report.counts.skipped} skipped · would write {report.counts.wouldWriteRows} rows · {report.fragilityFlagCount} fragile
           </p>
           <p>
-            Insider: {report.insider.insiderCallsUsed} calls · {report.insider.insiderSucceeded} ok · {report.insider.insiderFailed} failed · {report.insider.insiderSkippedByDeadline} skipped by deadline{report.insider.deadlineHit ? " (deadline hit)" : ""}
+            Insider: {report.insider.insiderCallsUsed} calls · {report.insider.insiderSucceeded} ok · {report.insider.insiderEmpty} empty · {report.insider.insiderFailed} failed · {report.insider.insiderSkippedByDeadline} skipped by deadline{report.insider.deadlineHit ? " (deadline hit)" : ""}
           </p>
           <div className="table-wrap">
             <table>
               <thead>
-                <tr><th>Rank</th><th>Symbol</th><th>Composite</th><th>Ext vs 200d</th><th>Vol 60d</th><th>Fragile</th><th>Insider net sold</th></tr>
+                <tr><th>Rank</th><th>Symbol</th><th>Composite</th><th>Ext vs 200d</th><th>Vol 60d</th><th>Frag. pctile</th><th>Fragile</th><th>Insider net sold</th></tr>
               </thead>
               <tbody>
                 {report.top10.map((r) => (
@@ -60,8 +60,30 @@ export function DryRunButton({ endpoint }: { endpoint: string }) {
                     <td className="mono">{r.composite}</td>
                     <td className="mono">{fmt(r.extensionVs200d)}</td>
                     <td className="mono">{fmt(r.vol60d)}</td>
+                    <td className="mono">{r.fragilityPercentile == null ? "n/a" : r.fragilityPercentile.toFixed(0)}</td>
                     <td>{r.fragilityFlag == null ? "—" : r.fragilityFlag ? "yes" : "no"}</td>
-                    <td className="mono">{r.insiderNetSoldUsd30d == null ? "—" : `$${Math.round(r.insiderNetSoldUsd30d).toLocaleString("en-US")}`}</td>
+                    <td className="mono">{r.insiderNetSoldUsd30d == null ? "n/a" : `$${Math.round(r.insiderNetSoldUsd30d).toLocaleString("en-US")}`}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p style={{ marginTop: "0.6rem", fontWeight: 600 }}>Insider diagnostics per ticker</p>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Symbol</th><th>Status</th><th>Rows returned</th><th>In 30d window</th><th>Sale rows counted</th><th>Net sold</th><th>Response keys / failure</th></tr>
+              </thead>
+              <tbody>
+                {report.insiderByTicker.map((t) => (
+                  <tr key={t.symbol}>
+                    <td>{t.symbol}</td>
+                    <td>{t.status}</td>
+                    <td className="mono">{t.rowsReturned}</td>
+                    <td className="mono">{t.rowsInWindow}</td>
+                    <td className="mono">{t.saleRowsCounted}</td>
+                    <td className="mono">{t.netSoldUsd == null ? "n/a" : `$${Math.round(t.netSoldUsd).toLocaleString("en-US")}`}</td>
+                    <td className="mono" style={{ color: "var(--text-muted)" }}>{t.failureReason ?? t.responseKeys.join(", ")}</td>
                   </tr>
                 ))}
               </tbody>

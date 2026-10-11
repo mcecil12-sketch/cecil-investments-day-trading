@@ -5,7 +5,7 @@ import { getCurrentHoldings, totalPortfolioValue } from "@/lib/agents/holdings";
 import { getHoldingSector, buildStockSectorIndex, type SectorRotationOutput, type SectorScore } from "@/lib/agents/sectorRotation";
 import { closestPlanFundsForProxy } from "@/lib/agents/fundMappings";
 import { getEarningsSurpriseTrendScores, type EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
-import { computeFragility } from "@/lib/agents/fragilityScore";
+import { applyFragilityCohort, computeFragility } from "@/lib/agents/fragilityScore";
 import { getNewsSentimentScores, type NewsSentimentCoverage } from "@/lib/agents/newsSentimentScore";
 import {
   MOMENTUM_TREND_WEIGHT,
@@ -58,6 +58,8 @@ export interface CandidateEntry {
   /** Logging-only fragility signals (see fragilityScore.ts) — NOT part of `score`. Null when price history is too short. */
   extensionVs200d: number | null;
   vol60d: number | null;
+  /** See MonthlyScanCandidateEntry.fragilityPercentile — cohort is this scan's top candidates. */
+  fragilityPercentile: number | null;
   fragilityFlag: boolean | null;
   rationale: string;
   accountType: CandidateAccountType;
@@ -258,6 +260,7 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
 
   scored.sort((a, b) => b.score - a.score);
   const topCandidates = scored.slice(0, MAX_TOP_CANDIDATES);
+  applyFragilityCohort(topCandidates);
 
   const exposureBySector = new Map<string, number>();
   for (const holding of holdings) {

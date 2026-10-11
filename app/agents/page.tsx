@@ -434,7 +434,7 @@ function renderMonthlyScanReport(output: MonthlyScanOutput) {
                       {c.symbol}
                       {c.fragilityFlag && (
                         <span
-                          title={`Extension vs 200d: ${c.extensionVs200d != null ? (c.extensionVs200d * 100).toFixed(1) + "%" : "n/a"} · 60d vol: ${c.vol60d != null ? (c.vol60d * 100).toFixed(1) + "%" : "n/a"} (logged only, not in score)${
+                          title={`Fragility percentile: ${c.fragilityPercentile != null ? c.fragilityPercentile.toFixed(0) + " (top third of cohort = flagged)" : "n/a"} · Extension vs 200d: ${c.extensionVs200d != null ? (c.extensionVs200d * 100).toFixed(1) + "%" : "n/a"} · 60d vol: ${c.vol60d != null ? (c.vol60d * 100).toFixed(1) + "%" : "n/a"} (logged only, not in score)${
                             c.insiderNetSoldUsd30d != null
                               ? ` · Insider selling (30d, upper bound): net ${formatCompactCurrency(c.insiderNetSoldUsd30d)} sold, ${c.insiderSellers30d ?? 0} seller(s)`
                               : ""

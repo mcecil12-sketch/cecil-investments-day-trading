@@ -8,10 +8,20 @@ import type { PricePoint } from "@/lib/agents/marketData";
  * Performance Analyst can test whether they predict underperformance.
  */
 
-/** Oct 6 2026, set from STX postmortem, hypothesis only, validate before use. */
+/**
+ * SUPERSEDED (Oct 11 2026). Oct 6 2026, set from STX postmortem, hypothesis
+ * only, validate before use: extension >= 0.25 OR vol >= 0.60.
+ * Oct 11 2026: absolute thresholds flagged 60% of candidates, no discriminating
+ * power; redefined as relative before any outcome data existed. The constants
+ * and `fragilityFlag()` below are kept only for reference/tests — scans no
+ * longer use them; see applyFragilityCohort().
+ */
 export const FRAGILITY_EXTENSION_THRESHOLD = 0.25;
-/** Oct 6 2026, set from STX postmortem, hypothesis only, validate before use. */
+/** SUPERSEDED Oct 11 2026 — see above. */
 export const FRAGILITY_VOL_THRESHOLD = 0.6;
+
+/** Smallest cohort (members with a percentile) for which a "top third" is defined; below it the flag stays null. */
+export const MIN_FRAGILITY_COHORT_SIZE = 3;
 
 const SMA_WINDOW = 200;
 const VOL_WINDOW = 60;
@@ -21,6 +31,8 @@ const BETA_WINDOW = 252;
 export interface FragilityMetrics {
   extensionVs200d: number | null;
   vol60d: number | null;
+  /** Cohort-relative; always null from computeFragility — set by applyFragilityCohort once the scan's ranked cohort is known. */
+  fragilityPercentile: number | null;
   fragilityFlag: boolean | null;
 }
 
@@ -91,7 +103,7 @@ export function betaVsSpx(stock: PricePoint[], spx: PricePoint[]): number | null
   return varM === 0 ? null : cov / varM;
 }
 
-/** True if extension >= FRAGILITY_EXTENSION_THRESHOLD OR vol >= FRAGILITY_VOL_THRESHOLD. Null only when neither metric is available. */
+/** SUPERSEDED Oct 11 2026 (absolute thresholds; see top of file). True if extension >= FRAGILITY_EXTENSION_THRESHOLD OR vol >= FRAGILITY_VOL_THRESHOLD. Null only when neither metric is available. */
 export function fragilityFlag(extension: number | null, vol: number | null): boolean | null {
   if (extension == null && vol == null) return null;
   return (
@@ -100,14 +112,62 @@ export function fragilityFlag(extension: number | null, vol: number | null): boo
   );
 }
 
-/** Never throws — any failure yields all-null metrics so a scan can't fail because of this logging-only factor. */
+/** Raw per-symbol metrics only (never throws — any failure yields all-null). The percentile/flag depend on the cohort; see applyFragilityCohort. */
 export function computeFragility(points: PricePoint[]): FragilityMetrics {
   try {
-    const extension = extensionVs200d(points);
-    const vol = vol60d(points);
-    const flag = fragilityFlag(extension, vol);
-    return { extensionVs200d: extension, vol60d: vol, fragilityFlag: flag };
+    return { extensionVs200d: extensionVs200d(points), vol60d: vol60d(points), fragilityPercentile: null, fragilityFlag: null };
   } catch {
-    return { extensionVs200d: null, vol60d: null, fragilityFlag: null };
+    return { extensionVs200d: null, vol60d: null, fragilityPercentile: null, fragilityFlag: null };
   }
+}
+
+/** Mid-rank percentile (0-100) of each value within `values`: (count below + half the count equal, incl. itself) / n. Ties share a rank. */
+export function percentileRanks(values: number[]): number[] {
+  const n = values.length;
+  return values.map((v) => {
+    let below = 0;
+    let equal = 0;
+    for (const w of values) {
+      if (w < v) below++;
+      else if (w === v) equal++;
+    }
+    return ((below + 0.5 * equal) / n) * 100;
+  });
+}
+
+/**
+ * Oct 11 2026: absolute thresholds flagged 60% of candidates, no discriminating
+ * power; redefined as relative before any outcome data existed.
+ *
+ * fragilityPercentile = mean of the cohort percentile ranks (0-100) of
+ * extensionVs200d and vol60d (over whichever of the two a member has; null if
+ * neither). fragilityFlag = the percentile is in the top third of the cohort:
+ * at or above the ceil(m/3)-th highest percentile among the m members that
+ * have one (ties at the cut are all flagged). Cohorts under
+ * MIN_FRAGILITY_COHORT_SIZE leave the flag null. The cohort is the scan's own
+ * ranked list (monthly: the 30 ranked candidates; weekly: the top 15).
+ * Mutates and returns `cohort`. Logging-only — never touches score or rank.
+ */
+export function applyFragilityCohort<T extends { extensionVs200d: number | null; vol60d: number | null; fragilityPercentile: number | null; fragilityFlag: boolean | null }>(
+  cohort: T[],
+): T[] {
+  const ext = cohort.filter((c) => c.extensionVs200d != null);
+  const vol = cohort.filter((c) => c.vol60d != null);
+  const extPct = percentileRanks(ext.map((e) => e.extensionVs200d as number));
+  const volPct = percentileRanks(vol.map((e) => e.vol60d as number));
+  const extRank = new Map(ext.map((c, i) => [c, extPct[i]]));
+  const volRank = new Map(vol.map((c, i) => [c, volPct[i]]));
+
+  for (const c of cohort) {
+    const parts = [extRank.get(c), volRank.get(c)].filter((v): v is number => v != null);
+    c.fragilityPercentile = parts.length > 0 ? parts.reduce((s, v) => s + v, 0) / parts.length : null;
+    c.fragilityFlag = null;
+  }
+  const withPct = cohort.filter((c) => c.fragilityPercentile != null);
+  if (withPct.length >= MIN_FRAGILITY_COHORT_SIZE) {
+    const sorted = withPct.map((c) => c.fragilityPercentile as number).sort((a, b) => b - a);
+    const cut = sorted[Math.ceil(withPct.length / 3) - 1];
+    for (const c of withPct) c.fragilityFlag = (c.fragilityPercentile as number) >= cut;
+  }
+  return cohort;
 }
