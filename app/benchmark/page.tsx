@@ -140,6 +140,13 @@ export default async function BenchmarkPage() {
     <div>
       <h1>Benchmark</h1>
 
+      <p>
+        {/* Plain same-origin link: Content-Disposition makes Safari (incl. iPad) download it, no JS needed. */}
+        <a href="/api/export/snapshot" download className="button" style={{ display: "inline-block", padding: "0.5rem 1rem", border: "1px solid var(--border, #888)", borderRadius: "6px", textDecoration: "none" }}>
+          Export snapshot
+        </a>
+      </p>
+
       <div className="card">
         <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: "0.5rem" }}>
           <div>

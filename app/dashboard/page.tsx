@@ -13,6 +13,8 @@ import {
   formatPercent,
   formatSignedCurrency,
 } from "@/lib/format";
+import { getVzExposure } from "@/lib/portfolio/vzExposureData";
+import { formatVzExposureLine, type VzExposure } from "@/lib/portfolio/vzExposure";
 import { getRecommendationPerformance } from "@/lib/agents/recommendationPerformance";
 import type { TimeframeKey } from "@/lib/timeframes";
 import { RecommendationPerformanceCharts, type PickQualityChartPoint } from "./RecommendationPerformanceCharts";
@@ -92,6 +94,13 @@ export default async function DashboardPage() {
     console.error("getRecommendationPerformance failed:", err);
   }
 
+  let vzExposure: VzExposure | null = null;
+  try {
+    vzExposure = await getVzExposure(computation?.totalCurrentValue ?? null);
+  } catch (err) {
+    console.error("getVzExposure failed:", err);
+  }
+
   if (computeError || !computation) {
     return (
       <div>
@@ -169,6 +178,14 @@ export default async function DashboardPage() {
 
   return (
     <div>
+      {vzExposure && vzExposure.components.length > 0 && (
+        <div className="card" style={{ padding: "0.6rem 1rem" }}>
+          <span style={{ fontWeight: 600 }}>{formatVzExposureLine(vzExposure)}</span>
+          {vzExposure.price && (
+            <span style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}> · VZ ${vzExposure.price.last.toFixed(2)}</span>
+          )}
+        </div>
+      )}
       <div className="top-bar">
         <div>
           <div className="top-bar-label">YTD Alpha vs S&amp;P (Total Portfolio)</div>
