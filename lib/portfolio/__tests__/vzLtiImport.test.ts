@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   isPlausibleVzLtiAsOfDate,
   mergeVzLtiTranches,
+  normalizeCohortLabel,
   parseGrantYear,
   parseVzLtiExtractionResponse,
 } from "@/lib/portfolio/vzLtiImport";
@@ -125,5 +126,44 @@ describe("mergeVzLtiTranches", () => {
     const { tranches, conflicts } = mergeVzLtiTranches([screenshot1, screenshot2]);
     expect(conflicts).toHaveLength(0);
     expect(tranches).toHaveLength(1);
+  });
+});
+
+describe("parseGrantYear with suffixed grant IDs", () => {
+  it("reads the year right after the RD prefix", () => {
+    expect(parseGrantYear("RD26VBSBS")).toBe(2026);
+    expect(parseGrantYear("RD24")).toBe(2024);
+    expect(parseGrantYear("RD25XYZ")).toBe(2025);
+    expect(parseGrantYear("RD2024")).toBe(2024);
+  });
+
+  it("returns null for garbage input", () => {
+    expect(parseGrantYear(null as unknown as string)).toBeNull();
+    expect(parseGrantYear("VBSBS")).toBeNull();
+  });
+});
+
+describe("normalizeCohortLabel", () => {
+  it("canonicalizes to RD + two-digit year", () => {
+    expect(normalizeCohortLabel("RD26VBSBS")).toBe("RD26");
+    expect(normalizeCohortLabel("RD26")).toBe("RD26");
+    expect(normalizeCohortLabel(" rd25xyz ")).toBe("RD25");
+    expect(normalizeCohortLabel("RD2024")).toBe("RD24");
+  });
+
+  it("falls back to the trimmed original when no year parses", () => {
+    expect(normalizeCohortLabel("  weird ")).toBe("weird");
+  });
+});
+
+describe("suffixed labels across screenshots", () => {
+  it("dedupes RD26 and RD26VBSBS for the same vest date into one tranche", () => {
+    const parse = (cohortLabel: string) =>
+      parseVzLtiExtractionResponse(
+        JSON.stringify({ asOfDate: "2026-09-03", tranches: [{ cohortLabel, vestDate: "2027-03-01", shares: 1216.27 }] }),
+      ).tranches;
+    const { tranches, conflicts } = mergeVzLtiTranches([parse("RD26"), parse("RD26VBSBS")]);
+    expect(conflicts).toEqual([]);
+    expect(tranches).toEqual([{ cohortLabel: "RD26", vestDate: "2027-03-01", shares: 1216.27 }]);
   });
 });

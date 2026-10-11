@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getPriceHistory, VZ_SYMBOL } from "@/lib/agents/marketData";
-import { isPlausibleVzLtiAsOfDate, parseGrantYear, type ExtractedVzLtiTranche } from "@/lib/portfolio/vzLtiImport";
+import { isPlausibleVzLtiAsOfDate, normalizeCohortLabel, parseGrantYear, type ExtractedVzLtiTranche } from "@/lib/portfolio/vzLtiImport";
 
 function isExtractedVzLtiTranche(value: unknown): value is ExtractedVzLtiTranche {
   if (!value || typeof value !== "object") return false;
@@ -46,7 +46,7 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const tranches = body.tranches as ExtractedVzLtiTranche[];
+  const tranches = (body.tranches as ExtractedVzLtiTranche[]).map((t) => ({ ...t, cohortLabel: normalizeCohortLabel(t.cohortLabel) }));
   const grantYearByLabel = new Map<string, number>();
   const seenKeys = new Set<string>();
   for (const tranche of tranches) {

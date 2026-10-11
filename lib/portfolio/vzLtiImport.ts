@@ -19,22 +19,36 @@ Return ONLY valid JSON:
 {
   asOfDate: string (YYYY-MM-DD, today's date if not otherwise shown),
   tranches: [{
-    cohortLabel: string (e.g. "RD24", "RD25", "RD26" — the grant cohort/year label as shown),
+    cohortLabel: string (only "RD" plus the two-digit grant year, e.g. "RD24", "RD25", "RD26"),
     vestDate: string (YYYY-MM-DD, always a March 1),
     shares: number (shares remaining unvested in this specific third)
   }]
 }
+Fidelity may show a longer grant ID such as "RD26VBSBS". cohortLabel must be only "RD" plus the two-digit grant year (e.g. "RD26"), dropping any suffix letters.
 Extract one entry per remaining unvested third shown — a grant with multiple remaining vest years (e.g. RD25 vesting in both 2027 and 2028) becomes multiple entries with the same cohortLabel and different vestDate/shares.
 Do NOT extract or invent a dollar value per tranche — shares only. Do NOT include already-vested/paid-out thirds that aren't shown on the page.
 Report shares as a plain number (e.g. 1653.52), not a formatted string.`;
 
-/** Parses "RD24" -> 2024, "RD9" -> 2009, etc. — the grant year is always the label's trailing digits, interpreted as 2000+n. */
+/**
+ * Parses "RD24" -> 2024, "RD26VBSBS" -> 2026, "RD2024" -> 2024. The year is the
+ * digits right after the RD prefix (so suffix letters are ignored); otherwise
+ * the label's trailing digits. Two-digit years are interpreted as 2000+n.
+ */
 export function parseGrantYear(cohortLabel: string): number | null {
-  const match = cohortLabel.match(/(\d{2,4})\s*$/);
+  if (typeof cohortLabel !== "string") return null;
+  const match = cohortLabel.trim().match(/^RD(\d{2,4})/i) ?? cohortLabel.match(/(\d{2,4})\s*$/);
   if (!match) return null;
   const digits = match[1];
   if (digits.length === 4) return Number(digits);
   return 2000 + Number(digits);
+}
+
+/** Canonical cohort label: "RD" + two-digit year ("RD26VBSBS" -> "RD26"); the trimmed original if no year parses. */
+export function normalizeCohortLabel(label: string): string {
+  const trimmed = typeof label === "string" ? label.trim() : "";
+  const year = parseGrantYear(trimmed);
+  if (year == null) return trimmed;
+  return `RD${String(year % 100).padStart(2, "0")}`;
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -78,7 +92,7 @@ export function parseVzLtiExtractionResponse(text: string): VzLtiExtractionResul
 
   return {
     asOfDate: result.asOfDate,
-    tranches: result.tranches as ExtractedVzLtiTranche[],
+    tranches: (result.tranches as ExtractedVzLtiTranche[]).map((t) => ({ ...t, cohortLabel: normalizeCohortLabel(t.cohortLabel) })),
   };
 }
 
