@@ -6,6 +6,9 @@ import { buildBandedMonthlyPositions, currentlyHeldSymbols, BUY_RANK_THRESHOLD }
 import type { RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
 import type { PerformanceAnalystOutput } from "@/lib/agents/performanceAnalyst";
 import { getLatestScanHealth } from "@/lib/agents/scanHealth";
+import { loadBenchmarkDisplay } from "@/lib/benchmark/displayData";
+import { loadAdjustedSeries, loadSp500TotalReturnSeries } from "@/lib/benchmark/sp500Comparator";
+import { averagePairwiseCorrelation, computeAllocation, computeSleeveScoreboard, computeThemeConcentration } from "@/lib/export/sleeveMath";
 import { getVzExposure } from "@/lib/portfolio/vzExposureData";
 import type { AgentType } from "@/lib/generated/prisma";
 import type { SnapshotAccountRow, SnapshotAnalystText, SnapshotData } from "@/lib/export/snapshotMarkdown";
@@ -66,25 +69,20 @@ export async function loadSnapshotData(now: Date = new Date()): Promise<Snapshot
 
   const computation = await guard("portfolio", () => computeBenchmark());
 
+  const display = computation ? await guard("benchmark display", () => loadBenchmarkDisplay(computation)) : null;
   const portfolio: SnapshotData["portfolio"] =
     computation && accounts
       ? {
           totalValue: computation.totalCurrentValue,
           accounts: accounts.map((a): SnapshotAccountRow => {
-            const rows = computation.accounts.filter((r) => r.accountId === a.id);
-            const period = (p: "ytd" | "1y" | "3y") => {
-              const r = rows.find((x) => x.period === p);
-              return r ? { ret: r.portfolioReturn, sp500: r.sp500Return, alpha: r.alpha } : null;
-            };
-            const sp = computation.sincePurchase.find((x) => x.accountId === a.id);
-            const reported = rows.find((r) => r.portfolioReturn != null);
+            const row = display?.accounts.find((r) => r.key === a.id);
+            const emptyWindow = (period: "ytd" | "1y" | "3y") => ({ period, status: "no_data" as const, returnPct: null, sp500: null, alpha: null, pdfSp500: null, asOf: null, windowStart: null, annualized: period === "3y", source: null });
             return {
               name: a.name,
               type: a.type,
-              value: rows[0]?.endValue ?? 0,
-              periods: { ytd: period("ytd"), "1y": period("1y"), "3y": period("3y") },
-              sincePurchase: sp ? { ret: sp.portfolioReturn, sp500: sp.sp500Return, alpha: sp.alpha } : null,
-              dataSource: reported?.dataSource ?? null,
+              value: row?.value ?? computation.accounts.find((r) => r.accountId === a.id)?.endValue ?? 0,
+              asOf: row?.asOf ?? null,
+              windows: row?.windows ?? { ytd: emptyWindow("ytd"), "1y": emptyWindow("1y"), "3y": emptyWindow("3y") },
               lastImportAt: lastImportByAccount.get(a.id) ?? null,
             };
           }),
@@ -156,6 +154,7 @@ export async function loadSnapshotData(now: Date = new Date()): Promise<Snapshot
       const batchRows = new Map(group3Rows.filter((r) => r.batchTag === latest.monthKey).map((r) => [r.symbol, r]));
       group3 = {
         monthKey: latest.monthKey,
+        batchDate: latest.date,
         top10: latest.rankedSymbols.slice(0, BUY_RANK_THRESHOLD).map((s, i) => {
           const row = batchRows.get(s.symbol);
           return {
@@ -175,6 +174,48 @@ export async function loadSnapshotData(now: Date = new Date()): Promise<Snapshot
     }
   }
 
+  // Per-account allocation + sleeve (Group 3 top-10 names held in taxable accounts).
+  const taxableAccounts = (accounts ?? []).filter((a) => a.type === "FIDELITY_TAXABLE");
+  const taxableHoldings = await guard("allocation", async () => {
+    const out: Array<{ name: string; holdings: Array<{ symbol: string; isCash: boolean; value: number }> }> = [];
+    for (const a of taxableAccounts) {
+      const batch = await prisma.importBatch.findFirst({
+        where: { accountId: a.id, status: { in: ["COMPLETE", "PARTIAL"] }, holdings: { some: {} } },
+        orderBy: [{ asOfDate: "desc" }, { uploadedAt: "desc" }],
+        select: { id: true },
+      });
+      const rows = batch ? await prisma.holding.findMany({ where: { importBatchId: batch.id }, include: { instrument: true } }) : [];
+      out.push({ name: a.name, holdings: rows.map((h) => ({ symbol: h.instrument.symbol, isCash: h.instrument.type === "CASH", value: h.currentValue })) });
+    }
+    return out;
+  });
+  const top10Symbols = new Set((group3?.top10 ?? []).map((r) => r.symbol));
+  const heldTaxable = new Set((taxableHoldings ?? []).flatMap((a) => a.holdings.filter((h) => !h.isCash).map((h) => h.symbol)));
+  const sleeveSymbols = [...top10Symbols].filter((s) => heldTaxable.has(s));
+  const allocation = taxableHoldings ? computeAllocation(taxableHoldings, new Set(sleeveSymbols)) : null;
+
+  const CONTROL_SYMBOL = "FXAIX";
+  let sleeve: SnapshotData["sleeve"] = null;
+  if (group3?.batchDate && sleeveSymbols.length > 0) {
+    const sleeveResult = await guard("sleeve", async () => {
+      const [index, control] = await Promise.all([loadSp500TotalReturnSeries(), loadAdjustedSeries(CONTROL_SYMBOL).catch(() => null)]);
+      const names = await Promise.all(
+        sleeveSymbols.map(async (symbol) => ({ symbol, series: await loadAdjustedSeries(symbol).catch(() => [] as Awaited<ReturnType<typeof loadAdjustedSeries>>) })),
+      );
+      const sectorBySymbol = new Map((group3Rows ?? []).filter((r) => r.batchTag === group3!.monthKey).map((r) => [r.symbol, r.sector]));
+      return {
+        scoreboard: computeSleeveScoreboard({ startDate: group3!.batchDate!, names, index, control }),
+        theme: computeThemeConcentration(sleeveSymbols.map((symbol) => ({ symbol, sector: sectorBySymbol.get(symbol) ?? null }))),
+        avgCorrelation60d: averagePairwiseCorrelation(names.filter((n) => n.series.length > 0).map((n) => n.series), 60),
+        sleeveSize: sleeveSymbols.length,
+        controlSymbol: CONTROL_SYMBOL,
+      };
+    });
+    sleeve = sleeveResult ?? { scoreboard: null, theme: null, avgCorrelation60d: null, sleeveSize: sleeveSymbols.length, controlSymbol: CONTROL_SYMBOL, unavailableReason: loadErrors.sleeve };
+  } else if (group3) {
+    sleeve = { scoreboard: null, theme: null, avgCorrelation60d: null, sleeveSize: 0, controlSymbol: CONTROL_SYMBOL, unavailableReason: "no Group 3 top-10 names held in taxable accounts" };
+  }
+
   const brief = await guard("brief", async () => {
     const b = await prisma.weeklyBrief.findFirst({ orderBy: { weekOf: "desc" } });
     return b ? { weekOf: b.weekOf, cioSummary: b.cioSummary, performanceAnalysis: toAnalystText(b.performanceAnalysis) } : null;
@@ -182,5 +223,5 @@ export async function loadSnapshotData(now: Date = new Date()): Promise<Snapshot
 
   const scanHealth = await guard("scanHealth", () => getLatestScanHealth());
 
-  return { generatedAt: now, freshness, portfolio, vz, taxable, group3, brief, scanHealth, loadErrors };
+  return { generatedAt: now, freshness, portfolio, vz, taxable, group3, allocation, sleeve, benchmarkWarnings: display?.warnings ?? [], brief, scanHealth, loadErrors };
 }

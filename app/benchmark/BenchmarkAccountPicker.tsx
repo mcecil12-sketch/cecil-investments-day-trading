@@ -30,7 +30,7 @@ export interface BenchmarkScopeView {
   label: string;
   meta: string;
   periods: BenchmarkPeriodRow[];
-  sincePurchase: BenchmarkSincePurchaseRow | null;
+  sincePurchase?: BenchmarkSincePurchaseRow | null;
   /** Present only for accounts holding a locked, non-reallocatable position (e.g. Verizon EDP's Verizon Stock Fund) — surfaces the single-stock concentration alongside the return data. */
   concentration?: BenchmarkConcentration | null;
 }
@@ -68,7 +68,7 @@ export function BenchmarkAccountPicker({ views }: { views: BenchmarkScopeView[] 
         </p>
       )}
 
-      {view.periods.length === 0 && !view.sincePurchase ? (
+      {view.periods.length === 0 ? (
         <p style={{ color: "var(--text-muted)" }}>No position data yet — import a statement to see benchmark data.</p>
       ) : (
         <div className="table-wrap" style={{ marginTop: "0.75rem" }}>
@@ -96,19 +96,6 @@ export function BenchmarkAccountPicker({ views }: { views: BenchmarkScopeView[] 
                   </td>
                 </tr>
               ))}
-              {view.sincePurchase && (
-                <tr>
-                  <td>Since Purchase (cost basis) — S&amp;P 500 price return only</td>
-                  <td className="mono">{formatPercent(view.sincePurchase.portfolioReturn)}</td>
-                  <td className="mono">{formatPercent(view.sincePurchase.sp500Return)}</td>
-                  <td className="mono" style={{ color: alphaColor(view.sincePurchase.alpha) }}>
-                    {formatPercent(view.sincePurchase.alpha)}
-                  </td>
-                  <td className="mono" style={{ color: "var(--text-muted)" }}>
-                    {view.sincePurchase.detail}
-                  </td>
-                </tr>
-              )}
             </tbody>
           </table>
         </div>

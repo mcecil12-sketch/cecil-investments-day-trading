@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeVzExposure, computeVzPriceStats, formatVzExposureLine, type VzExposureAccount } from "@/lib/portfolio/vzExposure";
+import { computeVzExposure, computeVzPriceStats, formatVzExposureLine, isVerizonStockHolding, type VzExposureAccount } from "@/lib/portfolio/vzExposure";
 
 const d = (s: string) => new Date(`${s}T00:00:00Z`);
 const price = { last: 40, dayChangePct: 0.01, ytdChangePct: 0.1 };
@@ -26,15 +26,24 @@ describe("computeVzPriceStats", () => {
   });
 });
 
+describe("isVerizonStockHolding", () => {
+  it("matches the VZ symbol and stock funds, but not target-date funds", () => {
+    expect(isVerizonStockHolding({ symbol: "VZ", name: null })).toBe(true);
+    expect(isVerizonStockHolding({ symbol: "VERIZON STOCK FUND", name: "Verizon Stock Fund" })).toBe(true);
+    expect(isVerizonStockHolding({ symbol: "VERIZON 2070 FUND", name: "VERIZON 2070 FUND" })).toBe(false);
+    expect(isVerizonStockHolding({ symbol: "FXAIX", name: "Fidelity 500 Index" })).toBe(false);
+  });
+});
+
 describe("computeVzExposure", () => {
   const accounts: VzExposureAccount[] = [
-    { name: "EDP", type: "VZ_EDP", holdings: [{ symbol: "EDPFUND", name: "Mgmt Fund", currentValue: 1000, lastPrice: 1 }] },
+    { name: "EDP", type: "VZ_EDP", holdings: [{ symbol: "VERIZON STOCK FUND", name: "Verizon Stock Fund", currentValue: 1000, lastPrice: 1 }] },
     { name: "LTI", type: "VZ_LTI", holdings: [], ltiShares: 100, ltiFrozenValue: 3000 },
     {
       name: "Savings",
       type: "VZ_SAVINGS_401K",
       holdings: [
-        { symbol: "VZSTK", name: "Verizon Stock Fund", currentValue: 500, lastPrice: 5 },
+        { symbol: "VERIZON 2070 FUND", name: "VERIZON 2070 FUND", currentValue: 5000, lastPrice: 5 },
         { symbol: "FXAIX", name: "Index", currentValue: 9999, lastPrice: 1 },
       ],
     },
@@ -42,13 +51,22 @@ describe("computeVzExposure", () => {
     { name: "Taxable", type: "FIDELITY_TAXABLE", holdings: [{ symbol: "VZ", name: "VZ", currentValue: 200, lastPrice: null }] },
   ];
 
-  it("totals EDP (assumed), LTI shares x price, and matched holdings; skips plans with no VZ", () => {
+  it("counts stock fund + VZ symbol + LTI shares x price; target-date fund goes to Excluded", () => {
     const e = computeVzExposure({ accounts, price, totalPortfolioValue: 10000 });
-    expect(e.totalValue).toBe(1000 + 4000 + 500 + 200);
-    expect(e.percentOfPortfolio).toBeCloseTo(0.57);
-    expect(e.components.map((c) => c.accountName)).toEqual(["EDP", "LTI", "Savings", "Taxable"]);
-    expect(e.components.find((c) => c.accountName === "Mid-Atlantic")).toBeUndefined();
-    expect(e.notes.some((n) => n.includes("EDP") && n.includes("assumed"))).toBe(true);
+    expect(e.totalValue).toBe(1000 + 4000 + 200);
+    expect(e.components.map((c) => c.accountName)).toEqual(["EDP", "LTI", "Taxable"]);
+    expect(e.excluded).toHaveLength(1);
+    expect(e.excluded[0]).toMatchObject({ accountName: "Savings", label: "VERIZON 2070 FUND", value: 5000 });
+    expect(e.excluded[0].reason).toMatch(/target-date/);
+    expect(e.notes.some((n) => /look-through/.test(n))).toBe(true);
+  });
+
+  it("reports exposure both including and excluding unvested LTI, each against its matching total", () => {
+    const e = computeVzExposure({ accounts, price, totalPortfolioValue: 10000 });
+    expect(e.percentOfPortfolio).toBeCloseTo(5200 / 10000);
+    expect(e.excludingLti.totalValue).toBe(1200);
+    // portfolio total with the 4000 of LTI removed from the denominator too
+    expect(e.excludingLti.percentOfPortfolio).toBeCloseTo(1200 / 6000);
   });
 
   it("counts a holding with no price at its imported value and says so", () => {
@@ -61,24 +79,7 @@ describe("computeVzExposure", () => {
     const e = computeVzExposure({ accounts, price: null, totalPortfolioValue: null });
     expect(e.components.find((c) => c.accountName === "LTI")?.value).toBe(3000);
     expect(e.percentOfPortfolio).toBeNull();
-  });
-
-  it("only counts matched EDP holdings when the EDP has a Verizon-named one", () => {
-    const e = computeVzExposure({
-      accounts: [
-        {
-          name: "EDP",
-          type: "VZ_EDP",
-          holdings: [
-            { symbol: "X", name: "VERIZON STOCK FUND", currentValue: 700, lastPrice: 1 },
-            { symbol: "Y", name: "Bond Fund", currentValue: 300, lastPrice: 1 },
-          ],
-        },
-      ],
-      price,
-      totalPortfolioValue: 1000,
-    });
-    expect(e.totalValue).toBe(700);
+    expect(e.excludingLti.percentOfPortfolio).toBeNull();
   });
 
   it("handles no Verizon exposure anywhere", () => {
@@ -87,8 +88,10 @@ describe("computeVzExposure", () => {
     expect(e.components).toEqual([]);
   });
 
-  it("formats the card line", () => {
+  it("formats the card line with both views", () => {
     const e = computeVzExposure({ accounts, price, totalPortfolioValue: 10000 });
-    expect(formatVzExposureLine(e)).toBe("Verizon-linked exposure: $5,700 (57.0% of portfolio), VZ day +1.0%, YTD +10.0%");
+    expect(formatVzExposureLine(e)).toBe(
+      "Verizon-linked exposure: $5,200 (52.0% of portfolio) incl. unvested LTI; $1,200 (20.0%) excl. LTI, VZ day +1.0%, YTD +10.0%",
+    );
   });
 });

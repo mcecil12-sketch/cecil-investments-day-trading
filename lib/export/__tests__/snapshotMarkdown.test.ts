@@ -3,7 +3,20 @@ import { buildSnapshotMarkdown, snapshotFilename, type SnapshotData } from "@/li
 
 const now = new Date("2026-10-11T16:00:00Z");
 const daysAgo = (n: number) => new Date(now.getTime() - n * 86_400_000);
-const per = { ret: 0.052, sp500: 0.06, alpha: -0.008 };
+const win = (period: "ytd" | "1y" | "3y", over: Partial<import("@/lib/benchmark/displayRows").DisplayWindow> = {}) => ({
+  period,
+  status: "ok" as const,
+  returnPct: 0.052,
+  sp500: 0.06,
+  alpha: -0.008,
+  pdfSp500: 0.06,
+  asOf: new Date("2026-09-30T00:00:00Z"),
+  windowStart: new Date("2025-12-31T00:00:00Z"),
+  annualized: period === "3y",
+  source: "fidelity_pdf" as const,
+  ...over,
+});
+const none = (period: "ytd" | "1y" | "3y", status: "no_data" | "too_young" = "no_data") => win(period, { status, returnPct: null, sp500: null, alpha: null, pdfSp500: null, source: null });
 
 function full(): SnapshotData {
   return {
@@ -19,14 +32,16 @@ function full(): SnapshotData {
     portfolio: {
       totalValue: 1234567.8,
       accounts: [
-        { name: "Cecil Investments", type: "FIDELITY_TAXABLE", value: 500000, periods: { ytd: per, "1y": per, "3y": null }, sincePurchase: per, dataSource: "fidelity_pdf", lastImportAt: daysAgo(2) },
-        { name: "Verizon LTI", type: "VZ_LTI", value: 400000, periods: { ytd: per, "1y": null, "3y": null }, sincePurchase: null, dataSource: "computed_total_return", lastImportAt: daysAgo(20) },
+        { name: "Cecil Investments", type: "FIDELITY_TAXABLE", value: 500000, asOf: new Date("2026-09-30T00:00:00Z"), windows: { ytd: win("ytd"), "1y": win("1y"), "3y": none("3y") }, lastImportAt: daysAgo(2) },
+        { name: "Verizon LTI", type: "VZ_LTI", value: 400000, asOf: new Date("2026-10-09T00:00:00Z"), windows: { ytd: win("ytd", { source: "proxy_vz_total_return" }), "1y": none("1y", "too_young"), "3y": win("3y", { source: "proxy_vz_total_return" }) }, lastImportAt: daysAgo(20) },
       ],
     },
     vz: {
       totalValue: 450000,
       percentOfPortfolio: 0.364,
       components: [{ accountName: "Verizon LTI", accountType: "VZ_LTI", label: "8,199 VZ shares x $50.22", value: 411771, basis: "lti_shares_x_live_price" }],
+      excludingLti: { totalValue: 38229, percentOfPortfolio: 0.045 },
+      excluded: [{ accountName: "Verizon Savings Plan", label: "VERIZON 2070 FUND", value: 116315, reason: "target-date fund" }],
       price: { last: 50.22, dayChangePct: 0.01, ytdChangePct: 0.1 },
       notes: [],
     },
@@ -59,9 +74,12 @@ describe("buildSnapshotMarkdown", () => {
     for (const h of ["## 1.", "## 2.", "## 3.", "## 4.", "## 5.", "## 6.", "## 7."]) expect(md).toContain(h);
     expect(md).toContain("$1,234,568");
     expect(md).toContain("5.2% vs 6.0% (α -0.8%)");
-    expect(md).toContain("fidelity_pdf");
-    expect(md).toContain("price only");
-    expect(md).toContain("Verizon-linked exposure: $450,000 (36.4% of portfolio)");
+    expect(md).toContain("[proxy: VZ stock total return]");
+    expect(md).toContain("3Y annualized");
+    expect(md).not.toMatch(/Since purchase/);
+    expect(md).toContain("Verizon-linked exposure: $450,000 (36.4% of portfolio) incl. unvested LTI; $38,229 (4.5%) excl. LTI");
+    expect(md).toContain("VERIZON 2070 FUND");
+    expect(md).toContain("Excluding unvested LTI");
     expect(md).toContain("FSELX | 40.0% | $12,346 | 81 | yes | $1,000,000");
     expect(md).toContain("Sell candidates (hard top-10 rule): AMD");
     expect(md).toContain("Trim FSELX | keep calm.");
@@ -88,6 +106,43 @@ describe("buildSnapshotMarkdown", () => {
     expect(md).toContain("| WEEKLY_BRIEF | DEGRADED |");
     expect(md).toContain("Scan health WEEKLY_BRIEF DEGRADED: Claude call failed — CIO brief: BILLING/CREDIT");
     expect(md).not.toContain("Scan health MONTHLY_SCAN");
+  });
+
+  it("labels the brief's age and flags a stale one in bold", () => {
+    const fresh = buildSnapshotMarkdown(full());
+    expect(fresh).toContain("(age: 1 days)");
+    expect(fresh).not.toContain("STALE");
+    const d = full();
+    d.brief!.weekOf = daysAgo(12);
+    const md = buildSnapshotMarkdown(d);
+    expect(md).toContain("(age: 12 days)");
+    expect(md).toContain("**STALE: this brief is 12 days old, treat positions and recommendations as out of date**");
+  });
+
+  it("renders allocation, sleeve scoreboard and theme sections", () => {
+    const d = full();
+    d.allocation = [{ name: "For Kennedy", value: 100000, sleeveValue: 30000, sleevePct: 0.3, sp500FundValue: 50000, sp500FundPct: 0.5, otherPct: 0.15, cashPct: 0.05 }];
+    d.sleeve = {
+      scoreboard: { startDate: new Date("2026-10-01T00:00:00Z"), endDate: new Date("2026-10-09T00:00:00Z"), names: [{ symbol: "NVDA", startClose: 100, endClose: 110, ret: 0.1, contribution: 0.05 }, { symbol: "AMD", startClose: 100, endClose: 100, ret: 0, contribution: 0 }], missing: [], sleeveReturn: 0.05, indexReturn: 0.02, controlReturn: 0.018, excessVsIndex: 0.03 },
+      theme: { clusters: [{ sector: "Technology", symbols: ["NVDA", "AMD"], count: 2, share: 1 }], largest: { sector: "Technology", share: 1 } },
+      avgCorrelation60d: 0.62,
+      sleeveSize: 2,
+      controlSymbol: "FXAIX",
+    };
+    const md = buildSnapshotMarkdown(d);
+    expect(md).toContain("### Allocation by taxable account");
+    expect(md).toContain("| For Kennedy | $100,000 | $30,000 | 30.0% | $50,000 | 50.0% | 15.0% | 5.0% |");
+    expect(md).toContain("model sleeve since batch date, not since purchase");
+    expect(md).toContain("| Sleeve minus ^SP500TR | 3.0% |");
+    expect(md).toContain("FXAIX (in-account control) | 1.8%");
+    expect(md).toContain("Largest cluster: Technology at 100.0% of the sleeve (2 names)");
+    expect(md).toContain("correlation, last 60 trading days: 0.62");
+  });
+
+  it("includes benchmark display warnings", () => {
+    const d = full();
+    d.benchmarkWarnings = ["S&P mismatch: X YTD"];
+    expect(buildSnapshotMarkdown(d)).toContain("- S&P mismatch: X YTD");
   });
 
   it("renders a wholly null analyst output as null", () => {

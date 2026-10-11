@@ -1,4 +1,6 @@
 import { formatVzExposureLine, type VzExposure } from "@/lib/portfolio/vzExposure";
+import type { DisplayRow } from "@/lib/benchmark/displayRows";
+import { STALE_BRIEF_DAYS, briefAgeDays, type AccountAllocation, type SleeveScoreboard, type ThemeConcentration } from "@/lib/export/sleeveMath";
 
 /**
  * Plain-data input for the Sunday snapshot export. Every section is nullable:
@@ -9,11 +11,10 @@ export interface SnapshotAccountRow {
   name: string;
   type: string;
   value: number;
-  /** Per period: fractions (0.052 = 5.2%). Null = not reported. */
-  periods: Record<"ytd" | "1y" | "3y", { ret: number | null; sp500: number | null; alpha: number | null } | null>;
-  sincePurchase: { ret: number | null; sp500: number | null; alpha: number | null } | null;
-  /** "fidelity_pdf" | "computed_total_return" | null (nothing reported). */
-  dataSource: string | null;
+  /** Latest PDF as-of date across this row's windows (LTI: latest close). */
+  asOf: Date | null;
+  /** Per window, already computed against the single S&P comparator (see lib/benchmark/displayRows.ts). */
+  windows: DisplayRow["windows"];
   lastImportAt: Date | null;
 }
 
@@ -60,7 +61,11 @@ export interface SnapshotData {
   portfolio: { totalValue: number; accounts: SnapshotAccountRow[] } | null;
   vz: VzExposure | null;
   taxable: SnapshotTaxableRow[] | null;
-  group3: { monthKey: string; top10: SnapshotGroup3Row[]; sellCandidates: string[] } | null;
+  group3: { monthKey: string; batchDate?: Date | null; top10: SnapshotGroup3Row[]; sellCandidates: string[] } | null;
+  allocation?: AccountAllocation[] | null;
+  sleeve?: { scoreboard: SleeveScoreboard | null; theme: ThemeConcentration | null; avgCorrelation60d: number | null; sleeveSize: number; controlSymbol: string; unavailableReason?: string } | null;
+  /** Data-quality warnings from the benchmark display layer (S&P mismatches, differing as-of dates, young accounts). */
+  benchmarkWarnings?: string[];
   brief: { weekOf: Date; cioSummary: string; performanceAnalysis: SnapshotAnalystText | null } | null;
   scanHealth?: Array<{ kind: string; status: string; reasons: string[]; createdAt: Date }> | null;
   /** Section name -> reason, for sections whose loader threw. */
@@ -104,9 +109,11 @@ function table(headers: string[], rows: string[][]): string[] {
   return [`| ${headers.join(" | ")} |`, `|${headers.map(() => "---").join("|")}|`, ...rows.map((r) => `| ${r.map(cell).join(" | ")} |`)];
 }
 
-function triple(p: { ret: number | null; sp500: number | null; alpha: number | null } | null): string {
-  if (!p || p.ret == null) return "—";
-  return `${pct(p.ret)} vs ${pct(p.sp500)} (α ${pct(p.alpha)})`;
+function windowCell(w: DisplayRow["windows"]["ytd"]): string {
+  if (w.status === "too_young") return "— (account younger than window)";
+  if (w.status !== "ok" || w.returnPct == null) return "—";
+  const label = w.source === "proxy_vz_total_return" ? " [proxy: VZ stock total return]" : "";
+  return `${pct(w.returnPct)} vs ${pct(w.sp500)} (α ${pct(w.alpha)})${label}`;
 }
 
 export function snapshotFilename(date: Date): string {
@@ -146,6 +153,7 @@ export function buildSnapshotWarnings(data: SnapshotData): string[] {
     if (pa.fragilityNote == null) warnings.push("Fragility note is null: not enough closed Group 3 positions/monthly cycles yet.");
     if (pa.insiderNote == null) warnings.push("Insider note is null: not enough closed Group 3 positions/monthly cycles with insider data yet.");
   }
+  for (const w of data.benchmarkWarnings ?? []) warnings.push(w);
   for (const h of data.scanHealth ?? []) {
     if (h.status === "HEALTHY") continue;
     for (const r of h.reasons) warnings.push(`Scan health ${h.kind} ${h.status}: ${r}`);
@@ -196,30 +204,34 @@ export function buildSnapshotMarkdown(data: SnapshotData): string {
     out.push(`Total value: **${money(data.portfolio.totalValue)}**`, "");
     out.push(
       ...table(
-        ["Account", "Value", "YTD (ret vs S&P)", "1Y", "3Y", "Since purchase (price only)", "Source"],
-        data.portfolio.accounts.map((a) => [
-          a.name,
-          money(a.value),
-          triple(a.periods.ytd),
-          triple(a.periods["1y"]),
-          triple(a.periods["3y"]),
-          a.sincePurchase ? triple(a.sincePurchase) : "—",
-          a.dataSource ?? "none",
-        ]),
+        ["Account", "Value", "As of", "YTD (ret vs S&P TR)", "1Y", "3Y annualized"],
+        data.portfolio.accounts.map((a) => [a.name, money(a.value), a.asOf ? etDate(a.asOf) : "—", windowCell(a.windows.ytd), windowCell(a.windows["1y"]), windowCell(a.windows["3y"])]),
       ),
     );
-    out.push("", "_Since purchase uses a price-only S&P comparison; YTD/1Y/3Y use total return._");
+    out.push("", "_Every S&P figure is ^SP500TR (total return) over that row's own as-of window; 3Y is annualized (CAGR)._");
   }
 
   out.push("", "## 3. Verizon-linked exposure");
   if (!data.vz) out.push(...missing("vz"));
   else {
     out.push(formatVzExposureLine(data.vz));
-    if (data.vz.price) out.push(`VZ last: $${data.vz.price.last.toFixed(2)}`);
-    else out.push("VZ price unavailable.");
+    out.push(data.vz.price ? `VZ last: $${data.vz.price.last.toFixed(2)}` : "VZ price unavailable.");
+    out.push(
+      "",
+      ...table(
+        ["View", "Dollars", "% of matching total"],
+        [
+          ["Including unvested LTI", money(data.vz.totalValue), pct(data.vz.percentOfPortfolio)],
+          ["Excluding unvested LTI", money(data.vz.excludingLti.totalValue), pct(data.vz.excludingLti.percentOfPortfolio)],
+        ],
+      ),
+    );
     if (data.vz.components.length > 0) {
-      out.push("", ...table(["Account", "Holding", "Value", "Basis"], data.vz.components.map((c) => [c.accountName, c.label, money(c.value), c.basis])));
+      out.push("", "**Counted**", ...table(["Account", "Holding", "Value", "Basis"], data.vz.components.map((c) => [c.accountName, c.label, money(c.value), c.basis])));
     } else out.push("", "No Verizon-linked holdings matched.");
+    out.push("", "**Excluded**");
+    if (data.vz.excluded.length > 0) out.push(...table(["Account", "Holding", "Value", "Reason"], data.vz.excluded.map((x) => [x.accountName, x.label, money(x.value), x.reason])));
+    else out.push("None.");
     for (const n of data.vz.notes) out.push(`- Note: ${n}`);
   }
 
@@ -236,6 +248,18 @@ export function buildSnapshotMarkdown(data: SnapshotData): string {
     out.push("", "_Score = Relative Strength composite (0-100). Fragility/insider shown only where the monthly scan logged the symbol._");
   }
 
+  out.push("", "### Allocation by taxable account");
+  if (data.allocation == null) out.push(...missing("allocation"));
+  else if (data.allocation.length === 0) out.push("_No taxable accounts on file._");
+  else {
+    out.push(
+      ...table(
+        ["Account", "Value", "Top-10 sleeve $", "Sleeve %", "S&P fund $", "S&P fund %", "Other %", "Cash %"],
+        data.allocation.map((a) => [a.name, money(a.value), money(a.sleeveValue), pct(a.sleevePct), money(a.sp500FundValue), pct(a.sp500FundPct), pct(a.otherPct), pct(a.cashPct)]),
+      ),
+    );
+  }
+
   out.push("", "## 5. Group 3 (monthly top 10)");
   if (!data.group3) out.push(...missing("group3"));
   else {
@@ -249,10 +273,47 @@ export function buildSnapshotMarkdown(data: SnapshotData): string {
     out.push("", `Sell candidates (hard top-10 rule): ${data.group3.sellCandidates.length > 0 ? data.group3.sellCandidates.join(", ") : "none"}`);
   }
 
+  out.push("", "### Sleeve scoreboard — model sleeve since batch date, not since purchase");
+  const sl = data.sleeve;
+  if (!sl || !sl.scoreboard) out.push(`_Sleeve scoreboard: data unavailable${sl?.unavailableReason ? ` (${sl.unavailableReason})` : ""}._`);
+  else {
+    const sb = sl.scoreboard;
+    out.push(
+      `Group 3 top-10 names held in taxable accounts (${sb.names.length}), equal-weighted, ${etDate(sb.startDate)} to ${etDate(sb.endDate)}. Some names may have been held before the batch date, so this is not a since-purchase return.`,
+      "",
+      ...table(["Name", "Return", "Contribution"], sb.names.map((n) => [n.symbol, pct(n.ret), pct(n.contribution)])),
+      "",
+      ...table(
+        ["Comparison", "Return"],
+        [
+          ["Sleeve (equal-weight)", pct(sb.sleeveReturn)],
+          ["^SP500TR", pct(sb.indexReturn)],
+          [`${sl.controlSymbol} (in-account control)`, pct(sb.controlReturn)],
+          ["Sleeve minus ^SP500TR", pct(sb.excessVsIndex)],
+        ],
+      ),
+    );
+    if (sb.missing.length > 0) out.push(`Missing price history: ${sb.missing.join(", ")}`);
+  }
+
+  out.push("", "### Theme concentration");
+  if (!sl || !sl.theme) out.push("_Theme concentration: data unavailable._");
+  else {
+    out.push(
+      sl.theme.largest ? `Largest cluster: ${sl.theme.largest.sector} at ${pct(sl.theme.largest.share)} of the sleeve (${sl.sleeveSize} names).` : "No sleeve names.",
+      `Average pairwise correlation, last 60 trading days: ${sl.avgCorrelation60d == null ? "—" : sl.avgCorrelation60d.toFixed(2)}`,
+      "",
+      ...table(["Sector", "Names", "Share"], sl.theme.clusters.map((c) => [c.sector, c.symbols.join(", "), pct(c.share)])),
+    );
+  }
+
   out.push("", "## 6. Latest weekly brief");
   if (!data.brief) out.push(...missing("brief"));
   else {
-    out.push(`Week of ${etDate(data.brief.weekOf)}`, "", "### CIO narrative", data.brief.cioSummary, "", "### Performance Analyst");
+    const age = briefAgeDays(data.brief.weekOf, now);
+    out.push(`Week of ${etDate(data.brief.weekOf)} (age: ${age} days)`);
+    if (age > STALE_BRIEF_DAYS) out.push("", `**STALE: this brief is ${age} days old, treat positions and recommendations as out of date**`);
+    out.push("", "### CIO narrative", data.brief.cioSummary, "", "### Performance Analyst");
     const pa = data.brief.performanceAnalysis;
     if (!pa) out.push("Performance Analyst output: null (insufficient data or not run).");
     else {

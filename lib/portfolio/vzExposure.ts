@@ -27,11 +27,7 @@ export interface VzPriceStats {
   ytdChangePct: number | null;
 }
 
-export type VzComponentBasis =
-  | "matched_holding"
-  | "edp_assumed_full_balance"
-  | "lti_shares_x_live_price"
-  | "lti_frozen_import_value";
+export type VzComponentBasis = "matched_holding" | "lti_shares_x_live_price" | "lti_frozen_import_value";
 
 export interface VzExposureComponent {
   accountName: string;
@@ -41,20 +37,34 @@ export interface VzExposureComponent {
   basis: VzComponentBasis;
 }
 
+export interface VzExcludedHolding {
+  accountName: string;
+  label: string;
+  value: number;
+  reason: string;
+}
+
 export interface VzExposure {
+  /** Including unvested LTI shares. */
   totalValue: number;
-  /** Fraction of the unified portfolio; null when the portfolio total is unavailable or zero. */
+  /** Fraction of the unified portfolio (LTI included); null when the portfolio total is unavailable or zero. */
   percentOfPortfolio: number | null;
+  /** Excluding unvested LTI: dollars, and percent of the portfolio total with the LTI value removed from it as well. */
+  excludingLti: { totalValue: number; percentOfPortfolio: number | null };
   components: VzExposureComponent[];
+  /** Holdings whose name mentions Verizon but which are not VZ stock or a stock fund (e.g. target-date funds). */
+  excluded: VzExcludedHolding[];
   price: VzPriceStats | null;
   /** Assumptions and data gaps worth stating alongside the number. */
   notes: string[];
 }
 
-/** VZ common stock or any Verizon-named holding (e.g. the captive "Verizon Stock Fund"). */
-export function isVerizonHolding(h: { symbol: string; name: string | null }): boolean {
-  return h.symbol.trim().toUpperCase() === "VZ" || (h.name ?? "").toLowerCase().includes("verizon");
+/** Counts only VZ common stock or a stock fund (e.g. "Verizon Stock Fund"). A bare "Verizon" in the name is NOT enough — "VERIZON 2070 FUND" is a target-date fund. */
+export function isVerizonStockHolding(h: { symbol: string; name: string | null }): boolean {
+  return h.symbol.trim().toUpperCase() === "VZ" || (h.name ?? "").toLowerCase().includes("stock fund");
 }
+
+const NAME_ONLY_REASON = 'Name mentions Verizon but it is not VZ stock or a stock fund (e.g. a target-date fund); any VZ look-through inside it is not counted';
 
 /** Last price, 1-day and YTD change from a daily close series (any order). */
 export function computeVzPriceStats(points: PricePoint[], now: Date = new Date()): VzPriceStats | null {
@@ -77,7 +87,10 @@ export function computeVzExposure(input: {
   totalPortfolioValue: number | null;
 }): VzExposure {
   const components: VzExposureComponent[] = [];
-  const notes: string[] = [];
+  const excluded: VzExcludedHolding[] = [];
+  const notes: string[] = [
+    "Target-date and other funds may hold a small VZ look-through that is not counted here.",
+  ];
 
   for (const account of input.accounts) {
     if (account.type === "VZ_LTI") {
@@ -87,7 +100,7 @@ export function computeVzExposure(input: {
         components.push({
           accountName: account.name,
           accountType: account.type,
-          label: `${Math.round(shares).toLocaleString("en-US")} VZ shares x $${input.price.last.toFixed(2)}`,
+          label: `${Math.round(shares).toLocaleString("en-US")} unvested VZ shares x $${input.price.last.toFixed(2)}`,
           value: shares * input.price.last,
           basis: "lti_shares_x_live_price",
         });
@@ -95,7 +108,7 @@ export function computeVzExposure(input: {
         components.push({
           accountName: account.name,
           accountType: account.type,
-          label: "VZ shares at import-time value (no live price)",
+          label: "Unvested VZ shares at import-time value (no live price)",
           value: account.ltiFrozenValue,
           basis: "lti_frozen_import_value",
         });
@@ -106,39 +119,37 @@ export function computeVzExposure(input: {
       continue;
     }
 
-    const valued = account.holdings.filter((h) => h.currentValue != null && Number.isFinite(h.currentValue));
-    const matched = valued.filter(isVerizonHolding);
-
-    if (matched.length > 0) {
-      for (const h of matched) {
+    for (const h of account.holdings) {
+      if (h.currentValue == null || !Number.isFinite(h.currentValue)) continue;
+      if (isVerizonStockHolding(h)) {
         components.push({
           accountName: account.name,
           accountType: account.type,
           label: h.name ?? h.symbol,
-          value: h.currentValue as number,
+          value: h.currentValue,
           basis: "matched_holding",
         });
         if (h.lastPrice == null) notes.push(`${account.name}: "${h.name ?? h.symbol}" has no price on record; used its imported value.`);
+      } else if ((h.name ?? "").toLowerCase().includes("verizon")) {
+        excluded.push({ accountName: account.name, label: h.name ?? h.symbol, value: h.currentValue, reason: NAME_ONLY_REASON });
       }
-    } else if (account.type === "VZ_EDP" && valued.length > 0) {
-      const balance = valued.reduce((sum, h) => sum + (h.currentValue as number), 0);
-      components.push({
-        accountName: account.name,
-        accountType: account.type,
-        label: "Full account balance",
-        value: balance,
-        basis: "edp_assumed_full_balance",
-      });
-      notes.push(`${account.name}: no Verizon-named holding found, so the whole EDP balance is assumed to be the Verizon stock fund.`);
     }
   }
 
   const totalValue = components.reduce((sum, c) => sum + c.value, 0);
+  const ltiValue = components.filter((c) => c.accountType === "VZ_LTI").reduce((sum, c) => sum + c.value, 0);
+  const excludingValue = totalValue - ltiValue;
   const portfolio = input.totalPortfolioValue;
+  const portfolioExLti = portfolio != null ? portfolio - ltiValue : null;
   return {
     totalValue,
     percentOfPortfolio: portfolio != null && portfolio > 0 ? totalValue / portfolio : null,
+    excludingLti: {
+      totalValue: excludingValue,
+      percentOfPortfolio: portfolioExLti != null && portfolioExLti > 0 ? excludingValue / portfolioExLti : null,
+    },
     components,
+    excluded,
     price: input.price,
     notes,
   };
@@ -150,7 +161,7 @@ function pct(value: number | null | undefined): string {
 
 /** The one-line summary shown on the dashboard card and at the head of the export section. */
 export function formatVzExposureLine(e: VzExposure): string {
-  const dollars = `$${Math.round(e.totalValue).toLocaleString("en-US")}`;
-  const share = e.percentOfPortfolio == null ? "n/a of portfolio" : `${(e.percentOfPortfolio * 100).toFixed(1)}% of portfolio`;
-  return `Verizon-linked exposure: ${dollars} (${share}), VZ day ${pct(e.price?.dayChangePct)}, YTD ${pct(e.price?.ytdChangePct)}`;
+  const money = (v: number) => `$${Math.round(v).toLocaleString("en-US")}`;
+  const share = (v: number | null) => (v == null ? "n/a" : `${(v * 100).toFixed(1)}%`);
+  return `Verizon-linked exposure: ${money(e.totalValue)} (${share(e.percentOfPortfolio)} of portfolio) incl. unvested LTI; ${money(e.excludingLti.totalValue)} (${share(e.excludingLti.percentOfPortfolio)}) excl. LTI, VZ day ${pct(e.price?.dayChangePct)}, YTD ${pct(e.price?.ytdChangePct)}`;
 }
