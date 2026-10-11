@@ -391,6 +391,14 @@ model CandidateRecommendationLog {
   insiderFetchedAt DateTime?
   /// Which source supplied the insider fields: "edgar" (SEC Form 4s, primary) or "alphavantage" (fallback). Null when not attempted or when both sources failed.
   insiderSource String?
+  /// Close used at scan time and its trading date (UTC) — the price behind marketCap. Logged for monthly and weekly scans. Logging-only.
+  scanClose Float?
+  priceDate DateTime?
+  /// Market cap at scan time = Alpha Vantage OVERVIEW SharesOutstanding x scanClose (marketCapSource "shares_x_close"), or its reported MarketCapitalization when shares are missing ("av_reported"); "unavailable" when the lookup failed. Monthly scan rows only, filled by the enrichment pass. Logging-only.
+  marketCap Float?
+  marketCapSource String?
+  /// insiderNetSoldUsd30d / marketCap x 100 (percent; positive = net selling). Null unless both are known. Logging-only.
+  insiderNetSoldPctOfMarketCap Float?
   recommendationType String
   recommendedAt      DateTime
   /// Relative performance (symbol return minus S&P 500 return, decimal fraction) 30/90 days after recommendedAt. Null until enough time has elapsed.

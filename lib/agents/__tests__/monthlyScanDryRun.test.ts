@@ -109,6 +109,25 @@ describe("dry run insider rendering", () => {
   });
 });
 
+describe("dry run: market cap and the EDGAR 'no filings' label", () => {
+  it("reports market cap, net sold as a percent of it, and $0 / no_filings for a valid EDGAR zero", async () => {
+    const report = await runMonthlyScanDryRun({
+      now: Date.now,
+      sleep: async () => {},
+      fetchRows: async (s) => (s === "AAA" ? { ok: true, rows: [], responseKeys: ["submissions"], source: "edgar" } : { ok: true, rows: sale, responseKeys: ["submissions"], source: "edgar" }),
+      fetchOverviewFn: async () => ({ ok: true, sharesOutstanding: 1_000, reportedMarketCap: null }),
+    });
+    const aaa = report.top10.find((r) => r.symbol === "AAA")!;
+    expect(aaa).toMatchObject({ insiderStatus: "no_filings", insiderNetSoldUsd30d: 0 });
+    expect(aaa.marketCap).toBeGreaterThan(0);
+    const bbb = report.top10.find((r) => r.symbol === "BBB")!;
+    expect(bbb.insiderNetSoldPctOfMarketCap).toBeCloseTo((50 / bbb.marketCap!) * 100);
+    expect(report.insider).toMatchObject({ insiderNoFilings: 1, insiderSucceeded: 1 });
+    expect(report.marketCapPass).toMatchObject({ attempted: 2, ok: 2, failed: 0 });
+    expect(h.writes).toEqual([]);
+  });
+});
+
 describe("composite and rank output is unchanged", () => {
   it("scores equal the documented weighted formula, ranks follow score, and insider fields stay null at scoring time", async () => {
     const dry = await runMonthlyScanAgent("manual", { dryRun: true });

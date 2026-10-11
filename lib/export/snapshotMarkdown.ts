@@ -25,6 +25,9 @@ export interface SnapshotTaxableRow {
   compositeScore: number | null;
   fragilityFlag: boolean | null;
   insiderNetSoldUsd30d: number | null;
+  /** EDGAR returned a valid result with no sales/purchases in the window: shown as "$0 (no filings)", not n/a. */
+  insiderNoFilings?: boolean;
+  insiderPctOfMarketCap?: number | null;
 }
 
 export interface SnapshotGroup3Row {
@@ -35,6 +38,8 @@ export interface SnapshotGroup3Row {
   inTaxableAccount: boolean;
   fragilityFlag: boolean | null;
   insiderNetSoldUsd30d: number | null;
+  insiderNoFilings?: boolean;
+  insiderPctOfMarketCap?: number | null;
 }
 
 export interface SnapshotAnalystText {
@@ -85,6 +90,13 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 const money = (v: number | null) => (v == null ? "—" : `${v < 0 ? "-" : ""}$${Math.round(Math.abs(v)).toLocaleString("en-US")}`);
 const pct = (v: number | null | undefined) => (v == null ? "—" : `${(v * 100).toFixed(1)}%`);
+/** Insider net sold cell: "$0 (no filings)" for a valid EDGAR zero, "n/a" for failed/unattempted, plus % of market cap when known. */
+export function insiderCell(r: { insiderNetSoldUsd30d: number | null; insiderNoFilings?: boolean; insiderPctOfMarketCap?: number | null }): string {
+  if (r.insiderNoFilings) return "$0 (no filings)";
+  if (r.insiderNetSoldUsd30d == null) return "n/a";
+  const base = money(r.insiderNetSoldUsd30d);
+  return r.insiderPctOfMarketCap != null ? `${base} (${r.insiderPctOfMarketCap.toFixed(3)}% of cap)` : base;
+}
 const flag = (v: boolean | null) => (v == null ? "—" : v ? "yes" : "no");
 const cell = (v: string) => v.replace(/\|/g, "/").replace(/\s*\n\s*/g, " ");
 
@@ -242,7 +254,7 @@ export function buildSnapshotMarkdown(data: SnapshotData): string {
     out.push(
       ...table(
         ["Ticker", "Weight", "Unrealized gain", "Score", "Fragile", "Insider net sold 30d"],
-        data.taxable.map((r) => [r.symbol, pct(r.weight), money(r.unrealizedGain), r.compositeScore == null ? "—" : String(r.compositeScore), flag(r.fragilityFlag), money(r.insiderNetSoldUsd30d)]),
+        data.taxable.map((r) => [r.symbol, pct(r.weight), money(r.unrealizedGain), r.compositeScore == null ? "—" : String(r.compositeScore), flag(r.fragilityFlag), insiderCell(r)]),
       ),
     );
     out.push("", "_Score = Relative Strength composite (0-100). Fragility/insider shown only where the monthly scan logged the symbol._");
@@ -267,7 +279,7 @@ export function buildSnapshotMarkdown(data: SnapshotData): string {
     out.push(
       ...table(
         ["Rank", "Ticker", "Score", "Tracked", "In taxable", "Fragile", "Insider net sold 30d"],
-        data.group3.top10.map((r) => [String(r.rank), r.symbol, String(r.score), r.tracked ? "held" : "no", r.inTaxableAccount ? "yes" : "no", flag(r.fragilityFlag), money(r.insiderNetSoldUsd30d)]),
+        data.group3.top10.map((r) => [String(r.rank), r.symbol, String(r.score), r.tracked ? "held" : "no", r.inTaxableAccount ? "yes" : "no", flag(r.fragilityFlag), insiderCell(r)]),
       ),
     );
     out.push("", `Sell candidates (hard top-10 rule): ${data.group3.sellCandidates.length > 0 ? data.group3.sellCandidates.join(", ") : "none"}`);

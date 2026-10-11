@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSnapshotMarkdown, snapshotFilename, type SnapshotData } from "@/lib/export/snapshotMarkdown";
+import { buildSnapshotMarkdown, insiderCell, snapshotFilename, type SnapshotData } from "@/lib/export/snapshotMarkdown";
 
 const now = new Date("2026-10-11T16:00:00Z");
 const daysAgo = (n: number) => new Date(now.getTime() - n * 86_400_000);
@@ -182,5 +182,25 @@ describe("buildSnapshotMarkdown", () => {
 describe("snapshotFilename", () => {
   it("uses the ET calendar date", () => {
     expect(snapshotFilename(new Date("2026-10-11T02:00:00Z"))).toBe("cecil-snapshot-2026-10-10.md");
+  });
+});
+
+describe("insiderCell: $0 for a valid EDGAR zero, n/a only for failed/unattempted", () => {
+  it("labels each case", () => {
+    expect(insiderCell({ insiderNetSoldUsd30d: 0, insiderNoFilings: true })).toBe("$0 (no filings)");
+    expect(insiderCell({ insiderNetSoldUsd30d: null })).toBe("n/a");
+    expect(insiderCell({ insiderNetSoldUsd30d: 1_234_567, insiderPctOfMarketCap: 0.01234 })).toBe("$1,234,567 (0.012% of cap)");
+    expect(insiderCell({ insiderNetSoldUsd30d: 5000 })).toBe("$5,000");
+  });
+
+  it("shows up in the Group 3 table", () => {
+    const d = full();
+    d.group3!.top10 = [
+      { rank: 1, symbol: "AAA", score: 70, tracked: true, inTaxableAccount: false, fragilityFlag: false, insiderNetSoldUsd30d: 0, insiderNoFilings: true },
+      { rank: 2, symbol: "BBB", score: 69, tracked: true, inTaxableAccount: false, fragilityFlag: false, insiderNetSoldUsd30d: null },
+    ];
+    const md = buildSnapshotMarkdown(d);
+    expect(md).toContain("| 1 | AAA | 70 | held | no | no | $0 (no filings) |");
+    expect(md).toContain("| 2 | BBB | 69 | held | no | no | n/a |");
   });
 });

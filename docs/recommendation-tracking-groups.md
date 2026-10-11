@@ -173,6 +173,33 @@ the indicator).
   idempotent, and `?retryFailed=1` re-attempts rows that came back with no data.
 - At most 100 filings per ticker are read (`truncatedFilings` is reported).
 
+**10b5-1 audit (2026-10-13), real NVDA and DELL Form 4s.** The indicator is the
+filing-level `<aff10b5One>` element (`1`/`0` on NVDA, `true`/`false` on DELL);
+the plan itself is described in a `<footnote id="F1">…effected pursuant to a
+Rule 10b5-1 trading plan adopted…</footnote>` that each sale row references via
+`<footnoteId id="F1"/>` inside `<transactionCoding>`. The parser reproduced the
+dry run exactly (NVDA $14.4M planned of $314.6M): the large NVDA sales carry
+`aff10b5One=0` and no plan footnote, and DELL's large sales are Silver Lake
+fund sales with `aff10b5One=false` — i.e. the low planned share is what the
+filings say. Row-level footnote detection was added anyway (a row is planned if
+the box is set OR one of its footnotes cites a plan, ignoring negations like
+"not pursuant to a 10b5-1 plan"); tests use the real filings under
+`lib/agents/__tests__/fixtures/`.
+
+**"No filings" vs n/a.** A valid EDGAR result with no S/P Form 4 transaction in
+the window is stored as `$0`, `insiderSaleCount30d = 0`, `insiderSource =
+'edgar'` and shown as "$0 (no filings)". n/a is only for failed or unattempted
+fetches and for Alpha Vantage's valid-but-empty responses (coverage unknown).
+Scan health counts both toward "suspiciously empty" (> 80%).
+
+**Market cap (logging-only).** Every scan row logs `scanClose` and `priceDate`
+(the close the scan used). The monthly enrichment pass then stores `marketCap` =
+Alpha Vantage OVERVIEW `SharesOutstanding` x `scanClose` (`marketCapSource`
+`shares_x_close`; `av_reported` when shares are missing; `unavailable` on
+failure, retried only with `?retryFailed=1`) and
+`insiderNetSoldPctOfMarketCap` = net sold / market cap x 100 (percent,
+positive = net selling). Weekly rows get `scanClose`/`priceDate` only.
+
 ### Insider selling (logging-only, monthly scan)
 
 **Oct 11 2026 root-cause fix.** The first dry run showed $0 net sold for every

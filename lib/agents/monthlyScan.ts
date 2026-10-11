@@ -12,7 +12,7 @@ import {
 } from "@/lib/agents/scoringShared";
 import { getMonthlyScanEarningsScores } from "@/lib/agents/monthlyScanEarnings";
 import type { EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
-import { applyFragilityCohort, computeFragility } from "@/lib/agents/fragilityScore";
+import { applyFragilityCohort, computeFragility, latestClose } from "@/lib/agents/fragilityScore";
 import { getNewsSentimentScores, type NewsSentimentCoverage } from "@/lib/agents/newsSentimentScore";
 import type { CandidateAccountType } from "@/lib/agents/candidateScanner";
 import { formatPercent } from "@/lib/format";
@@ -48,6 +48,9 @@ export interface MonthlyScanCandidateEntry {
   fragilityPercentile: number | null;
   /** Top third of the cohort by fragilityPercentile. Relative since Oct 11 2026. */
   fragilityFlag: boolean | null;
+  /** Close and UTC date of the price used at scan time (logged with the market cap). */
+  lastClose: number | null;
+  priceDate: string | null;
   /** Logging-only insider-selling signals (see insiderActivity.ts) — NOT part of `score`. Populated for every ranked candidate of a cron run; null on manual runs or fetch failure. */
   insiderNetSoldUsd30d: number | null;
   insiderSaleCount30d: number | null;
@@ -218,6 +221,7 @@ export async function runMonthlyScanAgent(
           sentimentScore: sentiment.score,
           sentimentCoverage: sentiment.coverage,
           ...computeFragility(points),
+          ...latestClose(points),
           insiderNetSoldUsd30d: null,
           insiderSaleCount30d: null,
           insiderSellers30d: null,

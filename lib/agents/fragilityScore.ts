@@ -73,6 +73,13 @@ export function vol60d(points: PricePoint[]): number | null {
   return sampleStdev(logReturns(window.map((p) => p.close))) * Math.sqrt(TRADING_DAYS_PER_YEAR);
 }
 
+/** Latest close and its UTC trading date from a price series — the price behind the logged market cap. */
+export function latestClose(points: PricePoint[]): { lastClose: number | null; priceDate: string | null } {
+  let best: PricePoint | null = null;
+  for (const p of points) if (Number.isFinite(p.close) && p.close > 0 && (!best || p.date.getTime() > best.date.getTime())) best = p;
+  return best ? { lastClose: best.close, priceDate: best.date.toISOString().slice(0, 10) } : { lastClose: null, priceDate: null };
+}
+
 function dayKey(date: Date): string {
   return date.toISOString().slice(0, 10);
 }

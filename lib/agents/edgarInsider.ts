@@ -127,6 +127,12 @@ function valueOf(block: string, tag: string): string | null {
 const COMMON_TITLE = /common|ordinary|class\s+[a-z]\b|\bstock\b|\bshares?\b/i;
 const NOT_COMMON_TITLE = /\bpreferred\b|\bnotes?\b|\bbonds?\b|\bdebentures?\b|\bwarrants?\b|\boptions?\b|\bunits?\b|\brights?\b/i;
 
+/** A footnote that cites a Rule 10b5-1 plan, and is not a negation ("not pursuant to a 10b5-1 plan"). */
+export function footnoteCites10b5Plan(text: string): boolean {
+  if (!/10b5-1/i.test(text)) return false;
+  return !/\bnot\b[^.]{0,60}10b5-1|10b5-1[^.]{0,60}\bnot\b/i.test(text);
+}
+
 export interface ParsedForm4 {
   rows: InsiderRawRow[];
   /** Non-derivative rows seen, including ones dropped as non-common. */
@@ -146,10 +152,20 @@ export function parseForm4Xml(xml: string, ticker: string): ParsedForm4 {
   const flagRaw = valueOf(xml, "aff10b5One");
   const planned = flagRaw == null ? undefined : flagRaw === "1" || flagRaw.toLowerCase() === "true";
 
+  // Footnotes: the plan footnote ("...effected pursuant to a Rule 10b5-1 trading plan adopted ...") is referenced from
+  // inside each transaction block (<footnoteId id="F1"/> under <transactionCoding>). Filers who do not tick the box can
+  // still cite the plan only here, so a row is planned if the filing box is set OR one of its footnotes cites a plan.
+  const planFootnotes = new Set<string>();
+  for (const m of xml.matchAll(/<footnote id="(F\d+)">([\s\S]*?)<\/footnote>/g)) {
+    if (footnoteCites10b5Plan(m[2])) planFootnotes.add(m[1]);
+  }
+
   const rows: InsiderRawRow[] = [];
   let nonDerivativeRows = 0;
   for (const tx of blocks(xml, "nonDerivativeTransaction")) {
     nonDerivativeRows++;
+    const rowCitesPlan = [...tx.matchAll(/<footnoteId id="(F\d+)"/g)].some((m) => planFootnotes.has(m[1]));
+    const rowPlanned: boolean | undefined = flagRaw == null && !rowCitesPlan ? undefined : planned === true || rowCitesPlan;
     const securityTitle = valueOf(tx, "securityTitle") ?? "";
     if (NOT_COMMON_TITLE.test(securityTitle) || !COMMON_TITLE.test(securityTitle)) continue;
     const code = valueOf(tx, "transactionCode");
@@ -166,7 +182,7 @@ export function parseForm4Xml(xml: string, ticker: string): ParsedForm4 {
       acquired_disposed: acquiredDisposed ?? "",
       shares: valueOf(tx, "transactionShares") ?? "",
       share_price: valueOf(tx, "transactionPricePerShare") ?? "",
-      ...(planned === undefined ? {} : { is_10b5_1: planned }),
+      ...(rowPlanned === undefined ? {} : { is_10b5_1: rowPlanned }),
     });
   }
   return { rows, nonDerivativeRows };

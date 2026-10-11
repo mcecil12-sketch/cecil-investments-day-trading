@@ -5,7 +5,7 @@ import { getCurrentHoldings, totalPortfolioValue } from "@/lib/agents/holdings";
 import { getHoldingSector, buildStockSectorIndex, type SectorRotationOutput, type SectorScore } from "@/lib/agents/sectorRotation";
 import { closestPlanFundsForProxy } from "@/lib/agents/fundMappings";
 import { getEarningsSurpriseTrendScores, type EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
-import { applyFragilityCohort, computeFragility } from "@/lib/agents/fragilityScore";
+import { applyFragilityCohort, computeFragility, latestClose } from "@/lib/agents/fragilityScore";
 import { getNewsSentimentScores, type NewsSentimentCoverage } from "@/lib/agents/newsSentimentScore";
 import {
   MOMENTUM_TREND_WEIGHT,
@@ -61,6 +61,9 @@ export interface CandidateEntry {
   /** See MonthlyScanCandidateEntry.fragilityPercentile — cohort is this scan's top candidates. */
   fragilityPercentile: number | null;
   fragilityFlag: boolean | null;
+  /** Close and UTC date of the price used at scan time (logged with the market cap). */
+  lastClose: number | null;
+  priceDate: string | null;
   rationale: string;
   accountType: CandidateAccountType;
 }
@@ -236,6 +239,7 @@ export async function runCandidateScannerAgent(): Promise<CandidateScannerOutput
           sentimentScore: sentiment.score,
           sentimentCoverage: sentiment.coverage,
           ...computeFragility(points),
+          ...latestClose(points),
           rationale: buildRationale(
             {
               symbol,

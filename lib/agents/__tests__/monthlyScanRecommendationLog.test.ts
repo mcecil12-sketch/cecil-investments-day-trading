@@ -29,6 +29,8 @@ function output(overrides: Partial<MonthlyScanOutput> = {}): MonthlyScanOutput {
         sentimentCoverage: "scored",
         extensionVs200d: 0.31,
         vol60d: 0.72,
+        lastClose: 123.45,
+        priceDate: "2026-08-21",
         fragilityPercentile: 91,
         fragilityFlag: true,
         insiderNetSoldUsd30d: 27700000,
@@ -56,6 +58,17 @@ describe("logMonthlyScanBatch", () => {
     createMany.mockResolvedValueOnce({ count: 1 });
     await logMonthlyScanBatch("run1", output({ triggerSource: "cron" }));
     expect(createMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs the scan close and its price date (the price behind the later market-cap lookup); market cap itself is filled by the enrichment pass", async () => {
+    createMany.mockClear();
+    createMany.mockResolvedValueOnce({ count: 1 });
+    await logMonthlyScanBatch("run1", output({ triggerSource: "cron" }));
+    const row = createMany.mock.calls[0][0].data[0];
+    expect(row.scanClose).toBe(123.45);
+    expect(row.priceDate).toEqual(new Date("2026-08-21T00:00:00Z"));
+    expect(row).not.toHaveProperty("marketCap");
+    expect(row.insiderFetchedAt).toBeUndefined();
   });
 
   it("never persists rows for a manual/test run — Group 3's banding and performance replay every GROUP_3 row unconditionally, so a manual run must not reach the table at all", async () => {

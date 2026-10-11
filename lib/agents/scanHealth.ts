@@ -29,7 +29,7 @@ export interface ScanHealthInput {
   insiderAttemptedRows?: number;
   insiderApplicable?: boolean;
   insiderDeadlineHit?: boolean;
-  insiderCounters?: { insiderCallsUsed: number; insiderSucceeded: number; insiderEmpty?: number; insiderFailed: number; insiderSkippedByDeadline: number } | null;
+  insiderCounters?: { insiderCallsUsed: number; insiderSucceeded: number; insiderEmpty?: number; insiderNoFilings?: number; insiderFailed: number; insiderSkippedByDeadline: number } | null;
   claudeFailures?: ClaudeFailure[];
   /** Non-fatal problems that should degrade the run (e.g. a skipped enrichment step). */
   extraReasons?: string[];
@@ -79,9 +79,10 @@ export function classifyScanHealth(input: ScanHealthInput): ScanHealthResult {
   }
   const c = input.insiderCounters;
   if (c && c.insiderCallsUsed > 0) {
-    const empty = c.insiderEmpty ?? 0;
+    // Alpha Vantage empties and EDGAR "no filings" both mean "nothing found"; if that is nearly everyone, the source or parser is suspect.
+    const empty = (c.insiderEmpty ?? 0) + (c.insiderNoFilings ?? 0);
     if (empty / c.insiderCallsUsed > MAX_EMPTY_INSIDER_SHARE) {
-      reasons.push(`Insider data suspiciously empty: ${empty} of ${c.insiderCallsUsed} fetches returned zero rows (limit ${MAX_EMPTY_INSIDER_SHARE * 100}%).`);
+      reasons.push(`Insider data suspiciously empty: ${empty} of ${c.insiderCallsUsed} fetches returned no rows/filings (limit ${MAX_EMPTY_INSIDER_SHARE * 100}%).`);
     }
     if (c.insiderFailed / c.insiderCallsUsed > MAX_FAILED_INSIDER_SHARE) {
       reasons.push(`Insider fetch failures: ${c.insiderFailed} of ${c.insiderCallsUsed} calls failed (rate limit, plan or parse error).`);

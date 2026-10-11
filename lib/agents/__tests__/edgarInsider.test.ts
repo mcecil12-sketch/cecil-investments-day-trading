@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "fs";
+import { join } from "path";
 import {
   EDGAR_FIELD_MAP,
   EDGAR_MIN_INTERVAL_MS,
@@ -6,6 +8,7 @@ import {
   createEdgarClient,
   edgarUserAgent,
   fetchEdgarInsider,
+  footnoteCites10b5Plan,
   parseForm4Xml,
   parseTickerMap,
   rawXmlName,
@@ -350,5 +353,63 @@ describe("insider pass with sources", () => {
     expect(result.insiderSkippedByDeadline).toBe(2);
     expect(result.deadlineHit).toBe(true);
     expect(result.diagnostics).toHaveLength(1);
+  });
+});
+
+// Real filings pulled from EDGAR on 2026-10-11 (public documents), unmodified.
+const fixture = (name: string) => readFileSync(join(__dirname, "fixtures", name), "utf8");
+
+describe("10b5-1 detection against real Form 4 XML", () => {
+  it("NVDA filing with <aff10b5One>1</aff10b5One> and a plan footnote on every sale row: all rows planned", () => {
+    const xml = fixture("nvda-form4-10b5-1-plan.xml");
+    expect(xml).toContain("<aff10b5One>1</aff10b5One>");
+    expect(xml).toMatch(/<footnote id="F1">The reported transaction was effected pursuant to a Rule 10b5-1 trading plan/);
+    const { rows } = parseForm4Xml(xml, "NVDA");
+    const sales = rows.filter((r) => r.acquisition_or_disposal === "S");
+    expect(sales).toHaveLength(3);
+    expect(sales.every((r) => r.is_10b5_1 === true)).toBe(true);
+    const s = summarizeInsiderActivity(rows, new Date("2026-10-12T12:00:00Z"), EDGAR_FIELD_MAP);
+    expect(s.plannedSalesUsd).toBeCloseTo(s.insiderNetSoldUsd30d);
+    expect(s.insiderHas10b5_1).toBe(true);
+  });
+
+  it("NVDA filing with <aff10b5One>0</aff10b5One> and no plan footnote: sales are discretionary (planned = false, not unknown)", () => {
+    const xml = fixture("nvda-form4-unplanned-sale.xml");
+    expect(xml).toContain("<aff10b5One>0</aff10b5One>");
+    expect(xml).not.toMatch(/10b5-1/i);
+    const { rows } = parseForm4Xml(xml, "NVDA");
+    expect(rows.filter((r) => r.acquisition_or_disposal === "S").length).toBeGreaterThan(0);
+    expect(rows.every((r) => r.is_10b5_1 === false)).toBe(true);
+    const s = summarizeInsiderActivity(rows, new Date("2026-10-12T12:00:00Z"), EDGAR_FIELD_MAP);
+    expect(s.plannedSalesUsd).toBe(0);
+    expect(s.insiderNetSoldUsd30d).toBeGreaterThan(0);
+  });
+
+  it("DELL filing uses the true/false spelling of the box (<aff10b5One>false</aff10b5One>)", () => {
+    const xml = fixture("dell-form4-sale-box-false.xml");
+    expect(xml).toContain("<aff10b5One>false</aff10b5One>");
+    const { rows } = parseForm4Xml(xml, "DELL");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ acquisition_or_disposal: "S", executive: "Durban Egon", is_10b5_1: false });
+  });
+
+  it("a plan cited only in a row's footnote (box absent or unticked) still marks that row planned; a negated footnote does not", () => {
+    const withFootnote = (box: string, note: string) =>
+      `<ownershipDocument>${box}<reportingOwner><reportingOwnerId><rptOwnerName>X</rptOwnerName></reportingOwnerId></reportingOwner><nonDerivativeTable>
+        <nonDerivativeTransaction><securityTitle><value>Common Stock</value></securityTitle><transactionDate><value>2026-10-01</value></transactionDate>
+        <transactionCoding><transactionCode>S</transactionCode><footnoteId id="F1"/></transactionCoding>
+        <transactionAmounts><transactionShares><value>10</value></transactionShares><transactionPricePerShare><value>5</value></transactionPricePerShare><transactionAcquiredDisposedCode><value>D</value></transactionAcquiredDisposedCode></transactionAmounts></nonDerivativeTransaction>
+        <nonDerivativeTransaction><securityTitle><value>Common Stock</value></securityTitle><transactionDate><value>2026-10-01</value></transactionDate>
+        <transactionCoding><transactionCode>S</transactionCode></transactionCoding>
+        <transactionAmounts><transactionShares><value>20</value></transactionShares><transactionPricePerShare><value>5</value></transactionPricePerShare><transactionAcquiredDisposedCode><value>D</value></transactionAcquiredDisposedCode></transactionAmounts></nonDerivativeTransaction>
+      </nonDerivativeTable><footnotes><footnote id="F1">${note}</footnote></footnotes></ownershipDocument>`;
+    const planned = parseForm4Xml(withFootnote("<aff10b5One>0</aff10b5One>", "Sold pursuant to a Rule 10b5-1 plan adopted on March 3, 2026."), "X").rows;
+    expect(planned.map((r) => r.is_10b5_1)).toEqual([true, false]); // row-level: only the row citing the plan
+    const noBox = parseForm4Xml(withFootnote("", "Sales made under a 10b5-1 trading arrangement."), "X").rows;
+    expect(noBox.map((r) => r.is_10b5_1)).toEqual([true, undefined]); // box absent: unknown unless cited
+    const negated = parseForm4Xml(withFootnote("<aff10b5One>0</aff10b5One>", "These sales were not made pursuant to a Rule 10b5-1 plan."), "X").rows;
+    expect(negated.map((r) => r.is_10b5_1)).toEqual([false, false]);
+    expect(footnoteCites10b5Plan("effected pursuant to a Rule 10b5-1 trading plan adopted May 22")).toBe(true);
+    expect(footnoteCites10b5Plan("Shares held by the Trust.")).toBe(false);
   });
 });

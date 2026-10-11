@@ -15,6 +15,11 @@ import type { SnapshotAccountRow, SnapshotAnalystText, SnapshotData } from "@/li
 
 const ACCOUNT_TYPES = ["FIDELITY_TAXABLE", "VZ_SAVINGS_401K", "VZ_LEGACY_401K", "VZ_EDP", "VZ_LTI"] as const;
 
+/** A valid EDGAR answer with nothing to count: stored as $0, source edgar, zero sale rows. */
+function isEdgarNoFilings(row: { insiderSource: string | null; insiderNetSoldUsd30d: number | null; insiderSaleCount30d: number | null } | null | undefined): boolean {
+  return !!row && row.insiderSource === "edgar" && row.insiderNetSoldUsd30d === 0 && row.insiderSaleCount30d === 0;
+}
+
 async function lastRunAt(agentType: AgentType): Promise<Date | null> {
   const run = await prisma.agentRun.findFirst({
     where: { agentType, status: "COMPLETE" },
@@ -138,6 +143,8 @@ export async function loadSnapshotData(now: Date = new Date()): Promise<Snapshot
           compositeScore: rsScores.get(p.symbol) ?? null,
           fragilityFlag: log?.fragilityFlag ?? null,
           insiderNetSoldUsd30d: log?.insiderNetSoldUsd30d ?? null,
+          insiderNoFilings: isEdgarNoFilings(log),
+          insiderPctOfMarketCap: log?.insiderNetSoldPctOfMarketCap ?? null,
         };
       })
     : taxableCtx === null && !loadErrors.taxable
@@ -165,6 +172,8 @@ export async function loadSnapshotData(now: Date = new Date()): Promise<Snapshot
             inTaxableAccount: taxableSymbols.has(s.symbol),
             fragilityFlag: row?.fragilityFlag ?? null,
             insiderNetSoldUsd30d: row?.insiderNetSoldUsd30d ?? null,
+            insiderNoFilings: isEdgarNoFilings(row),
+            insiderPctOfMarketCap: row?.insiderNetSoldPctOfMarketCap ?? null,
           };
         }),
         sellCandidates: buildBandedMonthlyPositions(rankings)

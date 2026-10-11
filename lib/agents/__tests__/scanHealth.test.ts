@@ -47,6 +47,12 @@ describe("classifyScanHealth", () => {
     expect(r.reasons.join()).toMatch(/Insider data suspiciously empty: 25 of 30/);
   });
 
+  it("EDGAR 'no filings' results count toward 'suspiciously empty' together with Alpha Vantage empties", () => {
+    const c = (noFilings: number, empty: number) => ({ insiderCallsUsed: 30, insiderSucceeded: 30 - noFilings - empty, insiderEmpty: empty, insiderNoFilings: noFilings, insiderFailed: 0, insiderSkippedByDeadline: 0 });
+    expect(classifyScanHealth({ ...healthyMonthly, insiderCounters: c(20, 4) }).status).toBe("HEALTHY");
+    expect(classifyScanHealth({ ...healthyMonthly, insiderCounters: c(20, 5) }).status).toBe("DEGRADED");
+  });
+
   it("DEGRADED: more than half of insider calls failing", () => {
     const r = classifyScanHealth({ ...healthyMonthly, insiderCounters: { insiderCallsUsed: 30, insiderSucceeded: 10, insiderEmpty: 0, insiderFailed: 16, insiderSkippedByDeadline: 0 } });
     expect(r.reasons.join()).toMatch(/Insider fetch failures: 16 of 30/);

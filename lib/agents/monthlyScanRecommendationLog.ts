@@ -45,6 +45,8 @@ export async function logMonthlyScanBatch(agentRunId: string, output: MonthlySca
       sentimentCoverage: c.sentimentCoverage,
       extensionVs200d: c.extensionVs200d ?? null,
       vol60d: c.vol60d ?? null,
+      scanClose: c.lastClose ?? null,
+      priceDate: c.priceDate ? new Date(`${c.priceDate}T00:00:00Z`) : null,
       fragilityPercentile: c.fragilityPercentile ?? null,
       fragilityFlag: c.fragilityFlag ?? null,
       insiderNetSoldUsd30d: c.insiderNetSoldUsd30d ?? null,
