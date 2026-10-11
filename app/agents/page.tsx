@@ -10,6 +10,8 @@ import type { CioTaxableOpportunities } from "@/lib/agents/cio";
 import type { NewsSentimentNote } from "@/lib/agents/newsSentiment";
 import { alphaColor, formatCompactCurrency, formatCurrency, formatDate, formatDateTime, formatPercent } from "@/lib/format";
 import { RunAgentButton } from "./RunAgentButton";
+import { DryRunButton } from "./DryRunButton";
+import { getLatestScanHealth, type LatestScanHealth } from "@/lib/agents/scanHealth";
 import { AgentStatusPoller } from "./AgentStatusPoller";
 import type { AgentStatusResponse } from "@/app/api/agents/status/route";
 
@@ -523,10 +525,26 @@ export default async function AgentsPage() {
     monthlyScan: latestRuns[AGENT_DEFINITIONS.findIndex((d) => d.type === "MONTHLY_SCAN")]?.status ?? null,
   };
 
+  let scanHealth: LatestScanHealth[] = [];
+  try {
+    scanHealth = await getLatestScanHealth();
+  } catch (err) {
+    console.error("getLatestScanHealth failed:", err);
+  }
+
   return (
     <div>
       <AgentStatusPoller initialStatuses={initialStatuses} />
       <h1>Agents</h1>
+
+      <p style={{ fontSize: "0.82rem", color: "var(--text-muted)" }} title={scanHealth.flatMap((h) => h.reasons).join("\n")}>
+        Scan health:{" "}
+        {scanHealth.length === 0
+          ? "no results yet"
+          : scanHealth
+              .map((h) => `${h.kind.replace("_", " ").toLowerCase()} ${h.status}${h.status === "HEALTHY" ? "" : ` (${h.reasons.length} issue${h.reasons.length === 1 ? "" : "s"})`} · ${formatDate(h.createdAt)}`)
+              .join("  |  ")}
+      </p>
 
       <div className="card card-accent">
         <div className="agent-card-header">
@@ -684,6 +702,7 @@ export default async function AgentsPage() {
               )}
 
               {def.implemented && <RunAgentButton endpoint={def.endpoint!} />}
+              {def.type === "MONTHLY_SCAN" && <DryRunButton endpoint={def.endpoint!} />}
             </div>
           );
         })}

@@ -37,6 +37,7 @@ function isAuthorized(request: NextRequest): boolean {
  * rather than blocking on the promise before responding.
  */
 export async function GET(request: NextRequest) {
+  const functionStartedAtMs = Date.now();
   if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -47,7 +48,7 @@ export async function GET(request: NextRequest) {
   }
 
   waitUntil(
-    runAndPersistMonthlyScan("cron").catch((err) => {
+    runAndPersistMonthlyScan("cron", { functionStartedAtMs }).catch((err) => {
       console.error("Post-universe-refresh monthly scan failed:", err);
     }),
   );

@@ -5,6 +5,7 @@ import { groupIntoMonthlyRankings } from "@/lib/agents/recommendationPerformance
 import { buildBandedMonthlyPositions, currentlyHeldSymbols, BUY_RANK_THRESHOLD } from "@/lib/agents/monthlyScanBanding";
 import type { RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
 import type { PerformanceAnalystOutput } from "@/lib/agents/performanceAnalyst";
+import { getLatestScanHealth } from "@/lib/agents/scanHealth";
 import { getVzExposure } from "@/lib/portfolio/vzExposureData";
 import type { AgentType } from "@/lib/generated/prisma";
 import type { SnapshotAccountRow, SnapshotAnalystText, SnapshotData } from "@/lib/export/snapshotMarkdown";
@@ -179,5 +180,7 @@ export async function loadSnapshotData(now: Date = new Date()): Promise<Snapshot
     return b ? { weekOf: b.weekOf, cioSummary: b.cioSummary, performanceAnalysis: toAnalystText(b.performanceAnalysis) } : null;
   });
 
-  return { generatedAt: now, freshness, portfolio, vz, taxable, group3, brief, loadErrors };
+  const scanHealth = await guard("scanHealth", () => getLatestScanHealth());
+
+  return { generatedAt: now, freshness, portfolio, vz, taxable, group3, brief, scanHealth, loadErrors };
 }

@@ -12,7 +12,6 @@ import {
 } from "@/lib/agents/scoringShared";
 import { getMonthlyScanEarningsScores } from "@/lib/agents/monthlyScanEarnings";
 import type { EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
-import { getInsiderActivity } from "@/lib/agents/insiderActivity";
 import { computeFragility } from "@/lib/agents/fragilityScore";
 import { getNewsSentimentScores, type NewsSentimentCoverage } from "@/lib/agents/newsSentimentScore";
 import type { CandidateAccountType } from "@/lib/agents/candidateScanner";
@@ -105,7 +104,37 @@ function buildRationale(
  * Filtered to taxable-eligible candidates (accountType !== "401k") since
  * this feeds a taxable account's trading decisions.
  */
-export async function runMonthlyScanAgent(triggerSource: "cron" | "manual"): Promise<MonthlyScanOutput> {
+/** Filled in by runMonthlyScanAgent when passed (dry-run reporting); never read by the scan itself. */
+export interface MonthlyScanDiagnostics {
+  phaseMs: Record<string, number>;
+  universeSymbols: number;
+}
+
+export interface MonthlyScanOptions {
+  /** Compute everything but write nothing (no earnings-state upserts, no S&P cache refresh). The caller is responsible for not persisting the output. */
+  dryRun?: boolean;
+  diagnostics?: MonthlyScanDiagnostics;
+}
+
+/**
+ * Scoring/ranking only. The insider fields are intentionally left null here:
+ * the log rows are written first and the insider pass fills them in
+ * afterwards (see insiderEnrichment.ts), so a timeout during the slow,
+ * paced insider fetch can never lose the month's log.
+ */
+export async function runMonthlyScanAgent(
+  triggerSource: "cron" | "manual",
+  options: MonthlyScanOptions = {},
+): Promise<MonthlyScanOutput> {
+  const dryRun = options.dryRun === true;
+  const phaseMs = options.diagnostics?.phaseMs ?? {};
+  let phaseStart = Date.now();
+  const endPhase = (name: string) => {
+    const t = Date.now();
+    phaseMs[name] = (phaseMs[name] ?? 0) + (t - phaseStart);
+    phaseStart = t;
+  };
+
   const latestSectorRun = await prisma.agentRun.findFirst({
     where: { agentType: "SECTOR_ROTATION", status: "COMPLETE" },
     orderBy: { startedAt: "desc" },
@@ -118,16 +147,19 @@ export async function runMonthlyScanAgent(triggerSource: "cron" | "manual"): Pro
   const sectorOutput = latestSectorRun.output as unknown as SectorRotationOutput;
   const topSectors = sectorOutput.topSectors.slice(0, 3);
 
-  const [sp500Points, universeMap] = await Promise.all([getSp500Series(), getMergedCandidateUniverse()]);
+  endPhase("loadSectorRun");
+  const [sp500Points, universeMap] = await Promise.all([getSp500Series({ readOnly: dryRun }), getMergedCandidateUniverse()]);
   const sp500Momentum = scorePriceSeries(sp500Points).momentum ?? 0;
 
   const candidateSymbols = Array.from(
     new Set(topSectors.flatMap((sector) => universeMap[sector.sector]?.symbols ?? [])),
   );
   const [earningsScores, sentimentScores] = await Promise.all([
-    getMonthlyScanEarningsScores(candidateSymbols),
+    getMonthlyScanEarningsScores(candidateSymbols, { persist: !dryRun }),
     getNewsSentimentScores(candidateSymbols),
   ]);
+  endPhase("benchmarkUniverseEarningsSentiment");
+  if (options.diagnostics) options.diagnostics.universeSymbols = candidateSymbols.length;
 
   const skipped: Array<{ symbol: string; reason: string }> = [];
   const sectorsWithoutUniverse: string[] = [];
@@ -209,27 +241,7 @@ export async function runMonthlyScanAgent(triggerSource: "cron" | "manual"): Pro
     .slice(0, MAX_TRACKED_CANDIDATES)
     .map((entry, i) => ({ ...entry, rank: i + 1 }));
 
-  // Logging-only, after ranking: fetch insider activity for every ranked
-  // candidate (all MAX_TRACKED_CANDIDATES). Cron runs only — manual reruns aren't logged, so they
-  // shouldn't spend the shared Alpha Vantage budget. Never fails the scan.
-  if (triggerSource === "cron") {
-    try {
-      const { summaries } = await getInsiderActivity(
-        rankedCandidates.map((c) => c.symbol),
-        new Date(),
-      );
-      for (const c of rankedCandidates) {
-        const s = summaries.get(c.symbol);
-        if (!s) continue;
-        c.insiderNetSoldUsd30d = s.insiderNetSoldUsd30d;
-        c.insiderSaleCount30d = s.insiderSaleCount30d;
-        c.insiderSellers30d = s.insiderSellers30d;
-        c.insiderHas10b5_1 = s.insiderHas10b5_1;
-      }
-    } catch (err) {
-      console.error("[insider] logging-only insider fetch failed; continuing without it", err);
-    }
-  }
+  endPhase("pricesFragilityScoringRanking");
 
   return { generatedAt: new Date().toISOString(), triggerSource, rankedCandidates, sectorsWithoutUniverse, skipped };
 }

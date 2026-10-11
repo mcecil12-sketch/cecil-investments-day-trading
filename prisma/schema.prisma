@@ -385,6 +385,8 @@ model CandidateRecommendationLog {
   insiderSellers30d Int?
   /// True/false only if the data indicates planned (10b5-1) sales; the real API carries no such field today, so this is null.
   insiderHas10b5_1 Boolean?
+  /// Set for every monthly row the insider-enrichment pass attempted (see lib/agents/insiderEnrichment.ts), including failures and empty responses — so "not attempted" (null) is distinguishable from "attempted, no data" (set, insider fields null). The log row is written first with insider fields null; this pass fills them in by id.
+  insiderFetchedAt DateTime?
   recommendationType String
   recommendedAt      DateTime
   /// Relative performance (symbol return minus S&P 500 return, decimal fraction) 30/90 days after recommendedAt. Null until enough time has elapsed.
@@ -566,4 +568,24 @@ model NotificationState {
   id         String   @id @default(cuid())
   key        String   @unique
   lastSentAt DateTime
+}
+
+enum ScanHealthStatus {
+  HEALTHY
+  DEGRADED
+  FAILED
+}
+
+/// Post-run health verdict for a monthly scan, weekly scan, or weekly brief (see lib/agents/scanHealth.ts) — one row per run, newest wins. Additive audit table; nothing reads it for scoring.
+model ScanHealth {
+  id         String           @id @default(cuid())
+  /// "MONTHLY_SCAN" | "WEEKLY_SCAN" | "WEEKLY_BRIEF"
+  kind       String
+  status     ScanHealthStatus
+  reasons    Json
+  metrics    Json
+  agentRunId String?
+  createdAt  DateTime         @default(now())
+
+  @@index([kind, createdAt])
 }

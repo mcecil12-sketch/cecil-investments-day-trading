@@ -111,8 +111,9 @@ async function fetchAlpacaHistory(symbol: string, days = 400): Promise<PricePoin
 }
 
 /** Cached daily ^GSPC closes (see lib/benchmark/priceCache.ts) — the shared S&P 500 baseline series for every portfolio-analysis agent. */
-export async function getSp500Series(): Promise<PricePoint[]> {
-  await ensureSp500PriceCache();
+export async function getSp500Series(options: { readOnly?: boolean } = {}): Promise<PricePoint[]> {
+  // readOnly (dry runs): never refresh/write the BenchmarkPrice cache, just read what is there.
+  if (!options.readOnly) await ensureSp500PriceCache();
   const rows = await prisma.benchmarkPrice.findMany({
     orderBy: { date: "desc" },
     take: 300,

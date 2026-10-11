@@ -23,7 +23,10 @@ export interface MonthlyScanEarningsResult {
  * getEarningsSurpriseTrendScores call for just those — not one call per
  * symbol.
  */
-export async function getMonthlyScanEarningsScores(symbols: string[]): Promise<Map<string, MonthlyScanEarningsResult>> {
+export async function getMonthlyScanEarningsScores(
+  symbols: string[],
+  options: { persist?: boolean } = {},
+): Promise<Map<string, MonthlyScanEarningsResult>> {
   const [latestReportedRows, states] = await Promise.all([
     prisma.earningsHistory.findMany({
       where: { symbol: { in: symbols }, reportedEPS: { not: null } },
@@ -51,7 +54,8 @@ export async function getMonthlyScanEarningsScores(symbols: string[]): Promise<M
 
   const freshScores = needsRefresh.length > 0 ? await getEarningsSurpriseTrendScores(needsRefresh) : new Map();
 
-  const upserts = needsRefresh.map((symbol) => {
+  // persist: false (dry runs) computes the same scores but leaves MonthlyScanEarningsState untouched.
+  const upserts = (options.persist === false ? [] : needsRefresh).map((symbol) => {
     const fresh = freshScores.get(symbol)!;
     const fiscalDateEndingUsed = latestReportedBySymbol.get(symbol) ?? null;
     return prisma.monthlyScanEarningsState.upsert({

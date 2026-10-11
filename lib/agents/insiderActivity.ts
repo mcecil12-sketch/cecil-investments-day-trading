@@ -10,11 +10,13 @@ const ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query";
 
 /** Same pacing constant/rationale as newsSentimentScore.ts / earningsHistory.ts. */
 const MIN_REQUEST_INTERVAL_MS = 1200;
+export const INSIDER_PACING_MS = MIN_REQUEST_INTERVAL_MS;
 
 /** Hard stop on Alpha Vantage calls per monthly scan run. The monthly scan fetches all of its ranked candidates (up to 30); this is headroom, not a target. Premium key assumed as of 2026-10-06 (see docs/recommendation-tracking-groups.md). */
 export const INSIDER_MAX_CALLS_PER_RUN = 60;
 
 const WINDOW_DAYS = 30;
+export const INSIDER_WINDOW_DAYS = WINDOW_DAYS;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**

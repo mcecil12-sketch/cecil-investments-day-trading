@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
+import { MISSING_KEY_REASON, recordClaudeError, recordClaudeFailure } from "@/lib/agents/claudeFailures";
 
 export type CioItemSource =
   | "risk_critical"
@@ -194,6 +195,7 @@ export async function synthesizeCioBrief(
 
   const apiKey = process.env.APP_ANTHROPIC_API_KEY;
   if (!apiKey) {
+    recordClaudeFailure("CIO brief", MISSING_KEY_REASON);
     return { summary: fallbackSummary(candidates), orderedItems: candidates.slice(0, 8), taxableOpportunities: null };
   }
 
@@ -213,14 +215,20 @@ export async function synthesizeCioBrief(
     ? `${candidateSection}\n\n${taxableContextPrompt(taxableContext)}`
     : candidateSection;
 
-  const message = await client.messages.create({
-    model: "claude-sonnet-5",
-    max_tokens: 2048,
-    system: SYSTEM_PROMPT,
-    tools: [BRIEF_TOOL],
-    tool_choice: { type: "tool", name: "submit_cio_brief" },
-    messages: [{ role: "user", content: userContent }],
-  });
+  let message: Anthropic.Message;
+  try {
+    message = await client.messages.create({
+      model: "claude-sonnet-5",
+      max_tokens: 2048,
+      system: SYSTEM_PROMPT,
+      tools: [BRIEF_TOOL],
+      tool_choice: { type: "tool", name: "submit_cio_brief" },
+      messages: [{ role: "user", content: userContent }],
+    });
+  } catch (err) {
+    recordClaudeError("CIO brief", err);
+    throw err;
+  }
 
   const toolUse = message.content.find((block): block is Anthropic.ToolUseBlock => block.type === "tool_use");
   if (!toolUse) {

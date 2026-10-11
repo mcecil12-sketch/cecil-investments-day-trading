@@ -62,6 +62,7 @@ export interface SnapshotData {
   taxable: SnapshotTaxableRow[] | null;
   group3: { monthKey: string; top10: SnapshotGroup3Row[]; sellCandidates: string[] } | null;
   brief: { weekOf: Date; cioSummary: string; performanceAnalysis: SnapshotAnalystText | null } | null;
+  scanHealth?: Array<{ kind: string; status: string; reasons: string[]; createdAt: Date }> | null;
   /** Section name -> reason, for sections whose loader threw. */
   loadErrors?: Record<string, string>;
 }
@@ -145,6 +146,10 @@ export function buildSnapshotWarnings(data: SnapshotData): string[] {
     if (pa.fragilityNote == null) warnings.push("Fragility note is null: not enough closed Group 3 positions/monthly cycles yet.");
     if (pa.insiderNote == null) warnings.push("Insider note is null: not enough closed Group 3 positions/monthly cycles with insider data yet.");
   }
+  for (const h of data.scanHealth ?? []) {
+    if (h.status === "HEALTHY") continue;
+    for (const r of h.reasons) warnings.push(`Scan health ${h.kind} ${h.status}: ${r}`);
+  }
   for (const [section, reason] of Object.entries(data.loadErrors ?? {})) {
     warnings.push(`Section "${section}" failed to load: ${reason}`);
   }
@@ -179,6 +184,11 @@ export function buildSnapshotMarkdown(data: SnapshotData): string {
       ),
     );
   }
+
+  out.push("", "### Scan health");
+  if (data.scanHealth == null) out.push("_scan health: no results recorded yet._");
+  else if (data.scanHealth.length === 0) out.push("_No scan health results recorded yet._");
+  else out.push(...table(["Kind", "Status", "When", "Issues"], data.scanHealth.map((h) => [h.kind, h.status, ago(h.createdAt, now), String(h.reasons.length)])));
 
   out.push("", "## 2. Unified portfolio");
   if (!data.portfolio) out.push(...missing("portfolio"));

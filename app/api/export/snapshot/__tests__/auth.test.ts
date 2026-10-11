@@ -19,6 +19,13 @@ describe("PIN gate on /api/export/snapshot", () => {
     expect(snapshot).toEqual(other);
   });
 
+  it.each(["/api/agents/scan-health", "/api/agents/monthly-scan", "/api/agents/monthly-scan/enrich-insider"])(
+    "also locks %s",
+    async (path) => {
+      expect((await locked(path)).status).toBe(401);
+    },
+  );
+
   it("rejects a forged session cookie", async () => {
     const res = await middleware(
       new NextRequest("http://localhost/api/export/snapshot", { headers: { cookie: "session=forged.token.value" } }),

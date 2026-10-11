@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { MISSING_KEY_REASON, recordClaudeError, recordClaudeFailure } from "@/lib/agents/claudeFailures";
 import { prisma } from "@/lib/prisma";
 import {
   buildTrackedPositions,
@@ -543,17 +544,26 @@ export async function synthesizePerformanceAnalysis(context: PerformanceAnalystC
   if (context.closedPositions === 0) return fallbackOutput(context);
 
   const apiKey = process.env.APP_ANTHROPIC_API_KEY;
-  if (!apiKey) return fallbackOutput(context);
+  if (!apiKey) {
+    recordClaudeFailure("Performance Analyst", MISSING_KEY_REASON);
+    return fallbackOutput(context);
+  }
 
   const client = new Anthropic({ apiKey });
-  const message = await client.messages.create({
-    model: "claude-sonnet-5",
-    max_tokens: 2048,
-    system: SYSTEM_PROMPT,
-    tools: [ANALYSIS_TOOL],
-    tool_choice: { type: "tool", name: "submit_performance_analysis" },
-    messages: [{ role: "user", content: JSON.stringify(context, null, 2) }],
-  });
+  let message: Anthropic.Message;
+  try {
+    message = await client.messages.create({
+      model: "claude-sonnet-5",
+      max_tokens: 2048,
+      system: SYSTEM_PROMPT,
+      tools: [ANALYSIS_TOOL],
+      tool_choice: { type: "tool", name: "submit_performance_analysis" },
+      messages: [{ role: "user", content: JSON.stringify(context, null, 2) }],
+    });
+  } catch (err) {
+    recordClaudeError("Performance Analyst", err);
+    throw err;
+  }
 
   const toolUse = message.content.find((block): block is Anthropic.ToolUseBlock => block.type === "tool_use");
   if (!toolUse) {

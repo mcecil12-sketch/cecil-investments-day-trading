@@ -20,6 +20,15 @@ import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
 import { buildTaxableAnalysisContext, type TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
 import { generateNewsSentimentNotes, type NewsSentimentNote } from "@/lib/agents/newsSentiment";
 import { sendWeeklyBriefNotification } from "@/lib/notifications/weeklyBrief";
+import { captureClaudeFailures, getCapturedClaudeFailures, type ClaudeFailure } from "@/lib/agents/claudeFailures";
+import { enrichInsiderForLatestMonthlyScan } from "@/lib/agents/insiderEnrichment";
+import {
+  classifyScanHealth,
+  countSentimentCovered,
+  loadRunRowMetrics,
+  recordScanHealth,
+  MONTHLY_EXPECTED_ROWS,
+} from "@/lib/agents/scanHealth";
 
 function formatPercent(value: number | null): string {
   if (value == null) return "unknown";
@@ -351,10 +360,29 @@ export async function runAndPersistCandidateScanner(): Promise<CandidateScannerR
       ),
     ]);
 
+    let logError: string | null = null;
     try {
       await logCandidateRecommendationBatch(run.id, output);
     } catch (err) {
+      logError = err instanceof Error ? err.message : String(err);
       console.error("logCandidateRecommendationBatch failed:", err);
+    }
+
+    try {
+      const rowMetrics = await loadRunRowMetrics(run.id, "GROUP_1");
+      await recordScanHealth(
+        classifyScanHealth({
+          kind: "WEEKLY_SCAN",
+          runFailed: logError ? `Log write failed: ${logError}` : null,
+          ...rowMetrics,
+          expectedRows: null,
+          sentimentCoveredSymbols: await countSentimentCovered(),
+          claudeFailures: getCapturedClaudeFailures(),
+        }),
+        run.id,
+      );
+    } catch (err) {
+      console.error("weekly scan health failed:", err instanceof Error ? err.message : err);
     }
 
     return { runId: run.id, status: "COMPLETE", output };
@@ -364,6 +392,7 @@ export async function runAndPersistCandidateScanner(): Promise<CandidateScannerR
       where: { id: run.id },
       data: { status: "FAILED", completedAt: new Date(), errorMessage: message },
     });
+    await recordScanHealth(classifyScanHealth({ kind: "WEEKLY_SCAN", runFailed: message }), run.id);
     return { runId: run.id, status: "FAILED", error: message };
   }
 }
@@ -384,33 +413,119 @@ export interface MonthlyScanRunResult {
  * MonthlyScanOutput) — only "cron" runs count toward Group 3's
  * trading-readiness banner.
  */
-export async function runAndPersistMonthlyScan(triggerSource: "cron" | "manual"): Promise<MonthlyScanRunResult> {
-  const run = await prisma.agentRun.create({
-    data: { agentType: "MONTHLY_SCAN", status: "RUNNING" },
-  });
-
-  try {
-    const output = await runMonthlyScanAgent(triggerSource);
-
-    await prisma.agentRun.update({
-      where: { id: run.id },
-      data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },
+export async function runAndPersistMonthlyScan(
+  triggerSource: "cron" | "manual",
+  options: { /** Epoch ms the enclosing route started — the insider pass's deadline is measured from it. */ functionStartedAtMs?: number } = {},
+): Promise<MonthlyScanRunResult> {
+  const startedAtMs = options.functionStartedAtMs ?? Date.now();
+  const captured = await captureClaudeFailures(async () => {
+    const run = await prisma.agentRun.create({
+      data: { agentType: "MONTHLY_SCAN", status: "RUNNING" },
     });
 
     try {
-      await logMonthlyScanBatch(run.id, output);
-    } catch (err) {
-      console.error("logMonthlyScanBatch failed:", err);
-    }
+      const output = await runMonthlyScanAgent(triggerSource);
 
-    return { runId: run.id, status: "COMPLETE", output };
+      await prisma.agentRun.update({
+        where: { id: run.id },
+        data: { status: "COMPLETE", completedAt: new Date(), output: output as unknown as object },
+      });
+
+      // Log FIRST (insider fields null), enrich SECOND: a timeout in the slow
+      // paced insider fetch must never lose the month's log.
+      let logged = true;
+      try {
+        await logMonthlyScanBatch(run.id, output);
+      } catch (err) {
+        logged = false;
+        console.error("logMonthlyScanBatch failed:", err);
+      }
+
+      if (triggerSource === "cron") {
+        const enrich = logged
+          ? await enrichInsiderForLatestMonthlyScan({ startedAtMs, sourceAgentRunId: run.id })
+          : null;
+        if (enrich && enrich.insiderCallsUsed > 0) await syncRunOutputInsider(run.id);
+        await recordMonthlyScanHealth(run.id, { logged, enrich, startedAtMs, claudeFailures: getCapturedClaudeFailures() });
+      }
+
+      return { runId: run.id, status: "COMPLETE" as const, output };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await prisma.agentRun.update({
+        where: { id: run.id },
+        data: { status: "FAILED", completedAt: new Date(), errorMessage: message },
+      });
+      if (triggerSource === "cron") {
+        await recordScanHealth(
+          classifyScanHealth({ kind: "MONTHLY_SCAN", runFailed: message, durationMs: Date.now() - startedAtMs, limitMs: MONTHLY_ROUTE_LIMIT_MS }),
+          run.id,
+        );
+      }
+      return { runId: run.id, status: "FAILED" as const, error: message };
+    }
+  });
+  if (captured.error) throw captured.error;
+  return captured.value!;
+}
+
+const MONTHLY_ROUTE_LIMIT_MS = 240_000;
+
+/** Mirrors the enriched insider fields back into the stored AgentRun output so the Agents page (which renders from it) shows them. Best effort. */
+async function syncRunOutputInsider(runId: string): Promise<void> {
+  try {
+    const [run, rows] = await Promise.all([
+      prisma.agentRun.findUnique({ where: { id: runId }, select: { output: true } }),
+      prisma.candidateRecommendationLog.findMany({ where: { sourceAgentRunId: runId, group: "GROUP_3" } }),
+    ]);
+    if (!run?.output) return;
+    const output = run.output as unknown as MonthlyScanOutput;
+    const bySymbol = new Map(rows.map((r) => [r.symbol, r]));
+    for (const c of output.rankedCandidates) {
+      const r = bySymbol.get(c.symbol);
+      if (!r) continue;
+      c.insiderNetSoldUsd30d = r.insiderNetSoldUsd30d;
+      c.insiderSaleCount30d = r.insiderSaleCount30d;
+      c.insiderSellers30d = r.insiderSellers30d;
+      c.insiderHas10b5_1 = r.insiderHas10b5_1;
+    }
+    await prisma.agentRun.update({ where: { id: runId }, data: { output: output as unknown as object } });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    await prisma.agentRun.update({
-      where: { id: run.id },
-      data: { status: "FAILED", completedAt: new Date(), errorMessage: message },
-    });
-    return { runId: run.id, status: "FAILED", error: message };
+    console.error("syncRunOutputInsider failed:", err instanceof Error ? err.message : err);
+  }
+}
+
+async function recordMonthlyScanHealth(
+  runId: string,
+  ctx: { logged: boolean; enrich: Awaited<ReturnType<typeof enrichInsiderForLatestMonthlyScan>> | null; startedAtMs: number; claudeFailures: ClaudeFailure[] },
+): Promise<void> {
+  try {
+    const rowMetrics = ctx.logged ? await loadRunRowMetrics(runId, "GROUP_3") : { rowsLogged: 0, fragilityPopulatedRows: 0, insiderAttemptedRows: 0 };
+    await recordScanHealth(
+      classifyScanHealth({
+        kind: "MONTHLY_SCAN",
+        runFailed: ctx.logged ? null : "Monthly log write failed",
+        ...rowMetrics,
+        expectedRows: MONTHLY_EXPECTED_ROWS,
+        insiderApplicable: true,
+        insiderDeadlineHit: ctx.enrich?.deadlineHit ?? false,
+        insiderCounters: ctx.enrich
+          ? {
+              insiderCallsUsed: ctx.enrich.insiderCallsUsed,
+              insiderSucceeded: ctx.enrich.insiderSucceeded,
+              insiderFailed: ctx.enrich.insiderFailed,
+              insiderSkippedByDeadline: ctx.enrich.insiderSkippedByDeadline,
+            }
+          : null,
+        claudeFailures: ctx.claudeFailures,
+        sentimentCoveredSymbols: await countSentimentCovered(),
+        durationMs: Date.now() - ctx.startedAtMs,
+        limitMs: MONTHLY_ROUTE_LIMIT_MS,
+      }),
+      runId,
+    );
+  } catch (err) {
+    console.error("recordMonthlyScanHealth failed:", err instanceof Error ? err.message : err);
   }
 }
 
@@ -779,6 +894,21 @@ async function buildCioCandidates(): Promise<{
  * one row instead of producing extra research runs.
  */
 export async function synthesizeWeeklyBrief(): Promise<void> {
+  const startedAtMs = Date.now();
+  const captured = await captureClaudeFailures(() => synthesizeWeeklyBriefInner());
+  await recordScanHealth(
+    classifyScanHealth({
+      kind: "WEEKLY_BRIEF",
+      runFailed: captured.error ? (captured.error instanceof Error ? captured.error.message : String(captured.error)) : null,
+      claudeFailures: captured.failures,
+      durationMs: Date.now() - startedAtMs,
+      limitMs: 240_000,
+    }),
+  );
+  if (captured.error) throw captured.error;
+}
+
+async function synthesizeWeeklyBriefInner(): Promise<void> {
   const { candidates, taxableContext, candidateRun } = await buildCioCandidates();
   if (candidates.length === 0) return;
 

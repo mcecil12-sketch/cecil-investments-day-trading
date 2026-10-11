@@ -77,6 +77,19 @@ describe("buildSnapshotMarkdown", () => {
     expect(md).not.toContain("Fragility note is null");
   });
 
+  it("renders scan health and lifts DEGRADED/FAILED reasons into Warnings", () => {
+    const d = full();
+    d.scanHealth = [
+      { kind: "MONTHLY_SCAN", status: "HEALTHY", reasons: [], createdAt: daysAgo(1) },
+      { kind: "WEEKLY_BRIEF", status: "DEGRADED", reasons: ["Claude call failed — CIO brief: BILLING/CREDIT: credit balance is too low"], createdAt: daysAgo(0) },
+    ];
+    const md = buildSnapshotMarkdown(d);
+    expect(md).toContain("### Scan health");
+    expect(md).toContain("| WEEKLY_BRIEF | DEGRADED |");
+    expect(md).toContain("Scan health WEEKLY_BRIEF DEGRADED: Claude call failed — CIO brief: BILLING/CREDIT");
+    expect(md).not.toContain("Scan health MONTHLY_SCAN");
+  });
+
   it("renders a wholly null analyst output as null", () => {
     const d = full();
     d.brief!.performanceAnalysis = null;

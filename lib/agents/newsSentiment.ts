@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { MISSING_KEY_REASON, recordClaudeError, recordClaudeFailure } from "@/lib/agents/claudeFailures";
 
 export type NewsSentimentNoteType = "watchout" | "tailwind";
 
@@ -84,6 +85,7 @@ async function researchCandidate(
     return { symbol, name, noteType: parsed.noteType, note: parsed.note, sourceHint: parsed.sourceHint };
   } catch (err) {
     console.error(`News sentiment check failed for ${symbol}:`, err);
+    recordClaudeError(`News sentiment (${symbol})`, err);
     return null;
   }
 }
@@ -114,7 +116,10 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T)
 export async function generateNewsSentimentNotes(candidates: CandidateInput[]): Promise<NewsSentimentNote[]> {
   if (candidates.length === 0) return [];
   const apiKey = process.env.APP_ANTHROPIC_API_KEY;
-  if (!apiKey) return [];
+  if (!apiKey) {
+    recordClaudeFailure("News sentiment notes", MISSING_KEY_REASON);
+    return [];
+  }
 
   const client = new Anthropic({ apiKey });
   const results = await mapWithConcurrency(candidates, CONCURRENCY, (c) =>

@@ -89,10 +89,47 @@ monthly cycles, flagged names underperform unflagged on risk-adjusted return.
 If it graduates, apply as a position-size haircut in recommendations, not as
 a rank penalty.
 
+### Log first, enrich second (2026-10-11)
+
+The monthly scan used to run the slow, paced insider fetch (~30 calls at 1.2s)
+before writing the log, so a timeout could lose the whole month. Now:
+
+1. The scan scores/ranks and `logMonthlyScanBatch` writes all rows with insider
+   fields **null** and `insiderFetchedAt` **null**.
+2. `enrichInsiderForLatestMonthlyScan()` (`lib/agents/insiderEnrichment.ts`) then
+   fetches insider data and updates rows by id. It sets `insiderFetchedAt` on
+   every row it attempts — including failures and empty responses — so
+   *not attempted* (`null`) is distinguishable from *attempted, no data*
+   (set, insider fields null).
+3. It stops cleanly at `INSIDER_PASS_DEADLINE_MS` (200s from the start of the
+   route function) and never throws; unattempted rows stay `null`.
+4. It is idempotent/resumable: only rows with `insiderFetchedAt` null are touched.
+   Finish a partial run with `POST /api/agents/monthly-scan/enrich-insider`
+   (PIN-gated; `?retryFailed=1` also retries attempted-but-empty rows).
+
+None of this touches the composite, ranks, banding, thresholds or the
+`fragilityFlag` formula (tests assert the scoring output is unchanged).
+
+**Dry run:** `POST /api/agents/monthly-scan?dryRun=1` (Agents page "Dry run"
+button) runs the full pipeline including the paced insider pass but writes
+nothing — no log rows, no `AgentRun`, no earnings/sentiment/S&P cache writes —
+and returns per-phase timings, duration vs the 240s limit, counts, insider
+counters and the top-10 table. It can never count toward the trading-readiness
+banner.
+
+**Scan health:** after each monthly scan (cron), weekly scan and weekly brief a
+`ScanHealth` row (HEALTHY / DEGRADED / FAILED + reasons + metrics) is stored;
+see `GET /api/agents/scan-health`, the Agents page status line, and the
+snapshot export's Warnings. DEGRADED on: fewer than 30 monthly rows, >20% rows
+with null `extensionVs200d`/`vol60d`, <80% rows with `insiderFetchedAt`, the
+insider deadline hit, or any Claude failure (missing key, API/billing errors —
+each recorded with its reason). FAILED on a thrown run or zero rows. Weekly
+scans skip the expected-row-count and insider checks.
+
 ### Insider selling (logging-only, monthly scan)
 
 Added 2026-10-06 after STX's CEO sold stock under 10b5-1 plans on the day we
-bought. For **all 30 ranked candidates** of the monthly scan (cron runs only;
+bought. For **all 30 ranked candidates** of the monthly scan (cron runs only, filled in by the second enrichment pass above;
 weekly Group 1 rows and manual runs get nulls) we log, from
 one Alpha Vantage `INSIDER_TRANSACTIONS` call per ticker
 (`lib/agents/insiderActivity.ts`):
