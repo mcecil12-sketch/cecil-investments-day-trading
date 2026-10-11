@@ -1,4 +1,6 @@
 import { formatVzExposureLine, type VzExposure } from "@/lib/portfolio/vzExposure";
+import type { SectorExposureView } from "@/lib/portfolio/sectorExposureData";
+import type { SectorWeights } from "@/lib/portfolio/sectorExposure";
 import type { DisplayRow } from "@/lib/benchmark/displayRows";
 import { STALE_BRIEF_DAYS, briefAgeDays, type AccountAllocation, type SleeveScoreboard, type ThemeConcentration } from "@/lib/export/sleeveMath";
 
@@ -68,6 +70,7 @@ export interface SnapshotData {
   taxable: SnapshotTaxableRow[] | null;
   group3: { monthKey: string; batchDate?: Date | null; top10: SnapshotGroup3Row[]; sellCandidates: string[] } | null;
   allocation?: AccountAllocation[] | null;
+  sectorExposure?: SectorExposureView | null;
   sleeve?: { scoreboard: SleeveScoreboard | null; theme: ThemeConcentration | null; avgCorrelation60d: number | null; sleeveSize: number; controlSymbol: string; unavailableReason?: string } | null;
   /** Data-quality warnings from the benchmark display layer (S&P mismatches, differing as-of dates, young accounts). */
   benchmarkWarnings?: string[];
@@ -306,6 +309,26 @@ export function buildSnapshotMarkdown(data: SnapshotData): string {
       ),
     );
     if (sb.missing.length > 0) out.push(`Missing price history: ${sb.missing.join(", ")}`);
+  }
+
+  out.push("", "### Sector exposure");
+  const se = data.sectorExposure;
+  if (!se) out.push("_Sector exposure: data unavailable._");
+  else {
+    const mix = (w: SectorWeights | null) => (w ? w.rows.map((r) => `${r.sector} ${pct(r.weight)}${r.sector === "Unknown" ? "*" : ""}`).join(", ") : "n/a");
+    out.push(
+      ...table(
+        ["View", "Sector weights"],
+        [
+          [`Group 3 top 10 (pure)${se.batchTag ? ` — ${se.batchTag}` : ""}`, mix(se.pureTop10)],
+          ["Group 3 top 10 (capped, 3/sector — shadow, never traded)", mix(se.cappedTop10)],
+          ["Unified portfolio (401k funds + taxable + Verizon-linked)", mix(se.portfolio)],
+        ],
+      ),
+      "",
+      "_* Unknown = sector not determinable from the app's classification (not guessed)._",
+      ...se.notes.map((n) => `- ${n}`),
+    );
   }
 
   out.push("", "### Theme concentration");

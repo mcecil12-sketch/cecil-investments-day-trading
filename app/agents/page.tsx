@@ -12,6 +12,8 @@ import { alphaColor, formatCompactCurrency, formatCurrency, formatCalendarDate, 
 import { RunAgentButton } from "./RunAgentButton";
 import { DryRunButton } from "./DryRunButton";
 import { getLatestScanHealth, type LatestScanHealth } from "@/lib/agents/scanHealth";
+import { loadSectorExposureView, type SectorExposureView } from "@/lib/portfolio/sectorExposureData";
+import type { SectorWeights } from "@/lib/portfolio/sectorExposure";
 import { getRecentCronRuns, summarizeCronRuns, type CronLatest } from "@/lib/agents/cronRun";
 import { AgentStatusPoller } from "./AgentStatusPoller";
 import type { AgentStatusResponse } from "@/app/api/agents/status/route";
@@ -532,6 +534,12 @@ export default async function AgentsPage() {
   } catch (err) {
     console.error("getRecentCronRuns failed:", err);
   }
+  let sectorExposure: SectorExposureView | null = null;
+  try {
+    sectorExposure = await loadSectorExposureView();
+  } catch (err) {
+    console.error("loadSectorExposureView failed:", err);
+  }
   let scanHealth: LatestScanHealth[] = [];
   try {
     scanHealth = await getLatestScanHealth();
@@ -559,6 +567,41 @@ export default async function AgentsPage() {
           ? "none recorded yet"
           : cronLatest.map((c) => `${c.name} ${c.state}${c.reasons[0] ? ` — ${c.reasons[0]}` : ""} · ${formatDateTimeET(c.at)}`).join("  |  ")}
       </p>
+
+      {sectorExposure && (
+        <div className="card">
+          <div className="agent-card-header">
+            <strong>Sector exposure</strong>
+            <span style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>{sectorExposure.batchTag ?? "no monthly batch yet"}</span>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>View</th><th>Sector weights</th></tr>
+              </thead>
+              <tbody>
+                {(
+                  [
+                    ["Group 3 top 10 (pure)", sectorExposure.pureTop10],
+                    ["Group 3 top 10 (capped 3/sector — shadow, never traded)", sectorExposure.cappedTop10],
+                    ["Unified portfolio (401k funds, taxable, Verizon-linked)", sectorExposure.portfolio],
+                  ] as Array<[string, SectorWeights | null]>
+                ).map(([label, w]) => (
+                  <tr key={label}>
+                    <td>{label}</td>
+                    <td className="mono">
+                      {w ? w.rows.map((r) => `${r.sector}${r.sector === "Unknown" ? "*" : ""} ${(r.weight * 100).toFixed(1)}%`).join(" · ") : "n/a"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p style={{ color: "var(--text-muted)", fontSize: "0.78rem", marginBottom: 0 }}>
+            * Unknown = sector not determinable from the app&apos;s classification (not guessed). {sectorExposure.notes.join(" ")}
+          </p>
+        </div>
+      )}
 
       <div className="card card-accent">
         <div className="agent-card-header">

@@ -138,6 +138,28 @@ insider deadline hit, or any Claude failure (missing key, API/billing errors —
 each recorded with its reason). FAILED on a thrown run or zero rows. Weekly
 scans skip the expected-row-count and insider checks.
 
+### Shadow capped top 10 and the sector exposure view (2026-10-13)
+
+Group 3's top 10 is pure composite rank, so it can concentrate in one sector.
+Alongside it we compute a **capped variant: at most 3 names per sector** (the
+sector already on each candidate). Walking the ranked list best-first, a name
+is kept only while its sector has fewer than 3 kept names; overflow gets
+`cappedRank = null` and the next-ranked candidate from a sector still under the
+cap takes its place. `cappedRank` (1..N over the whole ranked list) and
+`inCappedTop10` are stored on every monthly log row (`lib/agents/cappedTop10.ts`),
+shown as a second table with sector counts for both variants in the dry run,
+and compared by sector mix on the Agents page and in the snapshot export next to
+the unified portfolio (401k funds, taxable, Verizon-linked; cash excluded).
+Holdings whose sector can't be determined from the app's existing
+classification are marked **Unknown**, never guessed (e.g. target-date and bond
+funds).
+
+**The capped variant is a shadow portfolio.** It is never traded and never used
+to change a recommendation, ranking, banding or threshold. It exists so the two
+portfolios can be replayed later and compared on return, drawdown and sector
+mix. Any decision to act on it requires a **pre-registered comparison after at
+least 3 monthly cycles**; until then it is logging only.
+
 ### Insider data source: SEC EDGAR primary, Alpha Vantage fallback (2026-10-12)
 
 Alpha Vantage returned empty `data` for 28 of 30 ranked names on the Oct 11

@@ -204,3 +204,28 @@ describe("insiderCell: $0 for a valid EDGAR zero, n/a only for failed/unattempte
     expect(md).toContain("| 2 | BBB | 69 | held | no | no | n/a |");
   });
 });
+
+describe("sector exposure section", () => {
+  it("shows the pure vs capped top 10 and the unified portfolio, marking Unknown", () => {
+    const d = full();
+    const w = (rows: Array<[string, number]>, unknownSymbols: string[] = []) => ({ rows: rows.map(([sector, weight]) => ({ sector, value: null, count: 1, weight, symbols: [] })), total: 1, unknownWeight: 0, unknownSymbols });
+    d.sectorExposure = {
+      batchTag: "monthly-2026-10",
+      pureTop10: w([["Technology", 0.7], ["Energy", 0.3]]),
+      cappedTop10: w([["Technology", 0.3], ["Energy", 0.3], ["Health Care", 0.4]]),
+      portfolio: w([["Broad Market", 0.5], ["Unknown", 0.2], ["Communications", 0.3]], ["VERIZON 2070 FUND"]),
+      notes: ["Sector unknown (not guessed): VERIZON 2070 FUND."],
+    };
+    const md = buildSnapshotMarkdown(d);
+    expect(md).toContain("### Sector exposure");
+    expect(md).toContain("Technology 70.0%, Energy 30.0%");
+    expect(md).toContain("Technology 30.0%, Energy 30.0%, Health Care 40.0%");
+    expect(md).toContain("Unknown 20.0%*");
+    expect(md).toContain("shadow, never traded");
+    expect(md).toContain("not guessed");
+  });
+
+  it("degrades to a one-line note when unavailable", () => {
+    expect(buildSnapshotMarkdown(full())).toContain("_Sector exposure: data unavailable._");
+  });
+});

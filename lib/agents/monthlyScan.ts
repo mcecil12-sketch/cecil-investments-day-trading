@@ -12,6 +12,7 @@ import {
 } from "@/lib/agents/scoringShared";
 import { getMonthlyScanEarningsScores } from "@/lib/agents/monthlyScanEarnings";
 import type { EarningsSurpriseTrendCoverage } from "@/lib/agents/earningsSurpriseTrend";
+import { computeCappedTop10 } from "@/lib/agents/cappedTop10";
 import { applyFragilityCohort, computeFragility, latestClose } from "@/lib/agents/fragilityScore";
 import { getNewsSentimentScores, type NewsSentimentCoverage } from "@/lib/agents/newsSentimentScore";
 import type { CandidateAccountType } from "@/lib/agents/candidateScanner";
@@ -48,6 +49,9 @@ export interface MonthlyScanCandidateEntry {
   fragilityPercentile: number | null;
   /** Top third of the cohort by fragilityPercentile. Relative since Oct 11 2026. */
   fragilityFlag: boolean | null;
+  /** SHADOW capped top 10 (max 3 per sector; see cappedTop10.ts) — log-only, never traded or used in recommendations. Null cappedRank = overflow past the sector cap. */
+  cappedRank: number | null;
+  inCappedTop10: boolean;
   /** Close and UTC date of the price used at scan time (logged with the market cap). */
   lastClose: number | null;
   priceDate: string | null;
@@ -222,6 +226,8 @@ export async function runMonthlyScanAgent(
           sentimentCoverage: sentiment.coverage,
           ...computeFragility(points),
           ...latestClose(points),
+          cappedRank: null, // filled after ranking (shadow capped variant)
+          inCappedTop10: false,
           insiderNetSoldUsd30d: null,
           insiderSaleCount30d: null,
           insiderSellers30d: null,
@@ -249,6 +255,12 @@ export async function runMonthlyScanAgent(
     .map((entry, i) => ({ ...entry, rank: i + 1 }));
   // Logging-only, after ranking: cohort-relative fragility (never affects score/rank).
   applyFragilityCohort(rankedCandidates);
+  // Shadow capped variant (log-only): never alters score, rank, or banding.
+  const capped = computeCappedTop10(rankedCandidates.map((c) => ({ symbol: c.symbol, sector: c.sector, rank: c.rank })));
+  rankedCandidates.forEach((c, i) => {
+    c.cappedRank = capped[i].cappedRank;
+    c.inCappedTop10 = capped[i].inCappedTop10;
+  });
 
   endPhase("pricesFragilityScoringRanking");
 

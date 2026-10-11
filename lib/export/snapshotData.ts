@@ -9,6 +9,7 @@ import { getLatestScanHealth } from "@/lib/agents/scanHealth";
 import { loadBenchmarkDisplay } from "@/lib/benchmark/displayData";
 import { loadAdjustedSeries, loadSp500TotalReturnSeries } from "@/lib/benchmark/sp500Comparator";
 import { averagePairwiseCorrelation, computeAllocation, computeSleeveScoreboard, computeThemeConcentration } from "@/lib/export/sleeveMath";
+import { loadSectorExposureView } from "@/lib/portfolio/sectorExposureData";
 import { getVzExposure } from "@/lib/portfolio/vzExposureData";
 import type { AgentType } from "@/lib/generated/prisma";
 import type { SnapshotAccountRow, SnapshotAnalystText, SnapshotData } from "@/lib/export/snapshotMarkdown";
@@ -225,6 +226,8 @@ export async function loadSnapshotData(now: Date = new Date()): Promise<Snapshot
     sleeve = { scoreboard: null, theme: null, avgCorrelation60d: null, sleeveSize: 0, controlSymbol: CONTROL_SYMBOL, unavailableReason: "no Group 3 top-10 names held in taxable accounts" };
   }
 
+  const sectorExposure = await guard("sector exposure", () => loadSectorExposureView());
+
   const brief = await guard("brief", async () => {
     const b = await prisma.weeklyBrief.findFirst({ orderBy: { weekOf: "desc" } });
     return b ? { weekOf: b.weekOf, cioSummary: b.cioSummary, performanceAnalysis: toAnalystText(b.performanceAnalysis) } : null;
@@ -232,5 +235,5 @@ export async function loadSnapshotData(now: Date = new Date()): Promise<Snapshot
 
   const scanHealth = await guard("scanHealth", () => getLatestScanHealth());
 
-  return { generatedAt: now, freshness, portfolio, vz, taxable, group3, allocation, sleeve, benchmarkWarnings: display?.warnings ?? [], brief, scanHealth, loadErrors };
+  return { generatedAt: now, freshness, portfolio, vz, taxable, group3, allocation, sectorExposure, sleeve, benchmarkWarnings: display?.warnings ?? [], brief, scanHealth, loadErrors };
 }

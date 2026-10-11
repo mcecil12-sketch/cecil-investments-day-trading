@@ -70,6 +70,31 @@ export function DryRunButton({ endpoint }: { endpoint: string }) {
               </tbody>
             </table>
           </div>
+          <p style={{ marginTop: "0.6rem", fontWeight: 600 }}>Shadow capped top 10 (max {report.capped.maxPerSector} per sector — never traded)</p>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Capped rank</th><th>Pure rank</th><th>Symbol</th><th>Sector</th><th>Composite</th></tr>
+              </thead>
+              <tbody>
+                {report.capped.top10.map((r) => (
+                  <tr key={r.symbol}>
+                    <td>{r.cappedRank}</td>
+                    <td>{r.pureRank}</td>
+                    <td>{r.symbol}</td>
+                    <td>{r.sector}</td>
+                    <td className="mono">{r.composite}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p style={{ color: "var(--text-muted)" }}>
+            Displaced from the pure top 10: {report.capped.displaced.length > 0 ? report.capped.displaced.map((d) => `${d.symbol} (#${d.pureRank}, ${d.sector})`).join(", ") : "none"}
+          </p>
+          <p style={{ color: "var(--text-muted)" }}>
+            Sector counts — pure: {Object.entries(report.capped.sectorCounts.pure).map(([k, v]) => `${k} ${v}`).join(", ")} · capped: {Object.entries(report.capped.sectorCounts.capped).map(([k, v]) => `${k} ${v}`).join(", ")}
+          </p>
           <p style={{ marginTop: "0.6rem", fontWeight: 600 }}>Insider diagnostics per ticker</p>
           <div className="table-wrap">
             <table>

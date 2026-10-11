@@ -391,6 +391,9 @@ model CandidateRecommendationLog {
   insiderFetchedAt DateTime?
   /// Which source supplied the insider fields: "edgar" (SEC Form 4s, primary) or "alphavantage" (fallback). Null when not attempted or when both sources failed.
   insiderSource String?
+  /// SHADOW capped top 10 (monthly scan only): rank after capping at 3 names per sector (null = overflow past the cap) and whether the name is in the capped top 10. Never traded, never used for recommendations; stored so both portfolios can be replayed and compared (see lib/agents/cappedTop10.ts).
+  cappedRank Int?
+  inCappedTop10 Boolean?
   /// Close used at scan time and its trading date (UTC) — the price behind marketCap. Logged for monthly and weekly scans. Logging-only.
   scanClose Float?
   priceDate DateTime?

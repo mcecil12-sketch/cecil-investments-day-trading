@@ -1,4 +1,5 @@
 import type { OverviewResult } from "@/lib/agents/marketCap";
+import { CAPPED_MAX_PER_SECTOR, sectorCounts } from "@/lib/agents/cappedTop10";
 import { runMonthlyScanAgent, MAX_TRACKED_CANDIDATES, type MonthlyScanDiagnostics } from "@/lib/agents/monthlyScan";
 import { runInsiderPass, runMarketCapPass, INSIDER_PASS_DEADLINE_MS, type InsiderPassOptions, type InsiderTickerDiagnostics } from "@/lib/agents/insiderEnrichment";
 
@@ -32,6 +33,14 @@ export interface MonthlyScanDryRunReport {
     /** Net sold as a percent of market cap (positive = net selling). */
     insiderNetSoldPctOfMarketCap: number | null;
   }>;
+  /** SHADOW capped top 10 (max 3 per sector) beside the pure top 10 — log-only, never traded. */
+  capped: {
+    maxPerSector: number;
+    top10: Array<{ cappedRank: number; pureRank: number; symbol: string; sector: string; composite: number }>;
+    /** Overflow: pure top-10 names displaced by the cap. */
+    displaced: Array<{ symbol: string; sector: string; pureRank: number }>;
+    sectorCounts: { pure: Record<string, number>; capped: Record<string, number> };
+  };
   marketCapPass: { attempted: number; ok: number; failed: number; skippedByDeadline: number };
   notes: string[];
 }
@@ -109,6 +118,18 @@ export async function runMonthlyScanDryRun(
       marketCap: cap.results.get(c.symbol)?.marketCap ?? null,
       insiderNetSoldPctOfMarketCap: cap.results.get(c.symbol)?.pct ?? null,
     })),
+    capped: {
+      maxPerSector: CAPPED_MAX_PER_SECTOR,
+      top10: ranked
+        .filter((c) => c.inCappedTop10 && c.cappedRank != null)
+        .sort((a, b) => a.cappedRank! - b.cappedRank!)
+        .map((c) => ({ cappedRank: c.cappedRank!, pureRank: c.rank, symbol: c.symbol, sector: c.sector, composite: c.score })),
+      displaced: ranked.filter((c) => c.rank <= 10 && !c.inCappedTop10).map((c) => ({ symbol: c.symbol, sector: c.sector, pureRank: c.rank })),
+      sectorCounts: {
+        pure: sectorCounts(ranked.filter((c) => c.rank <= 10)),
+        capped: sectorCounts(ranked.filter((c) => c.inCappedTop10)),
+      },
+    },
     marketCapPass: { attempted: cap.marketCapAttempted, ok: cap.marketCapOk, failed: cap.marketCapFailed, skippedByDeadline: cap.marketCapSkippedByDeadline },
     notes: [
       "Nothing was written: no log rows, no AgentRun, no earnings/sentiment/S&P cache updates.",

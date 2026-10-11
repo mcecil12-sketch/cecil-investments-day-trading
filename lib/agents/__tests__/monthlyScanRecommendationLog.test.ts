@@ -29,6 +29,8 @@ function output(overrides: Partial<MonthlyScanOutput> = {}): MonthlyScanOutput {
         sentimentCoverage: "scored",
         extensionVs200d: 0.31,
         vol60d: 0.72,
+        cappedRank: 2,
+        inCappedTop10: true,
         lastClose: 123.45,
         priceDate: "2026-08-21",
         fragilityPercentile: 91,
@@ -65,6 +67,8 @@ describe("logMonthlyScanBatch", () => {
     createMany.mockResolvedValueOnce({ count: 1 });
     await logMonthlyScanBatch("run1", output({ triggerSource: "cron" }));
     const row = createMany.mock.calls[0][0].data[0];
+    expect(row.cappedRank).toBe(2);
+    expect(row.inCappedTop10).toBe(true);
     expect(row.scanClose).toBe(123.45);
     expect(row.priceDate).toEqual(new Date("2026-08-21T00:00:00Z"));
     expect(row).not.toHaveProperty("marketCap");
