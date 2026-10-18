@@ -61,6 +61,23 @@ const FIVE_YEAR_WEIGHT = 0.2;
 /** Minimum gap (percentage points, as a fraction) between YTD and 1Y returns, in opposite directions, before it's worth flagging as a divergence to verify. */
 const DIVERGENCE_THRESHOLD = 0.15;
 
+/** Max holdings whose price history is fetched at once in scoreCurrentHoldings. */
+const HOLDING_FETCH_CONCURRENCY = 6;
+
+/** Runs fn over items with at most `limit` in flight, preserving input order in the result. */
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
+}
+
 const scoreSeries = scorePriceSeries;
 
 /**
@@ -77,26 +94,40 @@ export async function scoreCurrentHoldings(): Promise<RelativeStrengthScoringRes
   const [sp500Points, holdings] = await Promise.all([getSp500Series(), getCurrentHoldings()]);
   const sp500 = scoreSeries(sp500Points);
 
-  const scored: RelativeStrengthEntry[] = [];
-  const skipped: Array<{ symbol: string; reason: string }> = [];
+  // Per-run memo: several 401k funds share one proxy ETF (e.g. SPY), so each
+  // symbol's history is fetched at most once per run.
+  const priceCache = new Map<string, Promise<PricePoint[]>>();
+  const fetchPoints = (symbol: string): Promise<PricePoint[]> => {
+    let pending = priceCache.get(symbol);
+    if (!pending) {
+      pending = getPriceHistory(symbol).then((result) => result.points);
+      priceCache.set(symbol, pending);
+    }
+    return pending;
+  };
 
-  for (const holding of holdings) {
+  type HoldingOutcome = { entry: RelativeStrengthEntry } | { skip: { symbol: string; reason: string } };
+
+  // Holdings were previously scored one at a time; with a fallback chain of up
+  // to three network calls per 401k fund, a full run could exceed the 120s
+  // route limit (Risk Manager timed out on Oct 18, 2026). Bounded concurrency
+  // keeps us polite to Yahoo while cutting wall-clock time several-fold.
+  const outcomes = await mapWithConcurrency(holdings, HOLDING_FETCH_CONCURRENCY, async (holding): Promise<HoldingOutcome> => {
     try {
       let points: PricePoint[];
       let proxySymbol: string | null = null;
       let isActiveFund = false;
 
       try {
-        ({ points } = await getPriceHistory(holding.symbol));
+        points = await fetchPoints(holding.symbol);
       } catch {
         const proxy = getFundProxy(holding.symbol, holding.name);
         if (!proxy) {
-          skipped.push({ symbol: holding.symbol, reason: "No proxy available" });
-          continue;
+          return { skip: { symbol: holding.symbol, reason: "No proxy available" } };
         }
         proxySymbol = proxy.proxy;
         isActiveFund = proxy.isActive;
-        ({ points } = await getPriceHistory(proxySymbol));
+        points = await fetchPoints(proxySymbol);
       }
 
       const priceScored = scoreSeries(points);
@@ -143,7 +174,8 @@ export async function scoreCurrentHoldings(): Promise<RelativeStrengthScoringRes
       }
       if (isActiveFund) noteParts.push(ACTIVE_FUND_NOTE);
 
-      scored.push({
+      return {
+        entry: {
         symbol: holding.symbol,
         name: holding.name,
         currentValue: holding.currentValue,
@@ -160,10 +192,18 @@ export async function scoreCurrentHoldings(): Promise<RelativeStrengthScoringRes
         note: noteParts.length > 0 ? noteParts.join(" — ") : null,
         ytdReturn,
         divergenceFlag,
-      });
+        },
+      };
     } catch (err) {
-      skipped.push({ symbol: holding.symbol, reason: err instanceof Error ? err.message : String(err) });
+      return { skip: { symbol: holding.symbol, reason: err instanceof Error ? err.message : String(err) } };
     }
+  });
+
+  const scored: RelativeStrengthEntry[] = [];
+  const skipped: Array<{ symbol: string; reason: string }> = [];
+  for (const outcome of outcomes) {
+    if ("entry" in outcome) scored.push(outcome.entry);
+    else skipped.push(outcome.skip);
   }
 
   return {

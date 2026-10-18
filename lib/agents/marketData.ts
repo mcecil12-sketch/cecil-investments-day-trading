@@ -9,6 +9,9 @@ export interface PricePoint {
 /** Verizon's ticker — shared by every live/at-import VZ price lookup (LTI grant valuation) so it's spelled in exactly one place. */
 export const VZ_SYMBOL = "VZ";
 
+/** Per-request cap for price-history fetches, so one hung request can't consume a whole route's time budget. */
+const PRICE_FETCH_TIMEOUT_MS = 10_000;
+
 const YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart";
 
 /**
@@ -24,6 +27,7 @@ async function fetchYahooHistory(
   const url = `${YAHOO_CHART_URL}/${encodeURIComponent(symbol)}?range=${range}&interval=1d`;
   const response = await fetch(url, {
     headers: { "User-Agent": "Mozilla/5.0 (compatible; portfolio-benchmark/1.0)" },
+    signal: AbortSignal.timeout(PRICE_FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -94,6 +98,7 @@ async function fetchAlpacaHistory(symbol: string, days = 400): Promise<PricePoin
       "APCA-API-SECRET-KEY": ALPACA_SECRET,
     },
     cache: "no-store",
+    signal: AbortSignal.timeout(PRICE_FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {

@@ -17,6 +17,7 @@ import { logCandidateRecommendationBatch } from "@/lib/agents/candidateRecommend
 import { runMonthlyScanAgent, type MonthlyScanOutput } from "@/lib/agents/monthlyScan";
 import { logMonthlyScanBatch } from "@/lib/agents/monthlyScanRecommendationLog";
 import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
+import { buildCioPolicyContext } from "@/lib/agents/cioPolicyContext";
 import { buildTaxableAnalysisContext, type TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
 import { generateNewsSentimentNotes, type NewsSentimentNote } from "@/lib/agents/newsSentiment";
 import { sendWeeklyBriefNotification } from "@/lib/notifications/weeklyBrief";
@@ -916,6 +917,7 @@ export interface WeeklyBriefResult {
 /** Per-step budgets so a slow enrichment can never stop the brief from being written (see synthesizeWeeklyBriefInner). */
 export const BRIEF_NEWS_TIMEOUT_MS = 90_000;
 export const BRIEF_ANALYST_TIMEOUT_MS = 60_000;
+export const BRIEF_POLICY_TIMEOUT_MS = 20_000;
 
 async function withTimeout<T>(label: string, ms: number, fn: () => Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -968,7 +970,15 @@ async function synthesizeWeeklyBriefInner(): Promise<WeeklyBriefResult> {
     return { outcome: "skipped", reason: "No candidate items: no completed Risk Manager / Relative Strength / Sector Rotation / Candidate Scanner output to synthesize", warnings };
   }
 
-  const brief = await synthesizeCioBrief(candidates, taxableContext);
+  // Rules context for the CIO (Group 3 top 10, locked Verizon). Bounded so a slow
+  // price lookup can't hold up the brief; on failure the CIO runs without it.
+  const policyContext = await withTimeout("CIO policy context", BRIEF_POLICY_TIMEOUT_MS, () => buildCioPolicyContext()).catch(
+    (err: unknown) => {
+      warnings.push(`CIO policy context unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    },
+  );
+  const brief = await synthesizeCioBrief(candidates, taxableContext, policyContext);
   if (brief.orderedItems.length === 0) {
     return { outcome: "skipped", reason: "CIO synthesis returned no action items", warnings };
   }
