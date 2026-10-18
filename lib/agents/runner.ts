@@ -17,6 +17,7 @@ import { logCandidateRecommendationBatch } from "@/lib/agents/candidateRecommend
 import { runMonthlyScanAgent, type MonthlyScanOutput } from "@/lib/agents/monthlyScan";
 import { logMonthlyScanBatch } from "@/lib/agents/monthlyScanRecommendationLog";
 import { synthesizeCioBrief, type CioCandidateItem } from "@/lib/agents/cio";
+import { buildCioPolicyContext } from "@/lib/agents/cioPolicyContext";
 import { buildTaxableAnalysisContext, type TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
 import { generateNewsSentimentNotes, type NewsSentimentNote } from "@/lib/agents/newsSentiment";
 import { sendWeeklyBriefNotification } from "@/lib/notifications/weeklyBrief";
@@ -968,7 +969,9 @@ async function synthesizeWeeklyBriefInner(): Promise<WeeklyBriefResult> {
     return { outcome: "skipped", reason: "No candidate items: no completed Risk Manager / Relative Strength / Sector Rotation / Candidate Scanner output to synthesize", warnings };
   }
 
-  const brief = await synthesizeCioBrief(candidates, taxableContext);
+  const policyContext = await buildCioPolicyContext().catch(() => null);
+  if (!policyContext?.group3) warnings.push("CIO policy context: Group 3 top 10 unavailable");
+  const brief = await synthesizeCioBrief(candidates, taxableContext, policyContext);
   if (brief.orderedItems.length === 0) {
     return { outcome: "skipped", reason: "CIO synthesis returned no action items", warnings };
   }

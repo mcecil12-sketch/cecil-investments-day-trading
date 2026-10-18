@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { TaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
+import type { CioPolicyContext } from "@/lib/agents/cioPolicyContext";
 import { MISSING_KEY_REASON, recordClaudeError, recordClaudeFailure } from "@/lib/agents/claudeFailures";
 
 export type CioItemSource =
@@ -55,7 +56,11 @@ export interface CioBrief {
 
 const SYSTEM_PROMPT = `You are the CIO of a household investment portfolio, writing the weekly brief that the household will read at a glance. You're given candidate findings from four portfolio agents (Risk Manager, Relative Strength, Sector Rotation, Candidate Scanner) as JSON. Each candidate has a "source" tag showing which agent raised it. Sources starting with "risk_", "relative_strength_", and "sector_" all concern the portfolio's existing holdings — HOLD, TRIM, or watch decisions. Sources tagged "candidate_new" are stocks/ETFs the household does not currently own — ADD decisions.
 
-The portfolio has five taxable Fidelity accounts (Cecil Investments, Grandma Potter Gift, Personal Investments, For Kennedy, Gifts and Trips) holding primarily FSELX, FSPGX, and FXAIX. These accounts have full flexibility for individual stocks and Fidelity funds. The owner has approximately $150k in capital gains capacity this year with minimal tax impact. Always include specific taxable account recommendations alongside retirement account recommendations.
+The portfolio has five taxable Fidelity accounts (Cecil Investments, Grandma Potter Gift, Personal Investments, For Kennedy, Gifts and Trips). Their stock holdings are a "Group 3" sleeve, the current monthly top 10, held alongside FXAIX (S&P 500 index). These accounts have full flexibility for individual stocks and Fidelity funds. The owner has approximately $150k in capital gains capacity this year with minimal tax impact. Always include specific taxable account recommendations alongside retirement account recommendations.
+
+Standing rules (binding; when "portfolioPolicy" data is provided, it is authoritative):
+- Group 3 is a pre-registered monthly test: buy names ranked 1-10 in the monthly scan, sell names ranked below 10, equal weight, rebalanced only at the monthly scan. Never recommend adding to, trimming, or exiting a top-10 name between scans, and never recommend buying a name that is a Group 3 sell candidate or outside the current top 10. A strong "candidate_new" name outside the top 10 is a "watch for the next monthly scan" item, not a buy.
+- Unvested Verizon LTI shares and the Verizon EDP account are locked and cannot be sold or reallocated. Never recommend trimming them. When discussing Verizon concentration, state the tradeable share (excluding unvested LTI) separately from the total, and only recommend action on the tradeable portion. Advise against new Verizon purchases.
 
 Do three things:
 1. Write a 2-4 sentence executive summary in plain English — no jargon dump, no restating every item. Lead with whatever is most urgent or most likely to matter to the household this week (critical risk flags first, if any). If there's no critical risk flag, and a "candidate_new" item is the single highest-conviction opportunity in the list, lead with that new candidate by name instead of an existing-holdings item — new-opportunity items are the freshest signal and should get top billing when nothing is on fire. Then cover anything else worth a sentence, explicitly distinguishing existing-position actions (HOLD/TRIM) from new-candidate actions (ADD) in your phrasing rather than blurring them together.
@@ -64,7 +69,8 @@ Do three things:
    - Review FSELX concentration across all taxable accounts combined, and flag if the semiconductor sector has weakened materially based on its relative-strength score and momentum.
    - Identify any taxable position worth trimming given the $150k capital gains capacity — include the estimated dollar gain and a plain-English note on the tax impact. Leave trimCandidates empty if nothing is worth trimming.
    - Call out sectors that are leading (top-ranked by the Sector Rotation agent) but have zero current taxable exposure — candidates for new taxable capital.
-   - Call out any position with strong momentum (from the Relative Strength data) worth adding to with new taxable capital.
+   - Call out any position with strong momentum (from the Relative Strength data) worth adding to with new taxable capital, limited to current Group 3 top-10 names and FXAIX, and framed as a use for new money at the next monthly rebalance, never a mid-cycle top-up.
+   - Trim candidates follow the same rule: never suggest trimming a current top-10 name between scans.
 
 Only use the "key" values you were given for orderedKeys — never invent a new key or alter an item's underlying facts. Base every taxable figure strictly on the data provided — never invent dollar amounts.`;
 
@@ -177,6 +183,17 @@ function taxableContextPrompt(context: TaxableAnalysisContext): string {
   )}`;
 }
 
+export function policyContextPrompt(context: CioPolicyContext): string {
+  return `portfolioPolicy (authoritative; apply the standing rules to these facts):\n\n${JSON.stringify(
+    {
+      group3: context.group3,
+      verizon: context.verizon,
+    },
+    null,
+    2,
+  )}`;
+}
+
 /**
  * Sends this week's candidate findings (and, when available, taxable account
  * data) to Claude for natural-language synthesis, priority ranking, and a
@@ -188,6 +205,7 @@ function taxableContextPrompt(context: TaxableAnalysisContext): string {
 export async function synthesizeCioBrief(
   candidates: CioCandidateItem[],
   taxableContext: TaxableAnalysisContext | null = null,
+  policyContext: CioPolicyContext | null = null,
 ): Promise<CioBrief> {
   if (candidates.length === 0) {
     return { summary: fallbackSummary(candidates), orderedItems: [], taxableOpportunities: null };
@@ -211,9 +229,10 @@ export async function synthesizeCioBrief(
     null,
     2,
   )}`;
-  const userContent = taxableContext
-    ? `${candidateSection}\n\n${taxableContextPrompt(taxableContext)}`
-    : candidateSection;
+  const sections = [candidateSection];
+  if (taxableContext) sections.push(taxableContextPrompt(taxableContext));
+  if (policyContext) sections.push(policyContextPrompt(policyContext));
+  const userContent = sections.join("\n\n");
 
   let message: Anthropic.Message;
   try {
