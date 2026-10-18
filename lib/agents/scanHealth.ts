@@ -111,26 +111,64 @@ export function classifyScanHealth(input: ScanHealthInput): ScanHealthResult {
   };
 }
 
-/** Emails a short alert via Resend — only on DEGRADED/FAILED and only if RESEND_API_KEY and ALERT_EMAIL are both set; otherwise silent. Never throws. */
-export async function maybeSendHealthAlert(result: ScanHealthResult): Promise<boolean> {
-  const apiKey = process.env.RESEND_API_KEY;
-  const to = process.env.ALERT_EMAIL;
-  if (!apiKey || !to || result.status === "HEALTHY") return false;
+/** Pushover caps message bodies at 1024 characters. */
+const PUSHOVER_MAX_MESSAGE = 1024;
+
+export function healthAlertText(result: ScanHealthResult): { title: string; message: string } {
+  const title = `[Cecil] ${result.kind} ${result.status}`;
+  const body = `${result.kind} finished ${result.status}.\n\n${result.reasons.map((r) => `- ${r}`).join("\n")}`;
+  const message = body.length <= PUSHOVER_MAX_MESSAGE ? body : `${body.slice(0, PUSHOVER_MAX_MESSAGE - 1)}…`;
+  return { title, message };
+}
+
+/** Push alert via Pushover (same keys as the weekly brief push). FAILED is high priority, DEGRADED normal. Never throws. */
+async function sendPushoverHealthAlert(result: ScanHealthResult): Promise<boolean> {
+  const user = process.env.PUSHOVER_USER_KEY;
+  const token = process.env.PUSHOVER_API_TOKEN || process.env.PUSHOVER_APP_TOKEN;
+  if (!user || !token) return false;
+  const { title, message } = healthAlertText(result);
   try {
-    const res = await fetch("https://api.resend.com/emails", {
+    const res = await fetch("https://api.pushover.net/1/messages.json", {
       method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        from: process.env.ALERT_FROM_EMAIL || "onboarding@resend.dev",
-        to: [to],
-        subject: `[Cecil] ${result.kind} ${result.status}`,
-        text: `${result.kind} finished ${result.status}.\n\n${result.reasons.map((r) => `- ${r}`).join("\n")}`,
-      }),
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token, user, title, message, priority: result.status === "FAILED" ? "1" : "0" }),
+      signal: AbortSignal.timeout(10_000),
     });
     return res.ok;
   } catch {
     return false;
   }
+}
+
+/** Optional email alert via Resend, only if RESEND_API_KEY and ALERT_EMAIL are both set. Never throws. */
+async function sendEmailHealthAlert(result: ScanHealthResult): Promise<boolean> {
+  const apiKey = process.env.RESEND_API_KEY;
+  const to = process.env.ALERT_EMAIL;
+  if (!apiKey || !to) return false;
+  const { title, message } = healthAlertText(result);
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: process.env.ALERT_FROM_EMAIL || "onboarding@resend.dev", to: [to], subject: title, text: message }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Alerts on DEGRADED/FAILED runs: Pushover first (the channel already used for
+ * the weekly brief), plus email when Resend is configured. Silent on HEALTHY
+ * or when no channel is configured. Returns true if any channel delivered.
+ * Never throws.
+ */
+export async function maybeSendHealthAlert(result: ScanHealthResult): Promise<boolean> {
+  if (result.status === "HEALTHY") return false;
+  const [pushed, emailed] = await Promise.all([sendPushoverHealthAlert(result), sendEmailHealthAlert(result)]);
+  return pushed || emailed;
 }
 
 /** Stores the verdict (and sends the optional alert). Never throws — health recording must not fail a run. */
