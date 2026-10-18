@@ -917,6 +917,7 @@ export interface WeeklyBriefResult {
 /** Per-step budgets so a slow enrichment can never stop the brief from being written (see synthesizeWeeklyBriefInner). */
 export const BRIEF_NEWS_TIMEOUT_MS = 90_000;
 export const BRIEF_ANALYST_TIMEOUT_MS = 60_000;
+export const BRIEF_POLICY_TIMEOUT_MS = 20_000;
 
 async function withTimeout<T>(label: string, ms: number, fn: () => Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -969,8 +970,14 @@ async function synthesizeWeeklyBriefInner(): Promise<WeeklyBriefResult> {
     return { outcome: "skipped", reason: "No candidate items: no completed Risk Manager / Relative Strength / Sector Rotation / Candidate Scanner output to synthesize", warnings };
   }
 
-  const policyContext = await buildCioPolicyContext().catch(() => null);
-  if (!policyContext?.group3) warnings.push("CIO policy context: Group 3 top 10 unavailable");
+  // Rules context for the CIO (Group 3 top 10, locked Verizon). Bounded so a slow
+  // price lookup can't hold up the brief; on failure the CIO runs without it.
+  const policyContext = await withTimeout("CIO policy context", BRIEF_POLICY_TIMEOUT_MS, () => buildCioPolicyContext()).catch(
+    (err: unknown) => {
+      warnings.push(`CIO policy context unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    },
+  );
   const brief = await synthesizeCioBrief(candidates, taxableContext, policyContext);
   if (brief.orderedItems.length === 0) {
     return { outcome: "skipped", reason: "CIO synthesis returned no action items", warnings };

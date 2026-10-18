@@ -43,6 +43,9 @@ vi.mock("@/lib/agents/cio", () => ({
     taxableOpportunities: null,
   })),
 }));
+vi.mock("@/lib/agents/cioPolicyContext", () => ({
+  buildCioPolicyContext: vi.fn(async () => ({ group3: null, verizon: null })),
+}));
 vi.mock("@/lib/agents/newsSentiment", () => ({
   generateNewsSentimentNotes: vi.fn(() => {
     h.events.push("news.start");
