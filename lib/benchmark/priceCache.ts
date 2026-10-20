@@ -1,22 +1,33 @@
 import { prisma } from "@/lib/prisma";
 import { fetchSp500History } from "@/lib/benchmark/sp500";
+import { dropUnsettledSessionBar, lastSettledSessionKey } from "@/lib/market/session";
 
-const STALE_AFTER_MS = 20 * 60 * 60 * 1000; // refresh at most a few times a day
+/** Minimum gap between refresh attempts on one server instance, so holidays (no new bar ever arrives) don't refetch on every request. */
+const MIN_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
+let lastRefreshAttemptMs = 0;
 
 function toUtcMidnight(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
 }
 
 /**
- * Refreshes the local S&P 500 price cache if it's missing or more than a
- * trading day stale. Safe to call on every request — it no-ops once fresh.
+ * Keeps the local S&P 500 cache current to the last settled session close.
+ * Refreshes when the newest cached day is older than the most recent close
+ * that has settled (after 4:15pm ET), and never stores today's partial bar,
+ * so the cache only ever holds completed closes. Previously it refreshed on a
+ * 20h clock from UTC midnight, which froze the first intraday price of the
+ * day until 4pm while picks were priced live. Safe to call on every request.
  */
-export async function ensureSp500PriceCache(): Promise<void> {
+export async function ensureSp500PriceCache(now: Date = new Date()): Promise<void> {
   const latest = await prisma.benchmarkPrice.findFirst({ orderBy: { date: "desc" } });
-  const isStale = !latest || Date.now() - latest.date.getTime() > STALE_AFTER_MS;
+  // Cached rows are stored at UTC midnight of the bar's own (NY) session date.
+  const latestKey = latest ? latest.date.toISOString().slice(0, 10) : null;
+  const isStale = !latestKey || latestKey < lastSettledSessionKey(now);
   if (!isStale) return;
+  if (latest && now.getTime() - lastRefreshAttemptMs < MIN_REFRESH_INTERVAL_MS) return;
+  lastRefreshAttemptMs = now.getTime();
 
-  const points = await fetchSp500History();
+  const points = dropUnsettledSessionBar(await fetchSp500History(), now);
   for (const point of points) {
     const date = toUtcMidnight(point.date);
     await prisma.benchmarkPrice.upsert({

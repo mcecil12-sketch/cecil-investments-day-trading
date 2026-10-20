@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { getPriceHistory, getSp500Series, type PricePoint } from "@/lib/agents/marketData";
+import { dropUnsettledSessionBar } from "@/lib/market/session";
 import { computeReturn } from "@/lib/agents/technicals";
 import { convictionMidpoint, resolvePortfolioBaseValue } from "@/lib/agents/positionSizing";
 import { TIMEFRAME_DAYS, type TimeframeKey } from "@/lib/timeframes";
@@ -355,7 +356,8 @@ async function buildPositionTimeline(positions: TrackedPosition[]): Promise<Posi
     uniqueSymbols.map(async (symbol) => {
       try {
         const { points } = await getPriceHistory(symbol);
-        priceBySymbol.set(symbol, points);
+        // Completed closes only, so picks share the S&P cache's as-of moment (see lib/market/session.ts).
+        priceBySymbol.set(symbol, dropUnsettledSessionBar(points));
       } catch {
         // Skip — this symbol just won't contribute to the aggregate until its price history is fetchable again.
       }
