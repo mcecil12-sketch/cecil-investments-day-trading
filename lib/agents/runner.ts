@@ -915,7 +915,8 @@ export interface WeeklyBriefResult {
 }
 
 /** Per-step budgets so a slow enrichment can never stop the brief from being written (see synthesizeWeeklyBriefInner). */
-export const BRIEF_NEWS_TIMEOUT_MS = 90_000;
+/** Safety net only: generateNewsSentimentNotes stops itself at NEWS_NOTES_BUDGET_MS (85s) and returns partial notes. */
+export const BRIEF_NEWS_TIMEOUT_MS = 100_000;
 export const BRIEF_ANALYST_TIMEOUT_MS = 60_000;
 export const BRIEF_POLICY_TIMEOUT_MS = 20_000;
 

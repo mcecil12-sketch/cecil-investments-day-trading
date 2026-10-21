@@ -87,7 +87,7 @@ describe("synthesizeWeeklyBrief: write the brief first, enrich second", () => {
     expect(h.events.indexOf("brief.create")).toBeLessThan(h.events.indexOf("news.start"));
     expect(h.events.indexOf("brief.create")).toBeLessThan(h.events.indexOf("analyst.start"));
     expect(result.outcome).toBe("created");
-    expect(result.warnings.join()).toMatch(/News sentiment notes step failed: News sentiment notes timed out after 90s/);
+    expect(result.warnings.join()).toMatch(/News sentiment notes step failed: News sentiment notes timed out after 100s/);
     // the analyst section is still saved by a follow-up update
     expect(h.events).toContain("brief.update:performanceAnalysis");
   });

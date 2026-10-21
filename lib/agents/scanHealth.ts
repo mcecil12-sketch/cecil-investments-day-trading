@@ -165,8 +165,31 @@ async function sendEmailHealthAlert(result: ScanHealthResult): Promise<boolean> 
  * or when no channel is configured. Returns true if any channel delivered.
  * Never throws.
  */
-export async function maybeSendHealthAlert(result: ScanHealthResult): Promise<boolean> {
+/**
+ * One failure is often recorded twice in the same request: the inner step's
+ * own row (e.g. WEEKLY_BRIEF) and the cron wrapper's finish row
+ * (CRON:weekly-brief) carry the same reasons. Alerts with identical status and
+ * reasons inside this window are sent once (Oct 18, 2026: two pushes for one
+ * news-notes timeout).
+ */
+const ALERT_DEDUPE_WINDOW_MS = 15 * 60 * 1000;
+const recentAlerts = new Map<string, number>();
+
+function alertFingerprint(result: ScanHealthResult): string {
+  return `${result.status}|${[...result.reasons].sort().join("\n")}`;
+}
+
+/** Test hook: forget previously sent alerts. */
+export function resetHealthAlertDedupe(): void {
+  recentAlerts.clear();
+}
+
+export async function maybeSendHealthAlert(result: ScanHealthResult, now: number = Date.now()): Promise<boolean> {
   if (result.status === "HEALTHY") return false;
+  const fingerprint = alertFingerprint(result);
+  const last = recentAlerts.get(fingerprint);
+  if (last != null && now - last < ALERT_DEDUPE_WINDOW_MS) return false;
+  recentAlerts.set(fingerprint, now);
   const [pushed, emailed] = await Promise.all([sendPushoverHealthAlert(result), sendEmailHealthAlert(result)]);
   return pushed || emailed;
 }

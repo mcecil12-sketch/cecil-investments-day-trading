@@ -18,7 +18,13 @@ interface CandidateInput {
 
 const MODEL = "claude-sonnet-5";
 const MAX_SEARCHES_PER_CANDIDATE = 2;
-const CONCURRENCY = 4;
+const CONCURRENCY = 6;
+/** Total wall-clock budget for the whole notes pass. Candidates not started by then are skipped, and whatever finished is kept. */
+export const NEWS_NOTES_BUDGET_MS = 85_000;
+/** Cap on any single candidate's research call (web search included). */
+const PER_CANDIDATE_TIMEOUT_MS = 45_000;
+/** A call isn't worth starting with less than this left in the budget. */
+const MIN_CALL_MS = 10_000;
 
 const NOTE_SCHEMA = {
   type: "object",
@@ -58,6 +64,7 @@ async function researchCandidate(
   client: Anthropic,
   symbol: string,
   name: string,
+  timeoutMs: number,
 ): Promise<NewsSentimentNote | null> {
   try {
     const response = await client.beta.messages.create({
@@ -74,7 +81,7 @@ async function researchCandidate(
           content: `Ticker: ${symbol} (${name}). Search for material, company-specific news from roughly the past 1-2 weeks and report back.`,
         },
       ],
-    });
+    }, { timeout: timeoutMs, maxRetries: 0 });
 
     const textBlock = response.content.find((b) => b.type === "text");
     if (!textBlock || textBlock.type !== "text") return null;
@@ -90,17 +97,33 @@ async function researchCandidate(
   }
 }
 
-async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length);
+/**
+ * Runs fn over items with at most `limit` in flight, but stops starting new
+ * items once the deadline is near. Unstarted items resolve to null, so a slow
+ * pass returns whatever finished instead of nothing.
+ */
+async function mapWithDeadline<T, R>(
+  items: T[],
+  limit: number,
+  deadlineMs: number,
+  fn: (item: T, timeoutMs: number) => Promise<R | null>,
+): Promise<{ results: Array<R | null>; skipped: number }> {
+  const results = new Array<R | null>(items.length).fill(null);
   let next = 0;
+  let skipped = 0;
   async function worker() {
     while (next < items.length) {
       const i = next++;
-      results[i] = await fn(items[i]);
+      const remaining = deadlineMs - Date.now();
+      if (remaining < MIN_CALL_MS) {
+        skipped++;
+        continue;
+      }
+      results[i] = await fn(items[i], Math.min(PER_CANDIDATE_TIMEOUT_MS, remaining));
     }
   }
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
+  return { results, skipped };
 }
 
 /**
@@ -113,7 +136,10 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T)
  * APP_ANTHROPIC_API_KEY is missing or there are no candidates, so weekly brief
  * synthesis is never blocked by this step.
  */
-export async function generateNewsSentimentNotes(candidates: CandidateInput[]): Promise<NewsSentimentNote[]> {
+export async function generateNewsSentimentNotes(
+  candidates: CandidateInput[],
+  budgetMs: number = NEWS_NOTES_BUDGET_MS,
+): Promise<NewsSentimentNote[]> {
   if (candidates.length === 0) return [];
   const apiKey = process.env.APP_ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -122,8 +148,13 @@ export async function generateNewsSentimentNotes(candidates: CandidateInput[]): 
   }
 
   const client = new Anthropic({ apiKey });
-  const results = await mapWithConcurrency(candidates, CONCURRENCY, (c) =>
-    researchCandidate(client, c.symbol, c.name),
+  // Previously each of the 15 candidates ran to completion with no per-call cap
+  // and the brief's 90s step limit discarded everything on timeout (degraded
+  // briefs Oct 11 and Oct 18, 2026). Now each call is capped and the pass keeps
+  // whatever finished inside its budget.
+  const { results, skipped } = await mapWithDeadline(candidates, CONCURRENCY, Date.now() + budgetMs, (c, timeoutMs) =>
+    researchCandidate(client, c.symbol, c.name, timeoutMs),
   );
+  if (skipped > 0) console.warn(`News sentiment notes: ${skipped} of ${candidates.length} candidates skipped (budget ${Math.round(budgetMs / 1000)}s)`);
   return results.filter((r): r is NewsSentimentNote => r !== null);
 }

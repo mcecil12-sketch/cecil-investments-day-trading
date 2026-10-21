@@ -2,12 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/prisma", () => ({ prisma: { scanHealth: { create: vi.fn(), findFirst: vi.fn() } } }));
 
-const { maybeSendHealthAlert, healthAlertText } = await import("@/lib/agents/scanHealth");
+const { maybeSendHealthAlert, healthAlertText, resetHealthAlertDedupe } = await import("@/lib/agents/scanHealth");
 
 const ENV_KEYS = ["PUSHOVER_USER_KEY", "PUSHOVER_API_TOKEN", "PUSHOVER_APP_TOKEN", "RESEND_API_KEY", "ALERT_EMAIL"] as const;
 const saved: Record<string, string | undefined> = {};
 
 beforeEach(() => {
+  resetHealthAlertDedupe();
   for (const k of ENV_KEYS) {
     saved[k] = process.env[k];
     delete process.env[k];
@@ -61,6 +62,28 @@ describe("maybeSendHealthAlert", () => {
     process.env.PUSHOVER_APP_TOKEN = "t";
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("network down"); }));
     expect(await maybeSendHealthAlert(degraded as never)).toBe(false);
+  });
+});
+
+describe("alert dedupe", () => {
+  it("sends one push when the inner step and the cron wrapper report the same failure", async () => {
+    process.env.PUSHOVER_USER_KEY = "u";
+    process.env.PUSHOVER_APP_TOKEN = "t";
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await maybeSendHealthAlert(degraded as never, 1_000)).toBe(true);
+    expect(await maybeSendHealthAlert({ ...degraded, kind: "CRON:weekly-brief" } as never, 2_000)).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("alerts again for a different failure, or the same one after the window", async () => {
+    process.env.PUSHOVER_USER_KEY = "u";
+    process.env.PUSHOVER_APP_TOKEN = "t";
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await maybeSendHealthAlert(degraded as never, 1_000);
+    expect(await maybeSendHealthAlert({ ...degraded, reasons: ["something else"] } as never, 2_000)).toBe(true);
+    expect(await maybeSendHealthAlert(degraded as never, 1_000 + 16 * 60 * 1000)).toBe(true);
   });
 });
 
