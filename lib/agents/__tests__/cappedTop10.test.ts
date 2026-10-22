@@ -20,6 +20,7 @@ describe("computeCappedTop10 (shadow, max 3 per sector)", () => {
     // 5 Tech at ranks 1-5, then Energy, Health, Tech, Utilities, Financials, Industrials, Materials ...
     const sectors = ["Tech", "Tech", "Tech", "Tech", "Tech", "Energy", "Health", "Tech", "Utilities", "Financials", "Industrials", "Materials"];
     const r = result(sectors);
+    expect(r.S4).toMatchObject({ cappedRank: null, inCappedTop10: false }); // 4th Tech: overflow
     expect(r.S5).toMatchObject({ cappedRank: null, inCappedTop10: false });
     expect(r.S8).toMatchObject({ cappedRank: null, inCappedTop10: false }); // later Tech also over the cap
     // Replacements walk in on rank order: S6..S7, S9..S12 fill capped ranks 4..9, ... until 10
@@ -28,9 +29,7 @@ describe("computeCappedTop10 (shadow, max 3 per sector)", () => {
     expect(r.S9.cappedRank).toBe(6);
     expect(r.S12.cappedRank).toBe(9);
     const inTop = Object.values(r).filter((x) => x.inCappedTop10);
-    // 9 kept under the cap; the fill pass takes the best overflow name (S4, a 4th Tech) as #10
-    expect(inTop).toHaveLength(10);
-    expect(r.S4).toMatchObject({ cappedRank: 10, inCappedTop10: true });
+    expect(inTop).toHaveLength(9); // only 12 names, 3 are overflow
   });
 
   it("fills a full 10 from a deeper list and never exceeds 3 per sector", () => {
@@ -54,21 +53,12 @@ describe("computeCappedTop10 (shadow, max 3 per sector)", () => {
     const shuffled = [input[4], input[1], input[3], input[0], input[2]];
     const out = computeCappedTop10(shuffled);
     expect(out.map((r) => r.symbol)).toEqual(shuffled.map((c) => c.symbol));
-    expect(Object.fromEntries(out.map((r) => [r.symbol, r.cappedRank]))).toEqual({ S1: 1, S2: 2, S3: 3, S4: 5, S5: 4 }); // S4 enters on the fill pass
+    expect(Object.fromEntries(out.map((r) => [r.symbol, r.cappedRank]))).toEqual({ S1: 1, S2: 2, S3: 3, S4: null, S5: 4 });
   });
 
   it("handles empty and small lists", () => {
     expect(computeCappedTop10([])).toEqual([]);
-    // 3 under the cap, then the fill pass allows a 4th from the same sector
-    expect(computeCappedTop10(mk(["A", "A", "A", "A", "A"])).filter((r) => r.inCappedTop10)).toHaveLength(4);
-  });
-
-  it("three-sector month: 3+3+3 under the cap, 10th is the next-highest name in any sector", () => {
-    // Oct 2026 shape: 7 Tech ranked first, then 2 Energy, 1 Health, more Tech, then Energy/Health further down
-    const sectors = ["T", "T", "T", "T", "T", "T", "E", "E", "H", "T", "H", "T", "T", "E", "H"];
-    const out = computeCappedTop10(mk(sectors));
-    const top = out.filter((r) => r.inCappedTop10).sort((a, b) => a.cappedRank! - b.cappedRank!).map((r) => r.symbol);
-    expect(top).toEqual(["S1", "S2", "S3", "S7", "S8", "S9", "S11", "S14", "S15", "S4"]);
+    expect(computeCappedTop10(mk(["A", "A", "A", "A"])).filter((r) => r.inCappedTop10)).toHaveLength(3);
   });
 
   it("sectorCounts sorts by count then name", () => {

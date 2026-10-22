@@ -279,7 +279,7 @@ export function buildSnapshotMarkdown(data: SnapshotData): string {
   if (!data.group3) out.push(...missing("group3"));
   else {
     out.push(`Batch: ${data.group3.monthKey}`);
-    out.push(`Held list: ${data.group3.heldVariant === "capped" ? "capped top 10 (max 3 per sector; 10th slot next-highest rank, any sector)" : "pure top 10 (by composite rank)"}`, "");
+    out.push(`Held list: ${data.group3.heldVariant === "capped" ? "capped list (max 3 per sector; usually 9 names, equal weight)" : "pure top 10 (by composite rank)"}`, "");
     out.push(
       ...table(
         ["Rank", "Ticker", "Score", "Tracked", "In taxable", "Fragile", "Insider net sold 30d"],

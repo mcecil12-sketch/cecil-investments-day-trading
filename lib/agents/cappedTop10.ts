@@ -1,18 +1,17 @@
 /**
  * Capped top 10 for Group 3. Alongside the pure top 10 (by composite rank) we
  * compute a variant that allows at most CAPPED_MAX_PER_SECTOR names per
- * sector, using the sector already on each candidate. If the walk can't fill
- * 10 (the monthly scan ranks only the top 3 sectors, so 3 per sector stops at
- * 9), the remaining slots go to the next-highest-ranked names in any sector,
- * up to CAPPED_FILL_MAX_PER_SECTOR per sector. Decided Oct 22, 2026: this is
+ * sector, using the sector already on each candidate. The monthly scan ranks
+ * only the top 3 sectors, so the list is usually 9 names (3 per sector); the
+ * empty 10th slot is deliberately left unfilled and the 9 are equal-weighted
+ * (decided Oct 22, 2026, over filling it). Decided Oct 22, 2026: this is
  * the version real money holds from the Nov 2, 2026 rebalance (see
  * group3Variant.ts); the pure top 10 is tracked alongside as the shadow.
  * It does not touch composite scores or ranks.
  */
 export const CAPPED_MAX_PER_SECTOR = 3;
 export const CAPPED_TOP_N = 10;
-/** Sector limit for the fill pass that tops the capped list up to CAPPED_TOP_N. */
-export const CAPPED_FILL_MAX_PER_SECTOR = 4;
+
 
 export interface CappedInput {
   symbol: string;
@@ -34,12 +33,7 @@ export interface CappedResult {
   inCappedTop10: boolean;
 }
 
-export function computeCappedTop10(
-  candidates: CappedInput[],
-  maxPerSector = CAPPED_MAX_PER_SECTOR,
-  topN = CAPPED_TOP_N,
-  fillMaxPerSector = CAPPED_FILL_MAX_PER_SECTOR,
-): CappedResult[] {
+export function computeCappedTop10(candidates: CappedInput[], maxPerSector = CAPPED_MAX_PER_SECTOR, topN = CAPPED_TOP_N): CappedResult[] {
   const sorted = [...candidates].sort((a, b) => a.rank - b.rank);
   const perSector = new Map<string, number>();
   let next = 1;
@@ -52,19 +46,6 @@ export function computeCappedTop10(
       next++;
     } else {
       bySymbol.set(c.symbol, { symbol: c.symbol, cappedRank: null, inCappedTop10: false });
-    }
-  }
-  // Fill pass: if the cap left fewer than topN names, take the next-highest-ranked
-  // overflow names in any sector, still never more than fillMaxPerSector per sector.
-  if (next <= topN) {
-    for (const c of sorted) {
-      if (next > topN) break;
-      if (bySymbol.get(c.symbol)?.cappedRank != null) continue;
-      const used = perSector.get(c.sector) ?? 0;
-      if (used >= fillMaxPerSector) continue;
-      perSector.set(c.sector, used + 1);
-      bySymbol.set(c.symbol, { symbol: c.symbol, cappedRank: next, inCappedTop10: true });
-      next++;
     }
   }
   return candidates.map((c) => bySymbol.get(c.symbol)!);

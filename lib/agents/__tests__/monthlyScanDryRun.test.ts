@@ -128,21 +128,21 @@ describe("dry run: market cap and the EDGAR 'no filings' label", () => {
   });
 });
 
-describe("capped top 10 in the scan and dry run", () => {
-  it("5 same-sector names: pure top 10 keeps all five, capped keeps 3 plus a 4th on the fill pass; displaced names listed; scores and ranks untouched", async () => {
+describe("shadow capped top 10 in the scan and dry run", () => {
+  it("5 same-sector names: pure top 10 keeps all five, capped keeps 3; displaced names listed; scores and ranks untouched", async () => {
     const { getMergedCandidateUniverse } = await import("@/lib/agents/scoringShared");
     vi.mocked(getMergedCandidateUniverse).mockResolvedValue({ Technology: { symbols: ["AAA", "BBB", "CCC", "DDD", "EEE"] } } as never);
     try {
       const before = await runMonthlyScanAgent("manual", { dryRun: true });
       expect(before.rankedCandidates.map((c) => c.rank)).toEqual([1, 2, 3, 4, 5]);
-      expect(before.rankedCandidates.map((c) => [c.cappedRank, c.inCappedTop10])).toEqual([[1, true], [2, true], [3, true], [4, true], [null, false]]);
+      expect(before.rankedCandidates.map((c) => [c.cappedRank, c.inCappedTop10])).toEqual([[1, true], [2, true], [3, true], [null, false], [null, false]]);
 
       const report = await runMonthlyScanDryRun({ now: Date.now, sleep: async () => {}, fetchRows: async () => sale, fetchOverviewFn: async () => ({ ok: false, reason: "n/a" }) });
       expect(report.capped.maxPerSector).toBe(3);
-      expect(report.capped.top10).toHaveLength(4);
-      expect(report.capped.top10.map((r) => r.cappedRank)).toEqual([1, 2, 3, 4]);
-      expect(report.capped.displaced.map((d) => d.pureRank)).toEqual([5]);
-      expect(report.capped.sectorCounts).toEqual({ pure: { Technology: 5 }, capped: { Technology: 4 } });
+      expect(report.capped.top10).toHaveLength(3);
+      expect(report.capped.top10.map((r) => r.cappedRank)).toEqual([1, 2, 3]);
+      expect(report.capped.displaced.map((d) => d.pureRank)).toEqual([4, 5]);
+      expect(report.capped.sectorCounts).toEqual({ pure: { Technology: 5 }, capped: { Technology: 3 } });
       expect(h.writes).toEqual([]);
     } finally {
       vi.mocked(getMergedCandidateUniverse).mockResolvedValue({ Technology: { symbols: ["AAA", "BBB"] } } as never);

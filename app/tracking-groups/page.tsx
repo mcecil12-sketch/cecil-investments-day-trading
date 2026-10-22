@@ -296,7 +296,7 @@ export default async function TrackingGroupsPage() {
       {group3.cappedPerformance.totalPositions > 0 && (
         <div className="card">
           <div className="agent-card-header">
-            <strong>Group 3 — Capped Top 10 Performance</strong>
+            <strong>Group 3 — Capped List Performance</strong>
           </div>
           <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginTop: 0 }}>
             {GROUP3_VARIANT_LABEL.capped}. Held with real money from the {GROUP3_HELD_VARIANT_SINCE} scan onward; earlier months are
@@ -304,7 +304,7 @@ export default async function TrackingGroupsPage() {
           </p>
           <RecommendationPerformanceCharts
             {...chartProps(group3.cappedPerformance)}
-            trackingNote="Bought when a name enters the month's capped top 10, sold when it drops out; carried forward month to month."
+            trackingNote="Bought when a name enters the month's capped list (max 3 per sector, usually 9 names, equal weight), sold when it drops off; carried forward month to month."
           />
         </div>
       )}

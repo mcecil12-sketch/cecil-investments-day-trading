@@ -14,9 +14,9 @@ import { getVzExposure } from "@/lib/portfolio/vzExposureData";
 export interface CioPolicyContext {
   group3: {
     batchTag: string;
-    /** Which list real money follows this month: "capped" (max 3 per sector, 10th slot next-highest any sector) or "pure". */
+    /** Which list real money follows this month: "capped" (max 3 per sector, usually 9 names) or "pure". */
     heldVariant: Group3Variant;
-    /** The 10 names real money should hold this month under heldVariant. */
+    /** The names real money should hold this month under heldVariant (9 under capped when only 3 sectors rank). */
     top10: string[];
     /** Held last month but not on this month's held list (handles the pure-to-capped switch). */
     sellCandidates: string[];

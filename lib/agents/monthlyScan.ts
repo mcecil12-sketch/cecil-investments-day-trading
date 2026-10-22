@@ -49,7 +49,7 @@ export interface MonthlyScanCandidateEntry {
   fragilityPercentile: number | null;
   /** Top third of the cohort by fragilityPercentile. Relative since Oct 11 2026. */
   fragilityFlag: boolean | null;
-  /** Capped top 10 (max 3 per sector, 10th slot next-highest any sector; see cappedTop10.ts and group3Variant.ts). Real money follows it from the Nov 1, 2026 scan. Null cappedRank = not on the capped list. */
+  /** Capped list (max 3 per sector, usually 9 names; see cappedTop10.ts and group3Variant.ts). Real money follows it from the Nov 1, 2026 scan. Null cappedRank = not on the capped list. */
   cappedRank: number | null;
   inCappedTop10: boolean;
   /** Close and UTC date of the price used at scan time (logged with the market cap). */

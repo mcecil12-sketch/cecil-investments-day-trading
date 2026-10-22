@@ -21,18 +21,16 @@ describe("group3 variants", () => {
     expect(heldVariantForBatch(nov)).toBe("capped");
   });
 
-  it("capped October list: 3 per sector, then the next-highest name in any sector", () => {
+  it("capped October list: 3 per sector, 9 names, no 10th fill", () => {
     const [month] = groupIntoCappedMonthlyRankings(batch("monthly-2026-10", oct, octList));
-    expect(month.rankedSymbols.slice(0, 10).map((s) => s.symbol)).toEqual([
-      "DELL", "STX", "MU", "VLO", "MPC", "MRNA", "AMGN", "PSX", "TMO", "SNDK",
-    ]);
+    expect(month.rankedSymbols.map((s) => s.symbol)).toEqual(["DELL", "STX", "MU", "VLO", "MPC", "MRNA", "AMGN", "PSX", "TMO"]);
   });
 
   it("sell list across the switch: last month's pure holdings that are not on the new capped list", () => {
     const rows = [...batch("monthly-2026-10", oct, octList), ...batch("monthly-2026-11", nov, octList)];
     const months = heldMonths(rows);
     expect(months.map((m) => m.variant)).toEqual(["pure", "capped"]);
-    expect(latestSellList(rows).sort()).toEqual(["AMD", "ANET", "MRVL"]);
+    expect(latestSellList(rows).sort()).toEqual(["AMD", "ANET", "MRVL", "SNDK"]);
   });
 
   it("no sells with a single month", () => {

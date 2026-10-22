@@ -21,7 +21,7 @@ export function heldVariantForBatch(batchDate: Date): Group3Variant {
 
 export const GROUP3_VARIANT_LABEL: Record<Group3Variant, string> = {
   pure: "Pure top 10 (by composite rank)",
-  capped: "Capped top 10 (max 3 per sector; 10th slot = next-highest rank, any sector)",
+  capped: "Capped list (max 3 per sector; usually 9 names, equal weight)",
 };
 
 export interface Group3LogRow {
@@ -35,8 +35,7 @@ export interface Group3LogRow {
 
 /**
  * Monthly rankings for the capped variant, in the shape the banding replay
- * expects: each month's capped top 10 first (in capped order), then every
- * other ranked name in pure rank order. Recomputed from each batch's ranks
+ * expects: only the month's capped names, in capped order (usually 9). Recomputed from each batch's ranks
  * and sectors, so months logged before the capped columns existed (Sep and
  * Oct 2026) replay the same way as later ones.
  */
@@ -52,11 +51,12 @@ export function groupIntoCappedMonthlyRankings(rows: Group3LogRow[]): MonthlyRan
     }));
     const capped = computeCappedTop10(ranked);
     const cappedRankBySymbol = new Map(capped.filter((c) => c.inCappedTop10).map((c) => [c.symbol, c.cappedRank!]));
+    // Only the capped names: anything not on the list is treated as off the list
+    // (sold), so a 9-name month never backfills a 10th from the overflow.
     const top = ranked
       .filter((r) => cappedRankBySymbol.has(r.symbol))
       .sort((a, b) => cappedRankBySymbol.get(a.symbol)! - cappedRankBySymbol.get(b.symbol)!);
-    const rest = ranked.filter((r) => !cappedRankBySymbol.has(r.symbol));
-    return { ...month, rankedSymbols: [...top, ...rest].map(({ symbol, score }) => ({ symbol, score })) };
+    return { ...month, rankedSymbols: top.map(({ symbol, score }) => ({ symbol, score })) };
   });
 }
 
