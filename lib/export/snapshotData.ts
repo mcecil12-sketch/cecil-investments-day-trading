@@ -2,7 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { computeBenchmark } from "@/lib/benchmark/engine";
 import { buildTaxableAnalysisContext } from "@/lib/agents/taxableAnalysis";
 import { groupIntoMonthlyRankings } from "@/lib/agents/recommendationPerformance";
-import { buildBandedMonthlyPositions, currentlyHeldSymbols, BUY_RANK_THRESHOLD } from "@/lib/agents/monthlyScanBanding";
+import { BUY_RANK_THRESHOLD } from "@/lib/agents/monthlyScanBanding";
 import type { RelativeStrengthOutput } from "@/lib/agents/relativeStrength";
 import type { PerformanceAnalystOutput } from "@/lib/agents/performanceAnalyst";
 import { getLatestScanHealth } from "@/lib/agents/scanHealth";
@@ -11,6 +11,7 @@ import { loadAdjustedSeries, loadSp500TotalReturnSeries } from "@/lib/benchmark/
 import { averagePairwiseCorrelation, computeAllocation, computeSleeveScoreboard, computeThemeConcentration } from "@/lib/export/sleeveMath";
 import { loadSectorExposureView } from "@/lib/portfolio/sectorExposureData";
 import { getVzExposure } from "@/lib/portfolio/vzExposureData";
+import { group3RankingsFor, heldVariantForBatch, latestSellList } from "@/lib/agents/group3Variant";
 import type { AgentType } from "@/lib/generated/prisma";
 import type { SnapshotAccountRow, SnapshotAnalystText, SnapshotData } from "@/lib/export/snapshotMarkdown";
 
@@ -154,10 +155,13 @@ export async function loadSnapshotData(now: Date = new Date()): Promise<Snapshot
 
   let group3: SnapshotData["group3"] = null;
   if (group3Rows) {
-    const rankings = groupIntoMonthlyRankings(group3Rows);
+    const pureLatest = groupIntoMonthlyRankings(group3Rows).at(-1);
+    // Real money follows the pure top 10 through Oct 2026 and the capped list from the Nov 1, 2026 scan (group3Variant.ts).
+    const heldVariant = pureLatest ? heldVariantForBatch(pureLatest.date) : "pure";
+    const rankings = group3RankingsFor(heldVariant, group3Rows);
     const latest = rankings.at(-1);
     if (latest) {
-      const held = currentlyHeldSymbols(rankings);
+      const held = new Set(latest.rankedSymbols.slice(0, BUY_RANK_THRESHOLD).map((s) => s.symbol));
       const taxableSymbols = new Set((taxableCtx?.positions ?? []).map((p) => p.symbol));
       const batchRows = new Map(group3Rows.filter((r) => r.batchTag === latest.monthKey).map((r) => [r.symbol, r]));
       group3 = {
@@ -177,9 +181,8 @@ export async function loadSnapshotData(now: Date = new Date()): Promise<Snapshot
             insiderPctOfMarketCap: row?.insiderNetSoldPctOfMarketCap ?? null,
           };
         }),
-        sellCandidates: buildBandedMonthlyPositions(rankings)
-          .filter((p) => p.exitDate?.getTime() === latest.date.getTime())
-          .map((p) => p.symbol),
+        heldVariant,
+        sellCandidates: latestSellList(group3Rows),
       };
     }
   }

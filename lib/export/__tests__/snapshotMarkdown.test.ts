@@ -221,7 +221,7 @@ describe("sector exposure section", () => {
     expect(md).toContain("Technology 70.0%, Energy 30.0%");
     expect(md).toContain("Technology 30.0%, Energy 30.0%, Health Care 40.0%");
     expect(md).toContain("Unknown 20.0%*");
-    expect(md).toContain("shadow, never traded");
+    expect(md).toContain("capped, 3/sector; held from the Nov 1, 2026 scan");
     expect(md).toContain("not guessed");
   });
 

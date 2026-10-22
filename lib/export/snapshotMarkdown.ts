@@ -68,7 +68,7 @@ export interface SnapshotData {
   portfolio: { totalValue: number; accounts: SnapshotAccountRow[] } | null;
   vz: VzExposure | null;
   taxable: SnapshotTaxableRow[] | null;
-  group3: { monthKey: string; batchDate?: Date | null; top10: SnapshotGroup3Row[]; sellCandidates: string[] } | null;
+  group3: { monthKey: string; batchDate?: Date | null; heldVariant?: "pure" | "capped"; top10: SnapshotGroup3Row[]; sellCandidates: string[] } | null;
   allocation?: AccountAllocation[] | null;
   sectorExposure?: SectorExposureView | null;
   sleeve?: { scoreboard: SleeveScoreboard | null; theme: ThemeConcentration | null; avgCorrelation60d: number | null; sleeveSize: number; controlSymbol: string; unavailableReason?: string } | null;
@@ -278,7 +278,8 @@ export function buildSnapshotMarkdown(data: SnapshotData): string {
   out.push("", "## 5. Group 3 (monthly top 10)");
   if (!data.group3) out.push(...missing("group3"));
   else {
-    out.push(`Batch: ${data.group3.monthKey}`, "");
+    out.push(`Batch: ${data.group3.monthKey}`);
+    out.push(`Held list: ${data.group3.heldVariant === "capped" ? "capped top 10 (max 3 per sector; 10th slot next-highest rank, any sector)" : "pure top 10 (by composite rank)"}`, "");
     out.push(
       ...table(
         ["Rank", "Ticker", "Score", "Tracked", "In taxable", "Fragile", "Insider net sold 30d"],
@@ -321,7 +322,7 @@ export function buildSnapshotMarkdown(data: SnapshotData): string {
         ["View", "Sector weights"],
         [
           [`Group 3 top 10 (pure)${se.batchTag ? ` — ${se.batchTag}` : ""}`, mix(se.pureTop10)],
-          ["Group 3 top 10 (capped, 3/sector — shadow, never traded)", mix(se.cappedTop10)],
+          ["Group 3 top 10 (capped, 3/sector; held from the Nov 1, 2026 scan)", mix(se.cappedTop10)],
           ["Unified portfolio (401k funds + taxable + Verizon-linked)", mix(se.portfolio)],
         ],
       ),
