@@ -32,6 +32,9 @@ export async function logCandidateRecommendationBatch(
       score: c.score,
       vsSpx: c.vsSpx,
       momentum1Y: c.momentum1Y,
+      // Was never written for weekly rows (all 570 null as of Oct 21, 2026), which
+      // left the Performance Analyst's earnings-coverage breakdown as one "unknown" group.
+      earningsSurpriseCoverage: c.earningsSurpriseCoverage,
       sentimentScore: c.sentimentScore,
       sentimentCoverage: c.sentimentCoverage,
       extensionVs200d: c.extensionVs200d ?? null,
