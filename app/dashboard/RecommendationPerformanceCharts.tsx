@@ -59,8 +59,13 @@ function windowDelta(first: number | null | undefined, last: number | null | und
   return last - first;
 }
 
+/** Chart points are session dates stored at UTC midnight; render them in UTC so an ET browser doesn't show the previous day. */
 function tickDate(value: string): string {
-  return new Date(value).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return new Date(value).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+}
+
+function sessionDate(value: string | Date): string {
+  return new Date(value).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
 }
 
 interface TooltipPayloadEntry {
@@ -270,7 +275,7 @@ export function RecommendationPerformanceCharts({
               <tbody>
                 {[...windowPickQuality].reverse().map((p) => (
                   <tr key={p.date}>
-                    <td className="mono">{formatDate(new Date(p.date))}</td>
+                    <td className="mono">{sessionDate(p.date)}</td>
                     <td className="mono">{formatPercent(p.pickReturn)}</td>
                     <td className="mono">{formatPercent(p.spxReturn)}</td>
                     <td className="mono">{p.activeCount}</td>
@@ -359,7 +364,7 @@ export function RecommendationPerformanceCharts({
                 <tbody>
                   {[...windowSimulatedPortfolio].reverse().map((p) => (
                     <tr key={p.date}>
-                      <td className="mono">{formatDate(new Date(p.date))}</td>
+                      <td className="mono">{sessionDate(p.date)}</td>
                       <td className="mono">{formatCurrency(p.portfolioValue)}</td>
                       <td className="mono">{formatCurrency(p.pnl)}</td>
                       <td className="mono">{p.activeCount}</td>
