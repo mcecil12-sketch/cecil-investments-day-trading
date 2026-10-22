@@ -357,7 +357,15 @@ async function buildPositionTimeline(positions: TrackedPosition[]): Promise<Posi
       try {
         const { points } = await getPriceHistory(symbol);
         // Completed closes only, so picks share the S&P cache's as-of moment (see lib/market/session.ts).
-        priceBySymbol.set(symbol, dropUnsettledSessionBar(points));
+        // Re-key each bar to UTC midnight of its own session date, the same key the S&P
+        // cache uses. Yahoo stamps daily bars at the session open (13:30Z), so a lookup
+        // "on or before" a UTC-midnight timeline date skipped that day's bar: picks
+        // lagged the S&P line by one session (Oct 22, 2026: S&P showed the -1.2% day,
+        // picks still showed the prior close).
+        priceBySymbol.set(
+          symbol,
+          dropUnsettledSessionBar(points).map((p) => ({ date: toUtcMidnight(p.date), close: p.close })),
+        );
       } catch {
         // Skip — this symbol just won't contribute to the aggregate until its price history is fetchable again.
       }
