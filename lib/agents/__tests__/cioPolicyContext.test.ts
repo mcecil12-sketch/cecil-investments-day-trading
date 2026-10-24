@@ -14,7 +14,7 @@ describe("nextMonthlyScanDate", () => {
 describe("policyContextPrompt", () => {
   it("carries the top 10, sell candidates and tradeable Verizon share", () => {
     const prompt = policyContextPrompt({
-      group3: { batchTag: "monthly-2026-10", top10: ["DELL", "MRNA"], sellCandidates: ["PSX"], nextScanDate: "2026-11-01" },
+      group3: { batchTag: "monthly-2026-10", heldVariant: "pure", top10: ["DELL", "MRNA"], sellCandidates: ["PSX"], nextScanDate: "2026-11-01" },
       verizon: { includingLtiValue: 400883, includingLtiPct: 0.313, tradeableValue: 33634, tradeablePct: 0.037 },
     });
     expect(prompt).toContain("portfolioPolicy");

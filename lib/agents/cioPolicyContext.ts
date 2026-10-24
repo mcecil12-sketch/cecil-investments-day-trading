@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
+import { group3RankingsFor, heldVariantForBatch, latestSellList, type Group3Variant } from "@/lib/agents/group3Variant";
 import { groupIntoMonthlyRankings } from "@/lib/agents/recommendationPerformance";
-import { buildBandedMonthlyPositions, BUY_RANK_THRESHOLD } from "@/lib/agents/monthlyScanBanding";
+import { BUY_RANK_THRESHOLD } from "@/lib/agents/monthlyScanBanding";
 import { getCurrentHoldings, totalPortfolioValue } from "@/lib/agents/holdings";
 import { getVzExposure } from "@/lib/portfolio/vzExposureData";
 
@@ -13,7 +14,11 @@ import { getVzExposure } from "@/lib/portfolio/vzExposureData";
 export interface CioPolicyContext {
   group3: {
     batchTag: string;
+    /** Which list real money follows this month: "capped" (max 3 per sector, usually 9 names) or "pure". */
+    heldVariant: Group3Variant;
+    /** The names real money should hold this month under heldVariant (9 under capped when only 3 sectors rank). */
     top10: string[];
+    /** Held last month but not on this month's held list (handles the pure-to-capped switch). */
     sellCandidates: string[];
     nextScanDate: string;
   } | null;
@@ -33,15 +38,15 @@ export function nextMonthlyScanDate(now: Date = new Date()): string {
 
 async function loadGroup3(now: Date): Promise<CioPolicyContext["group3"]> {
   const rows = await prisma.candidateRecommendationLog.findMany({ where: { group: "GROUP_3" }, orderBy: { recommendedAt: "asc" } });
-  const rankings = groupIntoMonthlyRankings(rows);
-  const latest = rankings.at(-1);
-  if (!latest) return null;
+  const pureLatest = groupIntoMonthlyRankings(rows).at(-1);
+  if (!pureLatest) return null;
+  const heldVariant = heldVariantForBatch(pureLatest.date);
+  const latest = group3RankingsFor(heldVariant, rows).at(-1)!;
   return {
     batchTag: latest.monthKey,
+    heldVariant,
     top10: latest.rankedSymbols.slice(0, BUY_RANK_THRESHOLD).map((s) => s.symbol),
-    sellCandidates: buildBandedMonthlyPositions(rankings)
-      .filter((p) => p.exitDate?.getTime() === latest.date.getTime())
-      .map((p) => p.symbol),
+    sellCandidates: latestSellList(rows),
     nextScanDate: nextMonthlyScanDate(now),
   };
 }

@@ -7,8 +7,15 @@ import {
   type FullRankPickQualityResult,
 } from "@/lib/agents/recommendationPerformance";
 import {
-  buildBandedMonthlyPositions,
-  currentlyHeldSymbols,
+  GROUP3_HELD_VARIANT_SINCE,
+  heldVariantForBatch,
+  latestSellList,
+  GROUP3_VARIANT_LABEL,
+  group3RankingsFor,
+  groupIntoCappedMonthlyRankings,
+  type Group3Variant,
+} from "@/lib/agents/group3Variant";
+import {
   BUY_RANK_THRESHOLD,
   SELL_RANK_THRESHOLD,
   TARGET_PORTFOLIO_SIZE,
@@ -42,13 +49,21 @@ async function getGroup3State() {
     }),
   ]);
 
+  // The table lists the month in pure composite-rank order; HELD/BUY/sold follow
+  // whichever variant real money held for that month (pure before
+  // GROUP3_HELD_VARIANT_SINCE, the configured held variant from then on).
   const monthlyRankings = groupIntoMonthlyRankings(rows);
-  const positions = buildBandedMonthlyPositions(monthlyRankings);
-  const heldSymbols = currentlyHeldSymbols(monthlyRankings);
   const latestMonth = monthlyRankings[monthlyRankings.length - 1] ?? null;
-  const soldThisMonth = latestMonth
-    ? positions.filter((p) => p.exitDate?.getTime() === latestMonth.date.getTime()).map((p) => p.symbol)
-    : [];
+  const heldVariant: Group3Variant = latestMonth ? heldVariantForBatch(latestMonth.date) : "pure";
+  const heldRankings = group3RankingsFor(heldVariant, rows);
+  const latestHeldMonth = heldRankings[heldRankings.length - 1] ?? null;
+  // Under the hard top-10 rule (cap 10, no grace band) the holding is exactly the month's list of 10.
+  const heldTop10 = new Set((latestHeldMonth?.rankedSymbols ?? []).slice(0, BUY_RANK_THRESHOLD).map((s) => s.symbol));
+  const heldSymbols = heldTop10;
+  const cappedRankings = groupIntoCappedMonthlyRankings(rows);
+  const cappedTop10 = new Set((cappedRankings[cappedRankings.length - 1]?.rankedSymbols ?? []).slice(0, BUY_RANK_THRESHOLD).map((s) => s.symbol));
+  // Actual sells at the latest scan, across a variant switch: last month's held list minus this month's.
+  const soldThisMonth = latestSellList(rows);
 
   const firstLiveRun =
     cronRuns.find((r) => (r.output as unknown as MonthlyScanOutput | null)?.triggerSource === "cron") ?? null;
@@ -56,19 +71,24 @@ async function getGroup3State() {
   const sectorFlags = sectorRun?.output ? (sectorRun.output as unknown as SectorRotationOutput).flags : [];
   const sectorFlagsAsOf = sectorRun?.output ? (sectorRun.output as unknown as SectorRotationOutput).generatedAt : null;
 
-  const [performance, fullRankPerformance] = await Promise.all([
+  const [performance, cappedPerformance, fullRankPerformance] = await Promise.all([
     getRecommendationPerformance(null, "GROUP_3"),
+    getRecommendationPerformance(null, "GROUP_3", groupIntoCappedMonthlyRankings),
     getGroup3FullRankPickQuality(),
   ]);
 
   return {
     latestMonth,
     heldSymbols,
+    heldVariant,
+    heldTop10,
+    cappedTop10,
     soldThisMonth,
     firstLiveRun,
     sectorFlags,
     sectorFlagsAsOf,
     performance,
+    cappedPerformance,
     fullRankPerformance,
   };
 }
@@ -238,6 +258,7 @@ export default async function TrackingGroupsPage() {
                     <th>Rank</th>
                     <th>Symbol</th>
                     <th>Score</th>
+                    <th>Capped 10</th>
                     <th>Status</th>
                   </tr>
                 </thead>
@@ -245,12 +266,13 @@ export default async function TrackingGroupsPage() {
                   {group3.latestMonth.rankedSymbols.map((s, i) => {
                     const rank = i + 1;
                     const held = group3.heldSymbols.has(s.symbol);
-                    const status = held ? "HELD" : rank <= BUY_RANK_THRESHOLD ? "BUY (no room)" : "—";
+                    const status = held ? "HELD" : group3.heldTop10.has(s.symbol) ? "BUY (no room)" : "—";
                     return (
                       <tr key={s.symbol}>
                         <td className="mono">{rank}</td>
                         <td>{s.symbol}</td>
                         <td className="mono">{s.score}</td>
+                        <td className="mono">{group3.cappedTop10.has(s.symbol) ? "✓" : ""}</td>
                         <td className="mono" style={{ color: held ? "var(--positive)" : undefined }}>{status}</td>
                       </tr>
                     );
@@ -258,6 +280,10 @@ export default async function TrackingGroupsPage() {
                 </tbody>
               </table>
             </div>
+            <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginTop: "0.5rem" }}>
+              Status follows the {group3.heldVariant === "capped" ? "capped" : "pure"} list for this month. Real money holds the
+              capped list from the {GROUP3_HELD_VARIANT_SINCE} scan onward; before that it held the pure top 10.
+            </p>
             {group3.soldThisMonth.length > 0 && (
               <p style={{ color: "var(--negative)", fontSize: "0.8rem", marginTop: "0.5rem" }}>
                 Sold this month: {group3.soldThisMonth.join(", ")}
@@ -267,14 +293,30 @@ export default async function TrackingGroupsPage() {
         )}
       </div>
 
+      {group3.cappedPerformance.totalPositions > 0 && (
+        <div className="card">
+          <div className="agent-card-header">
+            <strong>Group 3 — Capped List Performance</strong>
+          </div>
+          <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginTop: 0 }}>
+            {GROUP3_VARIANT_LABEL.capped}. Held with real money from the {GROUP3_HELD_VARIANT_SINCE} scan onward; earlier months are
+            replayed from each scan&apos;s ranks for comparison.
+          </p>
+          <RecommendationPerformanceCharts
+            {...chartProps(group3.cappedPerformance)}
+            trackingNote="Bought when a name enters the month's capped list (max 3 per sector, usually 9 names, equal weight), sold when it drops off; carried forward month to month."
+          />
+        </div>
+      )}
+
       {group3.performance.totalPositions > 0 && (
         <div className="card">
           <div className="agent-card-header">
-            <strong>Group 3 — Top 10 (Bought/Held) Performance</strong>
+            <strong>Group 3 — Pure Top 10 Performance</strong>
           </div>
           <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginTop: 0 }}>
-            Tracks the actual banding-driven portfolio — how the positions actually held for the Kennedy account
-            performed.
+            {GROUP3_VARIANT_LABEL.pure}. Held with real money Sep 1 to Nov 1, 2026; tracked as the shadow comparison
+            after that.
           </p>
           <RecommendationPerformanceCharts
             {...chartProps(group3.performance)}

@@ -583,7 +583,7 @@ export default async function AgentsPage() {
                 {(
                   [
                     ["Group 3 top 10 (pure)", sectorExposure.pureTop10],
-                    ["Group 3 top 10 (capped 3/sector — shadow, never traded)", sectorExposure.cappedTop10],
+                    ["Group 3 top 10 (capped 3/sector; held from the Nov 1, 2026 scan)", sectorExposure.cappedTop10],
                     ["Unified portfolio (401k funds, taxable, Verizon-linked)", sectorExposure.portfolio],
                   ] as Array<[string, SectorWeights | null]>
                 ).map(([label, w]) => (

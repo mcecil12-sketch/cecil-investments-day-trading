@@ -1,14 +1,17 @@
 /**
- * SHADOW capped top 10 for Group 3 (log-only). Alongside the pure top 10 (by
- * composite rank) we compute a variant that allows at most MAX_PER_SECTOR
- * names per sector, using the sector already on each candidate. It is a
- * shadow portfolio: never traded, never used to change a recommendation, and
- * stored only so the two portfolios can be replayed and compared later (see
- * docs/recommendation-tracking-groups.md for the pre-registered comparison).
- * It does not touch composite scores, ranks, banding, or thresholds.
+ * Capped top 10 for Group 3. Alongside the pure top 10 (by composite rank) we
+ * compute a variant that allows at most CAPPED_MAX_PER_SECTOR names per
+ * sector, using the sector already on each candidate. The monthly scan ranks
+ * only the top 3 sectors, so the list is usually 9 names (3 per sector); the
+ * empty 10th slot is deliberately left unfilled and the 9 are equal-weighted
+ * (decided Oct 22, 2026, over filling it). Decided Oct 22, 2026: this is
+ * the version real money holds from the Nov 2, 2026 rebalance (see
+ * group3Variant.ts); the pure top 10 is tracked alongside as the shadow.
+ * It does not touch composite scores or ranks.
  */
 export const CAPPED_MAX_PER_SECTOR = 3;
 export const CAPPED_TOP_N = 10;
+
 
 export interface CappedInput {
   symbol: string;

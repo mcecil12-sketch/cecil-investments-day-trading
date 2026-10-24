@@ -34,7 +34,7 @@ export interface RecommendationPerformanceResult {
   totalPositions: number;
 }
 
-interface LogRow {
+export interface LogRow {
   symbol: string;
   batchTag: string;
   recommendedAt: Date;
@@ -414,6 +414,8 @@ async function buildPositionTimeline(positions: TrackedPosition[]): Promise<Posi
 export async function getRecommendationPerformance(
   totalCurrentValue?: number | null,
   group: RecommendationGroup = "GROUP_1",
+  /** GROUP_3 only: how each month's ranked list is built before banding (e.g. the capped variant in group3Variant.ts). Defaults to pure composite rank. */
+  monthlyRankings: (rows: Array<LogRow & { sector?: string | null }>) => MonthlyRanking[] = groupIntoMonthlyRankings,
 ): Promise<RecommendationPerformanceResult> {
   const baseValue = resolvePortfolioBaseValue(totalCurrentValue);
   const rows = await prisma.candidateRecommendationLog.findMany({
@@ -437,7 +439,7 @@ export async function getRecommendationPerformance(
   // everything downstream (pick quality, simulated portfolio, realized P&L)
   // is identical regardless of which group this call is for.
   const positions =
-    group === "GROUP_3" ? buildBandedMonthlyPositions(groupIntoMonthlyRankings(rows)) : buildTrackedPositions(groupIntoWeeklyBatches(rows));
+    group === "GROUP_3" ? buildBandedMonthlyPositions(monthlyRankings(rows)) : buildTrackedPositions(groupIntoWeeklyBatches(rows));
 
   const { timeline, priceBySymbol, activePositionsByDate, pickQualityByTimeframe } = await buildPositionTimeline(positions);
 
